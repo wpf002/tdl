@@ -344,7 +344,7 @@ input  { font-family: var(--sans); }
 .section-header { font-size: 13px; font-weight: 700; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text); letter-spacing: -.01em; }
 
 /* Tactic grid */
-.tactic-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 24px; }
+.tactic-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
 .tactic-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 14px; cursor: pointer; transition: border-color .15s, box-shadow .15s; }
 .tactic-card:hover { border-color: var(--border2); box-shadow: var(--shadow-sm); }
 .tactic-dot  { width: 8px; height: 8px; border-radius: 50%; margin-bottom: 8px; }
@@ -525,7 +525,7 @@ function RuleDetail({ rule }) {
         </div>
         <div className="card">
           <div className="card-label">Test Method</div>
-          <div className="card-value" style={{ fontSize:12, color:'#aaa' }}>{rule.test_method}</div>
+          <div className="card-value" style={{ fontSize:12, color:'#aaa' }}>{(rule.test_method||'').replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase())}</div>
         </div>
       </div>
 
@@ -863,10 +863,8 @@ function ChainsView({ rules }) {
       <div className="section-header" style={{marginBottom:6}}>
         <Crosshair size={13} />Lockheed Martin Cyber Kill Chain®
       </div>
-      <div style={{fontSize:11,color:'var(--text2)',marginBottom:14,maxWidth:780,lineHeight:1.55}}>
-        The 7-stage adversary lifecycle from Lockheed Martin. Each stage shows the
-        ATT&CK tactic(s) that map to it and the number of TDL rules covering that
-        adversary behavior. <a href="https://www.lockheedmartin.com/en-us/capabilities/cyber/cyber-kill-chain.html" target="_blank" rel="noreferrer" style={{color:'var(--accent2)'}}>Reference ↗</a>
+      <div style={{fontSize:11,color:'var(--text2)',marginBottom:14,lineHeight:1.55,whiteSpace:'nowrap'}}>
+        The 7-stage adversary lifecycle from Lockheed Martin. Each stage shows the ATT&CK tactic(s) that map to it and the number of TDL rules covering that adversary behavior. <a href="https://www.lockheedmartin.com/en-us/capabilities/cyber/cyber-kill-chain.html" target="_blank" rel="noreferrer" style={{color:'var(--accent2)'}}>Reference ↗</a>
       </div>
 
       <div className="killchain">
@@ -937,12 +935,6 @@ function ChainsView({ rules }) {
                     </React.Fragment>
                   ))}
                 </div>
-                <div className="chain-meta">
-                  <span className="chain-meta-item">
-                    <span style={{color:chain.active?'#7C3AED':'#DC2626'}}>●</span>
-                    {chain.active ? 'ACTIVE — all required rules present' : 'INACTIVE — missing required rules'}
-                  </span>
-                </div>
               </div>
             )
           })}
@@ -955,94 +947,30 @@ function ChainsView({ rules }) {
 // ─── RECOMMEND VIEW ──────────────────────────────────────────────────────────
 
 function RecommendView({ rules }) {
-  const deployed    = LOG_SOURCES.filter(l=>l.deployed)
-  const undeployed  = LOG_SOURCES.filter(l=>!l.deployed).sort((a,b)=>b.rules_unlocked-a.rules_unlocked)
-  const deployable  = useMemo(() => {
-    const depIds = new Set(deployed.map(l=>l.id))
-    return rules.filter(r => {
-      const src = (r.data_sources||[]).join(' ').toLowerCase()
-      return depIds.has('windows_security_events') && (src.includes('windows') || src.includes('sysmon'))
-        || depIds.has('firewall') && src.includes('firewall')
-        || depIds.has('dns') && src.includes('dns')
-        || depIds.has('edr') && src.includes('edr')
-        || depIds.has('identity_provider') && (src.includes('azure ad')||src.includes('okta'))
-        || depIds.has('cloud') && (src.includes('aws')||src.includes('azure')||src.includes('cloudtrail'))
-    }).length
-  }, [rules, deployed])
-
-  const cCrit = { Critical:'#DC2626', High:'#7C3AED', Medium:'#2563EB' }
+  const cCrit = { Critical:'#DC2626', High:'#7C3AED', Medium:'#2563EB', Low:'#6E6E7C' }
+  const critOrder = { Critical:0, High:1, Medium:2, Low:3 }
+  const byCriticality = [...LOG_SOURCES].sort((a,b) =>
+    (critOrder[a.criticality] ?? 9) - (critOrder[b.criticality] ?? 9) || a.tier - b.tier || b.rules_unlocked - a.rules_unlocked
+  )
 
   return (
     <div className="view">
-      <div className="demo-banner">
-        <div className="demo-banner-icon"><AlertTriangle size={16} /></div>
-        <div>
-          <div className="demo-banner-title">Demo data — no real environment is configured</div>
-          <div className="demo-banner-body">
-            The numbers and tables below are computed against <code>profiles/default.yaml</code>, a hypothetical enterprise (Windows + M365 + Cloud).
-            They do <strong>not</strong> reflect anything you've deployed. To make this view useful, edit that file with your actual SIEM, log sources, and platforms — the recommendation engine then re-runs against your real stack.
-          </div>
-        </div>
-      </div>
-
-      <div className="section-header" style={{marginBottom:6,marginTop:24}}><MapIcon size={13} />Sample Environment Profile</div>
-      <div style={{fontSize:12,color:'var(--text2)',marginBottom:20,lineHeight:1.55}}>Default Enterprise — Windows + M365 + Cloud. Output of <code style={{fontFamily:'var(--mono)',fontSize:11}}>tools/recommend.py --profile profiles/default.yaml</code>.</div>
-
-      <div className="dash-metrics" style={{gridTemplateColumns:'repeat(3,1fr)',marginBottom:24}}>
-        {[
-          { icon:<CheckCircle size={15}/>, num:deployed.length,     lbl:'Sources in sample profile', color:'#F2F2F7', bg:'rgba(255,255,255,.06)' },
-          { icon:<Shield size={15}/>,      num:deployable,           lbl:'Rules runnable on these',   color:'#3B82F6', bg:'rgba(59,130,246,.18)' },
-          { icon:<TrendingUp size={15}/>,  num:undeployed.reduce((a,l)=>a+l.rules_unlocked,0), lbl:'Rules unlocked by adding the rest', color:'#A855F7', bg:'rgba(168,85,247,.18)' },
-        ].map((m,i)=>(
-          <div key={i} className="metric-card">
-            <div className="metric-icon" style={{background:m.bg}}>{React.cloneElement(m.icon,{color:m.color})}</div>
-            <div className="metric-num" style={{color:m.color}}>{m.num}</div>
-            <div className="metric-lbl">{m.lbl}</div>
-          </div>
-        ))}
-      </div>
-
-      <div className="two-col">
-        <div>
-          <div className="section-header"><Database size={13} />Log Source Criticality Assessment</div>
-          <table className="log-source-table">
-            <thead><tr>
-              <th>Status</th><th>Criticality</th><th>Tier</th><th>Log Source</th>
-            </tr></thead>
-            <tbody>
-              {LOG_SOURCES.map(ls => (
-                <tr key={ls.id}>
-                  <td>
-                    <span className="status-dot" style={{background:ls.deployed?'#7C3AED':'#DC2626'}} />
-                    {ls.deployed ? 'In profile' : 'Not in profile'}
-                  </td>
-                  <td style={{color:cCrit[ls.criticality]||'var(--text2)'}}>{ls.criticality}</td>
-                  <td style={{fontFamily:'var(--mono)',fontSize:11}}>T{ls.tier}</td>
-                  <td>{ls.name}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-
-        <div>
-          <div className="section-header"><TrendingUp size={13} />Log Source ROI — Deploy These Next</div>
-          <table className="log-source-table">
-            <thead><tr>
-              <th>Log Source</th><th>Tier</th><th>Rules Unlocked</th>
-            </tr></thead>
-            <tbody>
-              {undeployed.map(ls => (
-                <tr key={ls.id}>
-                  <td style={{fontWeight:500,color:'var(--text)'}}>{ls.name}</td>
-                  <td style={{fontFamily:'var(--mono)',fontSize:11}}>T{ls.tier}</td>
-                  <td style={{fontFamily:'var(--mono)',fontSize:12,color:'#7C3AED',fontWeight:700}}>+{ls.rules_unlocked}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      <div className="section-header"><Database size={13} />Log Source Criticality Assessment</div>
+      <table className="log-source-table">
+        <thead><tr>
+          <th>Criticality</th><th>Tier</th><th>Log Source</th><th>Rules</th>
+        </tr></thead>
+        <tbody>
+          {byCriticality.map(ls => (
+            <tr key={ls.id}>
+              <td style={{color:cCrit[ls.criticality]||'var(--text2)'}}>{ls.criticality}</td>
+              <td style={{fontFamily:'var(--mono)',fontSize:11}}>T{ls.tier}</td>
+              <td>{ls.name}</td>
+              <td style={{fontFamily:'var(--mono)',fontSize:12,color:'#7C3AED',fontWeight:700}}>{ls.rules_unlocked}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }
@@ -1054,7 +982,7 @@ const buildViews = (ruleCount, chainCount) => [
   { id:'rules',     label:'Detection Rules',  icon:<Shield size={14} />,   badge:ruleCount },
   { id:'matrix',    label:'ATT&CK Matrix',    icon:<MapIcon size={14} /> },
   { id:'chains',    label:'Kill Chain',       icon:<GitBranch size={14} />, badge:chainCount },
-  { id:'recommend', label:'Recommendations',  icon:<TrendingUp size={14} /> },
+  { id:'recommend', label:'Log Sources',      icon:<TrendingUp size={14} /> },
 ]
 
 export default function App() {

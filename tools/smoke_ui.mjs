@@ -43,9 +43,19 @@ errors.forEach(m => console.log(m))
 console.log('--- VIEW RENDER ---')
 results.forEach(r => console.log(`  ${r.view.padEnd(12)} main.innerText length: ${r.mainTextLen}`))
 
-const apiSourceLive = await page.evaluate(() => document.body.innerText.includes('● live API'))
-console.log('--- DATA SOURCE INDICATOR ---')
-console.log(`  shows "● live API": ${apiSourceLive}`)
+// Capture screenshots for visual review
+if (process.env.SCREENSHOT === '1') {
+  for (const v of VIEWS) {
+    await page.evaluate((label) => {
+      const items = Array.from(document.querySelectorAll('.nav-item'))
+      const target = items.find(el => el.textContent.toLowerCase().includes(label.toLowerCase().slice(0, 5)))
+      if (target) target.click()
+    }, v === 'recommend' ? 'recom' : v === 'matrix' ? 'matri' : v === 'chains' ? 'kill' : v === 'rules' ? 'detection' : 'dashb')
+    await new Promise(r => setTimeout(r, 350))
+    await page.screenshot({ path: `/tmp/tdl-${v}.png`, fullPage: false })
+    console.log(`  📸 /tmp/tdl-${v}.png`)
+  }
+}
 
 await browser.close()
 

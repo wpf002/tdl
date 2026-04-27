@@ -17,23 +17,27 @@ const TACTIC_ORDER = [
   'Command and Control','Collection','Exfiltration','Impact'
 ]
 
+// Tactic palette — three bands across the kill-chain progression:
+//   red   = early-stage (gain access, execute, escalate)
+//   purple = mid-stage  (evade, harvest, move)
+//   blue  = late-stage  (control, collect, exfil, impact)
 const TACTIC_COLOR = {
-  'Initial Access':        '#FF6B35',
-  'Execution':             '#F7C59F',
-  'Persistence':           '#EFEFD0',
-  'Privilege Escalation':  '#FF4757',
-  'Defense Evasion':       '#A855F7',
-  'Credential Access':     '#EC4899',
-  'Discovery':             '#3B82F6',
-  'Lateral Movement':      '#06B6D4',
-  'Command and Control':   '#10B981',
-  'Collection':            '#84CC16',
-  'Exfiltration':          '#EAB308',
-  'Impact':                '#EF4444',
+  'Initial Access':        '#B91C1C',
+  'Execution':             '#DC2626',
+  'Persistence':           '#E11D48',
+  'Privilege Escalation':  '#9F1239',
+  'Defense Evasion':       '#7C3AED',
+  'Credential Access':     '#6D28D9',
+  'Discovery':             '#8B5CF6',
+  'Lateral Movement':      '#5B21B6',
+  'Command and Control':   '#1D4ED8',
+  'Collection':            '#2563EB',
+  'Exfiltration':          '#1E40AF',
+  'Impact':                '#3B82F6',
 }
 
-const SEV_COLOR = { Critical:'#EF4444', High:'#F97316', Medium:'#EAB308', Low:'#22C55E' }
-const SEV_BG    = { Critical:'rgba(239,68,68,.12)', High:'rgba(249,115,22,.12)', Medium:'rgba(234,179,8,.12)', Low:'rgba(34,197,94,.12)' }
+const SEV_COLOR = { Critical:'#B91C1C', High:'#DC2626', Medium:'#7C3AED', Low:'#2563EB' }
+const SEV_BG    = { Critical:'rgba(185,28,28,.10)', High:'rgba(220,38,38,.10)', Medium:'rgba(124,58,237,.10)', Low:'rgba(37,99,235,.10)' }
 
 const PLATFORMS = ['Windows','Linux','macOS','AWS','Azure','GCP','Okta','Microsoft 365','Network','Kubernetes','SaaS']
 
@@ -94,26 +98,43 @@ const CSS = `
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg0:     #0a0a0b;
-  --bg1:     #111113;
-  --bg2:     #18181c;
-  --bg3:     #222228;
-  --border:  #2a2a32;
-  --border2: #363640;
-  --text:    #f0f0f8;
-  --text2:   #b8b8cc;
-  --text3:   #8a8aa0;
-  --accent:  #FF6B35;
-  --accent2: #3B82F6;
-  --green:   #22C55E;
-  --red:     #EF4444;
-  --yellow:  #EAB308;
-  --purple:  #A855F7;
+  /* Surfaces — pure white page, soft greys for chrome */
+  --bg0:      #FFFFFF;
+  --bg1:      #FAFAFB;
+  --bg2:      #F4F4F7;
+  --bg3:      #ECECF0;
+  --border:   #E4E4EA;
+  --border2:  #D0D0D9;
+
+  /* Text — near-black on white, all WCAG AAA */
+  --text:     #0B0B12;
+  --text2:    #4A4A57;
+  --text3:    #6E6E7C;
+
+  /* Restricted palette: red / blue / purple / grey / white / black */
+  --red:      #DC2626;
+  --red-dk:   #B91C1C;
+  --red-lt:   #FEE2E2;
+  --blue:     #2563EB;
+  --blue-dk:  #1D4ED8;
+  --blue-lt:  #DBEAFE;
+  --purple:   #7C3AED;
+  --purple-dk:#6D28D9;
+  --purple-lt:#EDE9FE;
+
+  /* Aliases — primary accent is purple, secondary is blue */
+  --accent:   var(--purple);
+  --accent2:  var(--blue);
+
+  --shadow-sm: 0 1px 2px rgba(11,11,18,.04);
+  --shadow:    0 2px 8px rgba(11,11,18,.06);
+  --shadow-lg: 0 8px 24px rgba(11,11,18,.08);
+
   --mono:    'IBM Plex Mono', monospace;
   --sans:    'IBM Plex Sans', sans-serif;
 }
 
-html, body, #root { height: 100%; background: var(--bg0); color: var(--text); font-family: var(--sans); overflow: hidden; }
+html, body, #root { height: 100%; background: var(--bg0); color: var(--text); font-family: var(--sans); overflow: hidden; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
 
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -138,9 +159,10 @@ input  { font-family: var(--sans); }
 }
 .logo-mark { display: flex; align-items: center; gap: 10px; }
 .logo-icon {
-  width: 30px; height: 30px; background: var(--accent);
-  border-radius: 6px; display: flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
+  width: 32px; height: 32px;
+  background: linear-gradient(135deg, var(--purple) 0%, var(--blue) 100%);
+  border-radius: 8px; display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; box-shadow: var(--shadow-sm);
 }
 .logo-text { font-size: 14px; font-weight: 700; letter-spacing: .06em; }
 .logo-ver  { font-size: 10px; font-family: var(--mono); color: var(--text3); margin-top: 1px; }
@@ -159,13 +181,13 @@ input  { font-family: var(--sans); }
   user-select: none;
 }
 .nav-item:hover { color: var(--text); background: var(--bg2); }
-.nav-item.active { color: var(--accent); background: rgba(255,107,53,.07); border-left-color: var(--accent); }
+.nav-item.active { color: var(--purple); background: var(--purple-lt); border-left-color: var(--purple); font-weight: 600; }
 .nav-badge {
   margin-left: auto; font-size: 10px; font-family: var(--mono);
   background: var(--bg3); color: var(--text3);
-  padding: 1px 6px; border-radius: 10px;
+  padding: 1px 7px; border-radius: 10px; font-weight: 600;
 }
-.nav-item.active .nav-badge { background: rgba(255,107,53,.15); color: var(--accent); }
+.nav-item.active .nav-badge { background: var(--purple); color: #fff; }
 
 .sidebar-stats { border-top: 1px solid var(--border); padding: 12px 18px; }
 .stat-row { display: flex; justify-content: space-between; padding: 2px 0; }
@@ -176,8 +198,8 @@ input  { font-family: var(--sans); }
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 
 .topbar {
-  height: 50px; background: var(--bg1); border-bottom: 1px solid var(--border);
-  display: flex; align-items: center; gap: 12px; padding: 0 20px; flex-shrink: 0;
+  height: 54px; background: var(--bg0); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 14px; padding: 0 24px; flex-shrink: 0;
 }
 .topbar-title { font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
 .topbar-sub   { font-size: 11px; color: var(--text2); font-family: var(--mono); }
@@ -185,39 +207,40 @@ input  { font-family: var(--sans); }
 .search-wrap { position: relative; margin-left: auto; }
 .search-icon { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--text3); pointer-events: none; }
 .search-input {
-  background: var(--bg2); border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg1); border: 1px solid var(--border); border-radius: 6px;
   color: var(--text); padding: 7px 12px 7px 32px; font-size: 12px;
-  width: 260px; outline: none; transition: border-color .15s;
+  width: 280px; outline: none; transition: border-color .15s, box-shadow .15s, background .15s;
 }
-.search-input:focus { border-color: var(--accent2); }
+.search-input:focus { border-color: var(--purple); background: var(--bg0); box-shadow: 0 0 0 3px var(--purple-lt); }
 .search-input::placeholder { color: var(--text3); }
 
 .filterbar {
-  display: flex; align-items: center; gap: 6px; padding: 8px 20px;
+  display: flex; align-items: center; gap: 6px; padding: 10px 24px;
   border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap;
+  background: var(--bg1);
 }
 .chip {
-  padding: 3px 10px; border-radius: 3px; font-size: 11px; font-weight: 600;
-  border: 1px solid var(--border2); background: var(--bg2); color: var(--text2);
+  padding: 4px 11px; border-radius: 4px; font-size: 11px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--bg0); color: var(--text2);
   cursor: pointer; transition: all .12s; white-space: nowrap;
 }
-.chip:hover { border-color: var(--accent); color: var(--text); }
-.chip.on    { border-color: var(--accent); background: rgba(255,107,53,.1); color: var(--accent); }
-.chip.clear { border-color: var(--red); color: var(--red); margin-left: auto; }
-.chip-label { font-size: 10px; color: var(--text3); }
+.chip:hover { border-color: var(--purple); color: var(--purple); }
+.chip.on    { border-color: var(--purple); background: var(--purple); color: #fff; }
+.chip.clear { border-color: var(--red); color: var(--red); margin-left: auto; background: var(--red-lt); }
+.chip-label { font-size: 10px; color: var(--text3); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
 
 /* ── RULE LIST ── */
-.rule-list { width: 360px; flex-shrink: 0; border-right: 1px solid var(--border); overflow-y: auto; }
-.list-count { padding: 8px 14px; font-size: 10px; font-family: var(--mono); color: var(--text3); border-bottom: 1px solid var(--border); }
+.rule-list { width: 380px; flex-shrink: 0; border-right: 1px solid var(--border); overflow-y: auto; background: var(--bg0); }
+.list-count { padding: 10px 16px; font-size: 10px; font-family: var(--mono); color: var(--text3); border-bottom: 1px solid var(--border); font-weight: 600; }
 .rule-row {
-  padding: 11px 14px; border-bottom: 1px solid var(--border);
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
   cursor: pointer; transition: background .1s; position: relative;
 }
-.rule-row:hover  { background: var(--bg2); }
-.rule-row.active { background: rgba(59,130,246,.07); }
-.rule-row.active::before { content:''; position:absolute; left:0; top:0; bottom:0; width:2px; background: var(--accent2); }
-.rule-rid  { font-family: var(--mono); font-size: 10px; color: var(--text3); margin-bottom: 3px; }
-.rule-name { font-size: 13px; font-weight: 500; line-height: 1.3; margin-bottom: 6px; }
+.rule-row:hover  { background: var(--bg1); }
+.rule-row.active { background: var(--purple-lt); }
+.rule-row.active::before { content:''; position:absolute; left:0; top:0; bottom:0; width:3px; background: var(--purple); }
+.rule-rid  { font-family: var(--mono); font-size: 10px; color: var(--text3); margin-bottom: 4px; font-weight: 600; }
+.rule-name { font-size: 13px; font-weight: 500; line-height: 1.35; margin-bottom: 7px; color: var(--text); }
 .rule-meta { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
 
 /* ── PILLS ── */
@@ -226,11 +249,11 @@ input  { font-family: var(--sans); }
   font-weight: 600; border: 1px solid transparent; white-space: nowrap; font-family: var(--mono);
 }
 .pill-sev { }
-.pill-tactic { background: rgba(59,130,246,.1); color: var(--accent2); border-color: rgba(59,130,246,.2); font-family: var(--sans); font-size: 10px; }
-.pill-fid-High   { background: rgba(34,197,94,.1);  color: var(--green);  border-color: rgba(34,197,94,.2);  }
-.pill-fid-Medium { background: rgba(234,179,8,.1);  color: var(--yellow); border-color: rgba(234,179,8,.2);  }
-.pill-fid-Low    { background: rgba(239,68,68,.1);  color: var(--red);    border-color: rgba(239,68,68,.2);  }
-.pill-lc { background: var(--bg3); color: var(--text2); font-family: var(--sans); font-size: 10px; }
+.pill-tactic { background: var(--bg2); color: var(--text2); border-color: var(--border); font-family: var(--sans); font-size: 10px; }
+.pill-fid-High   { background: var(--purple-lt); color: var(--purple-dk); border-color: rgba(124,58,237,.25); }
+.pill-fid-Medium { background: var(--blue-lt);   color: var(--blue-dk);   border-color: rgba(37,99,235,.25); }
+.pill-fid-Low    { background: var(--bg2);       color: var(--text2);     border-color: var(--border); }
+.pill-lc { background: var(--bg2); color: var(--text2); font-family: var(--sans); font-size: 10px; }
 
 /* ── RULE DETAIL ── */
 .content { flex: 1; display: flex; overflow: hidden; }
@@ -273,20 +296,20 @@ input  { font-family: var(--sans); }
   transition: all .12s;
 }
 .qtab:hover { color: var(--text); }
-.qtab.active { background: var(--bg1); color: var(--accent); border-color: var(--border2); }
-.qblock { background: var(--bg1); border: 1px solid var(--border2); border-radius: 0 6px 6px 6px; overflow: hidden; }
+.qtab.active { background: var(--bg0); color: var(--purple); border-color: var(--border2); }
+.qblock { background: var(--bg0); border: 1px solid var(--border2); border-radius: 0 8px 8px 8px; overflow: hidden; }
 .qblock-head {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 7px 14px; background: var(--bg2); border-bottom: 1px solid var(--border);
+  padding: 8px 14px; background: var(--bg1); border-bottom: 1px solid var(--border);
 }
-.qblock-lang { font-size: 11px; font-family: var(--mono); color: var(--accent); font-weight: 600; }
+.qblock-lang { font-size: 11px; font-family: var(--mono); color: var(--purple); font-weight: 700; letter-spacing: .03em; }
 .copy-btn {
-  display: flex; align-items: center; gap: 4px; font-size: 10px;
-  border: 1px solid var(--border2); border-radius: 4px; padding: 3px 8px;
-  color: var(--text2); background: var(--bg3); transition: all .12s;
+  display: flex; align-items: center; gap: 5px; font-size: 10px;
+  border: 1px solid var(--border); border-radius: 5px; padding: 4px 9px;
+  color: var(--text2); background: var(--bg0); transition: all .12s; font-weight: 600;
 }
-.copy-btn:hover { border-color: var(--accent); color: var(--accent); }
-.qcode { font-family: var(--mono); font-size: 11.5px; padding: 14px; overflow-x: auto; white-space: pre; color: var(--text); line-height: 1.7; max-height: 320px; overflow-y: auto; }
+.copy-btn:hover { border-color: var(--purple); color: var(--purple); background: var(--purple-lt); }
+.qcode { font-family: var(--mono); font-size: 11.5px; padding: 14px; overflow-x: auto; white-space: pre; color: var(--text); line-height: 1.7; max-height: 360px; overflow-y: auto; background: var(--bg1); }
 
 .tags-row { display: flex; gap: 5px; flex-wrap: wrap; }
 .tag { font-size: 10px; font-family: var(--mono); padding: 2px 8px; background: var(--bg2); border: 1px solid var(--border); border-radius: 3px; color: var(--text3); }
@@ -296,21 +319,22 @@ input  { font-family: var(--sans); }
 .list-dot { width: 4px; height: 4px; border-radius: 50%; background: var(--text3); margin-top: 5px; flex-shrink: 0; }
 
 /* ── VIEWS ── */
-.view { flex: 1; overflow-y: auto; padding: 24px; }
+.view { flex: 1; overflow-y: auto; padding: 28px; background: var(--bg0); }
 
 /* Dashboard */
-.dash-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
-.metric-card { background: var(--bg1); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
-.metric-icon { width: 34px; height: 34px; border-radius: 7px; display: flex; align-items: center; justify-content: center; margin-bottom: 10px; }
-.metric-num  { font-size: 28px; font-weight: 700; font-family: var(--mono); line-height: 1; }
-.metric-lbl  { font-size: 11px; color: var(--text2); margin-top: 3px; }
+.dash-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 28px; }
+.metric-card { background: var(--bg0); border: 1px solid var(--border); border-radius: 10px; padding: 18px; box-shadow: var(--shadow-sm); transition: box-shadow .15s, transform .15s; }
+.metric-card:hover { box-shadow: var(--shadow); transform: translateY(-1px); }
+.metric-icon { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; margin-bottom: 12px; }
+.metric-num  { font-size: 30px; font-weight: 700; font-family: var(--mono); line-height: 1; letter-spacing: -.02em; }
+.metric-lbl  { font-size: 11px; color: var(--text2); margin-top: 5px; font-weight: 500; }
 
-.section-header { font-size: 13px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 7px; }
+.section-header { font-size: 13px; font-weight: 700; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text); letter-spacing: -.01em; }
 
 /* Tactic grid */
 .tactic-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 24px; }
-.tactic-card { background: var(--bg1); border: 1px solid var(--border); border-radius: 6px; padding: 12px; cursor: pointer; transition: border-color .15s; }
-.tactic-card:hover { border-color: var(--border2); }
+.tactic-card { background: var(--bg0); border: 1px solid var(--border); border-radius: 8px; padding: 14px; cursor: pointer; transition: border-color .15s, box-shadow .15s; }
+.tactic-card:hover { border-color: var(--border2); box-shadow: var(--shadow-sm); }
 .tactic-dot  { width: 8px; height: 8px; border-radius: 50%; margin-bottom: 8px; }
 .tactic-name { font-size: 11px; font-weight: 600; margin-bottom: 6px; }
 .tactic-bar  { height: 3px; border-radius: 2px; background: var(--bg3); overflow: hidden; margin-bottom: 5px; }
@@ -318,19 +342,19 @@ input  { font-family: var(--sans); }
 .tactic-stat { font-size: 10px; font-family: var(--mono); color: var(--text2); }
 
 /* Sev dist */
-.sev-bars { display: flex; flex-direction: column; gap: 8px; }
-.sev-row  { display: flex; align-items: center; gap: 10px; }
-.sev-lbl  { font-size: 11px; font-weight: 700; width: 65px; }
-.sev-bar-bg { flex: 1; height: 18px; background: var(--bg3); border-radius: 3px; overflow: hidden; }
-.sev-bar-fill { height: 100%; border-radius: 3px; display: flex; align-items: center; padding: 0 8px; font-size: 11px; font-family: var(--mono); font-weight: 700; color: white; }
+.sev-bars { display: flex; flex-direction: column; gap: 10px; }
+.sev-row  { display: flex; align-items: center; gap: 12px; }
+.sev-lbl  { font-size: 11px; font-weight: 700; width: 70px; }
+.sev-bar-bg { flex: 1; height: 20px; background: var(--bg2); border-radius: 4px; overflow: hidden; }
+.sev-bar-fill { height: 100%; border-radius: 4px; display: flex; align-items: center; padding: 0 10px; font-size: 11px; font-family: var(--mono); font-weight: 700; color: white; min-width: 30px; }
 
 /* ATT&CK Matrix — column-per-tactic grid mirroring attack.mitre.org */
 .matrix-legend { display: flex; align-items: center; gap: 12px; padding: 8px 20px; border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; font-size: 10px; color: var(--text2); font-family: var(--mono); }
 .matrix-legend-item { display: inline-flex; align-items: center; gap: 5px; }
 .matrix-legend-swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; border: 1px solid; }
 .matrix-legend-link { margin-left: auto; }
-.matrix-legend-link a { color: var(--text2); text-decoration: none; }
-.matrix-legend-link a:hover { color: var(--accent); }
+.matrix-legend-link a { color: var(--purple); text-decoration: none; font-weight: 600; }
+.matrix-legend-link a:hover { text-decoration: underline; }
 .matrix-scroll { flex: 1; overflow: auto; padding: 12px; }
 .attack-grid { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(168px, 1fr); gap: 6px; min-width: max-content; }
 .attack-col { display: flex; flex-direction: column; min-width: 168px; }
@@ -344,61 +368,63 @@ input  { font-family: var(--sans); }
   cursor: pointer; transition: filter .12s, transform .08s;
   position: relative;
 }
-.attack-cell:hover { filter: brightness(1.25); transform: translateX(1px); }
-.attack-cell-id { font-size: 10px; font-family: var(--mono); font-weight: 600; }
-.attack-cell-name { font-size: 10.5px; color: var(--text); line-height: 1.25; }
+.attack-cell:hover { transform: translateX(2px); box-shadow: var(--shadow-sm); }
+.attack-cell-id { font-size: 10px; font-family: var(--mono); font-weight: 700; letter-spacing: .02em; }
+.attack-cell-name { font-size: 10.5px; line-height: 1.3; }
 .attack-cell-count {
-  position: absolute; top: 4px; right: 5px; font-size: 9px; font-family: var(--mono); font-weight: 700;
-  color: #86EFAC; background: rgba(34,197,94,.18); padding: 1px 5px; border-radius: 8px;
+  position: absolute; top: 5px; right: 6px; font-size: 9px; font-family: var(--mono); font-weight: 700;
+  color: #fff; background: var(--purple); padding: 1px 6px; border-radius: 8px;
 }
 
 /* Lockheed Cyber Kill Chain — horizontal 7-stage flow */
 .killchain { display: flex; align-items: stretch; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
 .kc-wrap { display: flex; align-items: center; flex: 1 1 230px; min-width: 220px; }
 .kc-stage {
-  flex: 1; padding: 12px 12px 10px; border-radius: 6px; border: 1px solid;
-  display: flex; flex-direction: column; gap: 6px; min-height: 154px; min-width: 0;
-  background: var(--bg1); transition: border-color .15s;
+  flex: 1; padding: 14px 14px 12px; border-radius: 8px; border: 1px solid;
+  display: flex; flex-direction: column; gap: 8px; min-height: 168px; min-width: 0;
+  background: var(--bg0); transition: border-color .15s, box-shadow .15s, transform .15s;
 }
-.kc-stage.kc-cov { border-color: rgba(34,197,94,.40); background: linear-gradient(180deg, rgba(34,197,94,.06) 0%, var(--bg1) 60%); }
-.kc-stage.kc-gap { border-color: rgba(239,68,68,.30); background: linear-gradient(180deg, rgba(239,68,68,.05) 0%, var(--bg1) 60%); }
-.kc-stage.kc-pre { border-color: var(--border); background: var(--bg2); opacity: .75; }
-.kc-stage-num { font-size: 9px; font-family: var(--mono); color: var(--text3); letter-spacing: .15em; }
-.kc-stage-name { font-size: 13px; font-weight: 700; color: var(--text); line-height: 1.15; }
-.kc-stage-desc { font-size: 10.5px; color: var(--text2); line-height: 1.45; flex: 1; }
-.kc-stage-meta { display: flex; flex-direction: column; gap: 5px; padding-top: 6px; border-top: 1px solid var(--border); }
-.kc-tactics { display: flex; flex-wrap: wrap; gap: 3px; }
-.kc-tactic-pill { font-size: 9px; padding: 1px 6px; border-radius: 3px; border: 1px solid; font-weight: 600; }
+.kc-stage:hover { box-shadow: var(--shadow); transform: translateY(-1px); }
+.kc-stage.kc-cov { border-color: rgba(124,58,237,.50); background: linear-gradient(180deg, var(--purple-lt) 0%, var(--bg0) 70%); }
+.kc-stage.kc-gap { border-color: rgba(220,38,38,.40); background: linear-gradient(180deg, var(--red-lt) 0%, var(--bg0) 70%); }
+.kc-stage.kc-pre { border-color: var(--border); background: var(--bg1); opacity: .80; }
+.kc-stage-num { font-size: 9px; font-family: var(--mono); color: var(--text3); letter-spacing: .18em; font-weight: 700; }
+.kc-stage-name { font-size: 13.5px; font-weight: 700; color: var(--text); line-height: 1.15; letter-spacing: -.01em; }
+.kc-stage-desc { font-size: 10.5px; color: var(--text2); line-height: 1.5; flex: 1; }
+.kc-stage-meta { display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border); }
+.kc-tactics { display: flex; flex-wrap: wrap; gap: 4px; }
+.kc-tactic-pill { font-size: 9px; padding: 2px 7px; border-radius: 3px; border: 1px solid; font-weight: 600; }
 .kc-count { font-size: 11px; font-family: var(--mono); font-weight: 700; }
-.kc-pre-tag { font-size: 9px; font-family: var(--mono); color: var(--text3); letter-spacing: .04em; }
-.kc-arrow { color: var(--text3); flex-shrink: 0; margin: 0 -1px; }
+.kc-pre-tag { font-size: 9px; font-family: var(--mono); color: var(--text3); letter-spacing: .04em; font-weight: 600; }
+.kc-arrow { color: var(--text3); flex-shrink: 0; margin: 0 -2px; }
 
 /* Chains */
-.chains-grid { display: flex; flex-direction: column; gap: 12px; }
-.chain-card { background: var(--bg1); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-.chain-head { display: flex; align-items: center; gap: 12px; padding: 14px 16px; }
-.chain-active { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.chain-id   { font-family: var(--mono); font-size: 11px; color: var(--text3); }
-.chain-name { font-size: 14px; font-weight: 600; flex: 1; }
+.chains-grid { display: flex; flex-direction: column; gap: 14px; }
+.chain-card { background: var(--bg0); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; transition: box-shadow .15s; }
+.chain-card:hover { box-shadow: var(--shadow); }
+.chain-head { display: flex; align-items: center; gap: 14px; padding: 16px 18px; }
+.chain-active { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.chain-id   { font-family: var(--mono); font-size: 11px; color: var(--text3); font-weight: 600; }
+.chain-name { font-size: 14px; font-weight: 600; flex: 1; color: var(--text); }
 .chain-threat { font-size: 11px; color: var(--text2); margin-left: auto; }
-.chain-steps { display: flex; align-items: center; gap: 0; padding: 0 16px 14px; flex-wrap: wrap; }
+.chain-steps { display: flex; align-items: center; gap: 0; padding: 0 18px 16px; flex-wrap: wrap; }
 .chain-step {
-  font-size: 11px; padding: 4px 10px; background: var(--bg2);
-  border: 1px solid var(--border); border-radius: 4px; color: var(--text2);
-  white-space: nowrap;
+  font-size: 11px; padding: 5px 11px; background: var(--bg1);
+  border: 1px solid var(--border); border-radius: 5px; color: var(--text2);
+  white-space: nowrap; font-weight: 500;
 }
-.chain-arrow { color: var(--text3); margin: 0 4px; flex-shrink: 0; }
-.chain-meta  { display: flex; gap: 16px; padding: 10px 16px; background: var(--bg0); border-top: 1px solid var(--border); }
-.chain-meta-item { font-size: 11px; color: var(--text2); display: flex; align-items: center; gap: 5px; font-family: var(--mono); }
+.chain-arrow { color: var(--text3); margin: 0 5px; flex-shrink: 0; }
+.chain-meta  { display: flex; gap: 16px; padding: 11px 18px; background: var(--bg1); border-top: 1px solid var(--border); }
+.chain-meta-item { font-size: 11px; color: var(--text2); display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-weight: 500; }
 
 /* Recommend */
 .rec-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 24px; }
 .log-source-table { width: 100%; border-collapse: collapse; }
-.log-source-table th { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--text3); padding: 8px 12px; border-bottom: 1px solid var(--border); text-align: left; }
-.log-source-table td { font-size: 12px; padding: 10px 12px; border-bottom: 1px solid var(--border); color: var(--text2); }
+.log-source-table th { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .10em; color: var(--text3); padding: 10px 14px; border-bottom: 1px solid var(--border); text-align: left; background: var(--bg1); }
+.log-source-table td { font-size: 12px; padding: 11px 14px; border-bottom: 1px solid var(--border); color: var(--text2); }
 .log-source-table tr:last-child td { border-bottom: none; }
-.log-source-table tr:hover td { background: var(--bg2); }
-.status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
+.log-source-table tr:hover td { background: var(--bg1); }
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; }
 
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 `
@@ -452,7 +478,7 @@ function RuleDetail({ rule }) {
         </div>
         <div className="card">
           <div className="card-label">Fidelity</div>
-          <div className="card-value" style={{ color: rule.fidelity==='High'?'#22C55E':rule.fidelity==='Medium'?'#EAB308':'#EF4444' }}>{rule.fidelity}</div>
+          <div className="card-value" style={{ color: rule.fidelity==='High'?'#7C3AED':rule.fidelity==='Medium'?'#2563EB':'#6E6E7C' }}>{rule.fidelity}</div>
         </div>
         <div className="card">
           <div className="card-label">Technique</div>
@@ -614,10 +640,10 @@ function DashboardView({ rules }) {
     <div className="view">
       <div className="dash-metrics">
         {[
-          { icon:<Shield size={16} />, num:rules.length, lbl:'Total Rules',       color:'#3B82F6', bg:'rgba(59,130,246,.15)' },
-          { icon:<Crosshair size={16} />, num:techniques.size, lbl:'ATT&CK Techniques', color:'#A855F7', bg:'rgba(168,85,247,.15)' },
-          { icon:<AlertTriangle size={16} />, num:critical, lbl:'Critical Severity', color:'#EF4444', bg:'rgba(239,68,68,.15)' },
-          { icon:<TrendingUp size={16} />, num:highFid,     lbl:'High Fidelity',   color:'#FF6B35', bg:'rgba(255,107,53,.15)' },
+          { icon:<Shield size={16} />, num:rules.length, lbl:'Total Rules',       color:'#0B0B12', bg:'#F4F4F7' },
+          { icon:<Crosshair size={16} />, num:techniques.size, lbl:'ATT&CK Techniques', color:'#7C3AED', bg:'#EDE9FE' },
+          { icon:<AlertTriangle size={16} />, num:critical, lbl:'Critical Severity', color:'#DC2626', bg:'#FEE2E2' },
+          { icon:<TrendingUp size={16} />, num:highFid,     lbl:'High Fidelity',   color:'#2563EB', bg:'#DBEAFE' },
         ].map((m,i) => (
           <div key={i} className="metric-card">
             <div className="metric-icon" style={{background:m.bg}}>{React.cloneElement(m.icon, {color:m.color})}</div>
@@ -660,19 +686,6 @@ function DashboardView({ rules }) {
             })}
           </div>
 
-          <div className="section-header"><Activity size={13} />Test Validation</div>
-          <div className="sev-bars">
-            {[['historical','#22C55E','Historical data'],['synthetic','#3B82F6','Synthetic events'],['purple_team','#A855F7','Purple team'],['none','#666','Not validated']].map(([key,color,label]) => {
-              const c = rules.filter(r=>r.test_method===key).length
-              const pct = rules.length ? Math.max(c/rules.length*100,1) : 1
-              return (
-                <div key={key} className="sev-row">
-                  <div className="sev-lbl" style={{color, fontSize:10}}>{label}</div>
-                  <div className="sev-bar-bg"><div className="sev-bar-fill" style={{width:`${pct}%`,background:color}}>{c}</div></div>
-                </div>
-              )
-            })}
-          </div>
         </div>
       </div>
     </div>
@@ -693,13 +706,13 @@ function MatrixView({ rules }) {
     return m
   }, [rules])
 
-  // Coverage shading buckets — based on rules-per-technique density.
+  // Coverage shading buckets — purple density based on rules-per-technique.
   const shade = (count) => {
-    if (!count) return { background:'var(--bg2)', border:'var(--border)', color:'var(--text3)' }
-    if (count >= 10) return { background:'rgba(34,197,94,.30)', border:'rgba(34,197,94,.55)', color:'#86EFAC' }
-    if (count >= 5)  return { background:'rgba(34,197,94,.20)', border:'rgba(34,197,94,.45)', color:'#86EFAC' }
-    if (count >= 2)  return { background:'rgba(34,197,94,.12)', border:'rgba(34,197,94,.35)', color:'#86EFAC' }
-    return { background:'rgba(34,197,94,.07)', border:'rgba(34,197,94,.25)', color:'#86EFAC' }
+    if (!count) return { background:'#FFFFFF', border:'var(--border)', color:'var(--text3)', name:'var(--text3)' }
+    if (count >= 10) return { background:'rgba(124,58,237,.22)', border:'rgba(124,58,237,.55)', color:'#5B21B6', name:'var(--text)' }
+    if (count >= 5)  return { background:'rgba(124,58,237,.15)', border:'rgba(124,58,237,.45)', color:'#6D28D9', name:'var(--text)' }
+    if (count >= 2)  return { background:'rgba(124,58,237,.09)', border:'rgba(124,58,237,.32)', color:'#6D28D9', name:'var(--text)' }
+    return { background:'rgba(124,58,237,.05)', border:'rgba(124,58,237,.20)', color:'#7C3AED', name:'var(--text)' }
   }
 
   const totalTactics = TACTIC_ORDER_MATRIX.length
@@ -716,11 +729,11 @@ function MatrixView({ rules }) {
         <span className="topbar-sub">Enterprise · {coveredTechs}/{totalTechs} techniques covered across {totalTactics} tactics</span>
       </div>
       <div className="matrix-legend">
-        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'var(--bg2)',borderColor:'var(--border)'}}/>Not covered</span>
-        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(34,197,94,.07)',borderColor:'rgba(34,197,94,.25)'}}/>1 rule</span>
-        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(34,197,94,.12)',borderColor:'rgba(34,197,94,.35)'}}/>2-4</span>
-        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(34,197,94,.20)',borderColor:'rgba(34,197,94,.45)'}}/>5-9</span>
-        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(34,197,94,.30)',borderColor:'rgba(34,197,94,.55)'}}/>10+</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'#FFFFFF',borderColor:'var(--border)'}}/>Not covered</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(124,58,237,.05)',borderColor:'rgba(124,58,237,.20)'}}/>1 rule</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(124,58,237,.09)',borderColor:'rgba(124,58,237,.32)'}}/>2-4</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(124,58,237,.15)',borderColor:'rgba(124,58,237,.45)'}}/>5-9</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(124,58,237,.22)',borderColor:'rgba(124,58,237,.55)'}}/>10+</span>
         <span className="matrix-legend-link"><a href="https://attack.mitre.org/matrices/enterprise/" target="_blank" rel="noreferrer">attack.mitre.org ↗</a></span>
       </div>
       <div className="matrix-scroll">
@@ -746,7 +759,7 @@ function MatrixView({ rules }) {
                          className="attack-cell" style={{background:s.background, borderColor:s.border}}
                          title={`${t.id} ${t.name}${c ? ` · ${c} rule${c>1?'s':''}` : ' · not covered'}`}>
                         <span className="attack-cell-id" style={{color:s.color}}>{t.id}</span>
-                        <span className="attack-cell-name">{t.name}</span>
+                        <span className="attack-cell-name" style={{color:s.name}}>{t.name}</span>
                         {c > 0 && <span className="attack-cell-count">{c}</span>}
                       </a>
                     )
@@ -806,7 +819,7 @@ function ChainsView({ rules }) {
                         <div className="kc-tactics">{stage.attack_tactics.map(t => (
                           <span key={t} className="kc-tactic-pill" style={{borderColor: TACTIC_COLOR[t]+'66', color:TACTIC_COLOR[t]}}>{t}</span>
                         ))}</div>
-                        <div className="kc-count" style={{color: isGap?'var(--text3)':'var(--green)'}}>
+                        <div className="kc-count" style={{color: isGap?'var(--red)':'var(--purple)'}}>
                           {count} rule{count===1?'':'s'}
                         </div>
                       </>
@@ -834,7 +847,7 @@ function ChainsView({ rules }) {
             return (
               <div key={chain.id} className="chain-card">
                 <div className="chain-head">
-                  <div className="chain-active" style={{background: chain.active ? '#22C55E' : '#EF4444'}} />
+                  <div className="chain-active" style={{background: chain.active ? '#7C3AED' : '#DC2626'}} />
                   <div>
                     <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:3}}>
                       <span className="chain-id">{chain.id}</span>
@@ -855,7 +868,7 @@ function ChainsView({ rules }) {
                 </div>
                 <div className="chain-meta">
                   <span className="chain-meta-item">
-                    <span style={{color:chain.active?'#22C55E':'#EF4444'}}>●</span>
+                    <span style={{color:chain.active?'#7C3AED':'#DC2626'}}>●</span>
                     {chain.active ? 'ACTIVE — all required rules present' : 'INACTIVE — missing required rules'}
                   </span>
                 </div>
@@ -886,18 +899,18 @@ function RecommendView({ rules }) {
     }).length
   }, [rules, deployed])
 
-  const cCrit = { Critical:'#EF4444', High:'#F97316', Medium:'#EAB308' }
+  const cCrit = { Critical:'#DC2626', High:'#7C3AED', Medium:'#2563EB' }
 
   return (
     <div className="view">
-      <div className="section-header" style={{marginBottom:4}}><MapIcon size={13} />Environment Profile <span style={{fontSize:10,fontWeight:500,color:'#F97316',marginLeft:8,padding:'2px 6px',background:'rgba(249,115,22,.12)',borderRadius:3,letterSpacing:0,textTransform:'none'}}>SAMPLE — not your environment</span></div>
+      <div className="section-header" style={{marginBottom:4}}><MapIcon size={13} />Environment Profile <span style={{fontSize:10,fontWeight:600,color:'#B91C1C',marginLeft:8,padding:'2px 8px',background:'#FEE2E2',border:'1px solid rgba(220,38,38,.25)',borderRadius:4,letterSpacing:0,textTransform:'none'}}>SAMPLE — not your environment</span></div>
       <div style={{fontSize:12,color:'var(--text2)',marginBottom:20}}>This view shows the <em>default</em> enterprise profile (Windows + M365 + Cloud) as a worked example. Edit <code style={{fontFamily:'var(--mono)',fontSize:11}}>profiles/default.yaml</code> with your real log sources for accurate recommendations.</div>
 
       <div className="dash-metrics" style={{gridTemplateColumns:'repeat(3,1fr)',marginBottom:24}}>
         {[
-          { icon:<CheckCircle size={15}/>, num:deployed.length,     lbl:'Sources in sample profile', color:'#22C55E', bg:'rgba(34,197,94,.15)' },
-          { icon:<Shield size={15}/>,      num:deployable,           lbl:'Rules runnable on these',   color:'#3B82F6', bg:'rgba(59,130,246,.15)' },
-          { icon:<TrendingUp size={15}/>,  num:undeployed.reduce((a,l)=>a+l.rules_unlocked,0), lbl:'Rules unlocked by adding the rest', color:'#FF6B35', bg:'rgba(255,107,53,.15)' },
+          { icon:<CheckCircle size={15}/>, num:deployed.length,     lbl:'Sources in sample profile', color:'#0B0B12', bg:'#F4F4F7' },
+          { icon:<Shield size={15}/>,      num:deployable,           lbl:'Rules runnable on these',   color:'#2563EB', bg:'#DBEAFE' },
+          { icon:<TrendingUp size={15}/>,  num:undeployed.reduce((a,l)=>a+l.rules_unlocked,0), lbl:'Rules unlocked by adding the rest', color:'#7C3AED', bg:'#EDE9FE' },
         ].map((m,i)=>(
           <div key={i} className="metric-card">
             <div className="metric-icon" style={{background:m.bg}}>{React.cloneElement(m.icon,{color:m.color})}</div>
@@ -918,7 +931,7 @@ function RecommendView({ rules }) {
               {LOG_SOURCES.map(ls => (
                 <tr key={ls.id}>
                   <td>
-                    <span className="status-dot" style={{background:ls.deployed?'#22C55E':'#EF4444'}} />
+                    <span className="status-dot" style={{background:ls.deployed?'#7C3AED':'#DC2626'}} />
                     {ls.deployed ? 'In profile' : 'Not in profile'}
                   </td>
                   <td style={{color:cCrit[ls.criticality]||'var(--text2)'}}>{ls.criticality}</td>
@@ -941,7 +954,7 @@ function RecommendView({ rules }) {
                 <tr key={ls.id}>
                   <td style={{fontWeight:500,color:'var(--text)'}}>{ls.name}</td>
                   <td style={{fontFamily:'var(--mono)',fontSize:11}}>T{ls.tier}</td>
-                  <td style={{fontFamily:'var(--mono)',fontSize:12,color:'#FF6B35',fontWeight:700}}>+{ls.rules_unlocked}</td>
+                  <td style={{fontFamily:'var(--mono)',fontSize:12,color:'#7C3AED',fontWeight:700}}>+{ls.rules_unlocked}</td>
                 </tr>
               ))}
             </tbody>
@@ -1010,10 +1023,9 @@ export default function App() {
           </nav>
           <div className="sidebar-stats">
             <div className="stat-row"><span className="stat-k">Total Rules</span><span className="stat-v">{rules.length}</span></div>
-            <div className="stat-row"><span className="stat-k">Techniques</span><span className="stat-v" style={{color:'#A855F7'}}>{techCount}</span></div>
-            <div className="stat-row"><span className="stat-k">SIEM Platforms</span><span className="stat-v" style={{color:'#FF6B35'}}>9</span></div>
-            <div className="stat-row"><span className="stat-k">Attack Chains</span><span className="stat-v" style={{color:'#3B82F6'}}>{chainCount}</span></div>
-            <div className="stat-row"><span className="stat-k">Data source</span><span className="stat-v" style={{color: source==='api' ? '#22C55E' : '#94A3B8', fontSize:9}}>{source==='api' ? '● live API' : '○ bundled'}</span></div>
+            <div className="stat-row"><span className="stat-k">Techniques</span><span className="stat-v" style={{color:'#7C3AED'}}>{techCount}</span></div>
+            <div className="stat-row"><span className="stat-k">SIEM Platforms</span><span className="stat-v">9</span></div>
+            <div className="stat-row"><span className="stat-k">Attack Chains</span><span className="stat-v" style={{color:'#2563EB'}}>{chainCount}</span></div>
           </div>
         </aside>
 

@@ -1,0 +1,123 @@
+rule_id: TDL-CA-000019
+v4_id: 000019
+name: Kerberoasting Activity
+description: Kerberoasting can be an effective method for extracting service account credentials from Active Directory as
+  a regular user without having to escalate privileges. This attack is effective because service accounts are typically given
+  easy passwords and set to never expire which makes brute forcing them a viable method of attack.
+tactic: Credential Access
+tactic_id: TA0006
+technique_id: T1558
+technique_name: Steal or Forge Kerberos Tickets
+platform:
+- Windows
+data_sources:
+- Windows Operating System
+- 'Event IDs: 4769'
+severity: Medium
+fidelity: Medium
+lifecycle: Deployed
+risk_score: 55
+queries:
+  spl: 'index=windows
+
+    | where (EventCode=4769 OR EventCode=4769)
+
+    | where TicketEncryptionType IN ("0x17","0x18")
+
+    | where ServiceName!="krbtgt"
+
+    | bucket _time span=10m
+
+    | stats dc(ServiceName) as unique_spns by _time, Account_Name, Client_Address
+
+    | where unique_spns >= 5
+
+    | table _time, host, user, ProcessName, CommandLine'
+  kql: 'SecurityEvent
+
+    | where TimeGenerated >= ago(1d)
+
+    | where EventID == 4769
+
+    | where TicketEncryptionType in ("0x17","0x18")
+
+    | where ServiceName !endswith "$" and ServiceName != "krbtgt"
+
+    | summarize UniqueSPNs = dcount(ServiceName), SPNs = make_set(ServiceName) by Account, IpAddress, bin(TimeGenerated, 10m)
+
+    | where UniqueSPNs >= 5
+
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
+  aql: "SELECT username AS requesting_user, QIDNAME(qid) AS event_name,\n       hostname AS destination, UNIQUECOUNT(hostname)\
+    \ AS unique_spns\nFROM events\nWHERE eventid = 4769\n  AND LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'\n  AND \"Ticket\
+    \ Encryption Type\" IN ('0x17', '0x18')\n  AND username NOT LIKE '%$'\n  AND INOFFSET(starttime, LAST 60 SECONDS)\nGROUP\
+    \ BY username\nHAVING unique_spns >= 5\nORDER BY unique_spns DESC"
+  yara_l: "rule zs_ca_000019 {\n  meta:\n    author = \"TDE\"\n    description = \"Kerberoasting Activity\"\n    severity\
+    \ = \"MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1558.003\"\n\n  events:\n    $kerberos.metadata.event_type\
+    \ = \"USER_RESOURCE_ACCESS\"\n    $kerberos.metadata.product_event_type = \"4769\"\n    $kerberos.additional.fields[\"\
+    TicketEncryptionType\"] = /0x17|0x18/\n    $kerberos.principal.user.userid != /\\$$/\n    $kerberos.target.resource.name\
+    \ != \"krbtgt\"\n    $kerberos.principal.user.userid = $user\n    $kerberos.target.resource.name = $spn\n\n  match:\n\
+    \    $user over 10m\n\n  condition:\n    #spn >= 5\n\n  outcome:\n    $risk_score = max(75)\n}"
+  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
+
+    | WHERE @timestamp > NOW() - 1 day
+
+    | WHERE event.code == "4769"
+
+    | WHERE winlog.event_data.TicketEncryptionType IN ("0x17", "0x18")
+
+    | WHERE NOT winlog.event_data.ServiceName LIKE "*$"
+
+    | WHERE winlog.event_data.ServiceName != "krbtgt"
+
+    | STATS unique_spns = COUNT_DISTINCT(winlog.event_data.ServiceName), spns = VALUES(winlog.event_data.ServiceName) BY winlog.event_data.SubjectUserName,
+    source.ip, @timestamp = BUCKET(@timestamp, 10 minutes)
+
+    | WHERE unique_spns >= 5
+
+    | SORT unique_spns DESC'
+  leql: "where(event_id = 4769 AND ticket_encryption_type IN [\"0x17\", \"0x18\"]\n  AND NOT destination_account ENDS WITH\
+    \ \"$\"\n  AND NOT destination_account = \"krbtgt\")\ngroupby(source_account, source_ip)\ncalculate(unique_count:destination_account\
+    \ AS spn_count)\nhaving(spn_count >= 5)"
+  crowdstrike: 'event_simpleName=KerberosServiceTicketGrantedFailed OR event_simpleName=KerberosServiceTicketGranted
+
+    | where TicketEncryptionType IN ("0x17", "0x18") AND ServiceName != "krbtgt" AND ServiceName!="*$"
+
+    | stats dc(ServiceName) as spn_count, values(ServiceName) as spns by aid, UserName
+
+    | where spn_count >= 5'
+  xql: 'dataset = xdr_data
+
+    | filter event_type = "NETWORK" and actor_process_image_name contains "lsass.exe"
+
+    | filter action_evtlog_event_id = 4769
+
+    | filter actor_process_command_line contains "0x17" or actor_process_command_line contains "0x18"
+
+    | comp dc(action_network_remote_port) as spn_count by actor_effective_username, src_ip
+
+    | filter spn_count >= 5'
+  lucene: 'event_id:4769 AND ticket_encryption_type:(0x17 OR 0x18)
+
+    AND NOT service_name:krbtgt AND NOT service_name:*$'
+false_positives:
+- Security software
+- Authorized admin tools
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- edp
+- credential-access
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: "7 Windows Kerberos Ticket Requested events\nFrom the same Source Username\nWhere the Event ID is in [673, 4769]\n\
+  Where the Failure Code is \"0x0\"\nWhere the Ticket Encryption is in [0x17, 0x18]\nWhere Ticket Options is in [\"0x40810000\"\
+  , \"0x40810010\", \"0x40800000\"]\nWhere the Service Name is NOT \"krbtgt\"\nWhere the Source Username does NOT end with\
+  \ \"$\" \nWhere the Service Name does NOT end with \"$\", \".LOCAL\", \".COM\"\nWith unique service names\nWithin 1 minutes"
+suppression:
+  window: 12 hours
+  fields:
+  - Source IP
+  - Source Username
+tuning_period: 7 days

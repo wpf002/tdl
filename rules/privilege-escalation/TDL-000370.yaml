@@ -1,0 +1,95 @@
+rule_id: TDL-PE-000370
+v4_id: '000370'
+name: Azure Domain Trust Modification Detected
+description: Adversaries may add new domain trusts or modify the properties of existing domain trusts to evade defenses and/or
+  elevate privileges. This will detect when a user or application modifies the federation settings on the domain or update
+  domain authentication.
+tactic: Privilege Escalation
+tactic_id: TA0004
+technique_id: T1484
+technique_name: Domain or Tenant Policy Modification
+platform:
+- Azure
+data_sources:
+- Azure AD
+severity: High
+fidelity: High
+lifecycle: Deployed
+risk_score: 75
+queries:
+  spl: 'index=azure
+
+    | table _time, host, Account_Name, IpAddress, LogonType'
+  kql: |-
+    SigninLogs
+    | where TimeGenerated >= ago(1d)
+    | project TimeGenerated, UserPrincipalName, IPAddress, Location, ResultType
+  aql: |-
+    SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+    FROM events
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+    GROUP BY username, hostname, QIDNAME(qid)
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_pe_000370 {
+      meta:
+        author = "TDE"
+        description = "Azure Domain Trust Modification Detected"
+        severity = "HIGH"
+        tactic = "TA0004"
+        technique = "T1484"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 5m
+
+      condition:
+        #event >= 1
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-azure*,logs-o365*
+    | WHERE @timestamp > NOW() - 1 day
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
+    | WHERE event_count >= 1
+    | SORT @timestamp DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 1)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 1
+    | sort -proc_count
+  xql: "dataset = cloud_audit_log\n| filter event_type = \"CLOUD\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\"\
+    )\n| fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort\
+    \ desc _time"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Legitimate admin activity
+- Authorized service accounts
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- auth
+- privilege-escalation
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: |-
+  1 Azure AD Event
+  Where the Event is in [Set federation settings on domain, Set domain authentication]
+  Where Action is in [success]
+suppression:
+  window: 8 hours
+  fields:
+  - src_user
+tuning_period: 7 days

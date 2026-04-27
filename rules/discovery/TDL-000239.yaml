@@ -1,0 +1,100 @@
+rule_id: TDL-DIS-000239
+v4_id: 000239
+name: Excessive Webserver Errors from Host
+description: Detects a host sending a high volume of requests that result in errors from the web server. During their exploitation,
+  attackers may try an exploit several times, with different obfuscation or techniques in order to successfully exploit the
+  server. Launching these exploits may result in errors from the server for invalid methods, requests, or form data that could
+  indicate an attacker performing this attack.
+tactic: Discovery
+tactic_id: TA0007
+technique_id: T1083
+technique_name: File and Directory Discovery
+platform:
+- Windows
+data_sources:
+- Webserver
+severity: Low
+fidelity: Low
+lifecycle: Deployed
+risk_score: 30
+queries:
+  spl: |-
+    index=windows
+    | bucket _time span=2m
+    | stats count by src_ip, Account_Name, _time
+    | where count >= 1000
+    | table _time, src_ip, dest_ip, dest_port, action
+  kql: |-
+    SecurityEvent
+    | where TimeGenerated >= ago(1d)
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 2m)
+    | where Count >= 1000
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity
+  aql: |-
+    SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+    FROM events
+    WHERE INOFFSET(starttime, LAST 120 SECONDS)
+    GROUP BY username, hostname, QIDNAME(qid)
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_dis_000239 {
+      meta:
+        author = "TDE"
+        description = "Excessive Webserver Errors from Host"
+        severity = "LOW"
+        tactic = "TA0007"
+        technique = "T1083"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 2m
+
+      condition:
+        #event >= 1000
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-windows.sysmon_operational*,logs-system.security*
+    | WHERE @timestamp > NOW() - 1 day
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 2m)
+    | WHERE event_count >= 1000
+    | SORT @timestamp DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 1000)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 1000
+    | sort -proc_count
+  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | comp count() as event_count by hostname, actor_effective_username\n| filter event_count >= 1000\n| fields hostname,\
+    \ actor_effective_username, event_count"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Authorized scanners
+- Monitoring agents
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- net
+- discovery
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: |-
+  1000 Webserver Request Events
+  Where the Request Code matches the regex "(?i)(4[0-9]{2}|5[0-9]{2})"
+  With the same Source IP
+  Within 2 minutes
+suppression:
+  window: 24 hours
+tuning_period: 7 days

@@ -1,0 +1,99 @@
+rule_id: TDL-EXE-000067
+v4_id: '000067'
+name: HTTP Traffic Pattern to Hard Coded IP
+description: Detects when a single IP connects to a single hard coded IP site. This could be an indicator of malware beaconing
+  out to newly stood up C2 hosts.
+tactic: Execution
+tactic_id: TA0002
+technique_id: T1204
+technique_name: User Execution
+platform:
+- Windows
+data_sources:
+- Forward Proxy
+severity: Low
+fidelity: Low
+lifecycle: Deployed
+risk_score: 30
+queries:
+  spl: |-
+    index=network
+    | bucket _time span=5m
+    | stats count by src_ip, Account_Name, _time
+    | where count >= 10
+    | table _time, src_ip, dest_ip, dest_port, action
+  kql: |-
+    SecurityEvent
+    | where TimeGenerated >= ago(1d)
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 5m)
+    | where Count >= 10
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity
+  aql: |-
+    SELECT sourceip, destinationip, destinationport, SUM(flowCount) AS total_flows
+    FROM flows
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+    GROUP BY sourceip, destinationip, destinationport
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_exe_000067 {
+      meta:
+        author = "TDE"
+        description = "HTTP Traffic Pattern to Hard Coded IP"
+        severity = "LOW"
+        tactic = "TA0002"
+        technique = "T1204"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 5m
+
+      condition:
+        #event >= 10
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-network*,logs-firewall*
+    | WHERE @timestamp > NOW() - 1 day
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
+    | WHERE event_count >= 10
+    | SORT @timestamp DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 10)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 10
+    | sort -proc_count
+  xql: "dataset = xdr_data\n| filter event_type = \"NETWORK\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | comp count() as event_count by hostname, actor_effective_username\n| filter event_count >= 10\n| fields hostname, actor_effective_username,\
+    \ event_count"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Authorized scanners
+- Monitoring agents
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- net
+- execution
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: |-
+  10 Forward Proxy Events
+  From one internal source to one external destination (Outbound)
+  Where the Destination Domain matches the regex: "\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+  With the same Destination Domain
+  Within 5 minutes
+suppression:
+  window: 24 hours
+tuning_period: 7 days

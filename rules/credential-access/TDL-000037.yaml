@@ -1,0 +1,107 @@
+rule_id: TDL-CA-000037
+v4_id: '000037'
+name: Account Guessing
+description: Detects a potential account guessing attack against Windows accounts. Attackers may attempt to determine if a
+  username exists by authenticating with a username and observing error messages received. The guessed usernames may be default
+  accounts for applications or permutations the organization's naming convention. Once the attacker has determined if a username
+  exists, they can target the existing accounts with password spraying attacks.
+tactic: Credential Access
+tactic_id: TA0006
+technique_id: T1110
+technique_name: Brute Force
+platform:
+- Linux
+- Windows
+data_sources:
+- Windows Operating System
+- Linux Operating System
+- 'Event IDs: 4625'
+severity: Low
+fidelity: Low
+lifecycle: Deployed
+risk_score: 30
+queries:
+  spl: 'index=linux
+
+    | bucket _time span=3m
+
+    | stats count by src_ip, Account_Name, _time
+
+    | where count >= 5
+
+    | table _time, host, Account_Name, IpAddress, LogonType'
+  kql: 'Syslog
+
+    | where TimeGenerated >= ago(1d)
+
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 3m)
+
+    | where Count >= 5
+
+    | project TimeGenerated, Computer, Account, Activity'
+  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
+    \ events\nWHERE eventid = 4625\n  AND INOFFSET(starttime, LAST 180 SECONDS)\nGROUP BY username, hostname, QIDNAME(qid)\n\
+    HAVING event_count >= 5\nORDER BY starttime DESC"
+  yara_l: "rule zs_ca_000037 {\n  meta:\n    author = \"TDE\"\n    description = \"Account Guessing\"\n    severity = \"LOW\"\
+    \n    tactic = \"TA0006\"\n    technique = \"T1110\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\n\
+    \    $event.metadata.product_event_type = \"4625\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
+    \ = $user\n\n  match:\n    $host over 3m\n\n  condition:\n    #event >= 5\n\n  outcome:\n    $risk_score = max(50)\n}"
+  esql: 'FROM logs-system.syslog*,logs-auditd*
+
+    | WHERE @timestamp > NOW() - 1 day
+
+    | WHERE event.code IN (''4625'')
+
+    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 3m)
+
+    | WHERE event_count >= 5
+
+    | SORT event_count DESC'
+  leql: 'where(event_id IN [4625])
+
+    groupby(source_ip, username, hostname)
+
+    calculate(count AS event_count)
+
+    having(event_count >= 5)'
+  crowdstrike: 'event_simpleName=SecurityEvent
+
+    | where EventCode=4625
+
+    | stats count as events by ComputerName, UserName
+
+    | where events >= 5'
+  xql: 'dataset = xdr_data
+
+    | filter event_type = "PROCESS" and action_evtlog_event_id in (4625)
+
+    | filter _time > to_timestamp(now() - 86400, "epoch")
+
+    | comp count() as event_count by hostname, actor_effective_username
+
+    | filter event_count >= 5
+
+    | fields hostname, actor_effective_username, event_count'
+  lucene: event_id:(4625)
+false_positives:
+- Legitimate admin activity
+- Authorized service accounts
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- auth
+- credential-access
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: "5 Windows Authentication Failure Events \nFrom the same internal Source IP to the same Destination\nWhere the\
+  \ Event ID in [529, 4625]\nWhere the Failure Code is \"0xC0000064\"\nWhere the Destination Username does NOT end with \"\
+  $\" \nWhere the Destination IP/Hostname is NOT on the Domain Controller List \nWhere the Source IP/Hostname is NOT on a\
+  \ Mail Server List \nWhere the Source IP/Hostname is NOT on a Central Authentication Server List \nWith unique Destination\
+  \ Usernames \nWith the same Event ID \nWithin 3 minutes"
+suppression:
+  window: 24 hours
+  fields:
+  - Source IP
+  - Source Hostname
+tuning_period: 7 days

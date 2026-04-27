@@ -1,0 +1,102 @@
+rule_id: TDL-AUTH-000285
+v4_id: 000285
+name: Stealth Remote Password Guessing
+description: This rule is designed to detect a low and slow password guessing attempt against a VPN or public-facing host,
+  which may indicate an attempt to brute force an account’s password.
+tactic: Initial Access
+tactic_id: TA0001
+technique_id: T1078
+technique_name: Valid Accounts
+platform:
+- Azure
+- Microsoft 365
+data_sources:
+- VPN
+- Azure AD
+- Office 365
+severity: Low
+fidelity: Low
+lifecycle: Proposed
+risk_score: 30
+queries:
+  spl: 'index=azure
+
+    | bucket _time span=1m
+
+    | stats count by src_ip, Account_Name, _time
+
+    | where count >= 4
+
+    | table _time, host, Account_Name, IpAddress, LogonType'
+  kql: 'SigninLogs
+
+    | where TimeGenerated >= ago(1d)
+
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 1m)
+
+    | where Count >= 4
+
+    | project TimeGenerated, UserPrincipalName, IPAddress, Location, ResultType'
+  aql: 'SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+
+    FROM events
+
+    WHERE INOFFSET(starttime, LAST 3600 SECONDS)
+
+    GROUP BY username, hostname, QIDNAME(qid)
+
+    ORDER BY starttime DESC'
+  yara_l: "rule zs_auth_000285 {\n  meta:\n    author = \"TDE\"\n    description = \"Stealth Remote Password Guessing\"\n\
+    \    severity = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n\n  events:\n    $event.metadata.event_type\
+    \ = \"GENERIC_EVENT\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n \
+    \   $host over 1h\n\n  condition:\n    #event >= 4\n\n  outcome:\n    $risk_score = max(50)\n}"
+  esql: 'FROM logs-azure*,logs-o365*
+
+    | WHERE @timestamp > NOW() - 1 day
+
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 1h)
+
+    | WHERE event_count >= 4
+
+    | SORT @timestamp DESC'
+  leql: 'where(logset = "Endpoint Activity")
+
+    groupby(hostname, username)
+
+    calculate(count AS event_count)
+
+    having(event_count >= 4)'
+  crowdstrike: 'event_simpleName=ProcessRollup2
+
+    | stats count as proc_count by ComputerName, FileName
+
+    | where proc_count >= 4
+
+    | sort -proc_count'
+  xql: "dataset = cloud_audit_log\n| filter event_type = \"CLOUD\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\"\
+    )\n| comp count() as event_count by hostname, actor_effective_username\n| filter event_count >= 4\n| fields hostname,\
+    \ actor_effective_username, event_count"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Legitimate admin activity
+- Authorized service accounts
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- auth
+- initial-access
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: none
+pseudo_logic: '4 Instances over 1 hour of 2 Remote Login Failures
+
+  From the same Source
+
+  With the same Destination Usernames
+
+  With unique failure timestamps
+
+  Within 3 minutes'
+suppression:
+  window: 24 hours
+tuning_period: 7 days

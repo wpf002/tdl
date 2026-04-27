@@ -1,0 +1,100 @@
+rule_id: TDL-EXE-000254
+v4_id: '000254'
+name: Traffic Pattern to Randomly Generated Domain
+description: Detects when a single ip performs multiple connections to a randomly generated domain. Botnets commonly use Domain
+  Generation Algorithms, DGA, to generate and register domains for Command and Control purposes. This could be an indication
+  that the impacted host is infected.
+tactic: Execution
+tactic_id: TA0002
+technique_id: T1568
+technique_name: Dynamic Resolution
+platform:
+- Windows
+data_sources:
+- Forward Proxy
+severity: Low
+fidelity: Low
+lifecycle: Proposed
+risk_score: 30
+queries:
+  spl: |-
+    index=network
+    | bucket _time span=3m
+    | stats count by src_ip, Account_Name, _time
+    | where count >= 5
+    | table _time, src_ip, dest_ip, dest_port, action
+  kql: |-
+    SecurityEvent
+    | where TimeGenerated >= ago(1d)
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 3m)
+    | where Count >= 5
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity
+  aql: |-
+    SELECT sourceip, destinationip, destinationport, SUM(flowCount) AS total_flows
+    FROM flows
+    WHERE INOFFSET(starttime, LAST 180 SECONDS)
+    GROUP BY sourceip, destinationip, destinationport
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_exe_000254 {
+      meta:
+        author = "TDE"
+        description = "Traffic Pattern to Randomly Generated Domain"
+        severity = "LOW"
+        tactic = "TA0002"
+        technique = "T1568"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 3m
+
+      condition:
+        #event >= 5
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-network*,logs-firewall*
+    | WHERE @timestamp > NOW() - 1 day
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 3m)
+    | WHERE event_count >= 5
+    | SORT @timestamp DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 5)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 5
+    | sort -proc_count
+  xql: "dataset = xdr_data\n| filter event_type = \"NETWORK\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | comp count() as event_count by hostname, actor_effective_username\n| filter event_count >= 5\n| fields hostname, actor_effective_username,\
+    \ event_count"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Authorized scanners
+- Monitoring agents
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- net
+- execution
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: none
+pseudo_logic: |-
+  5 Forward Proxy Events
+  From one internal source to on external destination (Outbound)
+  Where the Destination Domain matches the DGA Domain Regex
+  With the same Destination Domain
+  Within 3 minutes
+suppression:
+  window: 24 hours
+tuning_period: 7 days

@@ -1,0 +1,92 @@
+rule_id: TDL-EXE-000065
+v4_id: '000065'
+name: Executable File Downloaded from Shortened URL
+description: URL shortening services such as Bitly, Google, and Twitter in which a URL may be made substantially shorter and
+  still direct to the required page are used for many legitimate purposes such as messaging technologies that limit the number
+  of characters in a message (for example SMS, twitter, etc).
+tactic: Execution
+tactic_id: TA0002
+technique_id: T1204
+technique_name: User Execution
+platform:
+- Windows
+data_sources:
+- Forward Proxy
+severity: Medium
+fidelity: Medium
+lifecycle: Deployed
+risk_score: 55
+queries:
+  spl: 'index=network
+
+    | table _time, src_ip, dest_ip, dest_port, action'
+  kql: |-
+    SecurityEvent
+    | where TimeGenerated >= ago(1d)
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity
+  aql: |-
+    SELECT sourceip, destinationip, destinationport, SUM(flowCount) AS total_flows
+    FROM flows
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+    GROUP BY sourceip, destinationip, destinationport
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_exe_000065 {
+      meta:
+        author = "TDE"
+        description = "Executable File Downloaded from Shortened URL"
+        severity = "MEDIUM"
+        tactic = "TA0002"
+        technique = "T1204"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 5m
+
+      condition:
+        #event >= 1
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-network*,logs-firewall*
+    | WHERE @timestamp > NOW() - 1 day
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
+    | WHERE event_count >= 1
+    | SORT @timestamp DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 1)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 1
+    | sort -proc_count
+  xql: "dataset = xdr_data\n| filter event_type = \"NETWORK\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
+    \ _time"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Authorized scanners
+- Monitoring agents
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- net
+- execution
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: "1 Forward Proxy Event\nWhere the Destination Domain is in  [bit.ly, ow.ly, goo.gl, tinyurl.com, short.io, rebrand.ly,\
+  \ bl.ink, snip.ly, shor.by]\nOR\n\tWhere the File Extension is in the Executable File Extensions List\n\t\n\tWhere Content\
+  \ Type is in the Executable Content Types List"
+suppression:
+  window: 12 hours
+tuning_period: 7 days

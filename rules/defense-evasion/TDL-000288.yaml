@@ -1,0 +1,99 @@
+rule_id: TDL-DE-000288
+v4_id: 000288
+name: Typosquatting Activity
+description: Detects traffic to web domains that appear to be similar to a company's domain. Typosquatting can be used in
+  targeted phishing attempts for credentials or to deploy malware. The list of domains is pulled by using DNS Twister
+tactic: Defense Evasion
+tactic_id: TA0005
+technique_id: T1583
+technique_name: Acquire Infrastructure
+platform:
+- Windows
+data_sources:
+- Forward Proxy
+severity: Low
+fidelity: Low
+lifecycle: Proposed
+risk_score: 30
+queries:
+  spl: |-
+    index=network
+    | bucket _time span=5m
+    | stats count by src_ip, Account_Name, _time
+    | where count >= 2
+    | table _time, src_ip, dest_ip, dest_port, action
+  kql: |-
+    SecurityEvent
+    | where TimeGenerated >= ago(1d)
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 5m)
+    | where Count >= 2
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity
+  aql: |-
+    SELECT sourceip, destinationip, destinationport, SUM(flowCount) AS total_flows
+    FROM flows
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+    GROUP BY sourceip, destinationip, destinationport
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_de_000288 {
+      meta:
+        author = "TDE"
+        description = "Typosquatting Activity"
+        severity = "LOW"
+        tactic = "TA0005"
+        technique = "T1583"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 5m
+
+      condition:
+        #event >= 2
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-network*,logs-firewall*
+    | WHERE @timestamp > NOW() - 1 day
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
+    | WHERE event_count >= 2
+    | SORT @timestamp DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 2)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 2
+    | sort -proc_count
+  xql: "dataset = xdr_data\n| filter event_type = \"NETWORK\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | comp count() as event_count by hostname, actor_effective_username\n| filter event_count >= 2\n| fields hostname, actor_effective_username,\
+    \ event_count"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Authorized scanners
+- Monitoring agents
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- net
+- defense-evasion
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: none
+pseudo_logic: |-
+  2 URL Events
+  From the same Source
+  Where the Action is Allowed
+  Where the Destination Domain is on the Typosquatting Company Domains List
+  Within 5 minutes
+suppression:
+  window: 24 hours
+tuning_period: 7 days

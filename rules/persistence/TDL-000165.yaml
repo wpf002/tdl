@@ -1,0 +1,120 @@
+rule_id: TDL-PER-000165
+v4_id: '000165'
+name: Mass Group Deletions
+description: This rule is designed to alert when several user groups are removed by the same user. Several groups being deleted
+  by same user in a short amount of time could indicate malicious activity.
+tactic: Persistence
+tactic_id: TA0003
+technique_id: T1531
+technique_name: Account Access Removal
+platform:
+- Linux
+- Windows
+data_sources:
+- Windows Operating System
+- Linux Operating System
+- 'Event IDs: 4730, 4734, 4758'
+severity: Low
+fidelity: Low
+lifecycle: Deployed
+risk_score: 30
+queries:
+  spl: 'index=linux
+
+    | bucket _time span=5m
+
+    | stats count as total, dc(TargetUserName) as unique_targets by _time, SubjectUserName
+
+    | where total >= 10
+
+    | table _time, host, Account_Name, IpAddress, LogonType'
+  kql: 'Syslog
+
+    | where TimeGenerated >= ago(1d)
+
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 3m)
+
+    | where Count >= 10
+
+    | project TimeGenerated, Computer, Account, Activity'
+  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
+    \ events\nWHERE eventid IN (4730, 4734, 4758)\n  AND INOFFSET(starttime, LAST 180 SECONDS)\nGROUP BY username, hostname,\
+    \ QIDNAME(qid)\nHAVING event_count >= 10\nORDER BY starttime DESC"
+  yara_l: "rule zs_per_000165 {\n  meta:\n    author = \"TDE\"\n    description = \"Mass Group Deletions\"\n    severity =\
+    \ \"LOW\"\n    tactic = \"TA0003\"\n    technique = \"T1531\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\
+    \n    $event.metadata.product_event_type = \"4730\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
+    \ = $user\n\n  match:\n    $host over 3m\n\n  condition:\n    #event >= 10\n\n  outcome:\n    $risk_score = max(50)\n}"
+  esql: 'FROM logs-system.syslog*,logs-auditd*
+
+    | WHERE @timestamp > NOW() - 1 day
+
+    | WHERE event.code IN (''4730'', ''4734'', ''4758'')
+
+    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 3m)
+
+    | WHERE event_count >= 10
+
+    | SORT event_count DESC'
+  leql: 'where(event_id IN [4730, 4734, 4758])
+
+    groupby(source_ip, username, hostname)
+
+    calculate(count AS event_count)
+
+    having(event_count >= 10)'
+  crowdstrike: 'event_simpleName=SecurityEvent
+
+    | where EventCode=4730 OR EventCode=4734 OR EventCode=4758
+
+    | stats count as events by ComputerName, UserName
+
+    | where events >= 10'
+  xql: 'dataset = xdr_data
+
+    | filter event_type = "PROCESS" and action_evtlog_event_id in (4730, 4734, 4758)
+
+    | filter _time > to_timestamp(now() - 86400, "epoch")
+
+    | comp count() as event_count by hostname, actor_effective_username
+
+    | filter event_count >= 10
+
+    | fields hostname, actor_effective_username, event_count'
+  lucene: event_id:(4730 OR 4734 OR 4758)
+false_positives:
+- Legitimate admin activity
+- Authorized service accounts
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- auth
+- persistence
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: '10 Windows Group Deleted Events
+
+  Where the Event ID is in [634, 4730, 638, 4734, 662, 4758]
+
+  From a single Source Username
+
+  Where the Source Username is NOT on the Users Authorized to Delete Users and Groups List
+
+  Within 3 minutes
+
+
+  ---------------------------------------------------------------------------------------------------------------
+
+
+  10 Group Deleted Events
+
+  From a single Source Username
+
+  Where the Source Username is NOT on the Users Authorized to Delete Users and Groups List
+
+  Within 3 minutes'
+suppression:
+  window: 24 hours
+  fields:
+  - Source Username
+tuning_period: 7 days

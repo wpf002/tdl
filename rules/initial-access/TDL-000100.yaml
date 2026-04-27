@@ -1,0 +1,87 @@
+rule_id: TDL-AUTH-000100
+v4_id: '000100'
+name: AWS API Call From Unauthorized Location
+description: Detects when an AWS API call has been requested from a user who is logged from a location that is not approved.
+  A typical best practice is to only allow privileged access from designated IPs (i.e. the corporate LAN).
+tactic: Initial Access
+tactic_id: TA0001
+technique_id: T1098
+technique_name: Account Manipulation
+platform:
+- AWS
+data_sources:
+- AWS CloudTrail
+severity: Medium
+fidelity: Medium
+lifecycle: Deployed
+risk_score: 55
+queries:
+  spl: 'index=aws sourcetype=aws:cloudtrail
+
+    | table _time, host, Account_Name, IpAddress, LogonType'
+  kql: 'AWSCloudTrail
+
+    | where TimeGenerated >= ago(1d)
+
+    | project TimeGenerated, Computer, Account, Activity'
+  aql: 'SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+
+    FROM events
+
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+
+    GROUP BY username, hostname, QIDNAME(qid)
+
+    ORDER BY starttime DESC'
+  yara_l: "rule zs_auth_000100 {\n  meta:\n    author = \"TDE\"\n    description = \"AWS API Call From Unauthorized Location\"\
+    \n    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1098\"\n\n  events:\n    $event.metadata.event_type\
+    \ = \"GENERIC_EVENT\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n \
+    \   $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
+  esql: 'FROM logs-aws.cloudtrail*
+
+    | WHERE @timestamp > NOW() - 1 day
+
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
+
+    | WHERE event_count >= 1
+
+    | SORT @timestamp DESC'
+  leql: 'where(logset = "Endpoint Activity")
+
+    groupby(hostname, username)
+
+    calculate(count AS event_count)
+
+    having(event_count >= 1)'
+  crowdstrike: 'event_simpleName=ProcessRollup2
+
+    | stats count as proc_count by ComputerName, FileName
+
+    | where proc_count >= 1
+
+    | sort -proc_count'
+  xql: "dataset = cloud_audit_log\n| filter event_type = \"CLOUD\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\"\
+    )\n| fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort\
+    \ desc _time"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Legitimate admin activity
+- Authorized service accounts
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- auth
+- initial-access
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: '1 AWS CloudTrail Event
+
+  Where the Event Type is AwsApiCall
+
+  Where the User Identity is IAMUser
+
+  Where the Source IP is on a Non Approved Country List'
+suppression:
+  window: 12 hours
+tuning_period: 7 days

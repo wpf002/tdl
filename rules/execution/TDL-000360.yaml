@@ -1,0 +1,99 @@
+rule_id: TDL-EXE-000360
+v4_id: '000360'
+name: Encoded Powershell
+description: Detects powershell with suspicious encoding options. Attackers frequently use base64 and similar encoding to
+  evade detection. Investigate parent/child relationships to determine whether the activity is authorized.
+tactic: Execution
+tactic_id: TA0002
+technique_id: T1059
+technique_name: Command and Scripting Interpreter
+platform:
+- Windows
+data_sources:
+- Windows Operating System
+- 'Event IDs: 4688'
+severity: High
+fidelity: High
+lifecycle: Deployed
+risk_score: 75
+queries:
+  spl: |-
+    index=windows
+    | where (EventCode=4688 OR EventCode=4688)
+    | table _time, host, user, ProcessName, CommandLine
+  kql: |-
+    SecurityEvent
+    | where TimeGenerated >= ago(1d)
+    | where EventID in (4688, 4688)
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity
+  aql: |-
+    SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+    FROM events
+    WHERE eventid = 4688
+      AND INOFFSET(starttime, LAST 300 SECONDS)
+    GROUP BY username, hostname, QIDNAME(qid)
+
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_exe_000360 {
+      meta:
+        author = "TDE"
+        description = "Encoded Powershell"
+        severity = "HIGH"
+        tactic = "TA0002"
+        technique = "T1059"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.metadata.product_event_type = "4688"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 5m
+
+      condition:
+        #event >= 1
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-windows.sysmon_operational*,logs-system.security*
+    | WHERE @timestamp > NOW() - 1 day
+    | WHERE event.code IN ('4688')
+    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 5m)
+    | WHERE event_count >= 1
+    | SORT event_count DESC
+  leql: |-
+    where(event_id IN [4688])
+    groupby(hostname, username)
+    calculate(count AS event_count)
+  crowdstrike: |-
+    event_simpleName=SecurityEvent
+    | where EventCode=4688
+    | table ComputerName, UserName, CommandLine, ContextTimeStamp
+  xql: |-
+    dataset = xdr_data
+    | filter event_type = "PROCESS" and action_evtlog_event_id in (4688)
+    | filter _time > to_timestamp(now() - 86400, "epoch")
+    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time
+    | sort desc _time
+  lucene: event_id:(4688)
+false_positives:
+- Security software
+- Authorized admin tools
+tuning_guidance: 'Tune per environment baseline. Tuning period: 30 days.'
+tags:
+- edp
+- execution
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: |-
+  1 Windows Process Creation Event
+  Where the Event ID is in [592, 4688]
+  Where Process Name equals "powershell.exe"
+  AND Command Line contains ".*(-ec|-en|-enc|\/ec|\/-en|\/-enc|frombase64string|-EncodedCommand|base64)\b.*"
+tuning_period: 30 days

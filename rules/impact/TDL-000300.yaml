@@ -1,0 +1,95 @@
+rule_id: TDL-IMP-000300
+v4_id: '000300'
+name: Custom Google Workspace Email Route Created or Modified
+description: Detects when a custom Gmail route is added or modified in Google Workspace. Adversaries can add a custom e-mail
+  route for outbound mail to route these e-mails to their own inbox of choice for data gathering. This allows adversaries
+  to capture sensitive information from e-mail and potential attachments, such as invoices or payment documents. By default,
+  all email from current Google Workspace users with accounts are routed through a domain's mail server for inbound andoutbound
+  mail.
+tactic: Impact
+tactic_id: TA0040
+technique_id: T1498
+technique_name: Network Denial of Service
+platform:
+- Google Workspace
+data_sources:
+- Google Workspace
+severity: Low
+fidelity: Low
+lifecycle: Deployed
+risk_score: 30
+queries:
+  spl: 'index=windows
+
+    | table _time, host, Account_Name, IpAddress, LogonType'
+  kql: |-
+    SecurityEvent
+    | where TimeGenerated >= ago(1d)
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity
+  aql: |-
+    SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+    FROM events
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+    GROUP BY username, hostname, QIDNAME(qid)
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_imp_000300 {
+      meta:
+        author = "TDE"
+        description = "Custom Google Workspace Email Route Created or Modified"
+        severity = "LOW"
+        tactic = "TA0040"
+        technique = "T1498"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 5m
+
+      condition:
+        #event >= 1
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-windows.sysmon_operational*,logs-system.security*
+    | WHERE @timestamp > NOW() - 1 day
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
+    | WHERE event_count >= 1
+    | SORT @timestamp DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 1)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 1
+    | sort -proc_count
+  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
+    \ _time"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Legitimate admin activity
+- Authorized service accounts
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- auth
+- impact
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: |-
+  1 Google Workspace Event
+  Where the events.name is one of "CREATE_GMAIL_SETTING" or "CHANGE_GMAIL_SETTING"
+  And the SETTING_NAME is one of "email_route" or "message_security_rule"
+suppression:
+  window: 24 hours
+tuning_period: 7 days

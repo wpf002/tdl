@@ -1,0 +1,114 @@
+rule_id: TDL-DE-000589
+v4_id: 000589
+name: Pass the Ticket Attack Activity
+description: Detects when a source generates ticket granting service (TGS) events without ticket granting ticket (TGT) events,
+  which means a Pass the Ticket attack may be occurring. Adversaries may "pass the ticket" using stolen Kerberos tickets to
+  move laterally within an environment, bypassing normal system access controls. Pass the ticket (PtT) is a method of authenticating
+  to a system using Kerberos tickets without having access to an account's password.
+tactic: Defense Evasion
+tactic_id: TA0005
+technique_id: T1550
+technique_name: Use Alternate Authentication Material
+platform:
+- Windows
+data_sources:
+- Windows Operating System
+- 'Event IDs: 4768, 4769'
+severity: High
+fidelity: High
+lifecycle: Proposed
+risk_score: 75
+queries:
+  spl: |-
+    index=windows
+    | where (EventCode=4768 OR EventCode=4769 OR EventCode=4769 OR EventCode=4768)
+    | bucket _time span=5m
+    | stats count by src_ip, Account_Name, _time
+    | where count >= 5
+    | table _time, host, Account_Name, IpAddress, LogonType
+  kql: |-
+    SecurityEvent
+    | where TimeGenerated >= ago(1d)
+    | where EventID in (4768, 4769, 4769, 4768)
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 5m)
+    | where Count >= 5
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity
+  aql: |-
+    SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+    FROM events
+    WHERE eventid IN (4768, 4769)
+      AND INOFFSET(starttime, LAST 18000 SECONDS)
+    GROUP BY username, hostname, QIDNAME(qid)
+    HAVING event_count >= 5
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_de_000589 {
+      meta:
+        author = "TDE"
+        description = "Pass the Ticket Attack Activity"
+        severity = "HIGH"
+        tactic = "TA0005"
+        technique = "T1550"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.metadata.product_event_type = "4768"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 5h
+
+      condition:
+        #event >= 5
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-windows.sysmon_operational*,logs-system.security*
+    | WHERE @timestamp > NOW() - 1 day
+    | WHERE event.code IN ('4768', '4769')
+    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 5h)
+    | WHERE event_count >= 5
+    | SORT event_count DESC
+  leql: |-
+    where(event_id IN [4768, 4769])
+    groupby(source_ip, username, hostname)
+    calculate(count AS event_count)
+    having(event_count >= 5)
+  crowdstrike: |-
+    event_simpleName=SecurityEvent
+    | where EventCode=4768 OR EventCode=4769
+    | stats count as events by ComputerName, UserName
+    | where events >= 5
+  xql: |-
+    dataset = xdr_data
+    | filter event_type = "PROCESS" and action_evtlog_event_id in (4768, 4769)
+    | filter _time > to_timestamp(now() - 86400, "epoch")
+    | comp count() as event_count by hostname, actor_effective_username
+    | filter event_count >= 5
+    | fields hostname, actor_effective_username, event_count
+  lucene: event_id:(4768 OR 4769)
+false_positives:
+- Legitimate admin activity
+- Authorized service accounts
+tuning_guidance: Tune per environment baseline.
+tags:
+- auth
+- defense-evasion
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: none
+pseudo_logic: |-
+  5 Windows Events
+  Where the Event ID is  "4769"
+  Where the Source user is NOT a machine account
+  Where the Service Name does NOT end with "$"
+  Where the Service Name is NOT "krbtgt"
+  With 5 Unique Service Names
+  From the Same Src IP and Src User
+  Within 5 Hours
+
+  AND where there are no 4768 Events within the timeframe from the same source IP and user

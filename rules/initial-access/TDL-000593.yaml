@@ -1,0 +1,100 @@
+rule_id: TDL-AUTH-000593
+v4_id: 000593
+name: MFA Pin Spraying
+description: This rule is designed to detect multiple failed MFA pin code attempts for multiple users over a short period
+  of time . This may indicate a threat actor using a bypass code or common pin against multiple user accounts to see if they
+  can bypass MFA
+tactic: Initial Access
+tactic_id: TA0001
+technique_id: T1078
+technique_name: Valid Accounts
+platform:
+- Azure
+- Okta
+data_sources:
+- Duo
+- Okta
+- Azure
+severity: Low
+fidelity: Low
+lifecycle: Proposed
+risk_score: 30
+queries:
+  spl: |-
+    index=azure
+    | bucket _time span=3m
+    | stats count by src_ip, Account_Name, _time
+    | where count >= 5
+    | table _time, host, Account_Name, IpAddress, LogonType
+  kql: |-
+    OktaLogs_CL
+    | where TimeGenerated >= ago(1d)
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 3m)
+    | where Count >= 5
+    | project TimeGenerated, Computer, Account, Activity
+  aql: |-
+    SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+    FROM events
+    WHERE INOFFSET(starttime, LAST 180 SECONDS)
+    GROUP BY username, hostname, QIDNAME(qid)
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_auth_000593 {
+      meta:
+        author = "TDE"
+        description = "MFA Pin Spraying"
+        severity = "LOW"
+        tactic = "TA0001"
+        technique = "T1078"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 3m
+
+      condition:
+        #event >= 5
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-azure*,logs-o365*
+    | WHERE @timestamp > NOW() - 1 day
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 3m)
+    | WHERE event_count >= 5
+    | SORT @timestamp DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 5)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 5
+    | sort -proc_count
+  xql: "dataset = cloud_audit_log\n| filter event_type = \"CLOUD\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\"\
+    )\n| comp count() as event_count by hostname, actor_effective_username\n| filter event_count >= 5\n| fields hostname,\
+    \ actor_effective_username, event_count"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Legitimate admin activity
+- Authorized service accounts
+tuning_guidance: Tune per environment baseline.
+tags:
+- auth
+- initial-access
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: none
+pseudo_logic: |-
+  5 MFA Login Failures
+  From the same external  Source
+  Where the MFA Factor is a Pin or Device Code
+  With unique Destination Usernames
+  Within 3 minutes

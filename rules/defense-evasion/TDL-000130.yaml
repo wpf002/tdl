@@ -1,0 +1,92 @@
+rule_id: TDL-DE-000130
+v4_id: '000130'
+name: AWS Logging Stopped
+description: Detects when an AWS CloudTrail trail is stopped or deleted. This will stop AWS API events from logging into CloudTrail
+  and prevent visibility into the infrastructure.
+tactic: Defense Evasion
+tactic_id: TA0005
+technique_id: T1489
+technique_name: Service Stop
+platform:
+- AWS
+data_sources:
+- AWS CloudTrail
+severity: High
+fidelity: High
+lifecycle: Deployed
+risk_score: 75
+queries:
+  spl: |-
+    index=aws sourcetype=aws:cloudtrail
+    | table _time, host, user, ProcessName, CommandLine
+  kql: |-
+    AWSCloudTrail
+    | where TimeGenerated >= ago(1d)
+    | project TimeGenerated, Computer, Account, Activity
+  aql: |-
+    SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+    FROM events
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+    GROUP BY username, hostname, QIDNAME(qid)
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_de_000130 {
+      meta:
+        author = "TDE"
+        description = "AWS Logging Stopped"
+        severity = "HIGH"
+        tactic = "TA0005"
+        technique = "T1489"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 5m
+
+      condition:
+        #event >= 1
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-aws.cloudtrail*
+    | WHERE @timestamp > NOW() - 1 day
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
+    | WHERE event_count >= 1
+    | SORT @timestamp DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 1)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 1
+    | sort -proc_count
+  xql: "dataset = cloud_audit_log\n| filter event_type = \"CLOUD\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\"\
+    )\n| fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort\
+    \ desc _time"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Security software
+- Authorized admin tools
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- edp
+- defense-evasion
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: |-
+  1 AWS CloudTrail Event
+  Where the Event Type is AwsApiCall
+  Where the Event Name is in [DeleteTrail, StopLogging]
+suppression:
+  window: 8 hours
+tuning_period: 7 days

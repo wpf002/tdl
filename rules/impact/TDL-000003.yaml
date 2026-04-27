@@ -1,0 +1,120 @@
+rule_id: TDL-IMP-000003
+v4_id: '000003'
+name: Mass User Deletions
+description: Detects when a single user deletes multiple accounts within a short time. This could indicate an impact or interruption
+  to business operations.
+tactic: Impact
+tactic_id: TA0040
+technique_id: T1531
+technique_name: Account Access Removal
+platform:
+- Linux
+- Windows
+data_sources:
+- Windows Active Directory
+- Linux Operating System
+- 'Event IDs: 4726'
+severity: High
+fidelity: High
+lifecycle: Deployed
+risk_score: 75
+queries:
+  spl: 'index=linux
+
+    | bucket _time span=5m
+
+    | stats count as total, dc(TargetUserName) as unique_targets by _time, SubjectUserName
+
+    | where total >= 10
+
+    | table _time, host, Account_Name, IpAddress, LogonType'
+  kql: 'Syslog
+
+    | where TimeGenerated >= ago(1d)
+
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 3m)
+
+    | where Count >= 10
+
+    | project TimeGenerated, Computer, Account, Activity'
+  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
+    \ events\nWHERE eventid = 4726\n  AND INOFFSET(starttime, LAST 180 SECONDS)\nGROUP BY username, hostname, QIDNAME(qid)\n\
+    HAVING event_count >= 10\nORDER BY starttime DESC"
+  yara_l: "rule zs_imp_000003 {\n  meta:\n    author = \"TDE\"\n    description = \"Mass User Deletions\"\n    severity =\
+    \ \"HIGH\"\n    tactic = \"TA0040\"\n    technique = \"T1531\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\
+    \n    $event.metadata.product_event_type = \"4726\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
+    \ = $user\n\n  match:\n    $host over 3m\n\n  condition:\n    #event >= 10\n\n  outcome:\n    $risk_score = max(50)\n}"
+  esql: 'FROM logs-system.syslog*,logs-auditd*
+
+    | WHERE @timestamp > NOW() - 1 day
+
+    | WHERE event.code IN (''4726'')
+
+    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 3m)
+
+    | WHERE event_count >= 10
+
+    | SORT event_count DESC'
+  leql: 'where(event_id IN [4726])
+
+    groupby(source_ip, username, hostname)
+
+    calculate(count AS event_count)
+
+    having(event_count >= 10)'
+  crowdstrike: 'event_simpleName=SecurityEvent
+
+    | where EventCode=4726
+
+    | stats count as events by ComputerName, UserName
+
+    | where events >= 10'
+  xql: 'dataset = xdr_data
+
+    | filter event_type = "PROCESS" and action_evtlog_event_id in (4726)
+
+    | filter _time > to_timestamp(now() - 86400, "epoch")
+
+    | comp count() as event_count by hostname, actor_effective_username
+
+    | filter event_count >= 10
+
+    | fields hostname, actor_effective_username, event_count'
+  lucene: event_id:(4726)
+false_positives:
+- Legitimate admin activity
+- Authorized service accounts
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- auth
+- impact
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: '10 Windows User Deleted Events
+
+  Where the Event ID is in [630, 4726]
+
+  From a single Source Username
+
+  Where the Source Username is NOT on the Users Authorized to Delete Users and Groups List
+
+  Within 3 minutes
+
+
+  ---------------------------------------------------------------------------------------------------------------
+
+
+  10 User Deleted Events
+
+  From a single Source Username
+
+  Where the Source Username is NOT on the Users Authorized to Delete Users and Groups List
+
+  Within 3 minutes'
+suppression:
+  window: 8 hours
+  fields:
+  - Source Username
+tuning_period: 7 days

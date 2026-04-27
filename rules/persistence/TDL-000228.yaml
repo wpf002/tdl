@@ -1,0 +1,102 @@
+rule_id: TDL-PER-000228
+v4_id: 000228
+name: Netsh Helper DLL Injection
+description: Detects when a new DLL is registered to Netsh or when Netsh spawns another process. Netsh is used to configure
+  network settings on a Windows host. It can also extend its functionality by installer “helper” DLLs. An attacker can install
+  a malicious helper DLL to run arbitrary code every time netsh is executed which allows for a persistant or foothold on the
+  machine.
+tactic: Persistence
+tactic_id: TA0003
+technique_id: T1574
+technique_name: Hijack Execution Flow
+platform:
+- Windows
+data_sources:
+- Windows Operating System
+- 'Event IDs: 4688, 4657'
+severity: High
+fidelity: High
+lifecycle: Proposed
+risk_score: 75
+queries:
+  spl: 'index=windows
+
+    | where (EventCode=4688 OR EventCode=4657 OR EventCode=4688 OR EventCode=4657)
+
+    | table _time, host, user, ProcessName, CommandLine'
+  kql: 'SecurityEvent
+
+    | where TimeGenerated >= ago(1d)
+
+    | where EventID in (4688, 4657, 4688, 4657)
+
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
+  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
+    \ events\nWHERE eventid IN (4688, 4657)\n  AND INOFFSET(starttime, LAST 300 SECONDS)\nGROUP BY username, hostname, QIDNAME(qid)\n\
+    \nORDER BY starttime DESC"
+  yara_l: "rule zs_per_000228 {\n  meta:\n    author = \"TDE\"\n    description = \"Netsh Helper DLL Injection\"\n    severity\
+    \ = \"HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1574\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\
+    \n    $event.metadata.product_event_type = \"4688\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
+    \ = $user\n\n  match:\n    $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
+  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
+
+    | WHERE @timestamp > NOW() - 1 day
+
+    | WHERE event.code IN (''4688'', ''4657'')
+
+    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 5m)
+
+    | WHERE event_count >= 1
+
+    | SORT event_count DESC'
+  leql: 'where(event_id IN [4688, 4657])
+
+    groupby(hostname, username)
+
+    calculate(count AS event_count)'
+  crowdstrike: 'event_simpleName=SecurityEvent
+
+    | where EventCode=4688 OR EventCode=4657
+
+    | table ComputerName, UserName, CommandLine, ContextTimeStamp'
+  xql: 'dataset = xdr_data
+
+    | filter event_type = "PROCESS" and action_evtlog_event_id in (4688, 4657)
+
+    | filter _time > to_timestamp(now() - 86400, "epoch")
+
+    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time
+
+    | sort desc _time'
+  lucene: event_id:(4688 OR 4657)
+false_positives:
+- Security software
+- Authorized admin tools
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- edp
+- persistence
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: none
+pseudo_logic: '1 Process Execution Event
+
+  Where the Event ID is in [592, 4688]
+
+  Where the Parent Process is netsh.exe
+
+  Where the Child Process is NOT [NULL, conhost.exe]
+
+
+  ---------------------------------------------------------------------------------------------------------------
+
+
+  1 Windows Registry Modification Event
+
+  Where the Event ID is in [567, 4657]
+
+  Where the Registry Key is in [REGISTRY\MACHINE\SOFTWARE\Microsoft\Netsh, HKLM\SOFTWARE\Microsoft\Netsh, HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Netsh]'
+suppression:
+  window: 8 hours
+tuning_period: 7 days

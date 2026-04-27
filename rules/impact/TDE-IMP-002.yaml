@@ -1,0 +1,94 @@
+rule_id: TDE-IMP-002
+name: Shadow Copy Deletion via vssadmin or wmic
+tactic: Impact
+tactic_id: TA0040
+technique_id: T1490
+technique_name: Inhibit System Recovery
+platform:
+- Windows
+data_sources:
+- Windows Security Event Log (4688)
+- Sysmon Event ID 1
+severity: Critical
+fidelity: High
+lifecycle: Deployed
+risk_score: 100
+queries:
+  spl: "index=windows sourcetype=WinEventLog:Security EventCode=4688\n| where (ProcessName=\"vssadmin.exe\" AND match(CommandLine,\"\
+    (?i)delete\"))\n   OR (ProcessName=\"wmic.exe\" AND match(CommandLine,\"(?i)(shadowcopy.*delete)\"))\n| table _time, host,\
+    \ user, ProcessName, CommandLine"
+  kql: "DeviceProcessEvents\n| where TimeGenerated >= ago(1d)\n| where (FileName =~ \"vssadmin.exe\" and ProcessCommandLine\
+    \ matches regex @\"(?i)delete\")\n    or (FileName =~ \"wmic.exe\" and ProcessCommandLine matches regex @\"(?i)(shadowcopy.*delete)\"\
+    )\n| project TimeGenerated, DeviceName, AccountName, FileName, ProcessCommandLine"
+  aql: |-
+    SELECT username, hostname, "Process Name" AS process, "Command Line" AS cmdline
+    FROM events
+    WHERE ("Process Name" ILIKE '%vssadmin.exe%' AND "Command Line" ILIKE '%delete%')
+       OR ("Process Name" ILIKE '%wmic.exe%' AND "Command Line" ILIKE '%shadowcopy%delete%')
+      AND INOFFSET(starttime, LAST 86400 SECONDS)
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule tde_imp_002 {
+      meta:
+        author = "TDE"
+        description = "Shadow Copy Deletion via vssadmin or wmic"
+        severity = "CRITICAL"
+        tactic = "TA0040"
+        technique = "T1490"
+
+      events:
+        $proc.metadata.event_type = "PROCESS_LAUNCH"
+        ($proc.target.process.file.full_path = /vssadmin\.exe$/
+         and $proc.target.process.command_line = /delete/i)
+        or
+        ($proc.target.process.file.full_path = /wmic\.exe$/
+         and $proc.target.process.command_line = /shadowcopy.*delete/i)
+        $proc.principal.hostname = $host
+
+      match:
+        $host over 1h
+
+      condition:
+        #proc >= 1
+
+      outcome:
+        $risk_score = max(100)
+    }
+  esql: |-
+    FROM logs-windows.sysmon_operational*,logs-system.security*
+    | WHERE @timestamp > NOW() - 1 day
+    | WHERE event.code == "4688"
+    | WHERE (process.name LIKE "*vssadmin.exe" AND process.command_line LIKE "*delete*")
+         OR (process.name LIKE "*wmic.exe" AND process.command_line RLIKE "(?i)shadowcopy.*delete")
+    | KEEP host.name, user.name, process.name, process.command_line, @timestamp
+    | SORT @timestamp DESC
+  leql: |-
+    where((process CONTAINS "vssadmin.exe" AND command CONTAINS "delete")
+      OR (process CONTAINS "wmic.exe" AND command CONTAINS "shadowcopy"))
+    groupby(hostname, username)
+    calculate(count AS vss_deletions)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | where (FileName MATCHES "(?i)vssadmin.exe" AND CommandLine MATCHES "(?i)delete")
+        OR (FileName MATCHES "(?i)wmic.exe" AND CommandLine MATCHES "(?i)shadowcopy.*delete")
+    | table ComputerName, UserName, FileName, CommandLine, ContextTimeStamp
+  xql: |-
+    dataset = xdr_data
+    | filter event_type = "PROCESS"
+    | filter (action_process_image_name ~= "vssadmin.exe" and action_process_command_line contains "delete")
+           or (action_process_image_name ~= "wmic.exe" and action_process_command_line ~= "(?i)shadowcopy.*delete")
+    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time
+  lucene: |-
+    (process:vssadmin.exe AND command_line:*delete*)
+    OR (process:wmic.exe AND command_line:*shadowcopy*delete*)
+false_positives:
+- Authorized backup solutions managing shadow storage
+tags:
+- vss
+- shadow-copy
+- ransomware
+- critical
+author: TDE
+created: '2024-03-01'
+test_method: purple_team
+last_modified: '2026-04-27'

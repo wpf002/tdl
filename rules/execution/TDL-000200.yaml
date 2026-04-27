@@ -1,0 +1,120 @@
+rule_id: TDL-EXE-000200
+v4_id: '000200'
+name: Abnormal LSASS Parent Child Relationship
+description: Detects potential lsass.exe abuse based on unusual and suspicious parent-child relationships. Lsass doesn’t typically
+  spawn additional processes. This also detects suspicious parent processes of lsass, which may indicate LSASS memory access
+  attempts.
+tactic: Execution
+tactic_id: TA0002
+technique_id: T1569
+technique_name: System Services
+platform:
+- Windows
+data_sources:
+- Windows Operating System
+- 'Event IDs: 4688'
+severity: Medium
+fidelity: Medium
+lifecycle: Deployed
+risk_score: 55
+queries:
+  spl: |-
+    index=windows
+    | where (EventCode=4688 OR EventCode=4688)
+    | table _time, host, user, ProcessName, CommandLine
+  kql: |-
+    SecurityEvent
+    | where TimeGenerated >= ago(1d)
+    | where EventID in (4688, 4688)
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity
+  aql: |-
+    SELECT sourceaddress AS source_host, username, QIDNAME(qid) AS event_name,
+           "Process Name" AS accessing_process, "Granted Access" AS access_mask
+    FROM events
+    WHERE eventid = 10
+      AND "Target Image" ILIKE '%lsass.exe%'
+      AND "Granted Access" IN ('0x1010','0x1410','0x1fffff','0x147a')
+      AND "Source Image" NOT ILIKE '%\Windows\System32\%'
+      AND INOFFSET(starttime, LAST 3600 SECONDS)
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_exe_000200 {
+      meta:
+        author = "TDE"
+        description = "Abnormal LSASS Parent Child Relationship"
+        severity = "MEDIUM"
+        tactic = "TA0006"
+        technique = "T1003.001"
+
+      events:
+        $proc_access.metadata.event_type = "PROCESS_OPEN"
+        $proc_access.target.process.file.full_path = /lsass\.exe$/
+        $proc_access.additional.fields["GrantedAccess"] = /0x1010|0x1410|0x1fffff/
+        $proc_access.principal.process.file.full_path != /Windows\\System32/
+        $proc_access.principal.hostname = $host
+
+      match:
+        $host over 5m
+
+      condition:
+        #proc_access >= 1
+
+      outcome:
+        $risk_score = max(95)
+    }
+  esql: |-
+    FROM logs-windows.sysmon_operational*
+    | WHERE @timestamp > NOW() - 1 day
+    | WHERE event.code == "10"
+    | WHERE winlog.event_data.TargetImage LIKE "*\\lsass.exe"
+    | WHERE winlog.event_data.GrantedAccess IN ("0x1010","0x1410","0x1fffff","0x147a")
+    | WHERE NOT winlog.event_data.SourceImage LIKE "*\\Windows\\System32\\*"
+    | KEEP host.name, winlog.event_data.SourceImage, winlog.event_data.GrantedAccess, winlog.event_data.CallTrace, @timestamp
+    | SORT @timestamp DESC
+  leql: |-
+    where(source_name = "Microsoft-Windows-Sysmon"
+      AND event_id = 10
+      AND target_image CONTAINS "lsass.exe"
+      AND granted_access IN ["0x1010","0x1410","0x1fffff"]
+      AND NOT source_image CONTAINS "Windows\System32")
+    calculate(count AS total)
+    having(total >= 1)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | where TargetProcessName MATCHES "(?i)lsass.exe"
+    | where DesiredAccess IN ("0x1010","0x1410","0x1fffff")
+    | where FileName NOT MATCHES "(?i)C:\\Windows\\System32"
+    | table ComputerName, FileName, TargetProcessName, DesiredAccess, CommandLine, ContextTimeStamp
+  xql: |-
+    dataset = xdr_data
+    | filter event_type = "INJECTION"
+    | filter action_remote_process_image_path contains "lsass.exe"
+    | filter actor_process_image_path not contains "C:\Windows\System32"
+    | fields hostname, actor_process_image_name, action_remote_process_image_path, actor_effective_username, _time
+    | sort desc _time
+  lucene: |-
+    event_id:10 AND target_image:*lsass.exe
+    AND granted_access:(0x1010 OR 0x1410 OR 0x1fffff)
+    AND NOT source_image:*Windows\System32*
+false_positives:
+- Security software
+- Authorized admin tools
+tuning_guidance: 'Tune per environment baseline. Tuning period: 14 days.'
+tags:
+- edp
+- execution
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: |-
+  1 Windows Process Creation Event
+  Where the Event ID is in [592, 4688]
+  Where Parent Process Name equals "lsass.exe"
+  AND Process Name in ["cmd.exe", "powershel.exe", "regsvr32.exe", "mstsc.exe", "dllhost.exe"]
+  OR Process Name equals "lsass.exe"
+  AND Parent Process Name in ["explorer.exe", "cmd.exe", "lsass.exe"]
+suppression:
+  fields:
+  - Source Username
+tuning_period: 14 days

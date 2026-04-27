@@ -1,0 +1,95 @@
+rule_id: TDL-DIS-000055
+v4_id: '000055'
+name: Port Scan Detected - Inbound
+description: Detects a port scan from an external host to an internal host. Attackers will use port scans to perform reconnaissance
+  to determine open services on a target.
+tactic: Discovery
+tactic_id: TA0007
+technique_id: T1046
+technique_name: Network Service Scanning
+platform:
+- Network
+data_sources:
+- Firewall
+severity: Medium
+fidelity: Medium
+lifecycle: Deployed
+risk_score: 55
+queries:
+  spl: 'index=network
+
+    | bucket _time span=5m
+
+    | stats dc(dest_port) as ports, dc(dest_ip) as hosts by _time, src_ip
+
+    | where ports >= 20 OR hosts >= 30
+
+    | table _time, src_ip, dest_ip, dest_port, action'
+  kql: 'CommonSecurityLog
+
+    | where TimeGenerated >= ago(1d)
+
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 15m)
+
+    | where Count >= 30
+
+    | project TimeGenerated, SourceIP, DestinationIP, DestinationPort, DeviceAction'
+  aql: "SELECT sourceip, COUNT(DISTINCT destinationport) AS unique_ports,\n       COUNT(DISTINCT destinationip) AS unique_hosts,\
+    \ COUNT(*) AS total_conns\nFROM flows\nWHERE INOFFSET(starttime, LAST 300 SECONDS)\nGROUP BY sourceip\nHAVING unique_ports\
+    \ >= 20 OR unique_hosts >= 30\nORDER BY unique_ports DESC"
+  yara_l: "rule zs_dis_000055 {\n  meta:\n    author = \"TDE\"\n    description = \"Port Scan Detected - Inbound\"\n    severity\
+    \ = \"MEDIUM\"\n    tactic = \"TA0007\"\n    technique = \"T1046\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\
+    \n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n    $host over 15m\n\n\
+    \  condition:\n    #event >= 30\n\n  outcome:\n    $risk_score = max(50)\n}"
+  esql: 'FROM logs-network*,logs-firewall*
+
+    | WHERE @timestamp > NOW() - 1 hour
+
+    | STATS unique_ports = COUNT_DISTINCT(destination.port), unique_hosts = COUNT_DISTINCT(destination.ip), total = COUNT(*)
+    BY source.ip, @timestamp = BUCKET(@timestamp, 5 minutes)
+
+    | WHERE unique_ports >= 20 OR unique_hosts >= 30
+
+    | SORT unique_ports DESC'
+  leql: 'where(logset = "Firewall Activity")
+
+    groupby(source_ip)
+
+    calculate(unique_count:destination_port AS unique_ports)
+
+    calculate(unique_count:destination_ip AS unique_hosts)
+
+    having(unique_ports >= 20 OR unique_hosts >= 30)'
+  crowdstrike: 'event_simpleName=ProcessRollup2
+
+    | stats count as proc_count by ComputerName, FileName
+
+    | where proc_count >= 30
+
+    | sort -proc_count'
+  xql: "dataset = xdr_data\n| filter event_type = \"NETWORK\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | comp count() as event_count by hostname, actor_effective_username\n| filter event_count >= 30\n| fields hostname, actor_effective_username,\
+    \ event_count"
+  lucene: 'log_type:"firewall" AND NOT destination_ip:"10.0.0.0/8"
+
+    AND NOT destination_ip:"172.16.0.0/12"
+
+    AND NOT destination_ip:"192.168.0.0/16"'
+false_positives:
+- Authorized scanners
+- Monitoring agents
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- net
+- discovery
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: "30 Firewall Events\nFrom one external source to one internal destination (Inbound)\nWhere the Destination Port\
+  \ is 1-1024\nOR\n\tWhere the Log Source is Fortinet FortiGate\n\tWhere the action is NOT in [server-rst, client-rst, timeout]\n\
+  \n\tWhere the action/result is NOT in [reset, timeout]\n\t\nWith unique Destination Ports\nWithin 15 minutes"
+suppression:
+  fields:
+  - Source IP
+tuning_period: 7 days

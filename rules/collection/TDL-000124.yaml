@@ -1,0 +1,97 @@
+rule_id: TDL-COL-000124
+v4_id: '000124'
+name: Mass File Download from Unauthorized Country
+description: Detects when a user  from an unauthorized country downloads multiple files from a file transfer/storage appliance.
+  This could indicate a data exfiltration attempt by insider threat or a compromised user.
+tactic: Collection
+tactic_id: TA0009
+technique_id: T1213
+technique_name: Data from Information Repositories
+platform:
+- Microsoft 365
+data_sources:
+- Sharepoint
+severity: Medium
+fidelity: Medium
+lifecycle: Deployed
+risk_score: 55
+queries:
+  spl: 'index=windows
+
+    | bucket _time span=5m
+
+    | stats count by src_ip, Account_Name, _time
+
+    | where count >= 10
+
+    | table _time, src_ip, dest_ip, dest_port, action'
+  kql: 'OfficeActivity
+
+    | where TimeGenerated >= ago(1d)
+
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 5m)
+
+    | where Count >= 10
+
+    | project TimeGenerated, UserId, ClientIP, Operation, OfficeWorkload'
+  aql: 'SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+
+    FROM events
+
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+
+    GROUP BY username, hostname, QIDNAME(qid)
+
+    ORDER BY starttime DESC'
+  yara_l: "rule zs_col_000124 {\n  meta:\n    author = \"TDE\"\n    description = \"Mass File Download from Unauthorized Country\"\
+    \n    severity = \"MEDIUM\"\n    tactic = \"TA0009\"\n    technique = \"T1213\"\n\n  events:\n    $event.metadata.event_type\
+    \ = \"GENERIC_EVENT\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n \
+    \   $host over 5m\n\n  condition:\n    #event >= 10\n\n  outcome:\n    $risk_score = max(50)\n}"
+  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
+
+    | WHERE @timestamp > NOW() - 1 day
+
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
+
+    | WHERE event_count >= 10
+
+    | SORT @timestamp DESC'
+  leql: 'where(logset = "Endpoint Activity")
+
+    groupby(hostname, username)
+
+    calculate(count AS event_count)
+
+    having(event_count >= 10)'
+  crowdstrike: 'event_simpleName=BootstrapProcess OR event_simpleName=SuspiciousFilesWithOperation
+
+    | where FileOperation IN ("WRITE","RENAME","DELETE")
+
+    | stats count(FileName) as file_count, dc(FileExtension) as ext_count by ComputerName, FileName_parent
+
+    | where file_count >= 50 AND ext_count >= 3
+
+    | sort -file_count'
+  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | comp count() as event_count by hostname, actor_effective_username\n| filter event_count >= 10\n| fields hostname, actor_effective_username,\
+    \ event_count"
+  lucene: 'source_name:Microsoft-Windows-Sysmon AND event_id:11
+
+    AND NOT file_extension:(tmp OR log OR ini)'
+false_positives:
+- Authorized scanners
+- Monitoring agents
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- net
+- collection
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: "10 Sharepoint Events\nWhere the Operation is \"FileDownloaded\"\nWhere the workload is \"Sharepoint\"\nWhere\
+  \ the Source Country is Not on the Authorized Countries List\nWith distinct File Names\nWith the same Source Username \n\
+  Within 5 minutes"
+suppression:
+  window: 12 hours
+tuning_period: 7 days

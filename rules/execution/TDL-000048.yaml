@@ -1,0 +1,100 @@
+rule_id: TDL-EXE-000048
+v4_id: 000048
+name: Persistent Malware
+description: Detects a specific piece of malware that is repeatedly detected and cleaned by the AV on a system. This could
+  indicate that the AV is leaving remnants of the malware when deleting it that cause it to be installed again after it has
+  been cleaned. This could also be an indication that a user has bad network practice and is repeatedly infected with the
+  same malware.
+tactic: Execution
+tactic_id: TA0002
+technique_id: T1204
+technique_name: User Execution
+platform:
+- Windows
+data_sources:
+- Antivirus
+severity: Medium
+fidelity: Medium
+lifecycle: Deployed
+risk_score: 55
+queries:
+  spl: 'index=windows
+
+    | bucket _time span=20m
+
+    | stats count by src_ip, Account_Name, _time
+
+    | where count >= 4
+
+    | table _time, host, user, ProcessName, CommandLine'
+  kql: 'SecurityEvent
+
+    | where TimeGenerated >= ago(1d)
+
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 20m)
+
+    | where Count >= 4
+
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
+  aql: 'SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+
+    FROM events
+
+    WHERE INOFFSET(starttime, LAST 1200 SECONDS)
+
+    GROUP BY username, hostname, QIDNAME(qid)
+
+    ORDER BY starttime DESC'
+  yara_l: "rule zs_exe_000048 {\n  meta:\n    author = \"TDE\"\n    description = \"Persistent Malware\"\n    severity = \"\
+    MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\
+    \n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n    $host over 20m\n\n\
+    \  condition:\n    #event >= 4\n\n  outcome:\n    $risk_score = max(50)\n}"
+  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
+
+    | WHERE @timestamp > NOW() - 1 day
+
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 20m)
+
+    | WHERE event_count >= 4
+
+    | SORT @timestamp DESC'
+  leql: 'where(logset = "Endpoint Activity")
+
+    groupby(hostname, username)
+
+    calculate(count AS event_count)
+
+    having(event_count >= 4)'
+  crowdstrike: 'event_simpleName=ProcessRollup2
+
+    | stats count as proc_count by ComputerName, FileName
+
+    | where proc_count >= 4
+
+    | sort -proc_count'
+  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | comp count() as event_count by hostname, actor_effective_username\n| filter event_count >= 4\n| fields hostname, actor_effective_username,\
+    \ event_count"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Security software
+- Authorized admin tools
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- edp
+- execution
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: '4 Malware Detection Events
+
+  With the same Source Hostname and File Hash/Signature
+
+  Within 20 minutes'
+suppression:
+  window: 12 hours
+  fields:
+  - Source Hostname
+  - File Hash/Signature
+tuning_period: 7 days

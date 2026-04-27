@@ -1,0 +1,117 @@
+rule_id: TDL-AUTH-000004
+v4_id: '000004'
+name: Logon Attempts to Disabled Account
+description: Detects an attacker attempting to log into an account that has been disabled.
+tactic: Initial Access
+tactic_id: TA0001
+technique_id: T1078
+technique_name: Valid Accounts
+platform:
+- Linux
+- Windows
+data_sources:
+- Windows Active Directory
+- Linux Operating System
+- 'Event IDs: 4625'
+severity: Low
+fidelity: Low
+lifecycle: Deployed
+risk_score: 30
+queries:
+  spl: 'index=linux
+
+    | bucket _time span=10m
+
+    | stats count by src_ip, Account_Name, _time
+
+    | where count >= 3
+
+    | table _time, host, Account_Name, IpAddress, LogonType'
+  kql: 'Syslog
+
+    | where TimeGenerated >= ago(1d)
+
+    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 10m)
+
+    | where Count >= 3
+
+    | project TimeGenerated, Computer, Account, Activity'
+  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
+    \ events\nWHERE eventid = 4625\n  AND INOFFSET(starttime, LAST 600 SECONDS)\nGROUP BY username, hostname, QIDNAME(qid)\n\
+    HAVING event_count >= 3\nORDER BY starttime DESC"
+  yara_l: "rule zs_auth_000004 {\n  meta:\n    author = \"TDE\"\n    description = \"Logon Attempts to Disabled Account\"\n\
+    \    severity = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n\n  events:\n    $event.metadata.event_type\
+    \ = \"GENERIC_EVENT\"\n    $event.metadata.product_event_type = \"4625\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
+    \ = $user\n\n  match:\n    $host over 10m\n\n  condition:\n    #event >= 3\n\n  outcome:\n    $risk_score = max(50)\n}"
+  esql: 'FROM logs-system.syslog*,logs-auditd*
+
+    | WHERE @timestamp > NOW() - 1 day
+
+    | WHERE event.code IN (''4625'')
+
+    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 10m)
+
+    | WHERE event_count >= 3
+
+    | SORT event_count DESC'
+  leql: 'where(event_id IN [4625])
+
+    groupby(source_ip, username, hostname)
+
+    calculate(count AS event_count)
+
+    having(event_count >= 3)'
+  crowdstrike: 'event_simpleName=SecurityEvent
+
+    | where EventCode=4625
+
+    | stats count as events by ComputerName, UserName
+
+    | where events >= 3'
+  xql: 'dataset = xdr_data
+
+    | filter event_type = "PROCESS" and action_evtlog_event_id in (4625)
+
+    | filter _time > to_timestamp(now() - 86400, "epoch")
+
+    | comp count() as event_count by hostname, actor_effective_username
+
+    | filter event_count >= 3
+
+    | fields hostname, actor_effective_username, event_count'
+  lucene: event_id:(4625)
+false_positives:
+- Legitimate admin activity
+- Authorized service accounts
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- auth
+- initial-access
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: '3 Windows Authentication Failed Events
+
+  From one internal Source to one internal Destination
+
+  Where the Event ID is in [529, 4625]
+
+  Where the Failure Code is "0xC0000072"
+
+  Where the Source IP/Hostname is NOT on the Domain Controller List
+
+  Where the Source IP/Hostname is NOT on the Mail Server List
+
+  Where the source is NOT on the Central Authentication Server List
+
+
+  With the same Destination Username
+
+  Within 10 minutes'
+suppression:
+  window: 24 hours
+  fields:
+  - Source IP
+  - Source Host
+tuning_period: 7 days

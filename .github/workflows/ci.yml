@@ -1,0 +1,338 @@
+name: TDE Playbook CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'rules/**'
+      - 'schemas/**'
+      - 'chains/**'
+      - 'log-sources/**'
+      - 'tools/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rules/**'
+      - 'schemas/**'
+      - 'chains/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+
+  # ── 1. Validate all rules against schema ───────────────────────────────────
+  validate:
+    name: Rule Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Validate rules
+        run: node tools/validator.js
+        id: validate
+
+      - name: Upload validation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-results
+          path: exports/validation_*.json
+          if-no-files-found: ignore
+
+  # ── 2. Build rule index ────────────────────────────────────────────────────
+  index:
+    name: Build Rule Index
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate rule index
+        run: node tools/indexer.js
+
+      - name: Generate coverage report
+        run: node tools/coverage.js
+
+      - name: Upload index artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rule-index
+          path: |
+            exports/rule_index.json
+            matrix/coverage_report.json
+
+  # ── 3. Recommendation engine check ────────────────────────────────────────
+  recommend:
+    name: Recommendation Engine
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: pip install pyyaml
+
+      - name: Run recommendation engine (default profile)
+        run: |
+          python3 tools/recommend.py \
+            --profile profiles/default.yaml \
+            --catalog log-sources/catalog.yaml \
+            --rules rules \
+            --output exports/ci_recommendations.json \
+            --top 50
+
+      - name: Upload recommendations
+        uses: actions/upload-artifact@v4
+        with:
+          name: recommendations
+          path: exports/ci_recommendations.json
+
+  # ── 4. Chain coverage check ────────────────────────────────────────────────
+  chains:
+    name: Attack Chain Coverage
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: pip install pyyaml
+
+      - name: Evaluate attack chains
+        run: |
+          python3 tools/chain_eval.py \
+            --rules rules \
+            --chains chains/attack_chains.yaml \
+            --output exports/chain_coverage.json
+
+      - name: Check critical chains are active
+        run: |
+          python3 << 'EOF'
+          import json, sys
+          with open('exports/chain_coverage.json') as f:
+              chains = json.load(f)
+          critical_chains = [c for c in chains if c['severity'] == 'Critical']
+          inactive = [c for c in critical_chains if not c['active']]
+          if inactive:
+              print(f"❌ FAIL: {len(inactive)} critical chain(s) are not fully covered:")
+              for c in inactive:
+                  print(f"  - {c['chain_id']} — {c['name']}")
+                  for m in c['missing_rules']:
+                      if m['required']:
+                          print(f"    MISSING REQUIRED: {m['rule_id']}")
+              sys.exit(1)
+          print(f"✅ All {len(critical_chains)} critical attack chains are active")
+          EOF
+
+      - name: Upload chain results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chain-coverage
+          path: exports/chain_coverage.json
+
+  # ── 5. Sigma generation ────────────────────────────────────────────────────
+  sigma:
+    name: Generate Sigma Rules
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: pip install pyyaml
+
+      - name: Generate Sigma rules
+        run: python3 tools/sigma_gen.py --rules rules --output sigma
+
+      - name: Count Sigma rules
+        run: |
+          count=$(find sigma -name "*.yml" | wc -l)
+          echo "Generated $count Sigma rules"
+          echo "SIGMA_COUNT=$count" >> $GITHUB_ENV
+
+      - name: Upload Sigma rules
+        uses: actions/upload-artifact@v4
+        with:
+          name: sigma-rules
+          path: sigma/
+
+  # ── 6. PR comment with summary ────────────────────────────────────────────
+  pr-summary:
+    name: PR Summary Comment
+    runs-on: ubuntu-latest
+    needs: [validate, index, chains, sigma]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install pyyaml
+
+      - name: Build PR comment
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+          from pathlib import Path
+
+          lines = ["## TDE Playbook CI — PR Check Results\n"]
+
+          # Rule index
+          idx_path = Path("rule-index/rule_index.json")
+          if idx_path.exists():
+              idx = json.loads(idx_path.read_text())
+              lines.append(f"### 📊 Library Summary")
+              lines.append(f"- **Total rules:** {idx.get('total_rules', 'N/A')}")
+              stats = idx.get("stats", {})
+              by_lc = stats.get("by_lifecycle", {})
+              lines.append(f"- **Deployed:** {by_lc.get('Deployed', 0)}")
+              lines.append(f"- **Proposed:** {by_lc.get('Proposed', 0)}")
+              lines.append("")
+
+          # Chain coverage
+          chain_path = Path("chain-coverage/chain_coverage.json")
+          if chain_path.exists():
+              chains = json.loads(chain_path.read_text())
+              active = [c for c in chains if c["active"]]
+              lines.append(f"### 🔗 Attack Chain Coverage")
+              lines.append(f"- **Active chains:** {len(active)}/{len(chains)}")
+              for c in chains:
+                  icon = "✅" if c["active"] else "⚠️"
+                  lines.append(f"  - {icon} {c['chain_id']} — {c['name']} ({c['coverage_pct']}%)")
+              lines.append("")
+
+          # Sigma count
+          sigma_count = len(list(Path("sigma-rules").rglob("*.yml"))) if Path("sigma-rules").exists() else 0
+          lines.append(f"### Σ Sigma Rules Generated: {sigma_count}")
+          lines.append("")
+          lines.append("---")
+          lines.append("*CI run by TDE Playbook automated pipeline*")
+
+          comment = "\n".join(lines)
+          with open("pr_comment.md", "w") as f:
+              f.write(comment)
+          print(comment)
+          PYEOF
+
+      - name: Post PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const comment = fs.readFileSync('pr_comment.md', 'utf8');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('TDE Playbook CI')
+            );
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: comment,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment,
+              });
+            }
+
+  # ── 7. Export canonical pack on main merge ─────────────────────────────────
+  export:
+    name: Export Canonical Pack
+    runs-on: ubuntu-latest
+    needs: [validate, chains]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: pip install pyyaml
+
+      - name: Run full export pipeline
+        run: |
+          node tools/indexer.js
+          node tools/coverage.js
+          python3 tools/sigma_gen.py
+          python3 tools/recommend.py \
+            --profile profiles/default.yaml \
+            --catalog log-sources/catalog.yaml \
+            --output exports/latest_recommendations.json
+
+      - name: Create release artifact
+        run: |
+          timestamp=$(date +%Y%m%d-%H%M%S)
+          tar -czf tde-playbook-export-${timestamp}.tar.gz \
+            rules/ sigma/ exports/ chains/ log-sources/ profiles/ schemas/
+          echo "ARTIFACT_NAME=tde-playbook-export-${timestamp}.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: canonical-export
+          path: "*.tar.gz"
+          retention-days: 30

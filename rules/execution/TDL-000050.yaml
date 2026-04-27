@@ -1,0 +1,92 @@
+rule_id: TDL-EXE-000050
+v4_id: '000050'
+name: Ransomware AV Detection
+description: Detects an anti-virus notification for ransomware found on a host. Even if the anti-virus reports the ransomware
+  was cleaned, there may be other undetected parts of the ransomware that were not cleaned and still active.
+tactic: Execution
+tactic_id: TA0002
+technique_id: T1486
+technique_name: Data Encrypted for Impact
+platform:
+- Windows
+data_sources:
+- Antivirus
+severity: Critical
+fidelity: High
+lifecycle: Deployed
+risk_score: 95
+queries:
+  spl: 'index=windows
+
+    | table _time, host, user, ProcessName, CommandLine'
+  kql: 'SecurityEvent
+
+    | where TimeGenerated >= ago(1d)
+
+    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
+  aql: 'SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+
+    FROM events
+
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+
+    GROUP BY username, hostname, QIDNAME(qid)
+
+    ORDER BY starttime DESC'
+  yara_l: "rule zs_exe_000050 {\n  meta:\n    author = \"TDE\"\n    description = \"Ransomware AV Detection\"\n    severity\
+    \ = \"CRITICAL\"\n    tactic = \"TA0002\"\n    technique = \"T1486\"\n\n  events:\n    $event.metadata.event_type = \"\
+    GENERIC_EVENT\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n    $host\
+    \ over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
+  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
+
+    | WHERE @timestamp > NOW() - 1 day
+
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
+
+    | WHERE event_count >= 1
+
+    | SORT @timestamp DESC'
+  leql: 'where(logset = "Endpoint Activity")
+
+    groupby(hostname, username)
+
+    calculate(count AS event_count)
+
+    having(event_count >= 1)'
+  crowdstrike: 'event_simpleName=BootstrapProcess OR event_simpleName=SuspiciousFilesWithOperation
+
+    | where FileOperation IN ("WRITE","RENAME","DELETE")
+
+    | stats count(FileName) as file_count, dc(FileExtension) as ext_count by ComputerName, FileName_parent
+
+    | where file_count >= 50 AND ext_count >= 3
+
+    | sort -file_count'
+  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
+    \ _time"
+  lucene: 'source_name:Microsoft-Windows-Sysmon AND event_id:11
+
+    AND NOT file_extension:(tmp OR log OR ini)'
+false_positives:
+- Security software
+- Authorized admin tools
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- edp
+- execution
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: '1 Malware Detection Event
+
+  Where the Signature case insensitive contains one of: [ransom, lock, crypt]
+
+  Where the Signature does NOT case insensitive contain one of: [block, currency, cryptonight]'
+suppression:
+  window: 4 Hours
+  fields:
+  - Source Hostname
+  - File Hash/Signature
+tuning_period: 7 days

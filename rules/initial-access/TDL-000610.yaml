@@ -1,0 +1,87 @@
+rule_id: TDL-AUTH-000610
+v4_id: '000610'
+name: First Seen Allowed Inbound RDP Traffic
+description: A rule that detects allowed inbound RDP traffic from an IP that hasn’t been seen in the last 90 days
+tactic: Initial Access
+tactic_id: TA0001
+technique_id: T1021
+technique_name: Remote Services
+platform:
+- Network
+data_sources:
+- Firewall
+severity: Low
+fidelity: Low
+lifecycle: Proposed
+risk_score: 30
+queries:
+  spl: 'index=network
+
+    | table _time, src_ip, dest_ip, dest_port, action'
+  kql: |-
+    CommonSecurityLog
+    | where TimeGenerated >= ago(1d)
+    | project TimeGenerated, SourceIP, DestinationIP, DestinationPort, DeviceAction
+  aql: |-
+    SELECT sourceip, destinationip, destinationport, SUM(flowCount) AS total_flows
+    FROM flows
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+    GROUP BY sourceip, destinationip, destinationport
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_auth_000610 {
+      meta:
+        author = "TDE"
+        description = "First Seen Allowed Inbound RDP Traffic"
+        severity = "LOW"
+        tactic = "TA0001"
+        technique = "T1021"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 5m
+
+      condition:
+        #event >= 1
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-network*,logs-firewall*
+    | WHERE @timestamp > NOW() - 1 day
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
+    | WHERE event_count >= 1
+    | SORT @timestamp DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 1)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 1
+    | sort -proc_count
+  xql: "dataset = xdr_data\n| filter event_type = \"NETWORK\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
+    \ _time"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Authorized scanners
+- Monitoring agents
+tuning_guidance: Tune per environment baseline.
+tags:
+- net
+- initial-access
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: none
+pseudo_logic: "1 Firewall Event \nFrom one external source to one internal destination (Inbound)\nWhere the Action is Allowed\n\
+  OR\n    Where the Destination Port is \"3389\"\n\n    Where the Application is \"rdp\"\n\nBaseline Learning: 30 Days\nRetention:\
+  \ 90 Days\n\nNew Value: Source IP"

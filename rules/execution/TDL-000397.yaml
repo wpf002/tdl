@@ -1,0 +1,87 @@
+rule_id: TDL-EXE-000397
+v4_id: 000397
+name: AWS Reverse Shell Activity - GuardDuty
+description: Detects a reverse shell within an AWS enviroment. Threat actors create a reverse shell to execute commands on
+  the target after gaining initial access to the target.
+tactic: Execution
+tactic_id: TA0002
+technique_id: T1059
+technique_name: Command and Scripting Interpreter
+platform:
+- AWS
+data_sources:
+- AWS GuardDuty
+severity: Medium
+fidelity: Medium
+lifecycle: Deployed
+risk_score: 55
+queries:
+  spl: |-
+    index=aws sourcetype=aws:cloudtrail
+    | table _time, host, user, ProcessName, CommandLine
+  kql: |-
+    AWSCloudTrail
+    | where TimeGenerated >= ago(1d)
+    | project TimeGenerated, Computer, Account, Activity
+  aql: |-
+    SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+    FROM events
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+    GROUP BY username, hostname, QIDNAME(qid)
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule zs_exe_000397 {
+      meta:
+        author = "TDE"
+        description = "AWS Reverse Shell Activity - GuardDuty"
+        severity = "MEDIUM"
+        tactic = "TA0002"
+        technique = "T1059"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 5m
+
+      condition:
+        #event >= 1
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-aws.cloudtrail*
+    | WHERE @timestamp > NOW() - 1 day
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
+    | WHERE event_count >= 1
+    | SORT @timestamp DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 1)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 1
+    | sort -proc_count
+  xql: "dataset = cloud_audit_log\n| filter event_type = \"CLOUD\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\"\
+    )\n| fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort\
+    \ desc _time"
+  lucene: event_id:* AND log_type:"security"
+false_positives:
+- Security software
+- Authorized admin tools
+tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
+tags:
+- edp
+- execution
+author: TDE/TDE
+created: '2024-01-01'
+last_modified: '2026-04-27'
+test_method: historical
+pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Execution:Runtime/ReverseShell\"]"
+tuning_period: 7 days

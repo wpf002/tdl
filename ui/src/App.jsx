@@ -3,10 +3,11 @@ import {
   Shield, Search, ChevronRight, X, AlertTriangle, CheckCircle,
   Activity, Database, Target, Filter, Tag, Copy, Check,
   BarChart3, Layers, Crosshair, Clock, TrendingUp, ChevronDown,
-  Terminal, Zap, GitBranch, Map, Award, Eye, Lock, Cpu,
+  Terminal, Zap, GitBranch, Map as MapIcon, Award, Eye, Lock, Cpu,
   ArrowRight, Circle, Minus
 } from 'lucide-react'
 import RULES_RAW from './data/rules.json'
+import { ATTACK_MATRIX, KILL_CHAIN, TACTIC_ORDER_MATRIX } from './data/attack-matrix.js'
 
 // ─── CONSTANTS ──────────────────────────────────────────────────────────────
 
@@ -99,9 +100,9 @@ const CSS = `
   --bg3:     #222228;
   --border:  #2a2a32;
   --border2: #363640;
-  --text:    #e8e8f0;
-  --text2:   #8888a0;
-  --text3:   #4a4a5a;
+  --text:    #f0f0f8;
+  --text2:   #b8b8cc;
+  --text3:   #8a8aa0;
   --accent:  #FF6B35;
   --accent2: #3B82F6;
   --green:   #22C55E;
@@ -323,19 +324,54 @@ input  { font-family: var(--sans); }
 .sev-bar-bg { flex: 1; height: 18px; background: var(--bg3); border-radius: 3px; overflow: hidden; }
 .sev-bar-fill { height: 100%; border-radius: 3px; display: flex; align-items: center; padding: 0 8px; font-size: 11px; font-family: var(--mono); font-weight: 700; color: white; }
 
-/* ATT&CK Matrix */
-.matrix-grid { display: grid; gap: 8px; }
-.matrix-tactic { }
-.matrix-header { font-size: 11px; font-weight: 600; padding: 6px 0; margin-bottom: 6px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
-.matrix-techs { display: flex; flex-wrap: wrap; gap: 4px; }
-.tech-chip {
-  font-size: 10px; font-family: var(--mono); padding: 3px 8px;
-  border-radius: 3px; cursor: pointer; transition: all .12s;
-  white-space: nowrap;
+/* ATT&CK Matrix — column-per-tactic grid mirroring attack.mitre.org */
+.matrix-legend { display: flex; align-items: center; gap: 12px; padding: 8px 20px; border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; font-size: 10px; color: var(--text2); font-family: var(--mono); }
+.matrix-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+.matrix-legend-swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; border: 1px solid; }
+.matrix-legend-link { margin-left: auto; }
+.matrix-legend-link a { color: var(--text2); text-decoration: none; }
+.matrix-legend-link a:hover { color: var(--accent); }
+.matrix-scroll { flex: 1; overflow: auto; padding: 12px; }
+.attack-grid { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(168px, 1fr); gap: 6px; min-width: max-content; }
+.attack-col { display: flex; flex-direction: column; min-width: 168px; }
+.attack-col-head { padding: 8px 10px 7px; background: var(--bg1); border: 1px solid var(--border); border-top: 3px solid; border-radius: 4px 4px 0 0; }
+.attack-col-tactic { font-size: 11px; font-weight: 700; line-height: 1.2; margin-bottom: 2px; }
+.attack-col-meta { font-size: 9px; font-family: var(--mono); color: var(--text2); letter-spacing: .04em; }
+.attack-col-body { display: flex; flex-direction: column; gap: 3px; padding-top: 4px; }
+.attack-cell {
+  display: flex; flex-direction: column; gap: 1px; padding: 6px 8px;
+  border: 1px solid; border-radius: 3px; text-decoration: none;
+  cursor: pointer; transition: filter .12s, transform .08s;
+  position: relative;
 }
-.tech-chip.covered   { background: rgba(34,197,94,.12); color: var(--green); border: 1px solid rgba(34,197,94,.25); }
-.tech-chip.uncovered { background: var(--bg2); color: var(--text3); border: 1px solid var(--border); }
-.tech-chip.covered:hover { background: rgba(34,197,94,.2); }
+.attack-cell:hover { filter: brightness(1.25); transform: translateX(1px); }
+.attack-cell-id { font-size: 10px; font-family: var(--mono); font-weight: 600; }
+.attack-cell-name { font-size: 10.5px; color: var(--text); line-height: 1.25; }
+.attack-cell-count {
+  position: absolute; top: 4px; right: 5px; font-size: 9px; font-family: var(--mono); font-weight: 700;
+  color: #86EFAC; background: rgba(34,197,94,.18); padding: 1px 5px; border-radius: 8px;
+}
+
+/* Lockheed Cyber Kill Chain — horizontal 7-stage flow */
+.killchain { display: flex; align-items: stretch; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.kc-wrap { display: flex; align-items: center; flex: 1 1 230px; min-width: 220px; }
+.kc-stage {
+  flex: 1; padding: 12px 12px 10px; border-radius: 6px; border: 1px solid;
+  display: flex; flex-direction: column; gap: 6px; min-height: 154px; min-width: 0;
+  background: var(--bg1); transition: border-color .15s;
+}
+.kc-stage.kc-cov { border-color: rgba(34,197,94,.40); background: linear-gradient(180deg, rgba(34,197,94,.06) 0%, var(--bg1) 60%); }
+.kc-stage.kc-gap { border-color: rgba(239,68,68,.30); background: linear-gradient(180deg, rgba(239,68,68,.05) 0%, var(--bg1) 60%); }
+.kc-stage.kc-pre { border-color: var(--border); background: var(--bg2); opacity: .75; }
+.kc-stage-num { font-size: 9px; font-family: var(--mono); color: var(--text3); letter-spacing: .15em; }
+.kc-stage-name { font-size: 13px; font-weight: 700; color: var(--text); line-height: 1.15; }
+.kc-stage-desc { font-size: 10.5px; color: var(--text2); line-height: 1.45; flex: 1; }
+.kc-stage-meta { display: flex; flex-direction: column; gap: 5px; padding-top: 6px; border-top: 1px solid var(--border); }
+.kc-tactics { display: flex; flex-wrap: wrap; gap: 3px; }
+.kc-tactic-pill { font-size: 9px; padding: 1px 6px; border-radius: 3px; border: 1px solid; font-weight: 600; }
+.kc-count { font-size: 11px; font-family: var(--mono); font-weight: 700; }
+.kc-pre-tag { font-size: 9px; font-family: var(--mono); color: var(--text3); letter-spacing: .04em; }
+.kc-arrow { color: var(--text3); flex-shrink: 0; margin: 0 -1px; }
 
 /* Chains */
 .chains-grid { display: flex; flex-direction: column; gap: 12px; }
@@ -380,11 +416,6 @@ function SevBadge({ s }) {
   )
 }
 
-function LcBadge({ lc }) {
-  const colors = { Deployed:'#22C55E', Tested:'#3B82F6', Proposed:'#666', Tuned:'#A855F7', Retired:'#333' }
-  return <span className="pill pill-lc" style={{ color: colors[lc] || '#666', borderColor: (colors[lc]||'#333')+'33' }}>{lc}</span>
-}
-
 function CopyBtn({ text }) {
   const [ok, setOk] = useState(false)
   const copy = () => { navigator.clipboard.writeText(text); setOk(true); setTimeout(()=>setOk(false),1400) }
@@ -409,7 +440,6 @@ function RuleDetail({ rule }) {
       <div className="detail-name">{rule.name}</div>
       <div className="detail-badges">
         <SevBadge s={rule.severity} />
-        <LcBadge lc={rule.lifecycle} />
         <span className="pill pill-tactic">{rule.tactic}</span>
         <span className="pill pill-lc">{(rule.platform||[]).join(' · ')}</span>
       </div>
@@ -500,7 +530,6 @@ function RulesView({ rules }) {
   const [fTactic, setFTactic]     = useState('All')
   const [fSev, setFSev]           = useState('All')
   const [fFid, setFid]            = useState('All')
-  const [fLc, setFLc]             = useState('All')
 
   const filtered = useMemo(() => rules.filter(r => {
     const q = search.toLowerCase()
@@ -509,12 +538,11 @@ function RulesView({ rules }) {
     return mq &&
       (fTactic==='All'||r.tactic===fTactic) &&
       (fSev==='All'||r.severity===fSev) &&
-      (fFid==='All'||r.fidelity===fFid) &&
-      (fLc==='All'||r.lifecycle===fLc)
-  }), [rules, search, fTactic, fSev, fFid, fLc])
+      (fFid==='All'||r.fidelity===fFid)
+  }), [rules, search, fTactic, fSev, fFid])
 
-  const clearAll = () => { setSearch(''); setFTactic('All'); setFSev('All'); setFid('All'); setFLc('All') }
-  const dirty = search||fTactic!=='All'||fSev!=='All'||fFid!=='All'||fLc!=='All'
+  const clearAll = () => { setSearch(''); setFTactic('All'); setFSev('All'); setFid('All') }
+  const dirty = search||fTactic!=='All'||fSev!=='All'||fFid!=='All'
 
   return (
     <>
@@ -536,9 +564,9 @@ function RulesView({ rules }) {
         {['All','Critical','High','Medium','Low'].map(s=>(
           <button key={s} className={`chip${fSev===s?' on':''}`} onClick={()=>setFSev(s)}>{s}</button>
         ))}
-        <span className="chip-label" style={{marginLeft:6}}>Lifecycle:</span>
-        {['All','Deployed','Proposed','Tested'].map(l=>(
-          <button key={l} className={`chip${fLc===l?' on':''}`} onClick={()=>setFLc(l)}>{l}</button>
+        <span className="chip-label" style={{marginLeft:6}}>Fidelity:</span>
+        {['All','High','Medium','Low'].map(f=>(
+          <button key={f} className={`chip${fFid===f?' on':''}`} onClick={()=>setFid(f)}>{f}</button>
         ))}
         {dirty && <button className="chip clear" onClick={clearAll}><X size={10} style={{marginRight:3}} />Clear</button>}
       </div>
@@ -577,7 +605,7 @@ function RulesView({ rules }) {
 function DashboardView({ rules }) {
   const byTactic   = useMemo(() => TACTIC_ORDER.reduce((a,t) => ({...a,[t]:rules.filter(r=>r.tactic===t).length}), {}), [rules])
   const bySev      = useMemo(() => ['Critical','High','Medium','Low'].reduce((a,s) => ({...a,[s]:rules.filter(r=>r.severity===s).length}), {}), [rules])
-  const deployed   = rules.filter(r=>r.lifecycle==='Deployed').length
+  const techniques = useMemo(() => new Set(rules.map(r => (r.technique_id||'').split('.')[0]).filter(Boolean)), [rules])
   const critical   = rules.filter(r=>r.severity==='Critical').length
   const highFid    = rules.filter(r=>r.fidelity==='High').length
   const maxTactic  = Math.max(...Object.values(byTactic))
@@ -587,7 +615,7 @@ function DashboardView({ rules }) {
       <div className="dash-metrics">
         {[
           { icon:<Shield size={16} />, num:rules.length, lbl:'Total Rules',       color:'#3B82F6', bg:'rgba(59,130,246,.15)' },
-          { icon:<CheckCircle size={16} />, num:deployed,   lbl:'Deployed',        color:'#22C55E', bg:'rgba(34,197,94,.15)' },
+          { icon:<Crosshair size={16} />, num:techniques.size, lbl:'ATT&CK Techniques', color:'#A855F7', bg:'rgba(168,85,247,.15)' },
           { icon:<AlertTriangle size={16} />, num:critical, lbl:'Critical Severity', color:'#EF4444', bg:'rgba(239,68,68,.15)' },
           { icon:<TrendingUp size={16} />, num:highFid,     lbl:'High Fidelity',   color:'#FF6B35', bg:'rgba(255,107,53,.15)' },
         ].map((m,i) => (
@@ -632,14 +660,14 @@ function DashboardView({ rules }) {
             })}
           </div>
 
-          <div className="section-header"><Activity size={13} />Lifecycle Split</div>
+          <div className="section-header"><Activity size={13} />Test Validation</div>
           <div className="sev-bars">
-            {[['Deployed','#22C55E'],['Proposed','#666'],['Tested','#3B82F6']].map(([lc,color]) => {
-              const c = rules.filter(r=>r.lifecycle===lc).length
+            {[['historical','#22C55E','Historical data'],['synthetic','#3B82F6','Synthetic events'],['purple_team','#A855F7','Purple team'],['none','#666','Not validated']].map(([key,color,label]) => {
+              const c = rules.filter(r=>r.test_method===key).length
               const pct = rules.length ? Math.max(c/rules.length*100,1) : 1
               return (
-                <div key={lc} className="sev-row">
-                  <div className="sev-lbl" style={{color}}>{lc}</div>
+                <div key={key} className="sev-row">
+                  <div className="sev-lbl" style={{color, fontSize:10}}>{label}</div>
                   <div className="sev-bar-bg"><div className="sev-bar-fill" style={{width:`${pct}%`,background:color}}>{c}</div></div>
                 </div>
               )
@@ -652,85 +680,189 @@ function DashboardView({ rules }) {
 }
 
 // ─── ATT&CK MATRIX VIEW ──────────────────────────────────────────────────────
+// Column-per-tactic grid mirroring https://attack.mitre.org/matrices/enterprise.
 
 function MatrixView({ rules }) {
-  const coveredIds = useMemo(() => {
-    const s = new Set()
-    rules.forEach(r => { if(r.technique_id) s.add(r.technique_id.slice(0,5)) })
-    return s
+  // Map technique_id (top-level) → number of rules covering it.
+  const ruleCount = useMemo(() => {
+    const m = new Map()
+    rules.forEach(r => {
+      const tid = (r.technique_id || '').split('.')[0]
+      if (tid) m.set(tid, (m.get(tid) || 0) + 1)
+    })
+    return m
   }, [rules])
 
+  // Coverage shading buckets — based on rules-per-technique density.
+  const shade = (count) => {
+    if (!count) return { background:'var(--bg2)', border:'var(--border)', color:'var(--text3)' }
+    if (count >= 10) return { background:'rgba(34,197,94,.30)', border:'rgba(34,197,94,.55)', color:'#86EFAC' }
+    if (count >= 5)  return { background:'rgba(34,197,94,.20)', border:'rgba(34,197,94,.45)', color:'#86EFAC' }
+    if (count >= 2)  return { background:'rgba(34,197,94,.12)', border:'rgba(34,197,94,.35)', color:'#86EFAC' }
+    return { background:'rgba(34,197,94,.07)', border:'rgba(34,197,94,.25)', color:'#86EFAC' }
+  }
+
+  const totalTactics = TACTIC_ORDER_MATRIX.length
+  const totalTechs = TACTIC_ORDER_MATRIX.reduce((a,t) => a + (ATTACK_MATRIX[t]?.techniques.length || 0), 0)
+  const coveredTechs = TACTIC_ORDER_MATRIX.reduce((a,t) => {
+    const techs = ATTACK_MATRIX[t]?.techniques || []
+    return a + techs.filter(x => ruleCount.has(x.id)).length
+  }, 0)
+
   return (
-    <div className="view">
-      <div className="topbar" style={{marginBottom:0,borderBottom:'1px solid var(--border)'}}>
+    <>
+      <div className="topbar">
         <span className="topbar-title">ATT&CK Coverage Matrix</span>
-        <span className="topbar-sub">{coveredIds.size} techniques covered</span>
+        <span className="topbar-sub">Enterprise · {coveredTechs}/{totalTechs} techniques covered across {totalTactics} tactics</span>
       </div>
-      <div style={{padding:20,overflowY:'auto',height:'calc(100% - 0px)'}}>
-        {TACTIC_ORDER.map(tactic => {
-          const techs = ATTACK_TECHNIQUES[tactic] || []
-          const covered = techs.filter(t => coveredIds.has(t))
-          const color = TACTIC_COLOR[tactic]
-          return (
-            <div key={tactic} className="matrix-tactic" style={{marginBottom:20}}>
-              <div className="matrix-header" style={{color}}>
-                <span>{tactic}</span>
-                <span style={{fontSize:10,fontFamily:'var(--mono)',color:'var(--text3)'}}>{covered.length}/{techs.length} covered</span>
-              </div>
-              <div className="matrix-techs">
-                {techs.map(t => (
-                  <span key={t} className={`tech-chip ${coveredIds.has(t)?'covered':'uncovered'}`}>{t}</span>
-                ))}
-              </div>
-            </div>
-          )
-        })}
+      <div className="matrix-legend">
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'var(--bg2)',borderColor:'var(--border)'}}/>Not covered</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(34,197,94,.07)',borderColor:'rgba(34,197,94,.25)'}}/>1 rule</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(34,197,94,.12)',borderColor:'rgba(34,197,94,.35)'}}/>2-4</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(34,197,94,.20)',borderColor:'rgba(34,197,94,.45)'}}/>5-9</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(34,197,94,.30)',borderColor:'rgba(34,197,94,.55)'}}/>10+</span>
+        <span className="matrix-legend-link"><a href="https://attack.mitre.org/matrices/enterprise/" target="_blank" rel="noreferrer">attack.mitre.org ↗</a></span>
       </div>
-    </div>
+      <div className="matrix-scroll">
+        <div className="attack-grid">
+          {TACTIC_ORDER_MATRIX.map(tactic => {
+            const col = ATTACK_MATRIX[tactic]
+            if (!col) return null
+            const techs = col.techniques
+            const covered = techs.filter(t => ruleCount.has(t.id)).length
+            const color = TACTIC_COLOR[tactic]
+            return (
+              <div key={tactic} className="attack-col">
+                <div className="attack-col-head" style={{borderTopColor:color}}>
+                  <div className="attack-col-tactic" style={{color}}>{tactic}</div>
+                  <div className="attack-col-meta">{col.id} · {covered}/{techs.length}</div>
+                </div>
+                <div className="attack-col-body">
+                  {techs.map(t => {
+                    const c = ruleCount.get(t.id) || 0
+                    const s = shade(c)
+                    return (
+                      <a key={t.id} href={`https://attack.mitre.org/techniques/${t.id}/`} target="_blank" rel="noreferrer"
+                         className="attack-cell" style={{background:s.background, borderColor:s.border}}
+                         title={`${t.id} ${t.name}${c ? ` · ${c} rule${c>1?'s':''}` : ' · not covered'}`}>
+                        <span className="attack-cell-id" style={{color:s.color}}>{t.id}</span>
+                        <span className="attack-cell-name">{t.name}</span>
+                        {c > 0 && <span className="attack-cell-count">{c}</span>}
+                      </a>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </>
   )
 }
 
 // ─── CHAINS VIEW ─────────────────────────────────────────────────────────────
 
-function ChainsView() {
+function ChainsView({ rules }) {
+  // Per-tactic rule counts for Kill Chain stage coverage
+  const byTactic = useMemo(() => {
+    const m = new Map()
+    rules.forEach(r => { if(r.tactic) m.set(r.tactic, (m.get(r.tactic)||0) + 1) })
+    return m
+  }, [rules])
+
+  const stageCoverage = (stage) => {
+    if (stage.attack_tactics.length === 0) return { count: 0, status: 'pre' }
+    const count = stage.attack_tactics.reduce((a, t) => a + (byTactic.get(t) || 0), 0)
+    return { count, status: count > 0 ? 'covered' : 'gap' }
+  }
+
   return (
     <div className="view">
-      <div className="section-header" style={{marginBottom:16}}><GitBranch size={13} />Attack Chain Correlation</div>
-      <div className="chains-grid">
-        {CHAINS.map(chain => {
-          const sc = SEV_COLOR[chain.severity]
-          const sb = SEV_BG[chain.severity]
+      <div className="section-header" style={{marginBottom:6}}>
+        <Crosshair size={13} />Lockheed Martin Cyber Kill Chain®
+      </div>
+      <div style={{fontSize:11,color:'var(--text2)',marginBottom:14,maxWidth:780,lineHeight:1.55}}>
+        The 7-stage adversary lifecycle from Lockheed Martin. Each stage shows the
+        ATT&CK tactic(s) that map to it and the number of TDL rules covering that
+        adversary behavior. <a href="https://www.lockheedmartin.com/en-us/capabilities/cyber/cyber-kill-chain.html" target="_blank" rel="noreferrer" style={{color:'var(--accent2)'}}>Reference ↗</a>
+      </div>
+
+      <div className="killchain">
+        {KILL_CHAIN.map((stage, i) => {
+          const { count, status } = stageCoverage(stage)
+          const isPre = status === 'pre'
+          const isGap = status === 'gap'
           return (
-            <div key={chain.id} className="chain-card">
-              <div className="chain-head">
-                <div className="chain-active" style={{background: chain.active ? '#22C55E' : '#EF4444'}} />
-                <div>
-                  <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:3}}>
-                    <span className="chain-id">{chain.id}</span>
-                    <span className="pill pill-sev" style={{background:sb,color:sc,borderColor:sc+'44'}}>{chain.severity}</span>
-                    <span style={{fontSize:10,fontFamily:'var(--mono)',color:'var(--text3)'}}>window: {chain.window}</span>
-                  </div>
-                  <div className="chain-name">{chain.name}</div>
+            <div key={stage.id} className="kc-wrap">
+              <div className={`kc-stage ${isPre?'kc-pre':isGap?'kc-gap':'kc-cov'}`}>
+                <div className="kc-stage-num">{stage.stage}</div>
+                <div className="kc-stage-name">{stage.name}</div>
+                <div className="kc-stage-desc">{stage.description}</div>
+                <div className="kc-stage-meta">
+                  {isPre
+                    ? <span className="kc-pre-tag">{stage.pre_attack[0]} (PRE-ATT&CK)</span>
+                    : <>
+                        <div className="kc-tactics">{stage.attack_tactics.map(t => (
+                          <span key={t} className="kc-tactic-pill" style={{borderColor: TACTIC_COLOR[t]+'66', color:TACTIC_COLOR[t]}}>{t}</span>
+                        ))}</div>
+                        <div className="kc-count" style={{color: isGap?'var(--text3)':'var(--green)'}}>
+                          {count} rule{count===1?'':'s'}
+                        </div>
+                      </>
+                  }
                 </div>
-                <span className="chain-threat">{chain.threat}</span>
               </div>
-              <div className="chain-steps">
-                {chain.steps.map((s,i) => (
-                  <React.Fragment key={i}>
-                    <span className="chain-step">{s}</span>
-                    {i < chain.steps.length-1 && <ArrowRight size={12} className="chain-arrow" />}
-                  </React.Fragment>
-                ))}
-              </div>
-              <div className="chain-meta">
-                <span className="chain-meta-item">
-                  <span style={{color:chain.active?'#22C55E':'#EF4444'}}>●</span>
-                  {chain.active ? 'ACTIVE — all required rules present' : 'INACTIVE — missing required rules'}
-                </span>
-              </div>
+              {i < KILL_CHAIN.length - 1 && <ArrowRight size={16} className="kc-arrow" />}
             </div>
           )
         })}
+      </div>
+
+      <div style={{marginTop:32}}>
+        <div className="section-header" style={{marginBottom:6}}>
+          <GitBranch size={13} />TDL Internal Attack Chains
+        </div>
+        <div style={{fontSize:11,color:'var(--text2)',marginBottom:14}}>
+          Multi-rule correlation chains specific to this rule library. Each chain
+          fires when its required rules trigger within the time window.
+        </div>
+        <div className="chains-grid">
+          {CHAINS.map(chain => {
+            const sc = SEV_COLOR[chain.severity]
+            const sb = SEV_BG[chain.severity]
+            return (
+              <div key={chain.id} className="chain-card">
+                <div className="chain-head">
+                  <div className="chain-active" style={{background: chain.active ? '#22C55E' : '#EF4444'}} />
+                  <div>
+                    <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:3}}>
+                      <span className="chain-id">{chain.id}</span>
+                      <span className="pill pill-sev" style={{background:sb,color:sc,borderColor:sc+'44'}}>{chain.severity}</span>
+                      <span style={{fontSize:10,fontFamily:'var(--mono)',color:'var(--text3)'}}>window: {chain.window}</span>
+                    </div>
+                    <div className="chain-name">{chain.name}</div>
+                  </div>
+                  <span className="chain-threat">{chain.threat}</span>
+                </div>
+                <div className="chain-steps">
+                  {chain.steps.map((s,i) => (
+                    <React.Fragment key={i}>
+                      <span className="chain-step">{s}</span>
+                      {i < chain.steps.length-1 && <ArrowRight size={12} className="chain-arrow" />}
+                    </React.Fragment>
+                  ))}
+                </div>
+                <div className="chain-meta">
+                  <span className="chain-meta-item">
+                    <span style={{color:chain.active?'#22C55E':'#EF4444'}}>●</span>
+                    {chain.active ? 'ACTIVE — all required rules present' : 'INACTIVE — missing required rules'}
+                  </span>
+                </div>
+              </div>
+            )
+          })}
+        </div>
       </div>
     </div>
   )
@@ -758,14 +890,14 @@ function RecommendView({ rules }) {
 
   return (
     <div className="view">
-      <div className="section-header" style={{marginBottom:4}}><Map size={13} />Environment Profile</div>
-      <div style={{fontSize:12,color:'var(--text2)',marginBottom:20}}>Default Enterprise — Windows + M365 + Cloud. Edit <code style={{fontFamily:'var(--mono)',fontSize:11}}>profiles/default.yaml</code> to customize.</div>
+      <div className="section-header" style={{marginBottom:4}}><MapIcon size={13} />Environment Profile <span style={{fontSize:10,fontWeight:500,color:'#F97316',marginLeft:8,padding:'2px 6px',background:'rgba(249,115,22,.12)',borderRadius:3,letterSpacing:0,textTransform:'none'}}>SAMPLE — not your environment</span></div>
+      <div style={{fontSize:12,color:'var(--text2)',marginBottom:20}}>This view shows the <em>default</em> enterprise profile (Windows + M365 + Cloud) as a worked example. Edit <code style={{fontFamily:'var(--mono)',fontSize:11}}>profiles/default.yaml</code> with your real log sources for accurate recommendations.</div>
 
       <div className="dash-metrics" style={{gridTemplateColumns:'repeat(3,1fr)',marginBottom:24}}>
         {[
-          { icon:<CheckCircle size={15}/>, num:deployed.length,     lbl:'Log Sources Deployed',  color:'#22C55E', bg:'rgba(34,197,94,.15)' },
-          { icon:<Shield size={15}/>,      num:deployable,           lbl:'Rules Deployable Now',  color:'#3B82F6', bg:'rgba(59,130,246,.15)' },
-          { icon:<TrendingUp size={15}/>,  num:undeployed.reduce((a,l)=>a+l.rules_unlocked,0), lbl:'Rules Unlockable', color:'#FF6B35', bg:'rgba(255,107,53,.15)' },
+          { icon:<CheckCircle size={15}/>, num:deployed.length,     lbl:'Sources in sample profile', color:'#22C55E', bg:'rgba(34,197,94,.15)' },
+          { icon:<Shield size={15}/>,      num:deployable,           lbl:'Rules runnable on these',   color:'#3B82F6', bg:'rgba(59,130,246,.15)' },
+          { icon:<TrendingUp size={15}/>,  num:undeployed.reduce((a,l)=>a+l.rules_unlocked,0), lbl:'Rules unlocked by adding the rest', color:'#FF6B35', bg:'rgba(255,107,53,.15)' },
         ].map((m,i)=>(
           <div key={i} className="metric-card">
             <div className="metric-icon" style={{background:m.bg}}>{React.cloneElement(m.icon,{color:m.color})}</div>
@@ -787,7 +919,7 @@ function RecommendView({ rules }) {
                 <tr key={ls.id}>
                   <td>
                     <span className="status-dot" style={{background:ls.deployed?'#22C55E':'#EF4444'}} />
-                    {ls.deployed ? 'Deployed' : 'Missing'}
+                    {ls.deployed ? 'In profile' : 'Not in profile'}
                   </td>
                   <td style={{color:cCrit[ls.criticality]||'var(--text2)'}}>{ls.criticality}</td>
                   <td style={{fontFamily:'var(--mono)',fontSize:11}}>T{ls.tier}</td>
@@ -825,8 +957,8 @@ function RecommendView({ rules }) {
 const buildViews = (ruleCount, chainCount) => [
   { id:'dashboard', label:'Dashboard',        icon:<BarChart3 size={14} /> },
   { id:'rules',     label:'Detection Rules',  icon:<Shield size={14} />,   badge:ruleCount },
-  { id:'matrix',    label:'ATT&CK Matrix',    icon:<Map size={14} /> },
-  { id:'chains',    label:'Attack Chains',    icon:<GitBranch size={14} />, badge:chainCount },
+  { id:'matrix',    label:'ATT&CK Matrix',    icon:<MapIcon size={14} /> },
+  { id:'chains',    label:'Kill Chain',       icon:<GitBranch size={14} />, badge:chainCount },
   { id:'recommend', label:'Recommendations',  icon:<TrendingUp size={14} /> },
 ]
 
@@ -850,7 +982,7 @@ export default function App() {
     return () => { cancelled = true }
   }, [])
 
-  const deployed = rules.filter(r => r.lifecycle === 'Deployed').length
+  const techCount = useMemo(() => new Set(rules.map(r => (r.technique_id||'').split('.')[0]).filter(Boolean)).size, [rules])
   const chainCount = 5
 
   return (
@@ -878,7 +1010,7 @@ export default function App() {
           </nav>
           <div className="sidebar-stats">
             <div className="stat-row"><span className="stat-k">Total Rules</span><span className="stat-v">{rules.length}</span></div>
-            <div className="stat-row"><span className="stat-k">Deployed</span><span className="stat-v" style={{color:'#22C55E'}}>{deployed}</span></div>
+            <div className="stat-row"><span className="stat-k">Techniques</span><span className="stat-v" style={{color:'#A855F7'}}>{techCount}</span></div>
             <div className="stat-row"><span className="stat-k">SIEM Platforms</span><span className="stat-v" style={{color:'#FF6B35'}}>9</span></div>
             <div className="stat-row"><span className="stat-k">Attack Chains</span><span className="stat-v" style={{color:'#3B82F6'}}>{chainCount}</span></div>
             <div className="stat-row"><span className="stat-k">Data source</span><span className="stat-v" style={{color: source==='api' ? '#22C55E' : '#94A3B8', fontSize:9}}>{source==='api' ? '● live API' : '○ bundled'}</span></div>
@@ -907,10 +1039,10 @@ export default function App() {
           {view === 'chains' && (
             <>
               <div className="topbar">
-                <span className="topbar-title">Attack Chain Correlation</span>
-                <span className="topbar-sub">{chainCount} chains · all active</span>
+                <span className="topbar-title">Kill Chain &amp; Attack Chains</span>
+                <span className="topbar-sub">Lockheed Cyber Kill Chain · {chainCount} TDL internal chains</span>
               </div>
-              <ChainsView />
+              <ChainsView rules={rules} />
             </>
           )}
           {view === 'recommend' && (

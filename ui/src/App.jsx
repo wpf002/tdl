@@ -99,11 +99,12 @@ const CSS = `
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  /* Surfaces — soft grey page, near-black panels float as cards */
-  --bg0:      #1A1A22;   /* page background */
-  --bg1:      #0A0A10;   /* sidebar + cards (the dark contrast surface) */
-  --bg2:      #14141B;   /* hover / elevated panel */
-  --bg3:      #24242E;   /* chip bg / recessed surface */
+  /* Surfaces — grey page; cards sit *above* it as a lighter shade.
+     Sidebar / code blocks sit *below* it as a darker shade. */
+  --bg0:      #16161D;   /* page background (grey, mid-tone) */
+  --bg1:      #0B0B11;   /* sidebar / code / dark recess (BELOW page) */
+  --bg2:      #23232C;   /* elevated cards (ABOVE page) */
+  --bg3:      #2C2C36;   /* hover state on cards / interactive elevated */
   --border:   #2A2A35;
   --border2:  #3A3A47;
 
@@ -223,9 +224,11 @@ input  { font-family: var(--sans); }
 .filter-row {
   display: flex; align-items: center; gap: 6px;
   flex-wrap: nowrap; overflow-x: auto;
-  scrollbar-width: thin;
+  scrollbar-width: none;            /* Firefox */
+  -ms-overflow-style: none;          /* IE / old Edge */
 }
-.filter-row::-webkit-scrollbar { height: 0; }
+.filter-row::-webkit-scrollbar { display: none; width: 0; height: 0; }
+.filter-sep { width: 1px; height: 22px; background: var(--border2); margin: 0 18px; flex-shrink: 0; }
 .chip {
   padding: 4px 11px; border-radius: 4px; font-size: 11px; font-weight: 600;
   border: 1px solid var(--border); background: var(--bg0); color: var(--text2);
@@ -276,8 +279,8 @@ input  { font-family: var(--sans); }
 
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
 .card {
-  background: var(--bg1); border: 1px solid var(--border);
-  border-radius: 6px; padding: 12px;
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 14px;
 }
 .card-label { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: .1em; color: var(--text3); margin-bottom: 5px; }
 .card-value { font-size: 15px; font-weight: 700; font-family: var(--mono); }
@@ -330,8 +333,8 @@ input  { font-family: var(--sans); }
 
 /* Dashboard */
 .dash-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 28px; }
-.metric-card { background: var(--bg0); border: 1px solid var(--border); border-radius: 10px; padding: 18px; box-shadow: var(--shadow-sm); transition: box-shadow .15s, transform .15s; }
-.metric-card:hover { box-shadow: var(--shadow); transform: translateY(-1px); }
+.metric-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 18px; box-shadow: var(--shadow-sm); transition: box-shadow .15s, transform .15s, border-color .15s; }
+.metric-card:hover { box-shadow: var(--shadow); transform: translateY(-1px); border-color: var(--border2); }
 .metric-icon { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; margin-bottom: 12px; }
 .metric-num  { font-size: 30px; font-weight: 700; font-family: var(--mono); line-height: 1; letter-spacing: -.02em; }
 .metric-lbl  { font-size: 11px; color: var(--text2); margin-top: 5px; font-weight: 500; }
@@ -340,7 +343,7 @@ input  { font-family: var(--sans); }
 
 /* Tactic grid */
 .tactic-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 24px; }
-.tactic-card { background: var(--bg0); border: 1px solid var(--border); border-radius: 8px; padding: 14px; cursor: pointer; transition: border-color .15s, box-shadow .15s; }
+.tactic-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 14px; cursor: pointer; transition: border-color .15s, box-shadow .15s; }
 .tactic-card:hover { border-color: var(--border2); box-shadow: var(--shadow-sm); }
 .tactic-dot  { width: 8px; height: 8px; border-radius: 50%; margin-bottom: 8px; }
 .tactic-name { font-size: 11px; font-weight: 600; margin-bottom: 6px; }
@@ -350,13 +353,24 @@ input  { font-family: var(--sans); }
 
 /* Sev dist */
 .sev-bars { display: flex; flex-direction: column; gap: 10px; }
+.sev-bars-tall { gap: 18px; }
+.sev-bars-tall .sev-bar-bg { height: 32px; border-radius: 6px; }
+.sev-bars-tall .sev-bar-fill { border-radius: 6px; padding: 0 14px; font-size: 12px; }
+.sev-bars-tall .sev-lbl { font-size: 12px; width: 78px; }
 .sev-row  { display: flex; align-items: center; gap: 12px; }
 .sev-lbl  { font-size: 11px; font-weight: 700; width: 70px; }
-.sev-bar-bg { flex: 1; height: 20px; background: var(--bg2); border-radius: 4px; overflow: hidden; }
+.sev-bar-bg { flex: 1; height: 20px; background: var(--bg1); border-radius: 4px; overflow: hidden; }
 .sev-bar-fill { height: 100%; border-radius: 4px; display: flex; align-items: center; padding: 0 10px; font-size: 11px; font-family: var(--mono); font-weight: 700; color: white; min-width: 30px; }
+.panel-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 22px; box-shadow: var(--shadow-sm); }
 
 /* ATT&CK Matrix — column-per-tactic grid mirroring attack.mitre.org */
-.matrix-legend { display: flex; align-items: center; gap: 12px; padding: 8px 20px; border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; font-size: 10px; color: var(--text2); font-family: var(--mono); }
+.matrix-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 18px 24px; border-bottom: 1px solid var(--border); background: var(--bg0); }
+.matrix-stat { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; }
+.matrix-stat-num { font-size: 32px; font-weight: 700; font-family: var(--mono); line-height: 1; letter-spacing: -.02em; color: var(--text); }
+.matrix-stat-pct { font-size: 18px; font-weight: 700; color: var(--text2); margin-left: 1px; }
+.matrix-stat-lbl { font-size: 11px; color: var(--text2); margin-top: 8px; line-height: 1.4; }
+.matrix-stat-sub { color: var(--text3); font-size: 10px; }
+.matrix-legend { display: flex; align-items: center; gap: 14px; padding: 10px 24px; border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; font-size: 10px; color: var(--text2); font-family: var(--mono); background: var(--bg1); font-weight: 500; }
 .matrix-legend-item { display: inline-flex; align-items: center; gap: 5px; }
 .matrix-legend-swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; border: 1px solid; }
 .matrix-legend-link { margin-left: auto; }
@@ -389,7 +403,7 @@ input  { font-family: var(--sans); }
 .kc-stage {
   flex: 1; padding: 14px 14px 12px; border-radius: 8px; border: 1px solid;
   display: flex; flex-direction: column; gap: 8px; min-height: 168px; min-width: 0;
-  background: var(--bg0); transition: border-color .15s, box-shadow .15s, transform .15s;
+  background: var(--bg2); transition: border-color .15s, box-shadow .15s, transform .15s;
 }
 .kc-stage:hover { box-shadow: var(--shadow); transform: translateY(-1px); }
 .kc-stage.kc-cov { border-color: rgba(124,58,237,.50); background: linear-gradient(180deg, var(--purple-lt) 0%, var(--bg0) 70%); }
@@ -408,7 +422,7 @@ input  { font-family: var(--sans); }
 
 /* Chains */
 .chains-grid { display: flex; flex-direction: column; gap: 14px; }
-.chain-card { background: var(--bg0); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; transition: box-shadow .15s; }
+.chain-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; transition: box-shadow .15s; }
 .chain-card:hover { box-shadow: var(--shadow); }
 .chain-head { display: flex; align-items: center; gap: 14px; padding: 16px 18px; }
 .chain-active { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
@@ -616,7 +630,8 @@ function RulesView({ rules }) {
           {['All','Critical','High','Medium','Low'].map(s=>(
             <button key={s} className={`chip${fSev===s?' on':''}`} onClick={()=>setFSev(s)}>{s}</button>
           ))}
-          <span className="chip-label" style={{marginLeft:14}}>Fidelity</span>
+          <span className="filter-sep" aria-hidden="true" />
+          <span className="chip-label">Fidelity</span>
           {['All','High','Medium','Low'].map(f=>(
             <button key={f} className={`chip${fFid===f?' on':''}`} onClick={()=>setFid(f)}>{f}</button>
           ))}
@@ -698,9 +713,9 @@ function DashboardView({ rules }) {
           </div>
         </div>
 
-        <div>
-          <div className="section-header"><BarChart3 size={13} />Severity Distribution</div>
-          <div className="sev-bars" style={{marginBottom:24}}>
+        <div className="panel-card">
+          <div className="section-header" style={{marginBottom:18}}><BarChart3 size={14} />Severity Distribution</div>
+          <div className="sev-bars sev-bars-tall">
             {['Critical','High','Medium','Low'].map(s => {
               const c = bySev[s]||0
               const pct = rules.length ? Math.max(c/rules.length*100,2) : 2
@@ -712,7 +727,6 @@ function DashboardView({ rules }) {
               )
             })}
           </div>
-
         </div>
       </div>
     </div>
@@ -749,11 +763,32 @@ function MatrixView({ rules }) {
     return a + techs.filter(x => ruleCount.has(x.id)).length
   }, 0)
 
+  const totalRules = rules.length
+  const pctCovered = totalTechs ? Math.round(coveredTechs / totalTechs * 100) : 0
+
   return (
     <>
       <div className="topbar">
         <span className="topbar-title">ATT&CK Coverage Matrix</span>
-        <span className="topbar-sub">Enterprise · {coveredTechs}/{totalTechs} techniques covered across {totalTactics} tactics</span>
+        <span className="topbar-sub">Enterprise · v15</span>
+      </div>
+      <div className="matrix-stats">
+        <div className="matrix-stat">
+          <div className="matrix-stat-num" style={{color:'#A855F7'}}>{coveredTechs}</div>
+          <div className="matrix-stat-lbl">Techniques covered <span className="matrix-stat-sub">/ {totalTechs} in ATT&CK Enterprise</span></div>
+        </div>
+        <div className="matrix-stat">
+          <div className="matrix-stat-num">{pctCovered}<span className="matrix-stat-pct">%</span></div>
+          <div className="matrix-stat-lbl">Of the matrix covered by TDL</div>
+        </div>
+        <div className="matrix-stat">
+          <div className="matrix-stat-num" style={{color:'#3B82F6'}}>{totalTactics}</div>
+          <div className="matrix-stat-lbl">Tactics with coverage <span className="matrix-stat-sub">/ {totalTactics} total</span></div>
+        </div>
+        <div className="matrix-stat">
+          <div className="matrix-stat-num">{totalRules}</div>
+          <div className="matrix-stat-lbl">Detection rules backing this</div>
+        </div>
       </div>
       <div className="matrix-legend">
         <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'var(--bg1)',borderColor:'var(--border)'}}/>Not covered</span>
@@ -1066,7 +1101,7 @@ export default function App() {
             <div className="stat-row"><span className="stat-k">Total Rules</span><span className="stat-v">{rules.length}</span></div>
             <div className="stat-row"><span className="stat-k">Techniques</span><span className="stat-v" style={{color:'#7C3AED'}}>{techCount}</span></div>
             <div className="stat-row"><span className="stat-k">SIEM Platforms</span><span className="stat-v">9</span></div>
-            <div className="stat-row"><span className="stat-k">Attack Chains</span><span className="stat-v" style={{color:'#2563EB'}}>{chainCount}</span></div>
+            <div className="stat-row"><span className="stat-k">Attack Chains</span><span className="stat-v" style={{color:'#A855F7'}}>{chainCount}</span></div>
           </div>
         </aside>
 

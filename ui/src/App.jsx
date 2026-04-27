@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useEffect } from 'react'
+import React, { useState, useMemo, useCallback, useEffect } from 'react'
 import {
   Shield, Search, ChevronRight, X, AlertTriangle, CheckCircle,
   Activity, Database, Target, Filter, Tag, Copy, Check,

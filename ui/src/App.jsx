@@ -17,27 +17,28 @@ const TACTIC_ORDER = [
   'Command and Control','Collection','Exfiltration','Impact'
 ]
 
-// Tactic palette — three bands across the kill-chain progression:
-//   red   = early-stage (gain access, execute, escalate)
-//   purple = mid-stage  (evade, harvest, move)
-//   blue  = late-stage  (control, collect, exfil, impact)
+// Tactic palette — three bands across the kill-chain progression, tuned to
+// read well on near-black panels:
+//   red    = early-stage (gain access, execute, escalate)
+//   purple = mid-stage   (evade, harvest, move)
+//   blue   = late-stage  (control, collect, exfil, impact)
 const TACTIC_COLOR = {
-  'Initial Access':        '#B91C1C',
-  'Execution':             '#DC2626',
-  'Persistence':           '#E11D48',
-  'Privilege Escalation':  '#9F1239',
-  'Defense Evasion':       '#7C3AED',
-  'Credential Access':     '#6D28D9',
-  'Discovery':             '#8B5CF6',
-  'Lateral Movement':      '#5B21B6',
-  'Command and Control':   '#1D4ED8',
-  'Collection':            '#2563EB',
-  'Exfiltration':          '#1E40AF',
-  'Impact':                '#3B82F6',
+  'Initial Access':        '#EF4444',
+  'Execution':             '#F87171',
+  'Persistence':           '#FB7185',
+  'Privilege Escalation':  '#E11D48',
+  'Defense Evasion':       '#A855F7',
+  'Credential Access':     '#C084FC',
+  'Discovery':             '#B794F6',
+  'Lateral Movement':      '#9F75F4',
+  'Command and Control':   '#3B82F6',
+  'Collection':            '#60A5FA',
+  'Exfiltration':          '#2563EB',
+  'Impact':                '#93C5FD',
 }
 
-const SEV_COLOR = { Critical:'#B91C1C', High:'#DC2626', Medium:'#7C3AED', Low:'#2563EB' }
-const SEV_BG    = { Critical:'rgba(185,28,28,.10)', High:'rgba(220,38,38,.10)', Medium:'rgba(124,58,237,.10)', Low:'rgba(37,99,235,.10)' }
+const SEV_COLOR = { Critical:'#EF4444', High:'#F87171', Medium:'#A855F7', Low:'#3B82F6' }
+const SEV_BG    = { Critical:'rgba(239,68,68,.18)', High:'rgba(248,113,113,.18)', Medium:'rgba(168,85,247,.18)', Low:'rgba(59,130,246,.18)' }
 
 const PLATFORMS = ['Windows','Linux','macOS','AWS','Azure','GCP','Okta','Microsoft 365','Network','Kubernetes','SaaS']
 
@@ -98,37 +99,37 @@ const CSS = `
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  /* Surfaces — pure white page, soft greys for chrome */
-  --bg0:      #FFFFFF;
-  --bg1:      #FAFAFB;
-  --bg2:      #F4F4F7;
-  --bg3:      #ECECF0;
-  --border:   #E4E4EA;
-  --border2:  #D0D0D9;
+  /* Surfaces — soft grey page, near-black panels float as cards */
+  --bg0:      #1A1A22;   /* page background */
+  --bg1:      #0A0A10;   /* sidebar + cards (the dark contrast surface) */
+  --bg2:      #14141B;   /* hover / elevated panel */
+  --bg3:      #24242E;   /* chip bg / recessed surface */
+  --border:   #2A2A35;
+  --border2:  #3A3A47;
 
-  /* Text — near-black on white, all WCAG AAA */
-  --text:     #0B0B12;
-  --text2:    #4A4A57;
-  --text3:    #6E6E7C;
+  /* Text — white on dark, all WCAG AAA */
+  --text:     #F2F2F7;
+  --text2:    #B8B8C8;
+  --text3:    #80808E;
 
   /* Restricted palette: red / blue / purple / grey / white / black */
-  --red:      #DC2626;
-  --red-dk:   #B91C1C;
-  --red-lt:   #FEE2E2;
-  --blue:     #2563EB;
-  --blue-dk:  #1D4ED8;
-  --blue-lt:  #DBEAFE;
-  --purple:   #7C3AED;
-  --purple-dk:#6D28D9;
-  --purple-lt:#EDE9FE;
+  --red:      #EF4444;
+  --red-dk:   #DC2626;
+  --red-lt:   rgba(239,68,68,.14);
+  --blue:     #3B82F6;
+  --blue-dk:  #2563EB;
+  --blue-lt:  rgba(59,130,246,.14);
+  --purple:   #A855F7;
+  --purple-dk:#9333EA;
+  --purple-lt:rgba(168,85,247,.14);
 
   /* Aliases — primary accent is purple, secondary is blue */
   --accent:   var(--purple);
   --accent2:  var(--blue);
 
-  --shadow-sm: 0 1px 2px rgba(11,11,18,.04);
-  --shadow:    0 2px 8px rgba(11,11,18,.06);
-  --shadow-lg: 0 8px 24px rgba(11,11,18,.08);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.40);
+  --shadow:    0 2px 12px rgba(0,0,0,.45);
+  --shadow-lg: 0 12px 40px rgba(0,0,0,.55);
 
   --mono:    'IBM Plex Mono', monospace;
   --sans:    'IBM Plex Sans', sans-serif;
@@ -215,19 +216,25 @@ input  { font-family: var(--sans); }
 .search-input::placeholder { color: var(--text3); }
 
 .filterbar {
-  display: flex; align-items: center; gap: 6px; padding: 10px 24px;
-  border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap;
+  display: flex; flex-direction: column; gap: 6px; padding: 10px 24px;
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
   background: var(--bg1);
 }
+.filter-row {
+  display: flex; align-items: center; gap: 6px;
+  flex-wrap: nowrap; overflow-x: auto;
+  scrollbar-width: thin;
+}
+.filter-row::-webkit-scrollbar { height: 0; }
 .chip {
   padding: 4px 11px; border-radius: 4px; font-size: 11px; font-weight: 600;
   border: 1px solid var(--border); background: var(--bg0); color: var(--text2);
-  cursor: pointer; transition: all .12s; white-space: nowrap;
+  cursor: pointer; transition: all .12s; white-space: nowrap; flex-shrink: 0;
 }
 .chip:hover { border-color: var(--purple); color: var(--purple); }
 .chip.on    { border-color: var(--purple); background: var(--purple); color: #fff; }
-.chip.clear { border-color: var(--red); color: var(--red); margin-left: auto; background: var(--red-lt); }
-.chip-label { font-size: 10px; color: var(--text3); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+.chip.clear { border-color: var(--red); color: var(--red); background: var(--red-lt); }
+.chip-label { font-size: 10px; color: var(--text3); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; flex-shrink: 0; min-width: 56px; }
 
 /* ── RULE LIST ── */
 .rule-list { width: 380px; flex-shrink: 0; border-right: 1px solid var(--border); overflow-y: auto; background: var(--bg0); }
@@ -249,11 +256,11 @@ input  { font-family: var(--sans); }
   font-weight: 600; border: 1px solid transparent; white-space: nowrap; font-family: var(--mono);
 }
 .pill-sev { }
-.pill-tactic { background: var(--bg2); color: var(--text2); border-color: var(--border); font-family: var(--sans); font-size: 10px; }
-.pill-fid-High   { background: var(--purple-lt); color: var(--purple-dk); border-color: rgba(124,58,237,.25); }
-.pill-fid-Medium { background: var(--blue-lt);   color: var(--blue-dk);   border-color: rgba(37,99,235,.25); }
-.pill-fid-Low    { background: var(--bg2);       color: var(--text2);     border-color: var(--border); }
-.pill-lc { background: var(--bg2); color: var(--text2); font-family: var(--sans); font-size: 10px; }
+.pill-tactic { background: var(--bg3); color: var(--text2); border-color: var(--border); font-family: var(--sans); font-size: 10px; }
+.pill-fid-High   { background: var(--purple-lt); color: #C084FC; border-color: rgba(168,85,247,.35); }
+.pill-fid-Medium { background: var(--blue-lt);   color: #60A5FA; border-color: rgba(59,130,246,.35); }
+.pill-fid-Low    { background: var(--bg3);       color: var(--text2); border-color: var(--border); }
+.pill-lc { background: var(--bg3); color: var(--text2); font-family: var(--sans); font-size: 10px; }
 
 /* ── RULE DETAIL ── */
 .content { flex: 1; display: flex; overflow: hidden; }
@@ -395,7 +402,8 @@ input  { font-family: var(--sans); }
 .kc-tactics { display: flex; flex-wrap: wrap; gap: 4px; }
 .kc-tactic-pill { font-size: 9px; padding: 2px 7px; border-radius: 3px; border: 1px solid; font-weight: 600; }
 .kc-count { font-size: 11px; font-family: var(--mono); font-weight: 700; }
-.kc-pre-tag { font-size: 9px; font-family: var(--mono); color: var(--text3); letter-spacing: .04em; font-weight: 600; }
+.kc-pre-tag { font-size: 10px; color: var(--text3); font-weight: 600; line-height: 1.3; }
+.kc-pre-sub { font-size: 9.5px; color: var(--text3); line-height: 1.45; opacity: .85; }
 .kc-arrow { color: var(--text3); flex-shrink: 0; margin: 0 -2px; }
 
 /* Chains */
@@ -417,7 +425,22 @@ input  { font-family: var(--sans); }
 .chain-meta  { display: flex; gap: 16px; padding: 11px 18px; background: var(--bg1); border-top: 1px solid var(--border); }
 .chain-meta-item { font-size: 11px; color: var(--text2); display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-weight: 500; }
 
-/* Recommend */
+/* Recommend — demo banner makes the mock framing impossible to miss */
+.demo-banner {
+  display: flex; align-items: flex-start; gap: 14px; padding: 16px 18px;
+  background: linear-gradient(135deg, rgba(239,68,68,.10) 0%, rgba(168,85,247,.08) 100%);
+  border: 1px solid rgba(239,68,68,.30); border-radius: 10px;
+}
+.demo-banner-icon {
+  width: 32px; height: 32px; border-radius: 8px; flex-shrink: 0;
+  background: rgba(239,68,68,.15); color: var(--red);
+  display: flex; align-items: center; justify-content: center;
+}
+.demo-banner-title { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 4px; letter-spacing: -.01em; }
+.demo-banner-body  { font-size: 12px; color: var(--text2); line-height: 1.55; }
+.demo-banner-body code { font-family: var(--mono); font-size: 11px; padding: 1px 5px; background: var(--bg3); border-radius: 3px; color: var(--text); }
+.demo-banner-body strong { color: var(--text); font-weight: 700; }
+
 .rec-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 24px; }
 .log-source-table { width: 100%; border-collapse: collapse; }
 .log-source-table th { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .10em; color: var(--text3); padding: 10px 14px; border-bottom: 1px solid var(--border); text-align: left; background: var(--bg1); }
@@ -582,19 +605,23 @@ function RulesView({ rules }) {
         </div>
       </div>
       <div className="filterbar">
-        <span className="chip-label">Tactic:</span>
-        {['All',...TACTIC_ORDER].map(t=>(
-          <button key={t} className={`chip${fTactic===t?' on':''}`} onClick={()=>setFTactic(t)} style={{ fontSize:10 }}>{t}</button>
-        ))}
-        <span className="chip-label" style={{marginLeft:6}}>Sev:</span>
-        {['All','Critical','High','Medium','Low'].map(s=>(
-          <button key={s} className={`chip${fSev===s?' on':''}`} onClick={()=>setFSev(s)}>{s}</button>
-        ))}
-        <span className="chip-label" style={{marginLeft:6}}>Fidelity:</span>
-        {['All','High','Medium','Low'].map(f=>(
-          <button key={f} className={`chip${fFid===f?' on':''}`} onClick={()=>setFid(f)}>{f}</button>
-        ))}
-        {dirty && <button className="chip clear" onClick={clearAll}><X size={10} style={{marginRight:3}} />Clear</button>}
+        <div className="filter-row">
+          <span className="chip-label">Tactic</span>
+          {['All',...TACTIC_ORDER].map(t=>(
+            <button key={t} className={`chip${fTactic===t?' on':''}`} onClick={()=>setFTactic(t)} style={{ fontSize:10 }}>{t}</button>
+          ))}
+        </div>
+        <div className="filter-row">
+          <span className="chip-label">Severity</span>
+          {['All','Critical','High','Medium','Low'].map(s=>(
+            <button key={s} className={`chip${fSev===s?' on':''}`} onClick={()=>setFSev(s)}>{s}</button>
+          ))}
+          <span className="chip-label" style={{marginLeft:14}}>Fidelity</span>
+          {['All','High','Medium','Low'].map(f=>(
+            <button key={f} className={`chip${fFid===f?' on':''}`} onClick={()=>setFid(f)}>{f}</button>
+          ))}
+          {dirty && <button className="chip clear" style={{marginLeft:'auto'}} onClick={clearAll}><X size={10} style={{marginRight:3}} />Clear</button>}
+        </div>
       </div>
       <div className="content">
         <div className="rule-list">
@@ -640,10 +667,10 @@ function DashboardView({ rules }) {
     <div className="view">
       <div className="dash-metrics">
         {[
-          { icon:<Shield size={16} />, num:rules.length, lbl:'Total Rules',       color:'#0B0B12', bg:'#F4F4F7' },
-          { icon:<Crosshair size={16} />, num:techniques.size, lbl:'ATT&CK Techniques', color:'#7C3AED', bg:'#EDE9FE' },
-          { icon:<AlertTriangle size={16} />, num:critical, lbl:'Critical Severity', color:'#DC2626', bg:'#FEE2E2' },
-          { icon:<TrendingUp size={16} />, num:highFid,     lbl:'High Fidelity',   color:'#2563EB', bg:'#DBEAFE' },
+          { icon:<Shield size={16} />, num:rules.length, lbl:'Total Rules',       color:'#F2F2F7', bg:'rgba(255,255,255,.06)' },
+          { icon:<Crosshair size={16} />, num:techniques.size, lbl:'ATT&CK Techniques', color:'#A855F7', bg:'rgba(168,85,247,.18)' },
+          { icon:<AlertTriangle size={16} />, num:critical, lbl:'Critical Severity', color:'#EF4444', bg:'rgba(239,68,68,.18)' },
+          { icon:<TrendingUp size={16} />, num:highFid,     lbl:'High Fidelity',   color:'#3B82F6', bg:'rgba(59,130,246,.18)' },
         ].map((m,i) => (
           <div key={i} className="metric-card">
             <div className="metric-icon" style={{background:m.bg}}>{React.cloneElement(m.icon, {color:m.color})}</div>
@@ -706,13 +733,13 @@ function MatrixView({ rules }) {
     return m
   }, [rules])
 
-  // Coverage shading buckets — purple density based on rules-per-technique.
+  // Coverage shading buckets — purple density on dark.
   const shade = (count) => {
-    if (!count) return { background:'#FFFFFF', border:'var(--border)', color:'var(--text3)', name:'var(--text3)' }
-    if (count >= 10) return { background:'rgba(124,58,237,.22)', border:'rgba(124,58,237,.55)', color:'#5B21B6', name:'var(--text)' }
-    if (count >= 5)  return { background:'rgba(124,58,237,.15)', border:'rgba(124,58,237,.45)', color:'#6D28D9', name:'var(--text)' }
-    if (count >= 2)  return { background:'rgba(124,58,237,.09)', border:'rgba(124,58,237,.32)', color:'#6D28D9', name:'var(--text)' }
-    return { background:'rgba(124,58,237,.05)', border:'rgba(124,58,237,.20)', color:'#7C3AED', name:'var(--text)' }
+    if (!count) return { background:'var(--bg1)', border:'var(--border)', color:'var(--text3)', name:'var(--text3)' }
+    if (count >= 10) return { background:'rgba(168,85,247,.32)', border:'rgba(168,85,247,.65)', color:'#E9D5FF', name:'var(--text)' }
+    if (count >= 5)  return { background:'rgba(168,85,247,.22)', border:'rgba(168,85,247,.50)', color:'#D8B4FE', name:'var(--text)' }
+    if (count >= 2)  return { background:'rgba(168,85,247,.13)', border:'rgba(168,85,247,.36)', color:'#C084FC', name:'var(--text)' }
+    return { background:'rgba(168,85,247,.06)', border:'rgba(168,85,247,.22)', color:'#A855F7', name:'var(--text2)' }
   }
 
   const totalTactics = TACTIC_ORDER_MATRIX.length
@@ -729,11 +756,11 @@ function MatrixView({ rules }) {
         <span className="topbar-sub">Enterprise · {coveredTechs}/{totalTechs} techniques covered across {totalTactics} tactics</span>
       </div>
       <div className="matrix-legend">
-        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'#FFFFFF',borderColor:'var(--border)'}}/>Not covered</span>
-        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(124,58,237,.05)',borderColor:'rgba(124,58,237,.20)'}}/>1 rule</span>
-        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(124,58,237,.09)',borderColor:'rgba(124,58,237,.32)'}}/>2-4</span>
-        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(124,58,237,.15)',borderColor:'rgba(124,58,237,.45)'}}/>5-9</span>
-        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(124,58,237,.22)',borderColor:'rgba(124,58,237,.55)'}}/>10+</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'var(--bg1)',borderColor:'var(--border)'}}/>Not covered</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(168,85,247,.06)',borderColor:'rgba(168,85,247,.22)'}}/>1 rule</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(168,85,247,.13)',borderColor:'rgba(168,85,247,.36)'}}/>2-4</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(168,85,247,.22)',borderColor:'rgba(168,85,247,.50)'}}/>5-9</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(168,85,247,.32)',borderColor:'rgba(168,85,247,.65)'}}/>10+</span>
         <span className="matrix-legend-link"><a href="https://attack.mitre.org/matrices/enterprise/" target="_blank" rel="noreferrer">attack.mitre.org ↗</a></span>
       </div>
       <div className="matrix-scroll">
@@ -814,7 +841,10 @@ function ChainsView({ rules }) {
                 <div className="kc-stage-desc">{stage.description}</div>
                 <div className="kc-stage-meta">
                   {isPre
-                    ? <span className="kc-pre-tag">{stage.pre_attack[0]} (PRE-ATT&CK)</span>
+                    ? <>
+                        <span className="kc-pre-tag">Pre-compromise · external to your network</span>
+                        <span className="kc-pre-sub">Adversary acts on their own infrastructure. Detection requires threat intel feeds, not endpoint logs — outside the scope of this rule library.</span>
+                      </>
                     : <>
                         <div className="kc-tactics">{stage.attack_tactics.map(t => (
                           <span key={t} className="kc-tactic-pill" style={{borderColor: TACTIC_COLOR[t]+'66', color:TACTIC_COLOR[t]}}>{t}</span>
@@ -903,14 +933,25 @@ function RecommendView({ rules }) {
 
   return (
     <div className="view">
-      <div className="section-header" style={{marginBottom:4}}><MapIcon size={13} />Environment Profile <span style={{fontSize:10,fontWeight:600,color:'#B91C1C',marginLeft:8,padding:'2px 8px',background:'#FEE2E2',border:'1px solid rgba(220,38,38,.25)',borderRadius:4,letterSpacing:0,textTransform:'none'}}>SAMPLE — not your environment</span></div>
-      <div style={{fontSize:12,color:'var(--text2)',marginBottom:20}}>This view shows the <em>default</em> enterprise profile (Windows + M365 + Cloud) as a worked example. Edit <code style={{fontFamily:'var(--mono)',fontSize:11}}>profiles/default.yaml</code> with your real log sources for accurate recommendations.</div>
+      <div className="demo-banner">
+        <div className="demo-banner-icon"><AlertTriangle size={16} /></div>
+        <div>
+          <div className="demo-banner-title">Demo data — no real environment is configured</div>
+          <div className="demo-banner-body">
+            The numbers and tables below are computed against <code>profiles/default.yaml</code>, a hypothetical enterprise (Windows + M365 + Cloud).
+            They do <strong>not</strong> reflect anything you've deployed. To make this view useful, edit that file with your actual SIEM, log sources, and platforms — the recommendation engine then re-runs against your real stack.
+          </div>
+        </div>
+      </div>
+
+      <div className="section-header" style={{marginBottom:6,marginTop:24}}><MapIcon size={13} />Sample Environment Profile</div>
+      <div style={{fontSize:12,color:'var(--text2)',marginBottom:20,lineHeight:1.55}}>Default Enterprise — Windows + M365 + Cloud. Output of <code style={{fontFamily:'var(--mono)',fontSize:11}}>tools/recommend.py --profile profiles/default.yaml</code>.</div>
 
       <div className="dash-metrics" style={{gridTemplateColumns:'repeat(3,1fr)',marginBottom:24}}>
         {[
-          { icon:<CheckCircle size={15}/>, num:deployed.length,     lbl:'Sources in sample profile', color:'#0B0B12', bg:'#F4F4F7' },
-          { icon:<Shield size={15}/>,      num:deployable,           lbl:'Rules runnable on these',   color:'#2563EB', bg:'#DBEAFE' },
-          { icon:<TrendingUp size={15}/>,  num:undeployed.reduce((a,l)=>a+l.rules_unlocked,0), lbl:'Rules unlocked by adding the rest', color:'#7C3AED', bg:'#EDE9FE' },
+          { icon:<CheckCircle size={15}/>, num:deployed.length,     lbl:'Sources in sample profile', color:'#F2F2F7', bg:'rgba(255,255,255,.06)' },
+          { icon:<Shield size={15}/>,      num:deployable,           lbl:'Rules runnable on these',   color:'#3B82F6', bg:'rgba(59,130,246,.18)' },
+          { icon:<TrendingUp size={15}/>,  num:undeployed.reduce((a,l)=>a+l.rules_unlocked,0), lbl:'Rules unlocked by adding the rest', color:'#A855F7', bg:'rgba(168,85,247,.18)' },
         ].map((m,i)=>(
           <div key={i} className="metric-card">
             <div className="metric-icon" style={{background:m.bg}}>{React.cloneElement(m.icon,{color:m.color})}</div>

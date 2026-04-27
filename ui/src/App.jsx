@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useEffect } from 'react'
 import {
   Shield, Search, ChevronRight, X, AlertTriangle, CheckCircle,
   Activity, Database, Target, Filter, Tag, Copy, Check,
@@ -822,17 +822,36 @@ function RecommendView({ rules }) {
 
 // ─── APP ─────────────────────────────────────────────────────────────────────
 
-const VIEWS = [
+const buildViews = (ruleCount, chainCount) => [
   { id:'dashboard', label:'Dashboard',        icon:<BarChart3 size={14} /> },
-  { id:'rules',     label:'Detection Rules',  icon:<Shield size={14} />,   badge:700 },
+  { id:'rules',     label:'Detection Rules',  icon:<Shield size={14} />,   badge:ruleCount },
   { id:'matrix',    label:'ATT&CK Matrix',    icon:<Map size={14} /> },
-  { id:'chains',    label:'Attack Chains',    icon:<GitBranch size={14} />, badge:5 },
+  { id:'chains',    label:'Attack Chains',    icon:<GitBranch size={14} />, badge:chainCount },
   { id:'recommend', label:'Recommendations',  icon:<TrendingUp size={14} /> },
 ]
 
 export default function App() {
   const [view, setView] = useState('dashboard')
-  const deployed  = RULES_RAW.filter(r=>r.lifecycle==='Deployed').length
+  const [rules, setRules] = useState(RULES_RAW)
+  const [source, setSource] = useState('bundled')
+
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/rules')
+      .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+      .then(data => {
+        if (cancelled) return
+        if (Array.isArray(data) && data.length) {
+          setRules(data)
+          setSource('api')
+        }
+      })
+      .catch(() => { /* keep bundled fallback */ })
+    return () => { cancelled = true }
+  }, [])
+
+  const deployed = rules.filter(r => r.lifecycle === 'Deployed').length
+  const chainCount = 5
 
   return (
     <>
@@ -850,7 +869,7 @@ export default function App() {
           </div>
           <nav className="sidebar-nav">
             <div className="nav-label">Navigation</div>
-            {VIEWS.map(v => (
+            {buildViews(rules.length, chainCount).map(v => (
               <div key={v.id} className={`nav-item${view===v.id?' active':''}`} onClick={()=>setView(v.id)}>
                 {v.icon}{v.label}
                 {v.badge && <span className="nav-badge">{v.badge}</span>}
@@ -858,22 +877,23 @@ export default function App() {
             ))}
           </nav>
           <div className="sidebar-stats">
-            <div className="stat-row"><span className="stat-k">Total Rules</span><span className="stat-v">700</span></div>
+            <div className="stat-row"><span className="stat-k">Total Rules</span><span className="stat-v">{rules.length}</span></div>
             <div className="stat-row"><span className="stat-k">Deployed</span><span className="stat-v" style={{color:'#22C55E'}}>{deployed}</span></div>
             <div className="stat-row"><span className="stat-k">SIEM Platforms</span><span className="stat-v" style={{color:'#FF6B35'}}>9</span></div>
-            <div className="stat-row"><span className="stat-k">Attack Chains</span><span className="stat-v" style={{color:'#3B82F6'}}>5</span></div>
+            <div className="stat-row"><span className="stat-k">Attack Chains</span><span className="stat-v" style={{color:'#3B82F6'}}>{chainCount}</span></div>
+            <div className="stat-row"><span className="stat-k">Data source</span><span className="stat-v" style={{color: source==='api' ? '#22C55E' : '#94A3B8', fontSize:9}}>{source==='api' ? '● live API' : '○ bundled'}</span></div>
           </div>
         </aside>
 
         <div className="main">
-          {view === 'rules'     && <RulesView rules={RULES_RAW} />}
+          {view === 'rules'     && <RulesView rules={rules} />}
           {view === 'dashboard' && (
             <>
               <div className="topbar">
                 <span className="topbar-title">Dashboard</span>
                 <span className="topbar-sub">TDL Playbook · Threat Detection Library</span>
               </div>
-              <DashboardView rules={RULES_RAW} />
+              <DashboardView rules={rules} />
             </>
           )}
           {view === 'matrix' && (
@@ -881,14 +901,14 @@ export default function App() {
               <div className="topbar">
                 <span className="topbar-title">ATT&CK Coverage Matrix</span>
               </div>
-              <MatrixView rules={RULES_RAW} />
+              <MatrixView rules={rules} />
             </>
           )}
           {view === 'chains' && (
             <>
               <div className="topbar">
                 <span className="topbar-title">Attack Chain Correlation</span>
-                <span className="topbar-sub">5 chains · all active</span>
+                <span className="topbar-sub">{chainCount} chains · all active</span>
               </div>
               <ChainsView />
             </>
@@ -899,7 +919,7 @@ export default function App() {
                 <span className="topbar-title">Recommendations</span>
                 <span className="topbar-sub">Log source ROI · Coverage gaps</span>
               </div>
-              <RecommendView rules={RULES_RAW} />
+              <RecommendView rules={rules} />
             </>
           )}
         </div>

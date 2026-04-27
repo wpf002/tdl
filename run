@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# TDL Playbook — full app launcher.
+# Brings up Flask backend (:8787) and Vite dev server (:5173) together.
+# Usage:  ./run        (opens both)
+#         ./run prod   (build UI and serve everything from Flask on :8787)
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+API_PORT="${API_PORT:-8787}"
+UI_PORT="${UI_PORT:-5173}"
+
+ensure_python_deps() {
+  python3 -c "import flask, flask_cors, yaml" 2>/dev/null || {
+    echo "→ installing Python deps (flask, flask-cors, pyyaml)"
+    pip install flask flask-cors pyyaml --break-system-packages
+  }
+}
+
+ensure_node_deps() {
+  if [ ! -d ui/node_modules ]; then
+    echo "→ installing UI deps"
+    (cd ui && npm install)
+  fi
+}
+
+ensure_data() {
+  if [ ! -s ui/src/data/rules.json ]; then
+    echo "→ generating rules.json"
+    python3 tools/export_ui_data.py
+  fi
+}
+
+wait_for() {
+  local url="$1" name="$2"
+  local n=0
+  until curl -sf "$url" >/dev/null 2>&1; do
+    n=$((n+1))
+    [ $n -gt 100 ] && { echo "✗ $name did not become ready"; exit 1; }
+    sleep 0.2
+  done
+  echo "✓ $name ready"
+}
+
+ensure_python_deps
+ensure_node_deps
+ensure_data
+
+mode="${1:-dev}"
+
+if [ "$mode" = "prod" ]; then
+  echo "→ building UI"
+  (cd ui && npm run build)
+  echo "→ starting Flask (serves API + built SPA) on :$API_PORT"
+  exec python3 tools/server.py
+fi
+
+# dev mode: backend + Vite, both with proxied /api
+echo "→ starting backend on :$API_PORT"
+PORT="$API_PORT" python3 tools/server.py >/tmp/tdl-backend.log 2>&1 &
+BACKEND_PID=$!
+trap 'kill $BACKEND_PID 2>/dev/null || true; kill $FRONTEND_PID 2>/dev/null || true' EXIT INT TERM
+
+wait_for "http://localhost:$API_PORT/api/health" "backend"
+
+echo "→ starting Vite on :$UI_PORT (proxies /api → :$API_PORT)"
+(cd ui && npm run dev) &
+FRONTEND_PID=$!
+
+wait_for "http://localhost:$UI_PORT/" "frontend"
+
+cat <<EOF
+
+  ════════════════════════════════════════════
+   TDL Playbook is running
+   Frontend  →  http://localhost:$UI_PORT
+   API       →  http://localhost:$API_PORT/api/health
+   Backend log: /tmp/tdl-backend.log
+   Press Ctrl+C to stop
+  ════════════════════════════════════════════
+
+EOF
+
+wait $FRONTEND_PID

@@ -203,8 +203,10 @@ input  { font-family: var(--sans); }
   height: 54px; background: var(--bg0); border-bottom: 1px solid var(--border);
   display: flex; align-items: center; gap: 14px; padding: 0 24px; flex-shrink: 0;
 }
-.topbar-title { font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+.topbar-title { font-size: 15px; font-weight: 700; letter-spacing: -.01em; color: var(--text); }
 .topbar-sub   { font-size: 11px; color: var(--text2); font-family: var(--mono); }
+.topbar-link  { margin-left: auto; font-size: 11px; font-family: var(--mono); color: var(--purple); text-decoration: none; font-weight: 600; padding: 5px 10px; border: 1px solid var(--border); border-radius: 5px; transition: all .12s; }
+.topbar-link:hover { border-color: var(--purple); background: var(--purple-lt); }
 
 .search-wrap { position: relative; margin-left: auto; }
 .search-icon { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--text3); pointer-events: none; }
@@ -362,6 +364,7 @@ input  { font-family: var(--sans); }
 .sev-bar-bg { flex: 1; height: 20px; background: var(--bg1); border-radius: 4px; overflow: hidden; }
 .sev-bar-fill { height: 100%; border-radius: 4px; display: flex; align-items: center; padding: 0 10px; font-size: 11px; font-family: var(--mono); font-weight: 700; color: white; min-width: 30px; }
 .panel-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 22px; box-shadow: var(--shadow-sm); }
+.panel-card-fill { display: flex; flex-direction: column; justify-content: center; flex: 1; }
 
 /* ATT&CK Matrix — column-per-tactic grid mirroring attack.mitre.org */
 .matrix-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 18px 24px; border-bottom: 1px solid var(--border); background: var(--bg0); }
@@ -373,9 +376,7 @@ input  { font-family: var(--sans); }
 .matrix-legend { display: flex; align-items: center; gap: 14px; padding: 10px 24px; border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; font-size: 10px; color: var(--text2); font-family: var(--mono); background: var(--bg1); font-weight: 500; }
 .matrix-legend-item { display: inline-flex; align-items: center; gap: 5px; }
 .matrix-legend-swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; border: 1px solid; }
-.matrix-legend-link { margin-left: auto; }
-.matrix-legend-link a { color: var(--purple); text-decoration: none; font-weight: 600; }
-.matrix-legend-link a:hover { text-decoration: underline; }
+.matrix-legend-label { font-size: 10px; color: var(--text3); font-weight: 600; text-transform: uppercase; letter-spacing: .08em; margin-right: 4px; }
 .matrix-scroll { flex: 1; overflow: auto; padding: 12px; }
 .attack-grid { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(168px, 1fr); gap: 6px; min-width: max-content; }
 .attack-col { display: flex; flex-direction: column; min-width: 168px; }
@@ -463,7 +464,8 @@ input  { font-family: var(--sans); }
 .log-source-table tr:hover td { background: var(--bg1); }
 .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; }
 
-.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: stretch; }
+.two-col > div { display: flex; flex-direction: column; min-width: 0; }
 `
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -713,19 +715,21 @@ function DashboardView({ rules }) {
           </div>
         </div>
 
-        <div className="panel-card">
-          <div className="section-header" style={{marginBottom:18}}><BarChart3 size={14} />Severity Distribution</div>
-          <div className="sev-bars sev-bars-tall">
-            {['Critical','High','Medium','Low'].map(s => {
-              const c = bySev[s]||0
-              const pct = rules.length ? Math.max(c/rules.length*100,2) : 2
-              return (
-                <div key={s} className="sev-row">
-                  <div className="sev-lbl" style={{color:SEV_COLOR[s]}}>{s}</div>
-                  <div className="sev-bar-bg"><div className="sev-bar-fill" style={{width:`${pct}%`,background:SEV_COLOR[s]}}>{c}</div></div>
-                </div>
-              )
-            })}
+        <div>
+          <div className="section-header"><BarChart3 size={13} />Severity Distribution</div>
+          <div className="panel-card panel-card-fill">
+            <div className="sev-bars sev-bars-tall">
+              {['Critical','High','Medium','Low'].map(s => {
+                const c = bySev[s]||0
+                const pct = rules.length ? Math.max(c/rules.length*100,2) : 2
+                return (
+                  <div key={s} className="sev-row">
+                    <div className="sev-lbl" style={{color:SEV_COLOR[s]}}>{s}</div>
+                    <div className="sev-bar-bg"><div className="sev-bar-fill" style={{width:`${pct}%`,background:SEV_COLOR[s]}}>{c}</div></div>
+                  </div>
+                )
+              })}
+            </div>
           </div>
         </div>
       </div>
@@ -771,6 +775,7 @@ function MatrixView({ rules }) {
       <div className="topbar">
         <span className="topbar-title">ATT&CK Coverage Matrix</span>
         <span className="topbar-sub">Enterprise · v15</span>
+        <a className="topbar-link" href="https://attack.mitre.org/matrices/enterprise/" target="_blank" rel="noreferrer">attack.mitre.org ↗</a>
       </div>
       <div className="matrix-stats">
         <div className="matrix-stat">
@@ -791,12 +796,13 @@ function MatrixView({ rules }) {
         </div>
       </div>
       <div className="matrix-legend">
-        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'var(--bg1)',borderColor:'var(--border)'}}/>Not covered</span>
-        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(168,85,247,.06)',borderColor:'rgba(168,85,247,.22)'}}/>1 rule</span>
+        <span className="matrix-legend-label">Coverage:</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'var(--bg1)',borderColor:'var(--border)'}}/>0</span>
+        <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(168,85,247,.06)',borderColor:'rgba(168,85,247,.22)'}}/>1</span>
         <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(168,85,247,.13)',borderColor:'rgba(168,85,247,.36)'}}/>2-4</span>
         <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(168,85,247,.22)',borderColor:'rgba(168,85,247,.50)'}}/>5-9</span>
         <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(168,85,247,.32)',borderColor:'rgba(168,85,247,.65)'}}/>10+</span>
-        <span className="matrix-legend-link"><a href="https://attack.mitre.org/matrices/enterprise/" target="_blank" rel="noreferrer">attack.mitre.org ↗</a></span>
+        <span className="matrix-legend-item" style={{color:'var(--text3)'}}>rules per technique</span>
       </div>
       <div className="matrix-scroll">
         <div className="attack-grid">
@@ -1099,7 +1105,7 @@ export default function App() {
           </nav>
           <div className="sidebar-stats">
             <div className="stat-row"><span className="stat-k">Total Rules</span><span className="stat-v">{rules.length}</span></div>
-            <div className="stat-row"><span className="stat-k">Techniques</span><span className="stat-v" style={{color:'#7C3AED'}}>{techCount}</span></div>
+            <div className="stat-row"><span className="stat-k">Techniques</span><span className="stat-v" style={{color:'#A855F7'}}>{techCount}</span></div>
             <div className="stat-row"><span className="stat-k">SIEM Platforms</span><span className="stat-v">9</span></div>
             <div className="stat-row"><span className="stat-k">Attack Chains</span><span className="stat-v" style={{color:'#A855F7'}}>{chainCount}</span></div>
           </div>

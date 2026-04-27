@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TDE Playbook — Multi-SIEM Query Generator
+TDL Playbook — Multi-SIEM Query Generator
 Generates native query language implementations for all major SIEMs.
 
 Supported platforms (v3):
@@ -16,7 +16,7 @@ Supported platforms (v3):
 
 Usage:
   python3 tools/siem_expand.py                    # enrich all rules
-  python3 tools/siem_expand.py --rule TDE-CA-001  # single rule
+  python3 tools/siem_expand.py --rule TDL-CA-001  # single rule
   python3 tools/siem_expand.py --platform aql     # only add AQL
   python3 tools/siem_expand.py --stats            # show coverage stats only
 """
@@ -227,7 +227,7 @@ def build_yara_l(rule: dict) -> str:
     if "password spray" in name_l or "brute force" in name_l:
         return f"""rule {rule_id} {{
   meta:
-    author = "TDE"
+    author = "TDL"
     description = "{rule.get('name','')}"
     severity = "{sev}"
     tactic = "TA0006"
@@ -254,7 +254,7 @@ def build_yara_l(rule: dict) -> str:
     elif "kerberoast" in name_l:
         return f"""rule {rule_id} {{
   meta:
-    author = "TDE"
+    author = "TDL"
     description = "{rule.get('name','')}"
     severity = "{sev}"
     tactic = "TA0006"
@@ -282,7 +282,7 @@ def build_yara_l(rule: dict) -> str:
     elif "lsass" in name_l:
         return f"""rule {rule_id} {{
   meta:
-    author = "TDE"
+    author = "TDL"
     description = "{rule.get('name','')}"
     severity = "{sev}"
     tactic = "TA0006"
@@ -308,7 +308,7 @@ def build_yara_l(rule: dict) -> str:
     elif "log" in name_l and "clear" in name_l:
         return f"""rule {rule_id} {{
   meta:
-    author = "TDE"
+    author = "TDL"
     description = "{rule.get('name','')}"
     severity = "{sev}"
     tactic = "TA0005"
@@ -333,7 +333,7 @@ def build_yara_l(rule: dict) -> str:
     elif "shadow copy" in name_l or "vss" in name_l:
         return f"""rule {rule_id} {{
   meta:
-    author = "TDE"
+    author = "TDL"
     description = "{rule.get('name','')}"
     severity = "CRITICAL"
     tactic = "TA0040"
@@ -361,7 +361,7 @@ def build_yara_l(rule: dict) -> str:
     elif "beaconing" in name_l or "beacon" in name_l:
         return f"""rule {rule_id} {{
   meta:
-    author = "TDE"
+    author = "TDL"
     description = "{rule.get('name','')}"
     severity = "{sev}"
     tactic = "TA0011"
@@ -392,7 +392,7 @@ def build_yara_l(rule: dict) -> str:
 
     return f"""rule {rule_id} {{
   meta:
-    author = "TDE"
+    author = "TDL"
     description = "{rule.get('name','')}"
     severity = "{sev}"
     tactic = "{rule.get('tactic_id','TA0001')}"
@@ -843,7 +843,7 @@ def main():
         return
 
     enriched = 0
-    print(f"\n  TDE Playbook — Multi-SIEM Query Generator")
+    print(f"\n  TDL Playbook — Multi-SIEM Query Generator")
     print(f"  Enriching {len(rules)} rules with: {', '.join(platforms)}\n")
 
     for rule in rules:

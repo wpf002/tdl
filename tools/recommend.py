@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TDE Playbook — Rule Recommendation Engine
+TDL Playbook — Rule Recommendation Engine
 Scores every rule against your environment profile and outputs a prioritized
 deployment plan, coverage gaps, and log source ROI analysis.
 
@@ -77,7 +77,7 @@ LOG_SOURCE_MATCH_TERMS = {
 
 QUERY_FORMAT = {
     "splunk": "spl",
-    "sentinel": "kql":,
+    "sentinel": "kql",
     "elastic": "eql",
     "chronicle": "yara_l",
 }
@@ -211,7 +211,7 @@ def score_rule(rule: dict, deployed_ids: set, profile: dict) -> dict:
         "deployable":     coverage_ratio >= 0.5,
         "has_query":      bool(queries.get(fmt)),
         "query_format":   fmt,
-        "source":         "TDE" if rule.get("rule_id", "").startswith("TDE") else "TDL",
+        "source":         "TDL",
     }
 
 
@@ -312,7 +312,7 @@ def print_report(profile: dict, scored: list, roi: list, gaps: dict,
     BOLD = "\033[1m"
 
     print(f"\n{BOLD}{'═'*72}{W}")
-    print(f"{BOLD}  TDE PLAYBOOK — RECOMMENDATION ENGINE{W}")
+    print(f"{BOLD}  TDL PLAYBOOK — RECOMMENDATION ENGINE{W}")
     print(f"{BOLD}{'═'*72}{W}\n")
     print(f"  Profile:  {profile.get('name', 'Unknown')}")
     print(f"  Industry: {profile.get('industry', 'N/A')}")
@@ -408,6 +408,7 @@ def main():
     parser.add_argument("--top",      default=30, type=int)
     parser.add_argument("--output",   default=None)
     parser.add_argument("--lifecycle",default=None, help="Filter: Deployed|Proposed|Tested")
+    parser.add_argument("--siem",     default=None, help="Override SIEM platform from profile")
     args = parser.parse_args()
 
     profile = load_profile(args.profile)

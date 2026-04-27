@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-TDE Playbook — Sigma Generator
-Converts TDE/TDL rules into valid Sigma rule format.
+TDL Playbook — Sigma Generator
+Converts TDL rules into valid Sigma rule format.
 Sigma is the canonical vendor-neutral format — SPL/KQL are compiled outputs.
 
 Usage:
   python3 tools/sigma_gen.py                    # all rules
   python3 tools/sigma_gen.py --tactic credential-access
-  python3 tools/sigma_gen.py --rule-id TDE-CA-001
+  python3 tools/sigma_gen.py --rule-id TDL-CA-001
   python3 tools/sigma_gen.py --lifecycle Deployed
 
 Output: sigma/<tactic>/<rule_id>.yml
@@ -264,7 +264,7 @@ def build_detection_from_pseudo(rule: dict) -> dict:
 # ── Main rule builder ─────────────────────────────────────────────────────────
 
 def to_sigma(rule: dict) -> dict:
-    """Convert a TDE/TDL rule dict into a Sigma rule dict."""
+    """Convert a TDL rule dict into a Sigma rule dict."""
     rule_id   = rule.get("rule_id", "")
     tactic    = rule.get("tactic", "")
     tech_id   = rule.get("technique_id", "")
@@ -288,7 +288,7 @@ def to_sigma(rule: dict) -> dict:
                         "Tuned":"stable"}.get(rule.get("lifecycle","Proposed"), "experimental"),
         "description": str(rule.get("description", "")).strip(),
         "references":  rule.get("references", []),
-        "author":      rule.get("author", "TDE"),
+        "author":      rule.get("author", "TDL"),
         "date":        str(rule.get("created", date.today())),
         "modified":    str(rule.get("last_modified", date.today())),
         "tags":        tags,
@@ -354,7 +354,7 @@ def main():
     if args.lifecycle:
         rules = [r for r in rules if r.get("lifecycle") == args.lifecycle]
 
-    print(f"\n  TDE Playbook — Sigma Generator")
+    print(f"\n  TDL Playbook — Sigma Generator")
     print(f"  Converting {len(rules)} rules...\n")
 
     converted = 0

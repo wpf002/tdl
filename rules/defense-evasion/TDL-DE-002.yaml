@@ -1,0 +1,91 @@
+rule_id: TDL-DE-002
+name: Process Injection via CreateRemoteThread
+tactic: Defense Evasion
+tactic_id: TA0005
+technique_id: T1055.001
+technique_name: DLL Injection
+platform:
+- Windows
+data_sources:
+- Sysmon Event ID 8
+severity: High
+fidelity: High
+lifecycle: Deployed
+risk_score: 85
+queries:
+  spl: 'index=windows sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=8
+
+    | where NOT match(TargetImage, "(?i)(\\windows\\system32\\")
+
+    | where NOT match(SourceImage, "(?i)(\\windows\\system32\\")
+
+    | table _time, host, SourceImage, TargetImage, StartAddress'
+  kql: 'DeviceEvents
+
+    | where TimeGenerated >= ago(1d)
+
+    | where ActionType == "CreateRemoteThreadApiCall"
+
+    | where TargetFileName !startswith "C:\\Windows\\"
+
+    | project TimeGenerated, DeviceName, InitiatingProcessFileName, FileName'
+  aql: |-
+    SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
+    FROM events
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+    GROUP BY username, hostname, QIDNAME(qid)
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule tdl_de_002 {
+      meta:
+        author = "TDL"
+        description = "Process Injection via CreateRemoteThread"
+        severity = "HIGH"
+        tactic = "TA0005"
+        technique = "T1055.001"
+
+      events:
+        $event.metadata.event_type = "GENERIC_EVENT"
+        $event.principal.hostname = $host
+        $event.principal.user.userid = $user
+
+      match:
+        $host over 5m
+
+      condition:
+        #event >= 1
+
+      outcome:
+        $risk_score = max(50)
+    }
+  esql: |-
+    FROM logs-windows.sysmon_operational*,logs-system.security*
+    | WHERE @timestamp > NOW() - 1 day
+    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
+    | WHERE event_count >= 1
+    | SORT @timestamp DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 1)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 1
+    | sort -proc_count
+  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
+    \ _time"
+  lucene: |-
+    event_id:* AND log_type:"security"
+false_positives:
+- Debugging tools
+- AV/EDR products
+tags:
+- process-injection
+- defense-evasion
+author: TDL
+created: '2024-01-26'
+test_method: purple_team
+last_modified: '2026-04-27'

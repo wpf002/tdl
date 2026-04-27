@@ -1,0 +1,120 @@
+rule_id: TDL-CA-002
+name: Kerberoasting - Large Volume TGS Requests
+tactic: Credential Access
+tactic_id: TA0006
+technique_id: T1558.003
+technique_name: Kerberoasting
+platform:
+- Windows
+data_sources:
+- Windows Security Event Log (4769)
+severity: High
+fidelity: High
+lifecycle: Deployed
+risk_score: 85
+queries:
+  spl: 'index=windows sourcetype=WinEventLog:Security EventCode=4769
+
+    | where TicketEncryptionType IN ("0x17","0x18")
+
+    | where ServiceName!="krbtgt" AND NOT match(ServiceName,"\\$$")
+
+    | bucket _time span=10m
+
+    | stats dc(ServiceName) as spns by _time, Account_Name, Client_Address
+
+    | where spns >= 5
+
+    | table _time, Account_Name, Client_Address, spns'
+  kql: 'SecurityEvent
+
+    | where TimeGenerated >= ago(1d)
+
+    | where EventID == 4769
+
+    | where TicketEncryptionType in ("0x17","0x18") and ServiceName != "krbtgt"
+
+    | summarize SPNs = dcount(ServiceName) by Account, IpAddress, bin(TimeGenerated, 10m)
+
+    | where SPNs >= 5'
+  aql: |-
+    SELECT username AS requesting_user, QIDNAME(qid) AS event_name,
+           hostname AS destination, UNIQUECOUNT(hostname) AS unique_spns
+    FROM events
+    WHERE eventid = 4769
+      AND LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
+      AND "Ticket Encryption Type" IN ('0x17', '0x18')
+      AND username NOT LIKE '%$'
+      AND INOFFSET(starttime, LAST 300 SECONDS)
+    GROUP BY username
+    HAVING unique_spns >= 5
+    ORDER BY unique_spns DESC
+  yara_l: |-
+    rule tdl_ca_002 {
+      meta:
+        author = "TDL"
+        description = "Kerberoasting - Large Volume TGS Requests"
+        severity = "HIGH"
+        tactic = "TA0006"
+        technique = "T1558.003"
+
+      events:
+        $kerberos.metadata.event_type = "USER_RESOURCE_ACCESS"
+        $kerberos.metadata.product_event_type = "4769"
+        $kerberos.additional.fields["TicketEncryptionType"] = /0x17|0x18/
+        $kerberos.principal.user.userid != /\$$/
+        $kerberos.target.resource.name != "krbtgt"
+        $kerberos.principal.user.userid = $user
+        $kerberos.target.resource.name = $spn
+
+      match:
+        $user over 10m
+
+      condition:
+        #spn >= 5
+
+      outcome:
+        $risk_score = max(75)
+    }
+  esql: |-
+    FROM logs-windows.sysmon_operational*,logs-system.security*
+    | WHERE @timestamp > NOW() - 1 day
+    | WHERE event.code == "4769"
+    | WHERE winlog.event_data.TicketEncryptionType IN ("0x17", "0x18")
+    | WHERE NOT winlog.event_data.ServiceName LIKE "*$"
+    | WHERE winlog.event_data.ServiceName != "krbtgt"
+    | STATS unique_spns = COUNT_DISTINCT(winlog.event_data.ServiceName), spns = VALUES(winlog.event_data.ServiceName) BY winlog.event_data.SubjectUserName, source.ip, @timestamp = BUCKET(@timestamp, 10 minutes)
+    | WHERE unique_spns >= 5
+    | SORT unique_spns DESC
+  leql: |-
+    where(event_id = 4769 AND ticket_encryption_type IN ["0x17", "0x18"]
+      AND NOT destination_account ENDS WITH "$"
+      AND NOT destination_account = "krbtgt")
+    groupby(source_account, source_ip)
+    calculate(unique_count:destination_account AS spn_count)
+    having(spn_count >= 5)
+  crowdstrike: |-
+    event_simpleName=KerberosServiceTicketGrantedFailed OR event_simpleName=KerberosServiceTicketGranted
+    | where TicketEncryptionType IN ("0x17", "0x18") AND ServiceName != "krbtgt" AND ServiceName!="*$"
+    | stats dc(ServiceName) as spn_count, values(ServiceName) as spns by aid, UserName
+    | where spn_count >= 5
+  xql: |-
+    dataset = xdr_data
+    | filter event_type = "NETWORK" and actor_process_image_name contains "lsass.exe"
+    | filter action_evtlog_event_id = 4769
+    | filter actor_process_command_line contains "0x17" or actor_process_command_line contains "0x18"
+    | comp dc(action_network_remote_port) as spn_count by actor_effective_username, src_ip
+    | filter spn_count >= 5
+  lucene: |-
+    event_id:4769 AND ticket_encryption_type:(0x17 OR 0x18)
+    AND NOT service_name:krbtgt AND NOT service_name:*$
+false_positives:
+- Monitoring tools enumerating SPNs
+tags:
+- kerberoasting
+- active-directory
+- credential-access
+author: TDL
+created: '2024-02-02'
+test_method: purple_team
+last_modified: '2026-04-27'

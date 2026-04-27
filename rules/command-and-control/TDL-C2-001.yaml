@@ -1,0 +1,103 @@
+rule_id: TDL-C2-001
+name: Beaconing Detected - Periodic Outbound Connection
+tactic: Command and Control
+tactic_id: TA0011
+technique_id: T1071.001
+technique_name: Web Protocols
+platform:
+- Windows
+- Linux
+- macOS
+data_sources:
+- Proxy/web gateway logs
+- Firewall logs
+severity: High
+fidelity: Medium
+lifecycle: Deployed
+risk_score: 75
+queries:
+  spl: 'index=network sourcetype=proxy
+
+    | bucket _time span=1h
+
+    | stats count as requests, stdev(_time) as jitter, avg(bytes_out) as avg_bytes by src_ip, dest_host, _time
+
+    | where requests >= 10 AND jitter <= 300 AND avg_bytes < 5000
+
+    | table _time, src_ip, dest_host, requests, jitter, avg_bytes'
+  kql: 'CommonSecurityLog
+
+    | where TimeGenerated >= ago(1d)
+
+    | where DeviceAction == "allow"
+
+    | summarize Count = count(), Stdev = stdev(tolong(TimeGenerated)), AvgBytes = avg(SentBytes) by SourceIP, DestinationHostName,
+    bin(TimeGenerated, 1h)
+
+    | where Count >= 10 and Stdev <= 300 and AvgBytes < 5000'
+  aql: |-
+    SELECT sourceip, destinationip, destinationport, SUM(flowCount) AS total_flows
+    FROM flows
+    WHERE INOFFSET(starttime, LAST 300 SECONDS)
+    GROUP BY sourceip, destinationip, destinationport
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule tdl_c2_001 {
+      meta:
+        author = "TDL"
+        description = "Beaconing Detected - Periodic Outbound Connection"
+        severity = "HIGH"
+        tactic = "TA0011"
+        technique = "T1071.001"
+
+      events:
+        $network.metadata.event_type = "NETWORK_CONNECTION"
+        $network.security_result.action = "ALLOW"
+        $network.principal.ip = $src_ip
+        $network.target.hostname = $dest_host
+        $network.network.sent_bytes < 5000
+
+      match:
+        $src_ip, $dest_host over 1h
+
+      condition:
+        #network >= 10 and
+        math.stddev(timestamp.seconds, $network) < 300
+
+      outcome:
+        $risk_score = max(75)
+    }
+  esql: |-
+    FROM logs-network*,logs-proxy*
+    | WHERE @timestamp > NOW() - 1 day
+    | WHERE event.type == "allowed"
+    | STATS request_count = COUNT(*), avg_bytes = AVG(destination.bytes), std_time = STD_DEV(TO_LONG(@timestamp)) BY source.ip, destination.domain, @timestamp = BUCKET(@timestamp, 1 hour)
+    | WHERE request_count >= 10 AND avg_bytes < 5000
+    | SORT request_count DESC
+  leql: |-
+    where(logset = "Endpoint Activity")
+    groupby(hostname, username)
+    calculate(count AS event_count)
+    having(event_count >= 1)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | stats count as proc_count by ComputerName, FileName
+    | where proc_count >= 1
+    | sort -proc_count
+  xql: "dataset = xdr_data\n| filter event_type = \"NETWORK\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
+    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
+    \ _time"
+  lucene: |-
+    event_id:* AND log_type:"security"
+false_positives:
+- Software update clients
+- NTP clients
+- Monitoring agents
+tags:
+- beaconing
+- c2
+- cobalt-strike
+author: TDL
+created: '2024-02-15'
+test_method: historical
+last_modified: '2026-04-27'

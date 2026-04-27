@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TDE Playbook — Chain Evaluator
+TDL Playbook — Chain Evaluator
 Validates that all rules referenced in attack chains exist in the rule library,
 computes chain coverage, and outputs a chain coverage report.
 
@@ -104,7 +104,7 @@ def print_chain_report(results: list):
     G = "\033[92m"; Y = "\033[93m"; R = "\033[91m"; B = "\033[94m"
 
     print(f"\n{BOLD}{'═'*70}{W}")
-    print(f"{BOLD}  TDE PLAYBOOK — ATTACK CHAIN COVERAGE{W}")
+    print(f"{BOLD}  TDL PLAYBOOK — ATTACK CHAIN COVERAGE{W}")
     print(f"{BOLD}{'═'*70}{W}\n")
 
     active   = [r for r in results if r["active"]]

@@ -1,0 +1,117 @@
+rule_id: TDL-CA-001
+name: LSASS Memory Access by Non-System Process
+tactic: Credential Access
+tactic_id: TA0006
+technique_id: T1003.001
+technique_name: LSASS Memory
+platform:
+- Windows
+data_sources:
+- Sysmon Event ID 10 (ProcessAccess)
+severity: Critical
+fidelity: High
+lifecycle: Deployed
+risk_score: 95
+queries:
+  spl: 'index=windows sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=10
+
+    | where TargetImage="C:\\Windows\\system32\\lsass.exe"
+
+    | where match(GrantedAccess, "0x1010|0x1410|0x1fffff")
+
+    | where NOT match(SourceImage, "(?i)(\\windows\\system32\\")
+
+    | table _time, host, SourceImage, GrantedAccess, CallTrace'
+  kql: 'DeviceEvents
+
+    | where TimeGenerated >= ago(1d)
+
+    | where ActionType == "OpenProcessApiCall"
+
+    | where FileName =~ "lsass.exe"
+
+    | where not(InitiatingProcessFolderPath startswith "C:\\Windows\\")
+
+    | project TimeGenerated, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine'
+  aql: |-
+    SELECT sourceaddress AS source_host, username, QIDNAME(qid) AS event_name,
+           "Process Name" AS accessing_process, "Granted Access" AS access_mask
+    FROM events
+    WHERE eventid = 10
+      AND "Target Image" ILIKE '%lsass.exe%'
+      AND "Granted Access" IN ('0x1010','0x1410','0x1fffff','0x147a')
+      AND "Source Image" NOT ILIKE '%\Windows\System32\%'
+      AND INOFFSET(starttime, LAST 3600 SECONDS)
+    ORDER BY starttime DESC
+  yara_l: |-
+    rule tdl_ca_001 {
+      meta:
+        author = "TDL"
+        description = "LSASS Memory Access by Non-System Process"
+        severity = "CRITICAL"
+        tactic = "TA0006"
+        technique = "T1003.001"
+
+      events:
+        $proc_access.metadata.event_type = "PROCESS_OPEN"
+        $proc_access.target.process.file.full_path = /lsass\.exe$/
+        $proc_access.additional.fields["GrantedAccess"] = /0x1010|0x1410|0x1fffff/
+        $proc_access.principal.process.file.full_path != /Windows\\System32/
+        $proc_access.principal.hostname = $host
+
+      match:
+        $host over 5m
+
+      condition:
+        #proc_access >= 1
+
+      outcome:
+        $risk_score = max(95)
+    }
+  esql: |-
+    FROM logs-windows.sysmon_operational*
+    | WHERE @timestamp > NOW() - 1 day
+    | WHERE event.code == "10"
+    | WHERE winlog.event_data.TargetImage LIKE "*\\lsass.exe"
+    | WHERE winlog.event_data.GrantedAccess IN ("0x1010","0x1410","0x1fffff","0x147a")
+    | WHERE NOT winlog.event_data.SourceImage LIKE "*\\Windows\\System32\\*"
+    | KEEP host.name, winlog.event_data.SourceImage, winlog.event_data.GrantedAccess, winlog.event_data.CallTrace, @timestamp
+    | SORT @timestamp DESC
+  leql: |-
+    where(source_name = "Microsoft-Windows-Sysmon"
+      AND event_id = 10
+      AND target_image CONTAINS "lsass.exe"
+      AND granted_access IN ["0x1010","0x1410","0x1fffff"]
+      AND NOT source_image CONTAINS "Windows\System32")
+    calculate(count AS total)
+    having(total >= 1)
+  crowdstrike: |-
+    event_simpleName=ProcessRollup2
+    | where TargetProcessName MATCHES "(?i)lsass.exe"
+    | where DesiredAccess IN ("0x1010","0x1410","0x1fffff")
+    | where FileName NOT MATCHES "(?i)C:\\Windows\\System32"
+    | table ComputerName, FileName, TargetProcessName, DesiredAccess, CommandLine, ContextTimeStamp
+  xql: |-
+    dataset = xdr_data
+    | filter event_type = "INJECTION"
+    | filter action_remote_process_image_path contains "lsass.exe"
+    | filter actor_process_image_path not contains "C:\Windows\System32"
+    | fields hostname, actor_process_image_name, action_remote_process_image_path, actor_effective_username, _time
+    | sort desc _time
+  lucene: |-
+    event_id:10 AND target_image:*lsass.exe
+    AND granted_access:(0x1010 OR 0x1410 OR 0x1fffff)
+    AND NOT source_image:*Windows\System32*
+false_positives:
+- AV/EDR products
+- Windows Error Reporting
+tags:
+- lsass
+- credential-dumping
+- mimikatz
+- critical
+author: TDL
+created: '2024-02-01'
+test_method: purple_team
+simulation_id: SIM-010
+last_modified: '2026-04-27'

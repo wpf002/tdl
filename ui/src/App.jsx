@@ -1158,12 +1158,6 @@ export default function App() {
               </div>
             ))}
           </nav>
-          <div className="sidebar-stats">
-            <div className="stat-row"><span className="stat-k">Total Rules</span><span className="stat-v">{rules.length}</span></div>
-            <div className="stat-row"><span className="stat-k">Techniques</span><span className="stat-v" style={{color:'#A855F7'}}>{techCount}</span></div>
-            <div className="stat-row"><span className="stat-k">SIEM Platforms</span><span className="stat-v">10</span></div>
-            <div className="stat-row"><span className="stat-k">Attack Chains</span><span className="stat-v" style={{color:'#A855F7'}}>{chainCount}</span></div>
-          </div>
         </aside>
 
         <div className="main">

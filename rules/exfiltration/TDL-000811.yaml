@@ -1,0 +1,93 @@
+rule_id: TDL-EXF-000811
+v4_id: 000811
+name: Outbound Volume Spike on Existing C2 Beacon
+description: Established outbound session previously beaconing <1MB/h suddenly transfers >50MB in 10m. Exfil over C2. Generated
+  from gap analysis against canonical ATT&CK Enterprise matrix (T1041 under Exfiltration).
+tactic: Exfiltration
+tactic_id: TA0010
+technique_id: T1041
+technique_name: Exfiltration Over C2 Channel
+platform:
+- Network
+data_sources:
+- Firewall
+- Network IDS
+severity: High
+fidelity: Medium
+lifecycle: Proposed
+queries:
+  spl: 'index=network sourcetype=firewall OR sourcetype=ids
+
+    | search network.bytes_sent="*c2-bulk*"
+
+    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
+
+    | where count >= 1
+
+    | sort - bytes_out'
+  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+
+    | where TimeGenerated > ago(1d)
+
+    | where network.bytes_sent matches regex "c2-bulk"
+
+    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+
+    | order by Bytes desc'
+  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+
+    FROM flows
+
+    WHERE "network.bytes_sent" LIKE ''%c2-bulk%''
+
+    GROUP BY sourceip, destinationip, destinationport
+
+    LAST 1 HOURS'
+  yara_l: "rule tdl_tdl_exf_000811 {\n  meta:\n    author = \"TDL\"\n    description = \"Outbound Volume Spike on Existing\
+    \ C2 Beacon\"\n    severity = \"HIGH\"\n    tactic = \"TA0010\"\n    technique = \"T1041\"\n  events:\n    $e.metadata.event_type\
+    \ = \"NETWORK_CONNECTION\"\n    $e.network.bytes_sent = /c2-bulk/\n    $src = $e.principal.ip\n  match:\n    $src over\
+    \ 10m\n  condition:\n    $e\n}"
+  esql: 'FROM logs-network*,logs-endpoint*
+
+    | WHERE @timestamp > NOW() - 1 hour
+
+    | WHERE event.category == "network" AND network.bytes_sent LIKE "%c2-bulk%"
+
+    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+
+    | SORT bytes_out DESC'
+  leql: 'where(logset = "Network Activity" AND network.bytes_sent=/c2-bulk/)
+
+    groupby(source_ip, destination_ip, destination_port)
+
+    calculate(count, sum(bytes_out))'
+  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.bytes_sent=*c2-bulk*
+
+    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
+
+    | sort -bytes_out'
+  xql: 'dataset = xdr_data
+
+    | filter event_type = ENUM.NETWORK AND network.bytes_sent ~= "c2-bulk"
+
+    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
+
+    | sort desc bytes_out'
+  lucene: event.category:"network" AND network.bytes_sent:*c2-bulk*
+pseudo_logic: Established outbound session previously beaconing <1MB/h suddenly transfers >50MB in 10m. Exfil over C2.
+false_positives:
+- Sanctioned admin or engineering activity
+- Approved automation / CI workflows
+tuning_guidance: "Proposed rule generated from ATT&CK gap analysis \u2014 review the pseudo_logic, scope filters to the right\
+  \ asset group, and refine thresholds using \u22657 days of telemetry before promoting."
+tuning_period: 14 days
+tags:
+- exfil-c2
+- t1041
+- exfiltration
+references:
+- https://attack.mitre.org/techniques/T1041/
+author: TDL gap-analysis generator
+created: '2026-04-27'
+last_modified: '2026-04-27'
+test_method: none

@@ -1,0 +1,88 @@
+rule_id: TDL-CA-000750
+v4_id: '000750'
+name: MFA Code Replayed From Multiple Source IPs
+description: "Same TOTP / push code accepted from \u22652 distinct source IPs within 90s for the same user. MFA proxy / interception.\
+  \ Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1111 under Credential Access)."
+tactic: Credential Access
+tactic_id: TA0006
+technique_id: T1111
+technique_name: Multi-Factor Authentication Interception
+platform:
+- Windows
+- Network
+data_sources:
+- Auth Logs
+severity: High
+fidelity: Medium
+lifecycle: Proposed
+queries:
+  spl: 'index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
+
+    | search user.name="*mfa-replay*"
+
+    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
+
+    | where count >= 1
+
+    | sort - count'
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
+    | where TimeGenerated > ago(1d)
+
+    | where user.name matches regex "mfa-replay"
+
+    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId,
+    ResourceProvider))
+
+    | order by Count desc'
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"user.name\" LIKE '%mfa-replay%'\nLAST 24 HOURS"
+  yara_l: "rule tdl_tdl_ca_000750 {\n  meta:\n    author = \"TDL\"\n    description = \"MFA Code Replayed From Multiple Source\
+    \ IPs\"\n    severity = \"HIGH\"\n    tactic = \"TA0006\"\n    technique = \"T1111\"\n  events:\n    $e.metadata.event_type\
+    \ = \"USER_RESOURCE_ACCESS\"\n    $e.user.name = /mfa-replay/\n    $actor = $e.principal.user.userid\n  match:\n    $actor\
+    \ over 30m\n  condition:\n    $e\n}"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
+    | WHERE @timestamp > NOW() - 1 hour
+
+    | WHERE user.name LIKE "%mfa-replay%"
+
+    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
+    | SORT count DESC'
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND user.name=/mfa-replay/)
+
+    groupby(actor, event_name)
+
+    calculate(count)'
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND user.name=*mfa-replay*
+
+    | stats count as calls by Actor, ApiName, SourceIPAddress
+
+    | sort -calls'
+  xql: 'dataset = cloud_audit_logs
+
+    | filter user.name ~= "mfa-replay"
+
+    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
+    | sort desc calls'
+  lucene: event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND user.name:*mfa-replay*
+pseudo_logic: "Same TOTP / push code accepted from \u22652 distinct source IPs within 90s for the same user. MFA proxy / interception."
+false_positives:
+- Sanctioned admin or engineering activity
+- Approved automation / CI workflows
+tuning_guidance: "Proposed rule generated from ATT&CK gap analysis \u2014 review the pseudo_logic, scope filters to the right\
+  \ asset group, and refine thresholds using \u22657 days of telemetry before promoting."
+tuning_period: 14 days
+tags:
+- mfa
+- intercept
+- t1111
+- credential-access
+references:
+- https://attack.mitre.org/techniques/T1111/
+author: TDL gap-analysis generator
+created: '2026-04-27'
+last_modified: '2026-04-27'
+test_method: none

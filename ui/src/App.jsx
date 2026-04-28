@@ -773,7 +773,7 @@ function MatrixView({ rules }) {
   return (
     <>
       <div className="topbar">
-        <span className="topbar-title">ATT&CK Coverage Matrix</span>
+        <span className="topbar-title">MITRE ATT&CK</span>
         <span className="topbar-sub">Enterprise · v15</span>
         <a className="topbar-link" href="https://attack.mitre.org/matrices/enterprise/" target="_blank" rel="noreferrer">attack.mitre.org ↗</a>
       </div>
@@ -977,10 +977,10 @@ function RecommendView({ rules }) {
 
 // ─── APP ─────────────────────────────────────────────────────────────────────
 
-const buildViews = (ruleCount, chainCount) => [
+const buildViews = (ruleCount, techCount, chainCount) => [
   { id:'dashboard', label:'Dashboard',        icon:<BarChart3 size={14} /> },
   { id:'rules',     label:'Detection Rules',  icon:<Shield size={14} />,   badge:ruleCount },
-  { id:'matrix',    label:'ATT&CK Matrix',    icon:<MapIcon size={14} /> },
+  { id:'matrix',    label:'MITRE ATT&CK',     icon:<MapIcon size={14} />,   badge:techCount },
   { id:'chains',    label:'Kill Chain',       icon:<GitBranch size={14} />, badge:chainCount },
   { id:'recommend', label:'Log Sources',      icon:<TrendingUp size={14} /> },
 ]
@@ -1024,7 +1024,7 @@ export default function App() {
           </div>
           <nav className="sidebar-nav">
             <div className="nav-label">Navigation</div>
-            {buildViews(rules.length, chainCount).map(v => (
+            {buildViews(rules.length, techCount, chainCount).map(v => (
               <div key={v.id} className={`nav-item${view===v.id?' active':''}`} onClick={()=>setView(v.id)}>
                 {v.icon}{v.label}
                 {v.badge && <span className="nav-badge">{v.badge}</span>}
@@ -1053,7 +1053,7 @@ export default function App() {
           {view === 'matrix' && (
             <>
               <div className="topbar">
-                <span className="topbar-title">ATT&CK Coverage Matrix</span>
+                <span className="topbar-title">MITRE ATT&CK</span>
               </div>
               <MatrixView rules={rules} />
             </>

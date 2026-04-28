@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from gen.technique_kb import TECHNIQUES, TACTIC_IDS, TACTIC_FOLDER, TACTIC_PREFIX  # noqa: E402
 from gen.query_templates import render  # noqa: E402
+from gen.triage_kb import steps_for  # noqa: E402
 
 RULES_DIR = ROOT / "rules"
 MATRIX_JS = ROOT / "ui" / "src" / "data" / "attack-matrix.js"
@@ -179,6 +180,7 @@ def build_rule(tactic, technique_id, technique_name, v4_id):
             "thresholds using ≥7 days of telemetry before promoting."
         ),
         "tuning_period": "14 days",
+        "triage_steps": [],  # filled below once we have the rule shape
         "tags": list(kb.get("tags", [])) + [technique_id.lower(), TACTIC_FOLDER[tactic]],
         "references": [
             f"https://attack.mitre.org/techniques/{technique_id}/",
@@ -188,6 +190,7 @@ def build_rule(tactic, technique_id, technique_name, v4_id):
         "last_modified": today,
         "test_method": "none",
     }
+    rule["triage_steps"] = steps_for(rule)
     return rule
 
 

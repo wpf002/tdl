@@ -49,6 +49,7 @@ def normalize(rule):
         "tags": rule.get("tags") or [],
         "data_sources": rule.get("data_sources") or [],
         "false_positives": rule.get("false_positives") or [],
+        "triage_steps": rule.get("triage_steps") or [],
         "tuning_guidance": rule.get("tuning_guidance"),
         "description": rule.get("description"),
         "pseudo_logic": truncate(rule.get("pseudo_logic"), PSEUDO_MAX),

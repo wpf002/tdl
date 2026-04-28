@@ -331,6 +331,11 @@ input  { font-family: var(--sans); }
 .list-item { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: var(--text2); padding: 6px 10px; background: var(--bg1); border: 1px solid var(--border); border-radius: 4px; }
 .list-dot { width: 4px; height: 4px; border-radius: 50%; background: var(--text3); margin-top: 5px; flex-shrink: 0; }
 
+.triage-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.triage-item { display: flex; align-items: flex-start; gap: 10px; padding: 8px 12px; background: var(--bg1); border: 1px solid var(--border); border-radius: 4px; }
+.triage-num { flex-shrink: 0; width: 18px; height: 18px; border-radius: 50%; background: rgba(168,85,247,.18); color: #A855F7; font-size: 10px; font-weight: 700; font-family: var(--mono); display: flex; align-items: center; justify-content: center; margin-top: 1px; }
+.triage-text { font-size: 12px; line-height: 1.55; color: var(--text2); }
+
 /* ── VIEWS ── */
 .view { flex: 1; overflow-y: auto; padding: 28px; background: var(--bg0); }
 
@@ -361,6 +366,10 @@ input  { font-family: var(--sans); }
 .sev-bars-tall .sev-bar-fill { border-radius: 6px; padding: 0 14px; font-size: 12px; }
 .sev-bars-tall .sev-lbl { font-size: 12px; width: 78px; }
 .sev-row  { display: flex; align-items: center; gap: 12px; }
+.sev-row-clickable { cursor: pointer; padding: 4px 6px; border-radius: 6px; transition: background .15s; }
+.sev-row-clickable:hover { background: rgba(168,85,247,.06); }
+.tactic-card-clickable { outline: none; }
+.tactic-card-clickable:hover { border-color: rgba(168,85,247,.45); }
 .sev-lbl  { font-size: 11px; font-weight: 700; width: 70px; }
 .sev-bar-bg { flex: 1; height: 20px; background: var(--bg1); border-radius: 4px; overflow: hidden; }
 .sev-bar-fill { height: 100%; border-radius: 4px; display: flex; align-items: center; padding: 0 10px; font-size: 11px; font-family: var(--mono); font-weight: 700; color: white; min-width: 30px; }
@@ -395,9 +404,35 @@ input  { font-family: var(--sans); }
 .attack-cell-id { font-size: 10px; font-family: var(--mono); font-weight: 700; letter-spacing: .02em; }
 .attack-cell-name { font-size: 10.5px; line-height: 1.3; }
 .attack-cell-count {
-  position: absolute; top: 5px; right: 6px; font-size: 9px; font-family: var(--mono); font-weight: 700;
+  position: absolute; top: 5px; right: 22px; font-size: 9px; font-family: var(--mono); font-weight: 700;
   color: #fff; background: var(--purple); padding: 1px 6px; border-radius: 8px;
 }
+.attack-cell-link { display: flex; flex-direction: column; gap: 1px; text-decoration: none; padding-right: 18px; }
+.attack-cell-toggle {
+  position: absolute; top: 4px; right: 4px; width: 16px; height: 16px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(255,255,255,.04); border: 1px solid rgba(168,85,247,.30);
+  border-radius: 3px; cursor: pointer; color: #C084FC;
+  transition: background .12s, transform .15s;
+}
+.attack-cell-toggle:hover { background: rgba(168,85,247,.18); }
+.attack-cell-toggle.open { transform: rotate(180deg); background: rgba(168,85,247,.22); }
+.attack-cell-wrap { display: flex; flex-direction: column; gap: 0; }
+.attack-cell-wrap.open .attack-cell { border-radius: 3px 3px 0 0; }
+.attack-cell-rules {
+  background: var(--bg2); border: 1px solid rgba(168,85,247,.36); border-top: none;
+  border-radius: 0 0 3px 3px; padding: 6px 8px; display: flex; flex-direction: column; gap: 4px;
+  max-height: 260px; overflow-y: auto;
+}
+.attack-cell-rules-head { font-size: 9px; font-family: var(--mono); color: var(--text3); letter-spacing: .04em; padding-bottom: 4px; border-bottom: 1px solid var(--border); margin-bottom: 2px; }
+.attack-cell-rule {
+  display: grid; grid-template-columns: auto 1fr auto; gap: 6px; align-items: center;
+  padding: 4px 6px; background: var(--bg1); border: 1px solid var(--border); border-radius: 3px;
+  cursor: pointer; transition: border-color .12s;
+}
+.attack-cell-rule:hover { border-color: rgba(168,85,247,.55); background: rgba(168,85,247,.06); }
+.attack-cell-rule-rid { font-size: 9px; font-family: var(--mono); color: #A855F7; font-weight: 700; }
+.attack-cell-rule-name { font-size: 10.5px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* Lockheed Cyber Kill Chain — horizontal 7-stage flow */
 .killchain { display: flex; align-items: stretch; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
@@ -535,6 +570,20 @@ function RuleDetail({ rule }) {
         <div className="desc-box">{rule.description || 'No description available.'}</div>
       </div>
 
+      {rule.triage_steps?.length > 0 && (
+        <div className="section">
+          <div className="section-title"><Crosshair size={11} />Triage Steps</div>
+          <ol className="triage-list">
+            {rule.triage_steps.map((s,i) => (
+              <li key={i} className="triage-item">
+                <span className="triage-num">{i+1}</span>
+                <span className="triage-text">{s}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+
       {platforms.length > 0 && (
         <div className="section">
           <div className="section-title"><Terminal size={11} />Detection Queries</div>
@@ -590,12 +639,24 @@ function RuleDetail({ rule }) {
 
 // ─── RULES VIEW ──────────────────────────────────────────────────────────────
 
-function RulesView({ rules }) {
+function RulesView({ rules, pendingFilter, clearPendingFilter }) {
   const [selected, setSelected]   = useState(null)
   const [search, setSearch]       = useState('')
   const [fTactic, setFTactic]     = useState('All')
   const [fSev, setFSev]           = useState('All')
   const [fFid, setFid]            = useState('All')
+
+  // Apply a cross-view handoff (e.g., dashboard tile click) once, then clear it.
+  useEffect(() => {
+    if (!pendingFilter) return
+    if (pendingFilter.tactic) setFTactic(pendingFilter.tactic)
+    if (pendingFilter.severity) setFSev(pendingFilter.severity)
+    if (pendingFilter.ruleId) {
+      const r = rules.find(x => x.rule_id === pendingFilter.ruleId)
+      if (r) setSelected(r)
+    }
+    clearPendingFilter && clearPendingFilter()
+  }, [pendingFilter, rules, clearPendingFilter])
 
   const filtered = useMemo(() => rules.filter(r => {
     const q = search.toLowerCase()
@@ -673,7 +734,7 @@ function RulesView({ rules }) {
 
 // ─── DASHBOARD VIEW ─────────────────────────────────────────────────────────
 
-function DashboardView({ rules }) {
+function DashboardView({ rules, onNavigate }) {
   const byTactic   = useMemo(() => TACTIC_ORDER.reduce((a,t) => ({...a,[t]:rules.filter(r=>r.tactic===t).length}), {}), [rules])
   const bySev      = useMemo(() => ['Critical','High','Medium','Low'].reduce((a,s) => ({...a,[s]:rules.filter(r=>r.severity===s).length}), {}), [rules])
   const techniques = useMemo(() => new Set(rules.map(r => (r.technique_id||'').split('.')[0]).filter(Boolean)), [rules])
@@ -700,12 +761,13 @@ function DashboardView({ rules }) {
 
       <div className="two-col">
         <div>
-          <div className="section-header"><Crosshair size={13} />ATT&CK Tactic Coverage</div>
+          <div className="section-header"><Crosshair size={13} />MITRE ATT&CK Tactics</div>
           <div className="tactic-grid" style={{gridTemplateColumns:'repeat(3,1fr)'}}>
             {TACTIC_ORDER.map(t => {
               const c = byTactic[t]||0, color = TACTIC_COLOR[t]
               return (
-                <div key={t} className="tactic-card">
+                <div key={t} className="tactic-card tactic-card-clickable" onClick={() => onNavigate && onNavigate({ tactic: t })} role="button" tabIndex={0}
+                     title={`Show ${c} ${t} rule${c===1?'':'s'}`}>
                   <div className="tactic-dot" style={{background:color}} />
                   <div className="tactic-name" style={{color}}>{t}</div>
                   <div className="tactic-bar"><div className="tactic-fill" style={{width:`${maxTactic?c/maxTactic*100:0}%`,background:color}} /></div>
@@ -724,7 +786,8 @@ function DashboardView({ rules }) {
                 const c = bySev[s]||0
                 const pct = rules.length ? Math.max(c/rules.length*100,2) : 2
                 return (
-                  <div key={s} className="sev-row">
+                  <div key={s} className="sev-row sev-row-clickable" onClick={() => onNavigate && onNavigate({ severity: s })} role="button" tabIndex={0}
+                       title={`Show ${c} ${s} rule${c===1?'':'s'}`}>
                     <div className="sev-lbl" style={{color:SEV_COLOR[s]}}>{s}</div>
                     <div className="sev-bar-bg"><div className="sev-bar-fill" style={{width:`${pct}%`,background:SEV_COLOR[s]}}>{c}</div></div>
                   </div>
@@ -741,7 +804,7 @@ function DashboardView({ rules }) {
 // ─── ATT&CK MATRIX VIEW ──────────────────────────────────────────────────────
 // Column-per-tactic grid mirroring https://attack.mitre.org/matrices/enterprise.
 
-function MatrixView({ rules }) {
+function MatrixView({ rules, onSelectRule }) {
   // Map technique_id (top-level) → number of rules covering it.
   const ruleCount = useMemo(() => {
     const m = new Map()
@@ -751,6 +814,18 @@ function MatrixView({ rules }) {
     })
     return m
   }, [rules])
+
+  // Expansion: which (tactic|techniqueId) cell currently shows its rule list.
+  const [expandedKey, setExpandedKey] = useState(null)
+  // For an expanded cell, list rules whose tactic+technique match. Falls back
+  // to "any tactic" if there are no rules with that exact tactic+technique
+  // pair (handles cells where the technique exists in the library but under a
+  // sibling tactic — still useful to show those).
+  const rulesForCell = (tactic, techId) => {
+    const exact = rules.filter(r => r.tactic === tactic && (r.technique_id || '').split('.')[0] === techId)
+    if (exact.length) return exact
+    return rules.filter(r => (r.technique_id || '').split('.')[0] === techId)
+  }
 
   // Coverage shading buckets — purple density on dark.
   const shade = (count) => {
@@ -831,14 +906,39 @@ function MatrixView({ rules }) {
                   {techs.map(t => {
                     const c = ruleCount.get(t.id) || 0
                     const s = shade(c)
+                    const key = `${tactic}|${t.id}`
+                    const expanded = expandedKey === key
+                    const cellRules = expanded ? rulesForCell(tactic, t.id) : []
                     return (
-                      <a key={t.id} href={`https://attack.mitre.org/techniques/${t.id}/`} target="_blank" rel="noreferrer"
-                         className="attack-cell" style={{background:s.background, borderColor:s.border}}
-                         title={`${t.id} ${t.name}${c ? ` · ${c} rule${c>1?'s':''}` : ' · not covered'}`}>
-                        <span className="attack-cell-id" style={{color:s.color}}>{t.id}</span>
-                        <span className="attack-cell-name" style={{color:s.name}}>{t.name}</span>
-                        {c > 0 && <span className="attack-cell-count">{c}</span>}
-                      </a>
+                      <div key={t.id} className={`attack-cell-wrap${expanded?' open':''}`}>
+                        <div className="attack-cell" style={{background:s.background, borderColor:s.border}}
+                             title={`${t.id} ${t.name}${c ? ` · ${c} rule${c>1?'s':''}` : ' · not covered'}`}>
+                          <a className="attack-cell-link" href={`https://attack.mitre.org/techniques/${t.id}/`} target="_blank" rel="noreferrer">
+                            <span className="attack-cell-id" style={{color:s.color}}>{t.id}</span>
+                            <span className="attack-cell-name" style={{color:s.name}}>{t.name}</span>
+                          </a>
+                          {c > 0 && <span className="attack-cell-count">{c}</span>}
+                          {c > 0 && (
+                            <button type="button" className={`attack-cell-toggle${expanded?' open':''}`}
+                                    aria-label={expanded ? 'Hide rules' : 'Show rules'}
+                                    onClick={(e) => { e.stopPropagation(); setExpandedKey(expanded ? null : key) }}>
+                              <ChevronDown size={11} />
+                            </button>
+                          )}
+                        </div>
+                        {expanded && (
+                          <div className="attack-cell-rules">
+                            <div className="attack-cell-rules-head">{cellRules.length} rule{cellRules.length===1?'':'s'} · {t.id}</div>
+                            {cellRules.map(r => (
+                              <div key={r.rule_id} className="attack-cell-rule" onClick={() => onSelectRule && onSelectRule(r.rule_id)}>
+                                <div className="attack-cell-rule-rid">{r.rule_id}</div>
+                                <div className="attack-cell-rule-name">{r.name}</div>
+                                <SevBadge s={r.severity} />
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     )
                   })}
                 </div>
@@ -998,6 +1098,14 @@ export default function App() {
   const [view, setView] = useState('dashboard')
   const [rules, setRules] = useState(RULES_RAW)
   const [source, setSource] = useState('bundled')
+  // Cross-view filter handoff: dashboard tile / matrix tile click → Rules view
+  // pre-filtered. Shape: { tactic?, severity?, ruleId? }. Cleared after Rules
+  // applies it so subsequent in-view filter changes aren't overwritten.
+  const [pendingRulesFilter, setPendingRulesFilter] = useState(null)
+  const navigateToRules = (filter) => {
+    setPendingRulesFilter(filter || {})
+    setView('rules')
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -1059,14 +1167,14 @@ export default function App() {
         </aside>
 
         <div className="main">
-          {view === 'rules'     && <RulesView rules={rules} />}
+          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} />}
           {view === 'dashboard' && (
             <>
               <div className="topbar">
                 <span className="topbar-title">Dashboard</span>
                 <span className="topbar-sub">TDL Playbook · Threat Detection Library</span>
               </div>
-              <DashboardView rules={rules} />
+              <DashboardView rules={rules} onNavigate={navigateToRules} />
             </>
           )}
           {view === 'matrix' && (
@@ -1074,7 +1182,7 @@ export default function App() {
               <div className="topbar">
                 <span className="topbar-title">MITRE ATT&CK</span>
               </div>
-              <MatrixView rules={rules} />
+              <MatrixView rules={rules} onSelectRule={(rid) => navigateToRules({ ruleId: rid })} />
             </>
           )}
           {view === 'chains' && (

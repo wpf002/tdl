@@ -556,12 +556,12 @@ function RuleDetail({ rule }) {
           <div className="card-value" style={{ color: rule.fidelity==='High'?'#7C3AED':rule.fidelity==='Medium'?'#2563EB':'#6E6E7C' }}>{rule.fidelity}</div>
         </div>
         <div className="card">
-          <div className="card-label">Technique</div>
-          <div className="card-value" style={{ fontSize:12, color:'#aaa' }}>{rule.technique_name}</div>
+          <div className="card-label">Tactic</div>
+          <div className="card-value" style={{ fontSize:12, color:'#aaa' }}>{rule.tactic}</div>
         </div>
         <div className="card">
-          <div className="card-label">Test Method</div>
-          <div className="card-value" style={{ fontSize:12, color:'#aaa' }}>{(rule.test_method||'').replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase())}</div>
+          <div className="card-label">Technique</div>
+          <div className="card-value" style={{ fontSize:12, color:'#aaa' }}>{rule.technique_name}</div>
         </div>
       </div>
 

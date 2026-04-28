@@ -213,6 +213,6 @@ def static_files(path):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8787))
-    host = os.environ.get("HOST", "127.0.0.1")
+    host = os.environ.get("HOST", "0.0.0.0")
     print(f"TDL Playbook API → http://{host}:{port}")
     app.run(host=host, port=port, debug=False, use_reloader=False)

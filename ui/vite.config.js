@@ -1,9 +1,11 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-export default defineConfig({
+// In production the Flask app serves the built SPA from the same origin,
+// so the dev proxy is dev-only.
+export default defineConfig(({ command }) => ({
   plugins: [react()],
-  server: {
+  server: command === 'serve' ? {
     port: 5173,
     proxy: {
       '/api': {
@@ -11,5 +13,5 @@ export default defineConfig({
         changeOrigin: true,
       },
     },
-  },
-})
+  } : undefined,
+}))

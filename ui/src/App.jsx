@@ -570,20 +570,6 @@ function RuleDetail({ rule }) {
         <div className="desc-box">{rule.description || 'No description available.'}</div>
       </div>
 
-      {rule.triage_steps?.length > 0 && (
-        <div className="section">
-          <div className="section-title"><Crosshair size={11} />Triage Steps</div>
-          <ol className="triage-list">
-            {rule.triage_steps.map((s,i) => (
-              <li key={i} className="triage-item">
-                <span className="triage-num">{i+1}</span>
-                <span className="triage-text">{s}</span>
-              </li>
-            ))}
-          </ol>
-        </div>
-      )}
-
       {platforms.length > 0 && (
         <div className="section">
           <div className="section-title"><Terminal size={11} />Detection Queries</div>
@@ -626,6 +612,20 @@ function RuleDetail({ rule }) {
         <div className="section">
           <div className="section-title"><Tag size={11} />Tags</div>
           <div className="tags-row">{rule.tags.map(t=><span key={t} className="tag">{t}</span>)}</div>
+        </div>
+      )}
+
+      {rule.triage_steps?.length > 0 && (
+        <div className="section">
+          <div className="section-title"><Crosshair size={11} />Triage Steps</div>
+          <ol className="triage-list">
+            {rule.triage_steps.map((s,i) => (
+              <li key={i} className="triage-item">
+                <span className="triage-num">{i+1}</span>
+                <span className="triage-text">{s}</span>
+              </li>
+            ))}
+          </ol>
         </div>
       )}
 

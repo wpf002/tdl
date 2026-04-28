@@ -15,85 +15,90 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |-
-    index=aws sourcetype=aws:cloudtrail
+  spl: 'index=aws sourcetype=aws:cloudtrail
+
     | bucket _time span=5m
+
     | stats count as failures, dc(Account_Name) as unique_users by _time, IpAddress
+
     | where failures >= 10
-    | table _time, host, Account_Name, IpAddress, LogonType
-  kql: |-
-    AWSCloudTrail
+
+    | table _time, host, Account_Name, IpAddress, LogonType'
+  kql: 'AWSCloudTrail
+
     | where TimeGenerated >= ago(1d)
+
     | summarize Failures = count(), UniqueAccounts = dcount(TargetUserName) by IpAddress, bin(TimeGenerated, 5m)
+
     | where Failures >= 10
-    | project TimeGenerated, Computer, Account, Activity
-  aql: |-
-    SELECT username, sourceip, COUNT(*) AS failure_count, UNIQUECOUNT(username) AS unique_accounts
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
-      AND eventid IN (4625, 529, 4776)
-      AND INOFFSET(starttime, LAST 300 SECONDS)
-    GROUP BY sourceip
-    HAVING unique_accounts >= 10 AND (failure_count / unique_accounts) <= 3
-    ORDER BY failure_count DESC
-    START '2026-04-27 00:00:00'
-  yara_l: |-
-    rule zs_auth_000393 {
-      meta:
-        author = "TDL"
-        description = "AWS Successful RDS Login Brute Force - GuardDuty"
-        severity = "MEDIUM"
-        tactic = "TA0006"
-        technique = "T1078"
 
-      events:
-        $login.metadata.event_type = "USER_LOGIN"
-        $login.metadata.product_name = "Windows"
-        $login.security_result.action = "BLOCK"
-        $login.principal.ip = $src_ip
-        $login.target.user.userid = $user
+    | project TimeGenerated, Computer, Account, Activity'
+  aql: "SELECT username, sourceip, COUNT(*) AS failure_count, UNIQUECOUNT(username) AS unique_accounts\nFROM events\nWHERE\
+    \ LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'\n  AND eventid IN (4625, 529, 4776)\n  AND INOFFSET(starttime, LAST\
+    \ 300 SECONDS)\nGROUP BY sourceip\nHAVING unique_accounts >= 10 AND (failure_count / unique_accounts) <= 3\nORDER BY failure_count\
+    \ DESC\nSTART '2026-04-27 00:00:00'"
+  yara_l: "rule zs_auth_000393 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Successful RDS Login Brute Force\
+    \ - GuardDuty\"\n    severity = \"MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1078\"\n\n  events:\n    $login.metadata.event_type\
+    \ = \"USER_LOGIN\"\n    $login.metadata.product_name = \"Windows\"\n    $login.security_result.action = \"BLOCK\"\n  \
+    \  $login.principal.ip = $src_ip\n    $login.target.user.userid = $user\n\n  match:\n    $src_ip over 5m\n\n  condition:\n\
+    \    #login > 10 and\n    #user > 8\n\n  outcome:\n    $risk_score = max(50)\n}"
+  esql: 'FROM logs-aws.cloudtrail*
 
-      match:
-        $src_ip over 5m
-
-      condition:
-        #login > 10 and
-        #user > 8
-
-      outcome:
-        $risk_score = max(50)
-    }
-  esql: |-
-    FROM logs-aws.cloudtrail*
     | WHERE @timestamp > NOW() - 1 day
+
     | WHERE event.code IN ("4625", "529")
-    | STATS failure_count = COUNT(*), unique_accounts = COUNT_DISTINCT(winlog.event_data.TargetUserName) BY source.ip, @timestamp = BUCKET(@timestamp, 5m)
+
+    | STATS failure_count = COUNT(*), unique_accounts = COUNT_DISTINCT(winlog.event_data.TargetUserName) BY source.ip, @timestamp
+    = BUCKET(@timestamp, 5m)
+
     | WHERE unique_accounts >= 10
+
     | EVAL ratio = failure_count / unique_accounts
+
     | WHERE ratio <= 3
-    | SORT failure_count DESC
-  leql: |-
-    where(event_id IN [4625, 529] AND logset = "Active Directory")
+
+    | SORT failure_count DESC'
+  leql: 'where(event_id IN [4625, 529] AND logset = "Active Directory")
+
     groupby(source_ip)
+
     calculate(unique_count:destination_account AS unique_accounts)
+
     calculate(count AS total_failures)
+
     having(unique_accounts >= 10)
-    having(total_failures / unique_accounts <= 3)
-  crowdstrike: |-
-    event_simpleName=UserLogonFailed2
+
+    having(total_failures / unique_accounts <= 3)'
+  crowdstrike: 'event_simpleName=UserLogonFailed2
+
     | stats count(TargetUserName) as failures, dc(TargetUserName) as unique_accounts by RemoteIP
+
     | where unique_accounts >= 10 AND failures/unique_accounts <= 3
-    | sort -unique_accounts
-  xql: |-
-    dataset = cloud_audit_log
+
+    | sort -unique_accounts'
+  xql: 'dataset = cloud_audit_log
+
     | filter event_type = "CLOUD" and action_evtlog_event_id = 4625
+
     | filter _time > to_timestamp(now() - 86400, "epoch")
+
     | comp count() as failure_count, dc(actor_effective_username) as unique_accounts by src_ip
+
     | filter unique_accounts >= 10
-    | fields src_ip, failure_count, unique_accounts
-  lucene: |-
-    event_id:(4625 OR 529) AND log_source_type:"Windows Security"
-    AND NOT user_name:("ANONYMOUS LOGON" OR "*$")
+
+    | fields src_ip, failure_count, unique_accounts'
+  lucene: 'event_id:(4625 OR 529) AND log_source_type:"Windows Security"
+
+    AND NOT user_name:("ANONYMOUS LOGON" OR "*$")'
+  sumo: '_sourceCategory=*aws*
+
+    | parse regex "\"userIdentity\":\{\"arn\":\"(?<actor>[^\"]+)" nodrop
+
+    | where _raw matches "*T1078*"
+
+    | count by actor, eventName, sourceIPAddress
+
+    | sort by _count desc'
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts

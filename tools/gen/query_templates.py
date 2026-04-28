@@ -69,6 +69,12 @@ PROCESS_FAMILY = {
         | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
         | sort desc occurrences"""),
     "lucene": "event.category:\"process\" AND {filter_lucene}",
+    "sumo": dedent("""\
+        _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+        | parse \"EventID=*\\\"\" as event_id
+        | where event_id=\"1\" AND {filter_sumo}
+        | count by host, user, parent_process_name, command_line
+        | sort by _count desc"""),
 }
 
 NETWORK_FAMILY = {
@@ -127,6 +133,11 @@ NETWORK_FAMILY = {
         | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
         | sort desc bytes_out"""),
     "lucene": "event.category:\"network\" AND {filter_lucene}",
+    "sumo": dedent("""\
+        _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+        | where {filter_sumo}
+        | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+        | sort by bytes_out desc"""),
 }
 
 REGISTRY_FAMILY = {
@@ -185,6 +196,12 @@ REGISTRY_FAMILY = {
         | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
         | sort desc changes"""),
     "lucene": "event.category:\"registry\" AND {filter_lucene}",
+    "sumo": dedent("""\
+        _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+        | parse \"EventID=*\\\"\" as event_id
+        | where event_id IN (\"12\",\"13\",\"14\") AND {filter_sumo}
+        | count by host, user, registry_key, registry_value, image
+        | sort by _count desc"""),
 }
 
 FILE_FAMILY = {
@@ -244,6 +261,12 @@ FILE_FAMILY = {
         | comp count() as writes by agent_hostname, actor_effective_username, action_file_name, action_file_path
         | sort desc writes"""),
     "lucene": "event.category:\"file\" AND {filter_lucene}",
+    "sumo": dedent("""\
+        _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+        | parse \"EventID=*\\\"\" as event_id
+        | where event_id IN (\"11\",\"23\",\"26\") AND {filter_sumo}
+        | count by host, user, target_filename, image
+        | sort by _count desc"""),
 }
 
 CLOUD_FAMILY = {
@@ -302,6 +325,11 @@ CLOUD_FAMILY = {
         | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
         | sort desc calls"""),
     "lucene": "event.dataset:(\"aws.cloudtrail\" OR \"azure.audit\" OR \"gcp.audit\") AND {filter_lucene}",
+    "sumo": dedent("""\
+        _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+        | where {filter_sumo}
+        | count by userIdentity_arn, eventName, sourceIPAddress
+        | sort by _count desc"""),
 }
 
 
@@ -325,6 +353,7 @@ def _basic_filter(field, equals=None, regex=None):
             "filter_cs": f"AND {field}=\"{v}\"",
             "filter_xql": f"{field} = \"{v}\"",
             "filter_lucene": f"{field}:\"{v}\"",
+            "filter_sumo": f"{field}=\"{v}\"",
             "yara_match": f"$e.{field} = \"{v}\"",
         }
     if regex is not None:
@@ -338,9 +367,10 @@ def _basic_filter(field, equals=None, regex=None):
             "filter_cs": f"AND {field}=*{v}*",
             "filter_xql": f"{field} ~= \"{v}\"",
             "filter_lucene": f"{field}:*{v}*",
+            "filter_sumo": f"{field} matches \"*{v}*\"",
             "yara_match": f"$e.{field} = /{v}/",
         }
-    return {k: "*" for k in ("filter", "filter_kql", "filter_aql", "filter_esql", "filter_leql", "filter_cs", "filter_xql", "filter_lucene", "yara_match")}
+    return {k: "*" for k in ("filter", "filter_kql", "filter_aql", "filter_esql", "filter_leql", "filter_cs", "filter_xql", "filter_lucene", "filter_sumo", "yara_match")}
 
 
 # Map (technique_id, command) → (family, filter_snippet)

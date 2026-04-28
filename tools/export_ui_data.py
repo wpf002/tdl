@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 RULES_DIR = ROOT / "rules"
 OUT_PATH = ROOT / "ui" / "src" / "data" / "rules.json"
 
-QUERY_KEYS = ["spl", "kql", "aql", "yara_l", "esql", "leql", "crowdstrike", "xql", "lucene"]
+QUERY_KEYS = ["spl", "kql", "aql", "yara_l", "esql", "leql", "crowdstrike", "xql", "lucene", "sumo"]
 PSEUDO_MAX = 300
 QUERY_MAX = 800
 

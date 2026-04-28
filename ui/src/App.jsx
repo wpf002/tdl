@@ -45,7 +45,8 @@ const PLATFORMS = ['Windows','Linux','macOS','AWS','Azure','GCP','Okta','Microso
 const SIEM_LABELS = {
   spl:'Splunk SPL', kql:'Microsoft KQL', aql:'IBM QRadar AQL',
   yara_l:'Chronicle YARA-L', esql:'Elastic ES|QL', leql:'Rapid7 LEQL',
-  crowdstrike:'CrowdStrike', xql:'XSIAM XQL', lucene:'Lucene'
+  crowdstrike:'CrowdStrike', xql:'XSIAM XQL', lucene:'Lucene',
+  sumo:'Sumo Logic'
 }
 
 const ATTACK_TECHNIQUES = {
@@ -761,11 +762,19 @@ function MatrixView({ rules }) {
   }
 
   const totalTactics = TACTIC_ORDER_MATRIX.length
-  const totalTechs = TACTIC_ORDER_MATRIX.reduce((a,t) => a + (ATTACK_MATRIX[t]?.techniques.length || 0), 0)
-  const coveredTechs = TACTIC_ORDER_MATRIX.reduce((a,t) => {
-    const techs = ATTACK_MATRIX[t]?.techniques || []
-    return a + techs.filter(x => ruleCount.has(x.id)).length
-  }, 0)
+  // Unique top-level techniques in canonical Enterprise (some techniques span
+  // multiple tactic columns — count each technique once to match the sidebar).
+  const canonicalTechs = useMemo(() => {
+    const s = new Set()
+    TACTIC_ORDER_MATRIX.forEach(t => (ATTACK_MATRIX[t]?.techniques || []).forEach(x => s.add(x.id)))
+    return s
+  }, [])
+  const totalTechs = canonicalTechs.size
+  const coveredTechs = useMemo(() => {
+    let n = 0
+    canonicalTechs.forEach(tid => { if (ruleCount.has(tid)) n++ })
+    return n
+  }, [canonicalTechs, ruleCount])
 
   const totalRules = rules.length
   const pctCovered = totalTechs ? Math.round(coveredTechs / totalTechs * 100) : 0
@@ -1005,7 +1014,17 @@ export default function App() {
     return () => { cancelled = true }
   }, [])
 
-  const techCount = useMemo(() => new Set(rules.map(r => (r.technique_id||'').split('.')[0]).filter(Boolean)).size, [rules])
+  // Unique top-level techniques *in the canonical ATT&CK Enterprise matrix*
+  // that have at least one rule. Matches the matrix view's coverage stat so
+  // the sidebar badge and the matrix headline always agree.
+  const techCount = useMemo(() => {
+    const canonical = new Set()
+    TACTIC_ORDER_MATRIX.forEach(t => (ATTACK_MATRIX[t]?.techniques || []).forEach(x => canonical.add(x.id)))
+    const libTechs = new Set(rules.map(r => (r.technique_id||'').split('.')[0]).filter(Boolean))
+    let n = 0
+    canonical.forEach(tid => { if (libTechs.has(tid)) n++ })
+    return n
+  }, [rules])
   const chainCount = 5
 
   return (
@@ -1034,7 +1053,7 @@ export default function App() {
           <div className="sidebar-stats">
             <div className="stat-row"><span className="stat-k">Total Rules</span><span className="stat-v">{rules.length}</span></div>
             <div className="stat-row"><span className="stat-k">Techniques</span><span className="stat-v" style={{color:'#A855F7'}}>{techCount}</span></div>
-            <div className="stat-row"><span className="stat-k">SIEM Platforms</span><span className="stat-v">9</span></div>
+            <div className="stat-row"><span className="stat-k">SIEM Platforms</span><span className="stat-v">10</span></div>
             <div className="stat-row"><span className="stat-k">Attack Chains</span><span className="stat-v" style={{color:'#A855F7'}}>{chainCount}</span></div>
           </div>
         </aside>

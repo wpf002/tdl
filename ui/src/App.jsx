@@ -9,6 +9,22 @@ import {
 import RULES_RAW from './data/rules.json'
 import { ATTACK_MATRIX, KILL_CHAIN, TACTIC_ORDER_MATRIX } from './data/attack-matrix.js'
 
+// ─── HOOKS ──────────────────────────────────────────────────────────────────
+
+function useMediaQuery(query) {
+  const [matches, setMatches] = useState(() =>
+    typeof window !== 'undefined' ? window.matchMedia(query).matches : false
+  )
+  useEffect(() => {
+    const mql = window.matchMedia(query)
+    const handler = (e) => setMatches(e.matches)
+    mql.addEventListener('change', handler)
+    setMatches(mql.matches)
+    return () => mql.removeEventListener('change', handler)
+  }, [query])
+  return matches
+}
+
 // ─── CONSTANTS ──────────────────────────────────────────────────────────────
 
 const TACTIC_ORDER = [
@@ -502,6 +518,187 @@ input  { font-family: var(--sans); }
 
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: stretch; }
 .two-col > div { display: flex; flex-direction: column; min-width: 0; }
+
+/* ── BOTTOM TAB BAR (mobile only — hidden by default, shown via media query) ── */
+.bottom-tabs {
+  display: none;
+  position: fixed; bottom: 0; left: 0; right: 0;
+  height: calc(60px + env(safe-area-inset-bottom));
+  padding-bottom: env(safe-area-inset-bottom);
+  background: var(--bg1); border-top: 1px solid var(--border);
+  z-index: 50;
+}
+.bottom-tab {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 3px; padding: 8px 4px 0;
+  color: var(--text3); background: none; border: none; cursor: pointer;
+  position: relative; transition: color .12s;
+  min-width: 0;
+}
+.bottom-tab.active { color: var(--purple); }
+.bottom-tab.active::before {
+  content: ''; position: absolute; top: 0; left: 28%; right: 28%;
+  height: 2px; background: var(--purple); border-radius: 0 0 2px 2px;
+}
+.bottom-tab-icon { display: flex; align-items: center; justify-content: center; }
+.bottom-tab-label {
+  font-size: 10px; font-weight: 600; letter-spacing: -.01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+/* Mobile-only status dot (hidden on desktop, inline-block on mobile) */
+.status-dot-mobile { display: none; }
+
+/* Mobile-only matrix tactic picker (rendered conditionally; styled here) */
+.matrix-tactic-picker {
+  display: flex; flex-wrap: nowrap; overflow-x: auto;
+  gap: 6px; padding: 10px 12px;
+  background: var(--bg1); border-bottom: 1px solid var(--border);
+  scrollbar-width: none;
+}
+.matrix-tactic-picker::-webkit-scrollbar { display: none; }
+.matrix-tactic-pill {
+  flex-shrink: 0; font-size: 11px; font-weight: 600;
+  padding: 6px 12px; border-radius: 16px; border: 1px solid;
+  white-space: nowrap; cursor: pointer; background: transparent;
+  font-family: var(--sans);
+}
+.matrix-tactic-pill .mt-pill-count {
+  font-family: var(--mono); font-size: 10px; opacity: .7; margin-left: 6px;
+}
+
+/* Mobile rule-detail overlay (slides up full-screen) */
+.mobile-detail-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; flex-direction: column;
+  background: var(--bg0);
+  animation: mobileDetailSlideUp .25s ease-out;
+}
+@keyframes mobileDetailSlideUp {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+.mobile-detail-header {
+  height: 48px; flex-shrink: 0;
+  display: flex; align-items: center; padding: 0 8px;
+  background: var(--bg0); border-bottom: 1px solid var(--border);
+}
+.mobile-detail-back {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 14px; font-weight: 600; color: var(--text);
+  background: none; border: none; padding: 8px 10px; cursor: pointer;
+}
+.mobile-detail-back:hover { color: var(--purple); }
+.mobile-detail-body { flex: 1; overflow-y: auto; }
+
+/* ─────────────────────── MOBILE LAYOUT (≤ 768px) ─────────────────────── */
+@media (max-width: 768px) {
+  html, body, #root { overflow-x: hidden; }
+
+  .shell { flex-direction: column; height: 100vh; }
+
+  /* Sidebar fully hidden — replaced by bottom tabs */
+  .sidebar { display: none !important; }
+
+  /* Bottom tabs visible */
+  .bottom-tabs { display: flex; }
+
+  /* Main pane: leave room for bottom tabs */
+  .main { padding-bottom: calc(60px + env(safe-area-inset-bottom)); }
+
+  /* Topbar: 44px slim, title only — search wraps to its own row when present */
+  .topbar {
+    height: auto; min-height: 44px;
+    padding: 0 12px; gap: 6px;
+    flex-wrap: wrap; align-items: center;
+  }
+  .topbar-title { font-size: 14px; line-height: 44px; }
+  .topbar-sub, .topbar-link { display: none; }
+  .search-wrap { width: 100%; margin: 0 0 8px; order: 2; }
+  .search-input { width: 100%; padding: 8px 12px 8px 32px; font-size: 13px; }
+
+  /* Filterbar: single horizontal scrollable strip */
+  .filterbar {
+    flex-direction: row; flex-wrap: nowrap;
+    overflow-x: auto; overflow-y: hidden;
+    padding: 8px 12px; gap: 6px;
+    scrollbar-width: none;
+  }
+  .filterbar::-webkit-scrollbar { display: none; }
+  .filter-row { flex-shrink: 0; gap: 4px; overflow: visible; }
+  .filter-sep { display: none; }
+  .chip-label { min-width: 0; padding-right: 2px; }
+
+  /* Views: tighter padding */
+  .view { padding: 16px 12px; }
+
+  /* Dashboard: 2x2 metric grid, single-column tactic list, stacked two-col */
+  .dash-metrics { grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 20px; }
+  .metric-card { padding: 14px; }
+  .metric-num  { font-size: 24px; }
+  .two-col { grid-template-columns: 1fr; gap: 18px; }
+
+  /* Tactic grid (Dashboard): full-width single-column rows  — name + bar + count */
+  .tactic-grid { grid-template-columns: 1fr !important; gap: 6px; }
+  .tactic-card {
+    display: grid; grid-template-columns: 8px 1fr 1.2fr auto;
+    align-items: center; gap: 10px; padding: 10px 12px;
+  }
+  .tactic-dot  { margin-bottom: 0; }
+  .tactic-name { margin-bottom: 0; font-size: 12px; }
+  .tactic-bar  { margin-bottom: 0; }
+  .tactic-stat { white-space: nowrap; }
+
+  /* Rules: list takes full width, detail goes to fullscreen overlay */
+  .content { flex-direction: column; overflow: visible; }
+  .rule-list {
+    width: 100%; flex-shrink: 1;
+    border-right: none; border-bottom: 1px solid var(--border);
+  }
+  .detail { padding: 18px 14px; }
+  .detail-name { font-size: 17px; }
+  .grid2 { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .qcode { font-size: 11px; max-height: 280px; }
+  .qtabs { overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; }
+  .qtabs::-webkit-scrollbar { display: none; }
+  .qtab { flex-shrink: 0; }
+
+  /* Matrix: stats 2-col, picker visible (rendered by component) */
+  .matrix-stats { grid-template-columns: repeat(2, 1fr); gap: 8px; padding: 12px; }
+  .matrix-stat  { padding: 12px 14px; }
+  .matrix-stat-num { font-size: 24px; }
+  .matrix-stat-pct { font-size: 14px; }
+  .matrix-stat-lbl { font-size: 10px; }
+  .matrix-legend { padding: 8px 12px; gap: 8px; overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; }
+  .matrix-legend::-webkit-scrollbar { display: none; }
+  .matrix-legend-item, .matrix-legend-label { flex-shrink: 0; }
+  .matrix-scroll { padding: 12px; }
+  /* Mobile single-tactic body uses one full-width column */
+  .attack-grid { grid-auto-flow: row; grid-auto-columns: auto; min-width: 0; }
+  .attack-col { min-width: 0; width: 100%; }
+
+  /* Kill Chain: vertical stack with 90° rotated arrows */
+  .killchain { flex-direction: column; gap: 0; margin-bottom: 4px; }
+  .kc-wrap   { flex-direction: column; flex: 0 0 auto; min-width: 0; width: 100%; align-items: stretch; }
+  .kc-stage  { min-height: auto; padding: 12px 14px; }
+  .kc-arrow  { transform: rotate(90deg); margin: 6px auto; }
+
+  /* Attack chains: vertical step list */
+  .chain-head { flex-wrap: wrap; padding: 14px 16px; }
+  .chain-threat { margin-left: 0; width: 100%; margin-top: 4px; }
+  .chain-steps { flex-direction: column; align-items: flex-start; padding: 0 16px 14px; gap: 0; }
+  .chain-step  { width: 100%; }
+  .chain-arrow { transform: rotate(90deg); margin: 4px 12px; }
+  .chain-meta  { padding: 10px 16px; flex-wrap: wrap; gap: 12px; }
+
+  /* Log Sources: hide Tier column, sticky header, show status dot */
+  .log-source-table th:nth-child(2),
+  .log-source-table td:nth-child(2) { display: none; }
+  .log-source-table thead th { position: sticky; top: 0; z-index: 1; }
+  .log-source-table th, .log-source-table td { padding: 10px 12px; }
+  .status-dot-mobile { display: inline-block; }
+}
 `
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -639,7 +836,7 @@ function RuleDetail({ rule }) {
 
 // ─── RULES VIEW ──────────────────────────────────────────────────────────────
 
-function RulesView({ rules, pendingFilter, clearPendingFilter }) {
+function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile }) {
   const [selected, setSelected]   = useState(null)
   const [search, setSearch]       = useState('')
   const [fTactic, setFTactic]     = useState('All')
@@ -718,7 +915,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter }) {
             </div>
           ))}
         </div>
-        {selected
+        {!isMobile && (selected
           ? <RuleDetail rule={selected} />
           : <div className="detail empty-state">
               <div className="empty-inner">
@@ -726,8 +923,22 @@ function RulesView({ rules, pendingFilter, clearPendingFilter }) {
                 <p style={{marginTop:12}}>Select a rule</p>
               </div>
             </div>
-        }
+        )}
       </div>
+
+      {isMobile && selected && (
+        <div className="mobile-detail-overlay" role="dialog" aria-modal="true" aria-label="Rule detail">
+          <div className="mobile-detail-header">
+            <button type="button" className="mobile-detail-back" onClick={() => setSelected(null)} aria-label="Back to rule list">
+              <ChevronRight size={16} style={{ transform: 'rotate(180deg)' }} />
+              Back
+            </button>
+          </div>
+          <div className="mobile-detail-body">
+            <RuleDetail rule={selected} />
+          </div>
+        </div>
+      )}
     </>
   )
 }
@@ -804,7 +1015,7 @@ function DashboardView({ rules, onNavigate }) {
 // ─── ATT&CK MATRIX VIEW ──────────────────────────────────────────────────────
 // Column-per-tactic grid mirroring https://attack.mitre.org/matrices/enterprise.
 
-function MatrixView({ rules, onSelectRule }) {
+function MatrixView({ rules, onSelectRule, isMobile }) {
   // Map technique_id (top-level) → number of rules covering it.
   const ruleCount = useMemo(() => {
     const m = new Map()
@@ -817,6 +1028,8 @@ function MatrixView({ rules, onSelectRule }) {
 
   // Expansion: which (tactic|techniqueId) cell currently shows its rule list.
   const [expandedKey, setExpandedKey] = useState(null)
+  // Mobile: which tactic the picker has selected. Desktop ignores this.
+  const [pickedTactic, setPickedTactic] = useState(TACTIC_ORDER_MATRIX[0])
   // For an expanded cell, list rules whose tactic+technique match. Falls back
   // to "any tactic" if there are no rules with that exact tactic+technique
   // pair (handles cells where the technique exists in the library but under a
@@ -854,6 +1067,45 @@ function MatrixView({ rules, onSelectRule }) {
   const totalRules = rules.length
   const pctCovered = totalTechs ? Math.round(coveredTechs / totalTechs * 100) : 0
 
+  const renderCell = (tactic, t) => {
+    const c = ruleCount.get(t.id) || 0
+    const s = shade(c)
+    const key = `${tactic}|${t.id}`
+    const expanded = expandedKey === key
+    const cellRules = expanded ? rulesForCell(tactic, t.id) : []
+    return (
+      <div key={t.id} className={`attack-cell-wrap${expanded?' open':''}`}>
+        <div className="attack-cell" style={{background:s.background, borderColor:s.border}}
+             title={`${t.id} ${t.name}${c ? ` · ${c} rule${c>1?'s':''}` : ' · not covered'}`}>
+          <a className="attack-cell-link" href={`https://attack.mitre.org/techniques/${t.id}/`} target="_blank" rel="noreferrer">
+            <span className="attack-cell-id" style={{color:s.color}}>{t.id}</span>
+            <span className="attack-cell-name" style={{color:s.name}}>{t.name}</span>
+          </a>
+          {c > 0 && <span className="attack-cell-count">{c}</span>}
+          {c > 0 && (
+            <button type="button" className={`attack-cell-toggle${expanded?' open':''}`}
+                    aria-label={expanded ? 'Hide rules' : 'Show rules'}
+                    onClick={(e) => { e.stopPropagation(); setExpandedKey(expanded ? null : key) }}>
+              <ChevronDown size={11} />
+            </button>
+          )}
+        </div>
+        {expanded && (
+          <div className="attack-cell-rules">
+            <div className="attack-cell-rules-head">{cellRules.length} rule{cellRules.length===1?'':'s'} · {t.id}</div>
+            {cellRules.map(r => (
+              <div key={r.rule_id} className="attack-cell-rule" onClick={() => onSelectRule && onSelectRule(r.rule_id)}>
+                <div className="attack-cell-rule-rid">{r.rule_id}</div>
+                <div className="attack-cell-rule-name">{r.name}</div>
+                <SevBadge s={r.severity} />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
   return (
     <>
       <div className="topbar">
@@ -888,64 +1140,75 @@ function MatrixView({ rules, onSelectRule }) {
         <span className="matrix-legend-item"><span className="matrix-legend-swatch" style={{background:'rgba(168,85,247,.32)',borderColor:'rgba(168,85,247,.65)'}}/>10+</span>
         <span className="matrix-legend-item" style={{color:'var(--text3)'}}>rules per technique</span>
       </div>
-      <div className="matrix-scroll">
-        <div className="attack-grid">
+      {isMobile && (
+        <div className="matrix-tactic-picker" role="tablist" aria-label="ATT&CK tactic">
           {TACTIC_ORDER_MATRIX.map(tactic => {
             const col = ATTACK_MATRIX[tactic]
             if (!col) return null
-            const techs = col.techniques
-            const covered = techs.filter(t => ruleCount.has(t.id)).length
+            const covered = col.techniques.filter(t => ruleCount.has(t.id)).length
             const color = TACTIC_COLOR[tactic]
+            const on = pickedTactic === tactic
             return (
-              <div key={tactic} className="attack-col">
-                <div className="attack-col-head" style={{borderTopColor:color}}>
-                  <div className="attack-col-tactic" style={{color}}>{tactic}</div>
-                  <div className="attack-col-meta">{col.id} · {covered}/{techs.length}</div>
-                </div>
-                <div className="attack-col-body">
-                  {techs.map(t => {
-                    const c = ruleCount.get(t.id) || 0
-                    const s = shade(c)
-                    const key = `${tactic}|${t.id}`
-                    const expanded = expandedKey === key
-                    const cellRules = expanded ? rulesForCell(tactic, t.id) : []
-                    return (
-                      <div key={t.id} className={`attack-cell-wrap${expanded?' open':''}`}>
-                        <div className="attack-cell" style={{background:s.background, borderColor:s.border}}
-                             title={`${t.id} ${t.name}${c ? ` · ${c} rule${c>1?'s':''}` : ' · not covered'}`}>
-                          <a className="attack-cell-link" href={`https://attack.mitre.org/techniques/${t.id}/`} target="_blank" rel="noreferrer">
-                            <span className="attack-cell-id" style={{color:s.color}}>{t.id}</span>
-                            <span className="attack-cell-name" style={{color:s.name}}>{t.name}</span>
-                          </a>
-                          {c > 0 && <span className="attack-cell-count">{c}</span>}
-                          {c > 0 && (
-                            <button type="button" className={`attack-cell-toggle${expanded?' open':''}`}
-                                    aria-label={expanded ? 'Hide rules' : 'Show rules'}
-                                    onClick={(e) => { e.stopPropagation(); setExpandedKey(expanded ? null : key) }}>
-                              <ChevronDown size={11} />
-                            </button>
-                          )}
-                        </div>
-                        {expanded && (
-                          <div className="attack-cell-rules">
-                            <div className="attack-cell-rules-head">{cellRules.length} rule{cellRules.length===1?'':'s'} · {t.id}</div>
-                            {cellRules.map(r => (
-                              <div key={r.rule_id} className="attack-cell-rule" onClick={() => onSelectRule && onSelectRule(r.rule_id)}>
-                                <div className="attack-cell-rule-rid">{r.rule_id}</div>
-                                <div className="attack-cell-rule-name">{r.name}</div>
-                                <SevBadge s={r.severity} />
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
+              <button
+                key={tactic}
+                type="button"
+                role="tab"
+                aria-selected={on}
+                className="matrix-tactic-pill"
+                style={{
+                  borderColor: color,
+                  color: on ? '#fff' : color,
+                  background: on ? color : 'transparent',
+                }}
+                onClick={() => { setPickedTactic(tactic); setExpandedKey(null) }}
+              >
+                {tactic}<span className="mt-pill-count">{covered}/{col.techniques.length}</span>
+              </button>
             )
           })}
         </div>
+      )}
+      <div className="matrix-scroll">
+        {isMobile ? (() => {
+          const tactic = pickedTactic
+          const col = ATTACK_MATRIX[tactic]
+          if (!col) return null
+          const techs = col.techniques
+          const covered = techs.filter(t => ruleCount.has(t.id)).length
+          const color = TACTIC_COLOR[tactic]
+          return (
+            <div className="attack-col">
+              <div className="attack-col-head" style={{borderTopColor:color}}>
+                <div className="attack-col-tactic" style={{color}}>{tactic}</div>
+                <div className="attack-col-meta">{col.id} · {covered}/{techs.length}</div>
+              </div>
+              <div className="attack-col-body">
+                {techs.map(t => renderCell(tactic, t))}
+              </div>
+            </div>
+          )
+        })() : (
+          <div className="attack-grid">
+            {TACTIC_ORDER_MATRIX.map(tactic => {
+              const col = ATTACK_MATRIX[tactic]
+              if (!col) return null
+              const techs = col.techniques
+              const covered = techs.filter(t => ruleCount.has(t.id)).length
+              const color = TACTIC_COLOR[tactic]
+              return (
+                <div key={tactic} className="attack-col">
+                  <div className="attack-col-head" style={{borderTopColor:color}}>
+                    <div className="attack-col-tactic" style={{color}}>{tactic}</div>
+                    <div className="attack-col-meta">{col.id} · {covered}/{techs.length}</div>
+                  </div>
+                  <div className="attack-col-body">
+                    {techs.map(t => renderCell(tactic, t))}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
       </div>
     </>
   )
@@ -1074,7 +1337,14 @@ function RecommendView({ rules }) {
             <tr key={ls.id}>
               <td style={{color:cCrit[ls.criticality]||'var(--text2)'}}>{ls.criticality}</td>
               <td style={{fontFamily:'var(--mono)',fontSize:11}}>T{ls.tier}</td>
-              <td>{ls.name}</td>
+              <td>
+                <span
+                  className="status-dot status-dot-mobile"
+                  style={{background: ls.deployed ? '#7C3AED' : '#DC2626'}}
+                  aria-label={ls.deployed ? 'Deployed' : 'Not deployed'}
+                />
+                {ls.name}
+              </td>
               <td style={{fontFamily:'var(--mono)',fontSize:12,color:'#7C3AED',fontWeight:700}}>{ls.rules_unlocked}</td>
             </tr>
           ))}
@@ -1095,6 +1365,7 @@ const buildViews = (ruleCount, techCount, chainCount) => [
 ]
 
 export default function App() {
+  const isMobile = useMediaQuery('(max-width: 768px)')
   const [view, setView] = useState('dashboard')
   const [rules, setRules] = useState(RULES_RAW)
   const [source, setSource] = useState('bundled')
@@ -1161,7 +1432,7 @@ export default function App() {
         </aside>
 
         <div className="main">
-          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} />}
+          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} />}
           {view === 'dashboard' && (
             <>
               <div className="topbar">
@@ -1176,7 +1447,7 @@ export default function App() {
               <div className="topbar">
                 <span className="topbar-title">MITRE ATT&CK</span>
               </div>
-              <MatrixView rules={rules} onSelectRule={(rid) => navigateToRules({ ruleId: rid })} />
+              <MatrixView rules={rules} onSelectRule={(rid) => navigateToRules({ ruleId: rid })} isMobile={isMobile} />
             </>
           )}
           {view === 'chains' && (
@@ -1198,6 +1469,22 @@ export default function App() {
             </>
           )}
         </div>
+
+        <nav className="bottom-tabs" role="tablist" aria-label="Primary">
+          {buildViews(rules.length, techCount, chainCount).map(v => (
+            <button
+              key={v.id}
+              type="button"
+              role="tab"
+              aria-selected={view === v.id}
+              className={`bottom-tab${view === v.id ? ' active' : ''}`}
+              onClick={() => setView(v.id)}
+            >
+              <span className="bottom-tab-icon">{v.icon}</span>
+              <span className="bottom-tab-label">{v.label === 'Detection Rules' ? 'Rules' : v.label === 'MITRE ATT&CK' ? 'Matrix' : v.label === 'Kill Chain' ? 'Kill Chain' : v.label === 'Log Sources' ? 'Log Sources' : v.label}</span>
+            </button>
+          ))}
+        </nav>
       </div>
     </>
   )

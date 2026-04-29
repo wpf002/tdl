@@ -13,79 +13,68 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 85
 queries:
-  spl: 'index=windows sourcetype=WinEventLog:Security EventCode=4624
-
-    | where Logon_Type=3 AND Authentication_Package="NTLM"
-
-    | where NOT match(Account_Name,"\\$$")
-
-    | bucket _time span=1h
-
-    | stats dc(IpAddress) as src_ips by Account_Name, _time
-
-    | where src_ips >= 3
-
-    | table _time, Account_Name, src_ips'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | where EventID == 4624 and LogonType == 3 and AuthenticationPackageName == "NTLM"
-
-    | where TargetUserName !endswith "$"
-
-    | summarize SourceIPs = dcount(IpAddress) by TargetUserName, bin(TimeGenerated, 1h)
-
-    | where SourceIPs >= 3'
-  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
-    \ events\nWHERE eventid = 4624\n  AND INOFFSET(starttime, LAST 300 SECONDS)\nGROUP BY username, hostname, QIDNAME(qid)\n\
-    \nORDER BY starttime DESC"
-  yara_l: "rule tdl_lm_001 {\n  meta:\n    author = \"TDL\"\n    description = \"Pass-the-Hash NTLM Lateral Movement\"\n \
-    \   severity = \"HIGH\"\n    tactic = \"TA0008\"\n    technique = \"T1550.002\"\n\n  events:\n    $event.metadata.event_type\
-    \ = \"GENERIC_EVENT\"\n    $event.metadata.product_event_type = \"4624\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
-    \ = $user\n\n  match:\n    $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
+  spl: |
+    index=windows sourcetype="WinEventLog:Security"
+    | search event_id IN ("4624")
+    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
+    | where count >= 1
+    | sort - count
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1d)
+    | where event_id in ("4624")
+    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
+      AND "event_id" IN ('4624')
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_lm_001 {
+      meta:
+        author = "TDL"
+        description = "Pass-the-Hash NTLM Lateral Movement"
+        severity = "HIGH"
+        tactic = "TA0008"
+        technique = "T1550.002"
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.event_id = /(4624)/
+        $user = $e.target.user.userid
+      match:
+        $user over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.security*,logs-system.security*
     | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN (''4624'')
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT event_count DESC'
-  leql: 'where(event_id IN [4624])
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)'
-  crowdstrike: 'event_simpleName=UserLogon
-
-    | where LogonType = 3 AND AuthenticationPackage = "NTLM" AND UserName!="*$"
-
-    | stats dc(RemoteIP) as src_count by UserName, aid
-
-    | where src_count >= 3'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = "PROCESS" and action_evtlog_event_id in (4624)
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time
-
-    | sort desc _time'
-  lucene: event_id:(4624)
-  sumo: '_sourceCategory=*windows*
-
+    | WHERE event.category == "authentication" AND event_id IN ("4624")
+    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+    | SORT count DESC
+  leql: |
+    where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4624])
+    groupby(destination_account, source_ip, asset)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4624)
+    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+    | sort -auth_events
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.LOGIN AND event_id in ("4624")
+    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+    | sort desc logins
+  lucene: |
+    event.category:"authentication" AND event_id:(4624)
+  sumo: |
+    _sourceCategory=*windows*security* OR _sourceCategory=*ad*
     | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1550.002*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | where event_id IN ("4624")
+    | count by host, user, src_ip, logon_type, event_id
+    | sort by _count desc
 false_positives:
 - Legitimate admin accounts managing multiple systems
 tags:
@@ -95,12 +84,12 @@ tags:
 author: TDL
 created: '2024-02-10'
 test_method: purple_team
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, target host, and the protocol / credential used.'
-- "Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints \u2014 confirm the cross-host action (SMB write,\
-  \ WinRM exec, RDP session, kubectl exec) and the auth context."
-- "Pull a graph of the source identity's recent host touches \u2014 adversaries hop quickly across multiple endpoints."
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — confirm the cross-host action (SMB write, WinRM
+  exec, RDP session, kubectl exec) and the auth context.
+- Pull a graph of the source identity's recent host touches — adversaries hop quickly across multiple endpoints.
 - 'Validate against change tickets and admin patterns: is this admin-bastion traffic or worker-to-worker movement that has
   no business justification?'
 - 'Decide TP / FP: FP for sanctioned admin / vulnerability-scan / RMM activity; TP for movement that crosses security zones

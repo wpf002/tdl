@@ -16,63 +16,69 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: 'index=windows
-
-    | table _time, host, user, ProcessName, CommandLine'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
-  aql: 'SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
-
+  spl: |
+    index=endpoint sourcetype=Sysmon EventCode=1
+    | search process_name="*.+*"
+    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
+    | where count >= 1
+    | sort - count
+  kql: |
+    DeviceProcessEvents
+    | where TimeGenerated > ago(1d)
+    | where process_name matches regex ".+"
+    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
     FROM events
-
-    WHERE INOFFSET(starttime, LAST 300 SECONDS)
-
-    GROUP BY username, hostname, QIDNAME(qid)
-
-    ORDER BY starttime DESC'
-  yara_l: "rule zs_dis_000640 {\n  meta:\n    author = \"TDL\"\n    description = \"LDAP Trust Recon - Defender\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1482\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\
-    \n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n    $host over 5m\n\n \
-    \ condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT @timestamp DESC'
-  leql: 'where(logset = "Endpoint Activity")
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)
-
-    having(event_count >= 1)'
-  crowdstrike: 'event_simpleName=ProcessRollup2
-
-    | stats count as proc_count by ComputerName, FileName
-
-    | where proc_count >= 1
-
-    | sort -proc_count'
-  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
-    \ _time"
-  lucene: event_id:* AND log_type:"security"
-  sumo: '_sourceCategory=*endpoint/edr*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1482*"
-
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" = '1'
+      AND "process_name" LIKE '%.+%'
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_dis_000640 {
+      meta:
+        author = "TDL"
+        description = "LDAP Trust Recon - Defender"
+        severity = "LOW"
+        tactic = "TA0007"
+        technique = "T1482"
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.process_name = /.+/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*,logs-windows*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND process_name=/.+/)
+    groupby(asset, process_name, parent_process_name)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 AND process_name=*.+*
+    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+    | sort -occurrences
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+    | sort desc occurrences
+  lucene: |
+    event.category:"process" AND process_name:*.+*
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id="1" AND process_name matches "*.+*"
     | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | sort by _count desc
 false_positives:
 - Security software
 - Authorized admin tools
@@ -82,7 +88,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 pseudo_logic: "1 AdvancedHunting Device Event\nWhere event_category = \"AdvancedHunting-DeviceEvents\"\nWhere event_type =\
   \ \"LdapSearch\"\nWhere tags != \"[ ]\"\nWhere scope!=\"Base\"\n\nWhere (\n    additional_fields contains \"(objectCategory=nTDSDSA)\"\
@@ -91,11 +97,11 @@ pseudo_logic: "1 AdvancedHunting Device Event\nWhere event_category = \"Advanced
   (objectSid=)\"\n)"
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'
-- "Inspect the parent \u2192 child process tree, command line arguments, and code-signing status \u2014 determine whether\
-  \ the enumeration is targeted (specific user / share / OU) or scattered (broad, scripted)."
+- Inspect the parent → child process tree, command line arguments, and code-signing status — determine whether the enumeration
+  is targeted (specific user / share / OU) or scattered (broad, scripted).
 - 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from
   a finance or HR identity is high-signal.'
-- "Pull adjacent execution / lateral-movement / cred-access telemetry \u2014 discovery often precedes the next stage by minutes."
+- Pull adjacent execution / lateral-movement / cred-access telemetry — discovery often precedes the next stage by minutes.
 - 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and
   adjacent telemetry is suspicious.'
 - 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity

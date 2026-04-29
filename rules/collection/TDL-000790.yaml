@@ -1,8 +1,8 @@
 rule_id: TDL-COL-000790
 v4_id: 000790
 name: Mass File Read from Removable Volume
-description: "\u2265100 file reads from a DriveType=2 (removable) volume by user-shell process in 5m. Generated from gap analysis\
-  \ against canonical ATT&CK Enterprise matrix (T1025 under Collection)."
+description: ≥100 file reads from a DriveType=2 (removable) volume by user-shell process in 5m. Generated from gap analysis
+  against canonical ATT&CK Enterprise matrix (T1025 under Collection).
 tactic: Collection
 tactic_id: TA0009
 technique_id: T1025
@@ -19,72 +19,75 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: 'index=endpoint sourcetype=Sysmon (EventCode=11 OR EventCode=23 OR EventCode=26)
-
-    | search file.path="*usb-read*"
-
-    | stats count, values(host) as hosts by user, image, target_filename
-
+  spl: |
+    index=endpoint sourcetype=Sysmon EventCode=1
+    | search process_name="*.+*"
+    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
     | where count >= 1
-
-    | sort - count'
-  kql: 'DeviceFileEvents
-
+    | sort - count
+  kql: |
+    DeviceProcessEvents
     | where TimeGenerated > ago(1d)
-
-    | where file.path matches regex "usb-read"
-
-    | summarize Count=count() by DeviceName, InitiatingProcessFileName, FolderPath, FileName
-
-    | order by Count desc'
-  aql: "SELECT DEVICETIME, sourceip, \"File Path\", \"Process Name\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft\
-    \ Windows Sysmon'\n  AND \"EventID\" IN ('11','23','26')\n  AND \"file.path\" LIKE '%usb-read%'\nLAST 24 HOURS"
-  yara_l: "rule tdl_tdl_col_000790 {\n  meta:\n    author = \"TDL\"\n    description = \"Mass File Read from Removable Volume\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0009\"\n    technique = \"T1025\"\n  events:\n    $e.metadata.event_type\
-    \ = \"FILE_CREATION\"\n    $e.file.path = /usb-read/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n\
-    \  condition:\n    $e\n}"
-  esql: 'FROM logs-endpoint*
-
+    | where process_name matches regex ".+"
+    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" = '1'
+      AND "process_name" LIKE '%.+%'
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_col_000790 {
+      meta:
+        author = "TDL"
+        description = "Mass File Read from Removable Volume"
+        severity = "MEDIUM"
+        tactic = "TA0009"
+        technique = "T1025"
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.process_name = /.+/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*,logs-windows*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "file" AND file.path LIKE "%usb-read%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, file.path, process.name
-
-    | SORT count DESC'
-  leql: 'where(logset = "Endpoint Activity" AND log_type = "file" AND file.path=/usb-read/)
-
-    groupby(asset, file_path, process_name)
-
-    calculate(count)'
-  crowdstrike: 'event_simpleName IN (FileWritten, NewExecutableWritten) AND file.path=*usb-read*
-
-    | stats count as writes by ComputerName, UserName, FileName, ImageFileName
-
-    | sort -writes'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.FILE AND file.path ~= "usb-read"
-
-    | comp count() as writes by agent_hostname, actor_effective_username, action_file_name, action_file_path
-
-    | sort desc writes'
-  lucene: event.category:"file" AND file.path:*usb-read*
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*linux/auditd*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("11","23","26") AND _raw matches "*T1025*"
-
-    | count by host, user, target_filename, image
-
-    | sort by _count desc'
-pseudo_logic: "\u2265100 file reads from a DriveType=2 (removable) volume by user-shell process in 5m."
+    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND process_name=/.+/)
+    groupby(asset, process_name, parent_process_name)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 AND process_name=*.+*
+    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+    | sort -occurrences
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+    | sort desc occurrences
+  lucene: |
+    event.category:"process" AND process_name:*.+*
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id="1" AND process_name matches "*.+*"
+    | count by host, user, parent_process_name, command_line
+    | sort by _count desc
+pseudo_logic: ≥100 file reads from a DriveType=2 (removable) volume by user-shell process in 5m.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: "Proposed rule generated from ATT&CK gap analysis \u2014 review the pseudo_logic, scope filters to the right\
-  \ asset group, and refine thresholds using \u22657 days of telemetry before promoting."
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
+  group, and refine thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - usb
@@ -95,12 +98,12 @@ references:
 - https://attack.mitre.org/techniques/T1025/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'
-- "Inspect the file path, file hash, parent process, and any prior network/email delivery \u2014 determine the collection\
-  \ scope (single file, recursive walk, mailbox export)."
+- Inspect the file path, file hash, parent process, and any prior network/email delivery — determine the collection scope
+  (single file, recursive walk, mailbox export).
 - 'Compare against business need: does this user have a legitimate reason to read this data set in this way?'
 - 'Pull staging telemetry: archive creation, large temp folders, encrypted blobs in unusual locations within the next 30 minutes.'
 - 'Decide TP / FP: FP for sanctioned migration / backup / DLP testing; TP if collection volume is anomalous and lacks a ticket.'

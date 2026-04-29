@@ -15,70 +15,67 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: 'index=network
-
-    | bucket _time span=5m
-
-    | stats dc(dest_port) as ports, dc(dest_ip) as hosts by _time, src_ip
-
-    | where ports >= 20 OR hosts >= 30
-
-    | table _time, src_ip, dest_ip, dest_port, action'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
-  aql: "SELECT sourceip, COUNT(DISTINCT destinationport) AS unique_ports,\n       COUNT(DISTINCT destinationip) AS unique_hosts,\
-    \ COUNT(*) AS total_conns\nFROM flows\nWHERE INOFFSET(starttime, LAST 300 SECONDS)\nGROUP BY sourceip\nHAVING unique_ports\
-    \ >= 20 OR unique_hosts >= 30\nORDER BY unique_ports DESC"
-  yara_l: "rule zs_dis_000429 {\n  meta:\n    author = \"TDL\"\n    description = \"Advanced IP/Port Scanner Update Check\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0007\"\n    technique = \"T1590\"\n\n  events:\n    $event.metadata.event_type\
-    \ = \"GENERIC_EVENT\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n \
-    \   $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-network*,logs-firewall*
-
+  spl: |
+    index=network sourcetype=firewall OR sourcetype=ids
+    | search network.protocol="*tcp*"
+    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
+    | where count >= 1
+    | sort - bytes_out
+  kql: |
+    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+    | where TimeGenerated > ago(1d)
+    | where network.protocol matches regex "tcp"
+    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+    | order by Bytes desc
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+    FROM flows
+    WHERE "network.protocol" LIKE '%tcp%'
+    GROUP BY sourceip, destinationip, destinationport
+    LAST 1 HOURS
+  yara_l: |
+    rule tdl_tdl_dis_000429 {
+      meta:
+        author = "TDL"
+        description = "Advanced IP/Port Scanner Update Check"
+        severity = "MEDIUM"
+        tactic = "TA0007"
+        technique = "T1590"
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.protocol = /tcp/
+        $src = $e.principal.ip
+      match:
+        $src over 10m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network*,logs-endpoint*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | STATS unique_ports = COUNT_DISTINCT(destination.port), unique_hosts = COUNT_DISTINCT(destination.ip), total = COUNT(*)
-    BY source.ip, @timestamp = BUCKET(@timestamp, 5 minutes)
-
-    | WHERE unique_ports >= 20 OR unique_hosts >= 30
-
-    | SORT unique_ports DESC'
-  leql: 'where(logset = "Firewall Activity")
-
-    groupby(source_ip)
-
-    calculate(unique_count:destination_port AS unique_ports)
-
-    calculate(unique_count:destination_ip AS unique_hosts)
-
-    having(unique_ports >= 20 OR unique_hosts >= 30)'
-  crowdstrike: 'event_simpleName=ProcessRollup2
-
-    | stats count as proc_count by ComputerName, FileName
-
-    | where proc_count >= 1
-
-    | sort -proc_count'
-  xql: "dataset = xdr_data\n| filter event_type = \"NETWORK\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
-    \ _time"
-  lucene: 'log_type:"firewall" AND NOT destination_ip:"10.0.0.0/8"
-
-    AND NOT destination_ip:"172.16.0.0/12"
-
-    AND NOT destination_ip:"192.168.0.0/16"'
-  sumo: '_sourceCategory=*windows*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1590*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+    | SORT bytes_out DESC
+  leql: |
+    where(logset = "Network Activity" AND network.protocol=/tcp/)
+    groupby(source_ip, destination_ip, destination_port)
+    calculate(count, sum(bytes_out))
+  crowdstrike: |
+    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
+    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
+    | sort -bytes_out
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
+    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
+    | sort desc bytes_out
+  lucene: |
+    event.category:"network" AND network.protocol:*tcp*
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+    | where network.protocol matches "*tcp*"
+    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+    | sort by bytes_out desc
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -88,17 +85,17 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 pseudo_logic: "1 Outbound Forward Proxy event\nWhere URL contains \"checkupdate.php\"\n    AND Where Query Parameters Contain\
   \ (\"lng=\"\n    OR \"ver=\"\n    OR \"beta=\"\n    OR \"type=\"\n    OR \"rmode=\"\n    OR \"product=\")"
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'
-- "Inspect the parent \u2192 child process tree, command line arguments, and code-signing status \u2014 determine whether\
-  \ the enumeration is targeted (specific user / share / OU) or scattered (broad, scripted)."
+- Inspect the parent → child process tree, command line arguments, and code-signing status — determine whether the enumeration
+  is targeted (specific user / share / OU) or scattered (broad, scripted).
 - 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from
   a finance or HR identity is high-signal.'
-- "Pull adjacent execution / lateral-movement / cred-access telemetry \u2014 discovery often precedes the next stage by minutes."
+- Pull adjacent execution / lateral-movement / cred-access telemetry — discovery often precedes the next stage by minutes.
 - 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and
   adjacent telemetry is suspicious.'
 - 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity

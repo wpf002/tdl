@@ -13,67 +13,68 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 80
 queries:
-  spl: 'index=windows sourcetype=WinEventLog:System EventCode=7045
-
-    | where match(ServiceFileName, "(?i)(\\temp\\|\\appdata\\|\\public\\")
-
-    | table _time, host, AccountName, ServiceName, ServiceFileName'
-  kql: 'DeviceEvents
-
-    | where TimeGenerated >= ago(1d)
-
-    | where ActionType == "ServiceInstalled"
-
-    | where AdditionalFields matches regex @"(?i)(\\temp\\|\\appdata\\|\\public\\)"
-
-    | project TimeGenerated, DeviceName, InitiatingProcessAccountName, AdditionalFields'
-  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
-    \ events\nWHERE eventid = 7045\n  AND INOFFSET(starttime, LAST 300 SECONDS)\nGROUP BY username, hostname, QIDNAME(qid)\n\
-    \nORDER BY starttime DESC"
-  yara_l: "rule tdl_per_002 {\n  meta:\n    author = \"TDL\"\n    description = \"New Service Created with Suspicious Executable\
-    \ Path\"\n    severity = \"HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1543.003\"\n\n  events:\n    $event.metadata.event_type\
-    \ = \"GENERIC_EVENT\"\n    $event.metadata.product_event_type = \"7045\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
-    \ = $user\n\n  match:\n    $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
+  spl: |
+    index=windows sourcetype="WinEventLog:Security"
+    | search event_id IN ("7045")
+    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
+    | where count >= 1
+    | sort - count
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1d)
+    | where event_id in ("7045")
+    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
+      AND "event_id" IN ('7045')
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_per_002 {
+      meta:
+        author = "TDL"
+        description = "New Service Created with Suspicious Executable Path"
+        severity = "HIGH"
+        tactic = "TA0003"
+        technique = "T1543.003"
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.event_id = /(7045)/
+        $user = $e.target.user.userid
+      match:
+        $user over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.security*,logs-system.security*
     | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN (''7045'')
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT event_count DESC'
-  leql: 'where(event_id IN [7045])
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)'
-  crowdstrike: 'event_simpleName=SecurityEvent
-
-    | where EventCode=7045
-
-    | table ComputerName, UserName, CommandLine, ContextTimeStamp'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = "PROCESS" and action_evtlog_event_id in (7045)
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time
-
-    | sort desc _time'
-  lucene: event_id:(7045)
-  sumo: '_sourceCategory=*windows*
-
+    | WHERE event.category == "authentication" AND event_id IN ("7045")
+    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+    | SORT count DESC
+  leql: |
+    where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [7045])
+    groupby(destination_account, source_ip, asset)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (7045)
+    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+    | sort -auth_events
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.LOGIN AND event_id in ("7045")
+    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+    | sort desc logins
+  lucene: |
+    event.category:"authentication" AND event_id:(7045)
+  sumo: |
+    _sourceCategory=*windows*security* OR _sourceCategory=*ad*
     | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1543.003*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | where event_id IN ("7045")
+    | count by host, user, src_ip, logon_type, event_id
+    | sort by _count desc
 false_positives:
 - Some legitimate software in non-standard paths
 tags:
@@ -82,16 +83,16 @@ tags:
 author: TDL
 created: '2024-01-20'
 test_method: purple_team
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service
   / config).'
-- "Inspect the parent \u2192 child process tree, command line arguments, and code-signing status \u2014 verify the persistence\
-  \ target points to an unusual location or unsigned binary."
-- "Determine when the artifact was created and which process/account performed the write \u2014 pivot on that process for\
-  \ the original attack chain."
+- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the persistence target
+  points to an unusual location or unsigned binary.
+- Determine when the artifact was created and which process/account performed the write — pivot on that process for the original
+  attack chain.
 - 'Look for prior child-process activity from the persistence target: did anything actually launch from it?'
-- "Decide TP / FP: FP for sanctioned management software (RMM, vendor agents, custom installers) \u2014 verify against the\
-  \ asset register."
+- 'Decide TP / FP: FP for sanctioned management software (RMM, vendor agents, custom installers) — verify against the asset
+  register.'
 - 'If TP: remove the persistence artifact, isolate the host, hunt for the same artifact across the fleet, and rotate any credentials
   touched by the persistent process.'

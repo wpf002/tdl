@@ -22,74 +22,74 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: 'index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-
-    | search userIdentity.principalId="*trust*"
-
+  spl: |
+    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
+    | search eventName="*.+*"
     | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-
     | where count >= 1
-
-    | sort - count'
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
+    | sort - count
+  kql: |
+    union AWSCloudTrail, AzureActivity, AuditLogs
     | where TimeGenerated > ago(1d)
-
-    | where userIdentity.principalId matches regex "trust"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId,
-    ResourceProvider))
-
-    | order by Count desc'
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"userIdentity.principalId\" LIKE '%trust%'\nLAST 24 HOURS"
-  yara_l: "rule tdl_tdl_auth_000701 {\n  meta:\n    author = \"TDL\"\n    description = \"Federated Trust Login from Third-Party\
-    \ Tenant\"\n    severity = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1199\"\n  events:\n    $e.metadata.event_type\
-    \ = \"USER_RESOURCE_ACCESS\"\n    $e.userIdentity.principalId = /trust/\n    $actor = $e.principal.user.userid\n  match:\n\
-    \    $actor over 30m\n  condition:\n    $e\n}"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
+    | where eventName matches regex ".+"
+    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
+      AND "eventName" LIKE '%.+%'
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_auth_000701 {
+      meta:
+        author = "TDL"
+        description = "Federated Trust Login from Third-Party Tenant"
+        severity = "HIGH"
+        tactic = "TA0001"
+        technique = "T1199"
+      events:
+        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
+        $e.eventName = /.+/
+        $actor = $e.principal.user.userid
+      match:
+        $actor over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws*,logs-azure*,logs-gcp*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE userIdentity.principalId LIKE "%trust%"
-
+    | WHERE eventName LIKE "%.+%"
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC'
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND userIdentity.principalId=/trust/)
-
+    | SORT count DESC
+  leql: |
+    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
     groupby(actor, event_name)
-
-    calculate(count)'
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND userIdentity.principalId=*trust*
-
+    calculate(count)
+  crowdstrike: |
+    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
     | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls'
-  xql: 'dataset = cloud_audit_logs
-
-    | filter userIdentity.principalId ~= "trust"
-
+    | sort -calls
+  xql: |
+    dataset = cloud_audit_logs
+    | filter eventName ~= ".+"
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls'
-  lucene: event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND userIdentity.principalId:*trust*
-  sumo: '_sourceCategory=*cloud/audit* OR _sourceCategory=*saas/audit*
-
-    | parse regex "\"userIdentity\":\{\"arn\":\"(?<actor>[^\"]+)" nodrop
-
-    | where _raw matches "*T1199*"
-
-    | count by actor, eventName, sourceIPAddress
-
-    | sort by _count desc'
+    | sort desc calls
+  lucene: |
+    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+  sumo: |
+    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+    | where eventName matches "*.+*"
+    | count by userIdentity_arn, eventName, sourceIPAddress
+    | sort by _count desc
 pseudo_logic: Successful console/API login originates from an external IdP or partner tenant outside the approved trust list.
   Adversaries pivot through compromised MSPs and partners.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: "Proposed rule generated from ATT&CK gap analysis \u2014 review the pseudo_logic, scope filters to the right\
-  \ asset group, and refine thresholds using \u22657 days of telemetry before promoting."
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
+  group, and refine thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - third-party
@@ -101,7 +101,7 @@ references:
 - https://attack.mitre.org/techniques/T1199/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

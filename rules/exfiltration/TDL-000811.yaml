@@ -17,77 +17,73 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: 'index=network sourcetype=firewall OR sourcetype=ids
-
-    | search network.bytes_sent="*c2-bulk*"
-
+  spl: |
+    index=network sourcetype=firewall OR sourcetype=ids
+    | search network.protocol="*tcp*"
     | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-
     | where count >= 1
-
-    | sort - bytes_out'
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
+    | sort - bytes_out
+  kql: |
+    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
     | where TimeGenerated > ago(1d)
-
-    | where network.bytes_sent matches regex "c2-bulk"
-
+    | where network.protocol matches regex "tcp"
     | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc'
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+    | order by Bytes desc
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
     FROM flows
-
-    WHERE "network.bytes_sent" LIKE ''%c2-bulk%''
-
+    WHERE "network.protocol" LIKE '%tcp%'
     GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS'
-  yara_l: "rule tdl_tdl_exf_000811 {\n  meta:\n    author = \"TDL\"\n    description = \"Outbound Volume Spike on Existing\
-    \ C2 Beacon\"\n    severity = \"HIGH\"\n    tactic = \"TA0010\"\n    technique = \"T1041\"\n  events:\n    $e.metadata.event_type\
-    \ = \"NETWORK_CONNECTION\"\n    $e.network.bytes_sent = /c2-bulk/\n    $src = $e.principal.ip\n  match:\n    $src over\
-    \ 10m\n  condition:\n    $e\n}"
-  esql: 'FROM logs-network*,logs-endpoint*
-
+    LAST 1 HOURS
+  yara_l: |
+    rule tdl_tdl_exf_000811 {
+      meta:
+        author = "TDL"
+        description = "Outbound Volume Spike on Existing C2 Beacon"
+        severity = "HIGH"
+        tactic = "TA0010"
+        technique = "T1041"
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.protocol = /tcp/
+        $src = $e.principal.ip
+      match:
+        $src over 10m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network*,logs-endpoint*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.bytes_sent LIKE "%c2-bulk%"
-
+    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
     | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC'
-  leql: 'where(logset = "Network Activity" AND network.bytes_sent=/c2-bulk/)
-
+    | SORT bytes_out DESC
+  leql: |
+    where(logset = "Network Activity" AND network.protocol=/tcp/)
     groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))'
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.bytes_sent=*c2-bulk*
-
+    calculate(count, sum(bytes_out))
+  crowdstrike: |
+    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
     | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.bytes_sent ~= "c2-bulk"
-
+    | sort -bytes_out
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
     | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out'
-  lucene: event.category:"network" AND network.bytes_sent:*c2-bulk*
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids*
-
-    | where technique="T1041" OR _raw matches "*T1041*"
-
-    | count, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc'
+    | sort desc bytes_out
+  lucene: |
+    event.category:"network" AND network.protocol:*tcp*
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+    | where network.protocol matches "*tcp*"
+    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+    | sort by bytes_out desc
 pseudo_logic: Established outbound session previously beaconing <1MB/h suddenly transfers >50MB in 10m. Exfil over C2.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: "Proposed rule generated from ATT&CK gap analysis \u2014 review the pseudo_logic, scope filters to the right\
-  \ asset group, and refine thresholds using \u22657 days of telemetry before promoting."
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
+  group, and refine thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - exfil-c2
@@ -97,12 +93,12 @@ references:
 - https://attack.mitre.org/techniques/T1041/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination, total bytes transferred, and the protocol used.'
-- "Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints \u2014 quantify the data volume vs the host's\
-  \ baseline outbound profile."
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — quantify the data volume vs the host's baseline
+  outbound profile.
 - 'Pivot to preceding collection / staging activity: archives, mailbox dumps, database extracts in the prior 24h on the same
   host.'
 - Identify what was likely exfiltrated (path patterns, file types, classification labels) and the user/process that produced

@@ -21,72 +21,76 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: 'index=endpoint sourcetype=Sysmon (EventCode=12 OR EventCode=13 OR EventCode=14)
-
-    | search registry.path="*run-key*"
-
-    | stats count, values(host) as hosts by user, target_object, details, image
-
-    | sort - count'
-  kql: 'DeviceRegistryEvents
-
+  spl: |
+    index=endpoint sourcetype=Sysmon EventCode=1
+    | search process_name="*.+*"
+    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
+    | where count >= 1
+    | sort - count
+  kql: |
+    DeviceProcessEvents
     | where TimeGenerated > ago(1d)
-
-    | where registry.path matches regex "run-key"
-
-    | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
-
-    | order by Count desc'
-  aql: "SELECT DEVICETIME, sourceip, \"Registry Key\", \"Registry Value Name\", \"Registry Value Data\", \"Process Name\"\n\
-    FROM events\nWHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n  AND \"EventID\" IN ('12','13','14')\n\
-    \  AND \"registry.path\" LIKE '%run-key%'\nLAST 24 HOURS"
-  yara_l: "rule tdl_tdl_pe_000717 {\n  meta:\n    author = \"TDL\"\n    description = \"Run Key Modified Pointing to User-Writable\
-    \ Path\"\n    severity = \"HIGH\"\n    tactic = \"TA0004\"\n    technique = \"T1547\"\n  events:\n    $e.metadata.event_type\
-    \ = \"REGISTRY_MODIFICATION\"\n    $e.registry.path = /run-key/\n    $host = $e.principal.hostname\n  match:\n    $host\
-    \ over 30m\n  condition:\n    $e\n}"
-  esql: 'FROM logs-endpoint*
-
+    | where process_name matches regex ".+"
+    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" = '1'
+      AND "process_name" LIKE '%.+%'
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_pe_000717 {
+      meta:
+        author = "TDL"
+        description = "Run Key Modified Pointing to User-Writable Path"
+        severity = "HIGH"
+        tactic = "TA0004"
+        technique = "T1547"
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.process_name = /.+/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*,logs-windows*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "registry" AND registry.path LIKE "%run-key%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
-
-    | SORT count DESC'
-  leql: 'where(logset = "Endpoint Activity" AND log_type = "registry" AND registry.path=/run-key/)
-
-    groupby(asset, registry_key, registry_value)
-
-    calculate(count)'
-  crowdstrike: 'event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry.path=*run-key*
-
-    | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
-
-    | sort -changes'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.REGISTRY AND registry.path ~= "run-key"
-
-    | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
-
-    | sort desc changes'
-  lucene: event.category:"registry" AND registry.path:*run-key*
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint/edr* OR _sourceCategory=*windows/events*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("12","13","14") AND _raw matches "*T1547*"
-
-    | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc'
+    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND process_name=/.+/)
+    groupby(asset, process_name, parent_process_name)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 AND process_name=*.+*
+    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+    | sort -occurrences
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+    | sort desc occurrences
+  lucene: |
+    event.category:"process" AND process_name:*.+*
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id="1" AND process_name matches "*.+*"
+    | count by host, user, parent_process_name, command_line
+    | sort by _count desc
 pseudo_logic: HKLM\...\Run or HKCU\...\Run value set to an executable in %TEMP%/%APPDATA%/Public. Re-launches malicious binary
   at boot/logon with that user's context.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: "Proposed rule generated from ATT&CK gap analysis \u2014 review the pseudo_logic, scope filters to the right\
-  \ asset group, and refine thresholds using \u22657 days of telemetry before promoting."
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
+  group, and refine thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - autostart
@@ -98,12 +102,12 @@ references:
 - https://attack.mitre.org/techniques/T1547/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, source user, and (if visible) the resulting privileged context.'
-- "Inspect the registry hive, key path, value name, and writing process \u2014 verify the privilege gain was not part of an\
-  \ approved elevation flow (UAC consent, sudo, PAM ticket)."
+- Inspect the registry hive, key path, value name, and writing process — verify the privilege gain was not part of an approved
+  elevation flow (UAC consent, sudo, PAM ticket).
 - 'Pull preceding 1h of activity for the source user: was there earlier credential-access / discovery / exploit telemetry?'
 - 'Validate token / session changes: new SeImpersonate-style privileges, new IAM role assumption, or a SYSTEM-level child
   process from a user-level parent.'

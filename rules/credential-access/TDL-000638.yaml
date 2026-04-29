@@ -16,63 +16,68 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: 'index=windows
-
-    | table _time, host, user, ProcessName, CommandLine'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
-  aql: 'SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
-
+  spl: |
+    index=windows sourcetype="WinEventLog:Security"
+    | search event_id IN ("4624", "4625", "4768", "4769", "4776")
+    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
+    | where count >= 1
+    | sort - count
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1d)
+    | where event_id in ("4624", "4625", "4768", "4769", "4776")
+    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
     FROM events
-
-    WHERE INOFFSET(starttime, LAST 300 SECONDS)
-
-    GROUP BY username, hostname, QIDNAME(qid)
-
-    ORDER BY starttime DESC'
-  yara_l: "rule zs_ca_000638 {\n  meta:\n    author = \"TDL\"\n    description = \"LDAP Kerberos Recon - Defender\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0006\"\n    technique = \"T1558\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\
-    \n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n    $host over 5m\n\n \
-    \ condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
+      AND "event_id" IN ('4624', '4625', '4768', '4769', '4776')
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_ca_000638 {
+      meta:
+        author = "TDL"
+        description = "LDAP Kerberos Recon - Defender"
+        severity = "LOW"
+        tactic = "TA0006"
+        technique = "T1558"
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.event_id = /(4624|4625|4768|4769|4776)/
+        $user = $e.target.user.userid
+      match:
+        $user over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.security*,logs-system.security*
     | WHERE @timestamp > NOW() - 1 day
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT @timestamp DESC'
-  leql: 'where(logset = "Endpoint Activity")
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)
-
-    having(event_count >= 1)'
-  crowdstrike: 'event_simpleName=ProcessRollup2
-
-    | stats count as proc_count by ComputerName, FileName
-
-    | where proc_count >= 1
-
-    | sort -proc_count'
-  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
-    \ _time"
-  lucene: event_id:* AND log_type:"security"
-  sumo: '_sourceCategory=*endpoint/edr*
-
+    | WHERE event.category == "authentication" AND event_id IN ("4624", "4625", "4768", "4769", "4776")
+    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+    | SORT count DESC
+  leql: |
+    where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4624, 4625, 4768, 4769, 4776])
+    groupby(destination_account, source_ip, asset)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4624, 4625, 4768, 4769, 4776)
+    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+    | sort -auth_events
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.LOGIN AND event_id in ("4624", "4625", "4768", "4769", "4776")
+    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+    | sort desc logins
+  lucene: |
+    event.category:"authentication" AND event_id:(4624 OR 4625 OR 4768 OR 4769 OR 4776)
+  sumo: |
+    _sourceCategory=*windows*security* OR _sourceCategory=*ad*
     | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1558*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | where event_id IN ("4624", "4625", "4768", "4769", "4776")
+    | count by host, user, src_ip, logon_type, event_id
+    | sort by _count desc
 false_positives:
 - Security software
 - Authorized admin tools
@@ -82,7 +87,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 pseudo_logic: "1 AdvancedHunting Device Event\nWhere event_category = \"AdvancedHunting-DeviceEvents\"\nWhere event_type =\
   \ \"LdapSearch\"\nWhere tags != \"[ ]\"\nWhere scope!=\"Base\"\n\nWhere (\n    additional_fields contains \"(userAccountControl:1.2.840.113556.1.4.803:=4194304)\"\
@@ -92,8 +97,8 @@ pseudo_logic: "1 AdvancedHunting Device Event\nWhere event_category = \"Advanced
   \n)"
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- "Inspect the source IP, geo / ASN, authentication method, and prior sign-in pattern for the user \u2014 verify the read\
-  \ / dump / brute-force pattern is consistent with this technique."
+- Inspect the source IP, geo / ASN, authentication method, and prior sign-in pattern for the user — verify the read / dump
+  / brute-force pattern is consistent with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
 - 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
   kerberos tickets).'

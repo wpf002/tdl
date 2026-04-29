@@ -18,65 +18,68 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: 'index=windows
-
-    | where (EventCode=4657 OR EventCode=4657)
-
-    | table _time, host, user, ProcessName, CommandLine'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | where EventID in (4657, 4657)
-
-    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
-  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
-    \ events\nWHERE eventid = 4657\n  AND INOFFSET(starttime, LAST 300 SECONDS)\nGROUP BY username, hostname, QIDNAME(qid)\n\
-    \nORDER BY starttime DESC"
-  yara_l: "rule zs_de_000153 {\n  meta:\n    author = \"TDL\"\n    description = \"Sensitive Registry Key Modification\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1112\"\n\n  events:\n    $event.metadata.event_type\
-    \ = \"GENERIC_EVENT\"\n    $event.metadata.product_event_type = \"4657\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
-    \ = $user\n\n  match:\n    $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN (''4657'')
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT event_count DESC'
-  leql: 'where(event_id IN [4657])
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)'
-  crowdstrike: 'event_simpleName=SecurityEvent
-
-    | where EventCode=4657
-
-    | table ComputerName, UserName, CommandLine, ContextTimeStamp'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = "PROCESS" and action_evtlog_event_id in (4657)
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time
-
-    | sort desc _time'
-  lucene: event_id:(4657)
-  sumo: '_sourceCategory=*ids*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("12","13","14") AND _raw matches "*T1112*"
-
+  spl: |
+    index=endpoint sourcetype=Sysmon (EventCode=12 OR EventCode=13 OR EventCode=14)
+    | search registry_key="*.+*"
+    | stats count, values(host) as hosts by user, target_object, details, image
+    | sort - count
+  kql: |
+    DeviceRegistryEvents
+    | where TimeGenerated > ago(1d)
+    | where registry_key matches regex ".+"
+    | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "Registry Key", "Registry Value Name", "Registry Value Data", "Process Name"
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" IN ('12','13','14')
+      AND "registry_key" LIKE '%.+%'
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_de_000153 {
+      meta:
+        author = "TDL"
+        description = "Sensitive Registry Key Modification"
+        severity = "MEDIUM"
+        tactic = "TA0005"
+        technique = "T1112"
+      events:
+        $e.metadata.event_type = "REGISTRY_MODIFICATION"
+        $e.registry_key = /.+/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "registry" AND registry_key LIKE "%.+%"
+    | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/.+/)
+    groupby(asset, registry_key, registry_value)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*.+*
+    | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
+    | sort -changes
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.REGISTRY AND registry_key ~= ".+"
+    | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
+    | sort desc changes
+  lucene: |
+    event.category:"registry" AND registry_key:*.+*
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id IN ("12","13","14") AND registry_key matches "*.+*"
     | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc'
+    | sort by _count desc
 false_positives:
 - Security software
 - Authorized admin tools
@@ -86,7 +89,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 pseudo_logic: '1 Windows Registry Modification Event
 
@@ -96,8 +99,8 @@ pseudo_logic: '1 Windows Registry Modification Event
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
-- "Inspect the registry hive, key path, value name, and writing process \u2014 distinguish administrative tooling from adversary\
-  \ tradecraft (LOLBins, signed binary proxies, masquerading paths)."
+- Inspect the registry hive, key path, value name, and writing process — distinguish administrative tooling from adversary
+  tradecraft (LOLBins, signed binary proxies, masquerading paths).
 - 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log channel state to see what was suppressed.'
 - 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same
   minute.'

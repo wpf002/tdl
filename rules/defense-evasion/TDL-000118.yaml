@@ -18,57 +18,69 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 95
 queries:
-  spl: 'index=linux
-
-    | table _time, host, user, ProcessName, CommandLine'
-  kql: 'Syslog
-
-    | where TimeGenerated >= ago(1d)
-
-    | project TimeGenerated, Computer, Account, Activity'
-  aql: "SELECT username, hostname, QIDNAME(qid) AS event_name, eventid\nFROM events\nWHERE eventid IN (1102, 104)\n  AND INOFFSET(starttime,\
-    \ LAST 86400 SECONDS)\nORDER BY starttime DESC"
-  yara_l: "rule zs_de_000118 {\n  meta:\n    author = \"TDL\"\n    description = \"Audit Log Cleared - HVT\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0005\"\n    technique = \"T1070.001\"\n\n  events:\n    $log_clear.metadata.event_type\
-    \ = \"SYSTEM_AUDIT_LOG_WIPE\"\n    ($log_clear.metadata.product_event_type = \"1102\" or\n     $log_clear.metadata.product_event_type\
-    \ = \"104\")\n    $log_clear.principal.hostname = $host\n\n  match:\n    $host over 24h\n\n  condition:\n    #log_clear\
-    \ >= 1\n\n  outcome:\n    $risk_score = max(90)\n}"
-  esql: 'FROM logs-system.security*,logs-system.system*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN ("1102", "104")
-
-    | KEEP host.name, winlog.event_data.SubjectUserName, event.code, @timestamp
-
-    | SORT @timestamp DESC'
-  leql: 'where(event_id IN [1102, 104])
-
-    groupby(hostname)
-
-    calculate(count AS clear_count)'
-  crowdstrike: 'event_simpleName=SecurityLogCleared OR event_simpleName=EventLogCleared
-
-    | table ComputerName, UserName, EventCode, ContextTimeStamp
-
-    | sort -ContextTimeStamp'
-  xql: 'dataset = xdr_data
-
-    | filter action_evtlog_event_id in (1102, 104)
-
-    | fields hostname, actor_effective_username, action_evtlog_event_id, _time
-
-    | sort desc _time'
-  lucene: event_id:(1102 OR 104)
-  sumo: '_sourceCategory=*ids*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1070*"
-
+  spl: |
+    index=endpoint sourcetype=Sysmon EventCode=1
+    | search event_id IN ("1102", "104")
+    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
+    | where count >= 1
+    | sort - count
+  kql: |
+    DeviceProcessEvents
+    | where TimeGenerated > ago(1d)
+    | where event_id in ("1102", "104")
+    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" = '1'
+      AND "event_id" IN ('1102', '104')
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_de_000118 {
+      meta:
+        author = "TDL"
+        description = "Audit Log Cleared - HVT"
+        severity = "CRITICAL"
+        tactic = "TA0005"
+        technique = "T1070"
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.event_id = /(1102|104)/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*,logs-windows*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "process" AND event_id IN ("1102", "104")
+    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND event_id IN [1102, 104])
+    groupby(asset, process_name, parent_process_name)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 AND event_id IN (1102, 104)
+    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+    | sort -occurrences
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.PROCESS AND event_id in ("1102", "104")
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+    | sort desc occurrences
+  lucene: |
+    event.category:"process" AND event_id:(1102 OR 104)
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id="1" AND event_id IN ("1102", "104")
     | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | sort by _count desc
 false_positives:
 - Security software
 - Authorized admin tools
@@ -78,7 +90,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: historical
 pseudo_logic: "1 Windows Audit Log Cleared Event\nWhere the Source is \"Microsoft-Windows-Eventlog\"\nOR\n\tWhere the Event\
   \ Type is \"Security\"\n\tWhere the Event ID is in [517, 1102]\n\t\n\tWhere the Event Type is \"System\"\n\tWhere the Event\
@@ -90,8 +102,8 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
-- "Inspect the parent \u2192 child process tree, command line arguments, and code-signing status \u2014 distinguish administrative\
-  \ tooling from adversary tradecraft (LOLBins, signed binary proxies, masquerading paths)."
+- Inspect the parent → child process tree, command line arguments, and code-signing status — distinguish administrative tooling
+  from adversary tradecraft (LOLBins, signed binary proxies, masquerading paths).
 - 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log channel state to see what was suppressed.'
 - 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same
   minute.'

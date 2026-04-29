@@ -18,52 +18,69 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: 'index=windows
-
-    | where (EventCode=4688 OR EventCode=4688)
-
-    | table _time, host, Account_Name, IpAddress, LogonType'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | where EventID in (4688, 4688)
-
-    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
-  aql: "SELECT username, hostname, \"Process Name\" AS process, \"Command Line\" AS cmdline\nFROM events\nWHERE (\"Process\
-    \ Name\" ILIKE '%vssadmin.exe%' AND \"Command Line\" ILIKE '%delete%')\n   OR (\"Process Name\" ILIKE '%wmic.exe%' AND\
-    \ \"Command Line\" ILIKE '%shadowcopy%delete%')\n  AND INOFFSET(starttime, LAST 86400 SECONDS)\nORDER BY starttime DESC"
-  yara_l: "rule zs_ca_000115 {\n  meta:\n    author = \"TDL\"\n    description = \"Windows Shadow Copy Creation\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0040\"\n    technique = \"T1490\"\n\n  events:\n    $proc.metadata.event_type = \"\
-    PROCESS_LAUNCH\"\n    ($proc.target.process.file.full_path = /vssadmin\\.exe$/\n     and $proc.target.process.command_line\
-    \ = /delete/i)\n    or\n    ($proc.target.process.file.full_path = /wmic\\.exe$/\n     and $proc.target.process.command_line\
-    \ = /shadowcopy.*delete/i)\n    $proc.principal.hostname = $host\n\n  match:\n    $host over 1h\n\n  condition:\n    #proc\
-    \ >= 1\n\n  outcome:\n    $risk_score = max(100)\n}"
-  esql: "FROM logs-windows.sysmon_operational*,logs-system.security*\n| WHERE @timestamp > NOW() - 1 day\n| WHERE event.code\
-    \ == \"4688\"\n| WHERE (process.name LIKE \"*vssadmin.exe\" AND process.command_line LIKE \"*delete*\")\n     OR (process.name\
-    \ LIKE \"*wmic.exe\" AND process.command_line RLIKE \"(?i)shadowcopy.*delete\")\n| KEEP host.name, user.name, process.name,\
-    \ process.command_line, @timestamp\n| SORT @timestamp DESC"
-  leql: "where((process CONTAINS \"vssadmin.exe\" AND command CONTAINS \"delete\")\n  OR (process CONTAINS \"wmic.exe\" AND\
-    \ command CONTAINS \"shadowcopy\"))\ngroupby(hostname, username)\ncalculate(count AS vss_deletions)"
-  crowdstrike: "event_simpleName=ProcessRollup2\n| where (FileName MATCHES \"(?i)vssadmin.exe\" AND CommandLine MATCHES \"\
-    (?i)delete\")\n    OR (FileName MATCHES \"(?i)wmic.exe\" AND CommandLine MATCHES \"(?i)shadowcopy.*delete\")\n| table\
-    \ ComputerName, UserName, FileName, CommandLine, ContextTimeStamp"
-  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\"\n| filter (action_process_image_name ~= \"vssadmin.exe\" and\
-    \ action_process_command_line contains \"delete\")\n       or (action_process_image_name ~= \"wmic.exe\" and action_process_command_line\
-    \ ~= \"(?i)shadowcopy.*delete\")\n| fields hostname, actor_effective_username, action_process_image_name, action_process_command_line,\
-    \ _time"
-  lucene: '(process:vssadmin.exe AND command_line:*delete*)
-
-    OR (process:wmic.exe AND command_line:*shadowcopy*delete*)'
-  sumo: '_sourceCategory=*ids*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("12","13","14") AND _raw matches "*T1003*"
-
-    | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc'
+  spl: |
+    index=endpoint sourcetype=Sysmon EventCode=1
+    | search process_name IN ("vssadmin.exe", "ntdsutil.exe", "wmic.exe", "powershell.exe")
+    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
+    | where count >= 1
+    | sort - count
+  kql: |
+    DeviceProcessEvents
+    | where TimeGenerated > ago(1d)
+    | where process_name in ("vssadmin.exe", "ntdsutil.exe", "wmic.exe", "powershell.exe")
+    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" = '1'
+      AND "process_name" IN ('vssadmin.exe', 'ntdsutil.exe', 'wmic.exe', 'powershell.exe')
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_ca_000115 {
+      meta:
+        author = "TDL"
+        description = "Windows Shadow Copy Creation"
+        severity = "HIGH"
+        tactic = "TA0006"
+        technique = "T1003"
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.process_name = /(vssadmin.exe|ntdsutil.exe|wmic.exe|powershell.exe)/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*,logs-windows*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "process" AND process_name IN ("vssadmin.exe", "ntdsutil.exe", "wmic.exe", "powershell.exe")
+    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND process_name IN [vssadmin.exe, ntdsutil.exe, wmic.exe, powershell.exe])
+    groupby(asset, process_name, parent_process_name)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 AND process_name IN (vssadmin.exe, ntdsutil.exe, wmic.exe, powershell.exe)
+    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+    | sort -occurrences
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.PROCESS AND process_name in ("vssadmin.exe", "ntdsutil.exe", "wmic.exe", "powershell.exe")
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+    | sort desc occurrences
+  lucene: |
+    event.category:"process" AND process_name:(vssadmin.exe OR ntdsutil.exe OR wmic.exe OR powershell.exe)
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id="1" AND process_name IN ("vssadmin.exe", "ntdsutil.exe", "wmic.exe", "powershell.exe")
+    | count by host, user, parent_process_name, command_line
+    | sort by _count desc
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -73,7 +90,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 pseudo_logic: '1 Windows Process Creation Event
 
@@ -91,8 +108,8 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- "Inspect the file path, file hash, parent process, and any prior network/email delivery \u2014 verify the read / dump /\
-  \ brute-force pattern is consistent with this technique."
+- Inspect the file path, file hash, parent process, and any prior network/email delivery — verify the read / dump / brute-force
+  pattern is consistent with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
 - 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
   kerberos tickets).'

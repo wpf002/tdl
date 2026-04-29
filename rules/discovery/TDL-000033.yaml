@@ -16,72 +16,67 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: 'index=network
-
-    | bucket _time span=5m
-
-    | stats dc(dest_port) as ports, dc(dest_ip) as hosts by _time, src_ip
-
-    | where ports >= 20 OR hosts >= 30
-
-    | table _time, src_ip, dest_ip, dest_port, action'
-  kql: 'CommonSecurityLog
-
-    | where TimeGenerated >= ago(1d)
-
-    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 10m)
-
-    | where Count >= 30
-
-    | project TimeGenerated, SourceIP, DestinationIP, DestinationPort, DeviceAction'
-  aql: "SELECT sourceip, COUNT(DISTINCT destinationport) AS unique_ports,\n       COUNT(DISTINCT destinationip) AS unique_hosts,\
-    \ COUNT(*) AS total_conns\nFROM flows\nWHERE INOFFSET(starttime, LAST 300 SECONDS)\nGROUP BY sourceip\nHAVING unique_ports\
-    \ >= 20 OR unique_hosts >= 30\nORDER BY unique_ports DESC"
-  yara_l: "rule zs_dis_000033 {\n  meta:\n    author = \"TDL\"\n    description = \"Port Scan Detected - Internal\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0007\"\n    technique = \"T1046\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\
-    \n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n    $host over 10m\n\n\
-    \  condition:\n    #event >= 30\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-network*,logs-firewall*
-
+  spl: |
+    index=network sourcetype=firewall OR sourcetype=ids
+    | search destination_port IN ("53", "80", "88", "129", "137", "138", "139", "161")
+    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
+    | where count >= 1
+    | sort - bytes_out
+  kql: |
+    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+    | where TimeGenerated > ago(1d)
+    | where destination_port in ("53", "80", "88", "129", "137", "138", "139", "161")
+    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+    | order by Bytes desc
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+    FROM flows
+    WHERE "destination_port" IN ('53', '80', '88', '129', '137', '138', '139', '161')
+    GROUP BY sourceip, destinationip, destinationport
+    LAST 1 HOURS
+  yara_l: |
+    rule tdl_tdl_dis_000033 {
+      meta:
+        author = "TDL"
+        description = "Port Scan Detected - Internal"
+        severity = "MEDIUM"
+        tactic = "TA0007"
+        technique = "T1046"
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.destination_port = /(53|80|88|129|137|138|139|161)/
+        $src = $e.principal.ip
+      match:
+        $src over 10m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network*,logs-endpoint*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | STATS unique_ports = COUNT_DISTINCT(destination.port), unique_hosts = COUNT_DISTINCT(destination.ip), total = COUNT(*)
-    BY source.ip, @timestamp = BUCKET(@timestamp, 5 minutes)
-
-    | WHERE unique_ports >= 20 OR unique_hosts >= 30
-
-    | SORT unique_ports DESC'
-  leql: 'where(logset = "Firewall Activity")
-
-    groupby(source_ip)
-
-    calculate(unique_count:destination_port AS unique_ports)
-
-    calculate(unique_count:destination_ip AS unique_hosts)
-
-    having(unique_ports >= 20 OR unique_hosts >= 30)'
-  crowdstrike: 'event_simpleName=ProcessRollup2
-
-    | stats count as proc_count by ComputerName, FileName
-
-    | where proc_count >= 30
-
-    | sort -proc_count'
-  xql: "dataset = xdr_data\n| filter event_type = \"NETWORK\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
-    | comp count() as event_count by hostname, actor_effective_username\n| filter event_count >= 30\n| fields hostname, actor_effective_username,\
-    \ event_count"
-  lucene: 'log_type:"firewall" AND NOT destination_ip:"10.0.0.0/8"
-
-    AND NOT destination_ip:"172.16.0.0/12"
-
-    AND NOT destination_ip:"192.168.0.0/16"'
-  sumo: '_sourceCategory=*firewall*
-
-    | where technique="T1046" OR _raw matches "*T1046*"
-
-    | count, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc'
+    | WHERE event.category == "network" AND destination_port IN ("53", "80", "88", "129", "137", "138", "139", "161")
+    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+    | SORT bytes_out DESC
+  leql: |
+    where(logset = "Network Activity" AND destination_port IN [53, 80, 88, 129, 137, 138, 139, 161])
+    groupby(source_ip, destination_ip, destination_port)
+    calculate(count, sum(bytes_out))
+  crowdstrike: |
+    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND destination_port IN (53, 80, 88, 129, 137, 138, 139, 161)
+    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
+    | sort -bytes_out
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.NETWORK AND destination_port in ("53", "80", "88", "129", "137", "138", "139", "161")
+    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
+    | sort desc bytes_out
+  lucene: |
+    event.category:"network" AND destination_port:(53 OR 80 OR 88 OR 129 OR 137 OR 138 OR 139 OR 161)
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+    | where destination_port IN ("53", "80", "88", "129", "137", "138", "139", "161")
+    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+    | sort by bytes_out desc
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -91,7 +86,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: historical
 pseudo_logic: "30 Firewall Events\nFrom one internal source to one internal destination (Internal)\nWhere the Destination\
   \ Port is 1-1024\nWhere the Destination Port is NOT in [53, 80 , 88, 129, 137, 138, 139, 161, 389, 443, 445]\nOR\n\tWhere\
@@ -104,11 +99,11 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'
-- "Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints \u2014 determine whether the enumeration is targeted\
-  \ (specific user / share / OU) or scattered (broad, scripted)."
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — determine whether the enumeration is targeted
+  (specific user / share / OU) or scattered (broad, scripted).
 - 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from
   a finance or HR identity is high-signal.'
-- "Pull adjacent execution / lateral-movement / cred-access telemetry \u2014 discovery often precedes the next stage by minutes."
+- Pull adjacent execution / lateral-movement / cred-access telemetry — discovery often precedes the next stage by minutes.
 - 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and
   adjacent telemetry is suspicious.'
 - 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity

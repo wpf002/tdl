@@ -1,9 +1,9 @@
 rule_id: TDL-AUTH-000278
 v4_id: 000278
 name: Stealth Password Spraying - 4776
-description: "Detects a potential low and slow password spraying attack against Windows accounts. Attackers may have gathered\
-  \ a list of user accounts and could be attempting to use common passwords against each one in order to compromise the accounts.\_\
-  The attacker, in this instance, is preforming the spray at a slow rate to avoid detection and prevent lockouts."
+description: Detects a potential low and slow password spraying attack against Windows accounts. Attackers may have gathered
+  a list of user accounts and could be attempting to use common passwords against each one in order to compromise the accounts. The
+  attacker, in this instance, is preforming the spray at a slow rate to avoid detection and prevent lockouts.
 tactic: Initial Access
 tactic_id: TA0001
 technique_id: T1078
@@ -18,94 +18,68 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: 'index=windows
-
-    | where (EventCode=4776 OR EventCode=4776)
-
-    | bucket _time span=1m
-
-    | stats count as failures, dc(Account_Name) as unique_users by _time, IpAddress
-
-    | where failures >= 10
-
-    | table _time, host, Account_Name, IpAddress, LogonType'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | where EventID in (4776, 4776)
-
-    | summarize Failures = count(), UniqueAccounts = dcount(TargetUserName) by IpAddress, bin(TimeGenerated, 1m)
-
-    | where Failures >= 10
-
-    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
-  aql: "SELECT username, sourceip, COUNT(*) AS failure_count, UNIQUECOUNT(username) AS unique_accounts\nFROM events\nWHERE\
-    \ LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'\n  AND eventid IN (4625, 529, 4776)\n  AND INOFFSET(starttime, LAST\
-    \ 3600 SECONDS)\nGROUP BY sourceip\nHAVING unique_accounts >= 10 AND (failure_count / unique_accounts) <= 3\nORDER BY\
-    \ failure_count DESC\nSTART '2026-04-27 00:00:00'"
-  yara_l: "rule zs_auth_000278 {\n  meta:\n    author = \"TDL\"\n    description = \"Stealth Password Spraying - 4776\"\n\
-    \    severity = \"LOW\"\n    tactic = \"TA0006\"\n    technique = \"T1078\"\n\n  events:\n    $login.metadata.event_type\
-    \ = \"USER_LOGIN\"\n    $login.metadata.product_name = \"Windows\"\n    $login.security_result.action = \"BLOCK\"\n  \
-    \  $login.principal.ip = $src_ip\n    $login.target.user.userid = $user\n\n  match:\n    $src_ip over 1h\n\n  condition:\n\
-    \    #login > 10 and\n    #user > 8\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
+  spl: |
+    index=windows sourcetype="WinEventLog:Security"
+    | search event_id IN ("4776")
+    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
+    | where count >= 1
+    | sort - count
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1d)
+    | where event_id in ("4776")
+    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
+      AND "event_id" IN ('4776')
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_auth_000278 {
+      meta:
+        author = "TDL"
+        description = "Stealth Password Spraying - 4776"
+        severity = "LOW"
+        tactic = "TA0001"
+        technique = "T1078"
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.event_id = /(4776)/
+        $user = $e.target.user.userid
+      match:
+        $user over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.security*,logs-system.security*
     | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN ("4625", "529")
-
-    | STATS failure_count = COUNT(*), unique_accounts = COUNT_DISTINCT(winlog.event_data.TargetUserName) BY source.ip, @timestamp
-    = BUCKET(@timestamp, 1h)
-
-    | WHERE unique_accounts >= 10
-
-    | EVAL ratio = failure_count / unique_accounts
-
-    | WHERE ratio <= 3
-
-    | SORT failure_count DESC'
-  leql: 'where(event_id IN [4625, 529] AND logset = "Active Directory")
-
-    groupby(source_ip)
-
-    calculate(unique_count:destination_account AS unique_accounts)
-
-    calculate(count AS total_failures)
-
-    having(unique_accounts >= 10)
-
-    having(total_failures / unique_accounts <= 3)'
-  crowdstrike: 'event_simpleName=UserLogonFailed2
-
-    | stats count(TargetUserName) as failures, dc(TargetUserName) as unique_accounts by RemoteIP
-
-    | where unique_accounts >= 10 AND failures/unique_accounts <= 3
-
-    | sort -unique_accounts'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = "PROCESS" and action_evtlog_event_id = 4625
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | comp count() as failure_count, dc(actor_effective_username) as unique_accounts by src_ip
-
-    | filter unique_accounts >= 10
-
-    | fields src_ip, failure_count, unique_accounts'
-  lucene: 'event_id:(4625 OR 529) AND log_source_type:"Windows Security"
-
-    AND NOT user_name:("ANONYMOUS LOGON" OR "*$")'
-  sumo: '_sourceCategory=*ids*
-
+    | WHERE event.category == "authentication" AND event_id IN ("4776")
+    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+    | SORT count DESC
+  leql: |
+    where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4776])
+    groupby(destination_account, source_ip, asset)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4776)
+    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+    | sort -auth_events
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.LOGIN AND event_id in ("4776")
+    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+    | sort desc logins
+  lucene: |
+    event.category:"authentication" AND event_id:(4776)
+  sumo: |
+    _sourceCategory=*windows*security* OR _sourceCategory=*ad*
     | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1078*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | where event_id IN ("4776")
+    | count by host, user, src_ip, logon_type, event_id
+    | sort by _count desc
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -115,7 +89,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 pseudo_logic: "4 Instances over 1 hour of at least 2 Windows Authentication Failure Events \nFrom the same internal Source\
   \ Hostname to the same Destination\nWhere the Event ID in [680, 681, 4776]\nWhere the Failure Code is \"0xC000006A\"\nWhere\

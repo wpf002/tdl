@@ -269,6 +269,70 @@ FILE_FAMILY = {
         | sort by _count desc"""),
 }
 
+AUTH_FAMILY = {
+    "spl": dedent("""\
+        index=windows sourcetype="WinEventLog:Security"
+        | search {filter}
+        | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
+        | where count >= 1
+        | sort - count"""),
+    "kql": dedent("""\
+        SecurityEvent
+        | where TimeGenerated > ago(1d)
+        | where {filter_kql}
+        | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+        | order by Count desc"""),
+    "aql": dedent("""\
+        SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
+        FROM events
+        WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
+          AND {filter_aql}
+        LAST 24 HOURS"""),
+    "yara_l": dedent("""\
+        rule {rule_yid} {{
+          meta:
+            author = \"TDL\"
+            description = \"{name}\"
+            severity = \"{severity_upper}\"
+            tactic = \"{tactic_id}\"
+            technique = \"{technique_id}\"
+          events:
+            $e.metadata.event_type = \"USER_LOGIN\"
+            {yara_match}
+            $user = $e.target.user.userid
+          match:
+            $user over 30m
+          condition:
+            $e
+        }}"""),
+    "esql": dedent("""\
+        FROM logs-windows.security*,logs-system.security*
+        | WHERE @timestamp > NOW() - 1 day
+        | WHERE event.category == \"authentication\" AND {filter_esql}
+        | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+        | SORT count DESC"""),
+    "leql": dedent("""\
+        where(logset IN [\"Active Directory\", \"Asset Authentication\"] AND {filter_leql})
+        groupby(destination_account, source_ip, asset)
+        calculate(count)"""),
+    "crowdstrike": dedent("""\
+        event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) {filter_cs}
+        | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+        | sort -auth_events"""),
+    "xql": dedent("""\
+        dataset = xdr_data
+        | filter event_type = ENUM.LOGIN AND {filter_xql}
+        | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+        | sort desc logins"""),
+    "lucene": "event.category:\"authentication\" AND {filter_lucene}",
+    "sumo": dedent("""\
+        _sourceCategory=*windows*security* OR _sourceCategory=*ad*
+        | parse \"EventID=*\\\"\" as event_id nodrop
+        | where {filter_sumo}
+        | count by host, user, src_ip, logon_type, event_id
+        | sort by _count desc"""),
+}
+
 CLOUD_FAMILY = {
     "spl": dedent("""\
         index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
@@ -340,8 +404,40 @@ CLOUD_FAMILY = {
 # are deliberately small — they're starting points the analyst will tune.
 # ----------------------------------------------------------------------
 
-def _basic_filter(field, equals=None, regex=None):
-    """Generate a uniform per-language filter snippet."""
+def _basic_filter(field, equals=None, regex=None, values=None):
+    """Generate a uniform per-language filter snippet.
+
+    `values` is a list — when present, emits dialect-correct alternation
+    (`IN (...)`, `field:(a OR b)`, regex `a|b`) instead of pretending the
+    pipe-separated regex string works in every dialect.
+    """
+    if values:
+        vs = list(values)
+        # SPL/AQL/ESQL etc. SQL-style IN
+        spl_in   = f"{field} IN (" + ", ".join(f'"{v}"' for v in vs) + ")"
+        aql_in   = f"\"{field}\" IN (" + ", ".join(f"'{v}'" for v in vs) + ")"
+        esql_in  = f"{field} IN (" + ", ".join(f'"{v}"' for v in vs) + ")"
+        leql_in  = f"{field} IN [" + ", ".join(vs) + "]"
+        kql_in   = f"{field} in (" + ", ".join(f'"{v}"' for v in vs) + ")"
+        xql_in   = f"{field} in (" + ", ".join(f'"{v}"' for v in vs) + ")"
+        cs_in    = f"AND {field} IN (" + ", ".join(vs) + ")"
+        sumo_in  = f"{field} IN (" + ", ".join(f'"{v}"' for v in vs) + ")"
+        # Lucene OR alternation
+        lucene_or = f"{field}:(" + " OR ".join(vs) + ")"
+        # YARA-L regex alternation
+        yara_alt = f"$e.{field} = /(" + "|".join(vs) + ")/"
+        return {
+            "filter":         spl_in,
+            "filter_kql":     kql_in,
+            "filter_aql":     aql_in,
+            "filter_esql":    esql_in,
+            "filter_leql":    leql_in,
+            "filter_cs":      cs_in,
+            "filter_xql":     xql_in,
+            "filter_lucene":  lucene_or,
+            "filter_sumo":    sumo_in,
+            "yara_match":     yara_alt,
+        }
     if equals is not None:
         v = equals
         return {
@@ -381,13 +477,24 @@ def _resolve(technique_id, hint):
     field = hint.get("field", "process.command_line")
     cmd = hint.get("command", "")
     event = hint.get("event", "ProcessCreate")
+    values = hint.get("values")  # optional list — emits dialect-correct alternation
+
+    def _filter(f):
+        if values:
+            return _basic_filter(f, values=values)
+        return _basic_filter(f, regex=cmd)
+
+    # Windows / on-prem authentication
+    if event in ("UserLogon", "UserLogonFailed", "KerberosEvent", "Authentication",
+                 "TgsRequest", "AdAuthentication"):
+        return AUTH_FAMILY, _filter(field)
 
     # Cloud-flavored techniques
     if event in ("ConsoleLogin", "CreateFunction", "PushImage", "RunInstances",
                  "DescribeAll", "ListServices", "ListObjects", "GetObject",
                  "RoleAssignment", "AAD", "OAuthConsent", "PasswordReset",
                  "K8sApi", "CreatePod", "GroupAddMember", "TokenIssue", "MfaPush", "MfaSuccess"):
-        return CLOUD_FAMILY, _basic_filter(field, regex=cmd)
+        return CLOUD_FAMILY, _filter(field)
 
     # Network-flavored
     if event in ("NetworkConnect", "Tls", "Http", "Dns", "Icmp", "Arp",
@@ -397,19 +504,19 @@ def _resolve(technique_id, hint):
                  "DirectoryReplication", "DeviceTransfer", "DeviceConnect",
                  "DeviceAccess", "GpoChange", "Deploy", "PolicyChange",
                  "WmiEvent"):
-        return NETWORK_FAMILY, _basic_filter(field, regex=cmd)
+        return NETWORK_FAMILY, _filter(field)
 
     # Registry-flavored
     if event in ("RegistryEvent",):
-        return REGISTRY_FAMILY, _basic_filter(field, regex=cmd)
+        return REGISTRY_FAMILY, _filter(field)
 
     # File-flavored
     if event in ("FileCreate", "FileWrite", "FileModify", "FileAccess",
                  "FileDelete", "FileRename"):
-        return FILE_FAMILY, _basic_filter(field, regex=cmd)
+        return FILE_FAMILY, _filter(field)
 
     # Default: process
-    return PROCESS_FAMILY, _basic_filter(field, regex=cmd)
+    return PROCESS_FAMILY, _filter(field)
 
 
 def render(rule_id, technique_id, tactic_id, name, severity, hint):

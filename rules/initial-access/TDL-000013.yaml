@@ -18,61 +18,68 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: 'index=linux
-
-    | table _time, host, Account_Name, IpAddress, LogonType'
-  kql: 'Syslog
-
-    | where TimeGenerated >= ago(1d)
-
-    | project TimeGenerated, Computer, Account, Activity'
-  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
-    \ events\nWHERE eventid IN (4720, 4722, 4728, 4732, 4756)\n  AND INOFFSET(starttime, LAST 300 SECONDS)\nGROUP BY username,\
-    \ hostname, QIDNAME(qid)\n\nORDER BY starttime DESC"
-  yara_l: "rule zs_auth_000013 {\n  meta:\n    author = \"TDL\"\n    description = \"Local Admin Created\"\n    severity =\
-    \ \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1136\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\
-    \n    $event.metadata.product_event_type = \"4720\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
-    \ = $user\n\n  match:\n    $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-system.syslog*,logs-auditd*
-
+  spl: |
+    index=windows sourcetype="WinEventLog:Security"
+    | search event_id IN ("4720", "4722", "4728", "4732", "4756")
+    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
+    | where count >= 1
+    | sort - count
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1d)
+    | where event_id in ("4720", "4722", "4728", "4732", "4756")
+    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
+      AND "event_id" IN ('4720', '4722', '4728', '4732', '4756')
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_auth_000013 {
+      meta:
+        author = "TDL"
+        description = "Local Admin Created"
+        severity = "LOW"
+        tactic = "TA0001"
+        technique = "T1136"
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.event_id = /(4720|4722|4728|4732|4756)/
+        $user = $e.target.user.userid
+      match:
+        $user over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.security*,logs-system.security*
     | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN (''4720'', ''4722'', ''4728'', ''4732'', ''4756'')
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT event_count DESC'
-  leql: 'where(event_id IN [4720, 4722, 4728, 4732, 4756])
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)'
-  crowdstrike: 'event_simpleName=SecurityEvent
-
-    | where EventCode=4720 OR EventCode=4722 OR EventCode=4728 OR EventCode=4732
-
-    | table ComputerName, UserName, CommandLine, ContextTimeStamp'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = "PROCESS" and action_evtlog_event_id in (4720, 4722, 4728, 4732)
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time
-
-    | sort desc _time'
-  lucene: event_id:(4720 OR 4722 OR 4728 OR 4732 OR 4756)
-  sumo: '_sourceCategory=*ids*
-
+    | WHERE event.category == "authentication" AND event_id IN ("4720", "4722", "4728", "4732", "4756")
+    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+    | SORT count DESC
+  leql: |
+    where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4720, 4722, 4728, 4732, 4756])
+    groupby(destination_account, source_ip, asset)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4720, 4722, 4728, 4732, 4756)
+    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+    | sort -auth_events
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.LOGIN AND event_id in ("4720", "4722", "4728", "4732", "4756")
+    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+    | sort desc logins
+  lucene: |
+    event.category:"authentication" AND event_id:(4720 OR 4722 OR 4728 OR 4732 OR 4756)
+  sumo: |
+    _sourceCategory=*windows*security* OR _sourceCategory=*ad*
     | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1136*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | where event_id IN ("4720", "4722", "4728", "4732", "4756")
+    | count by host, user, src_ip, logon_type, event_id
+    | sort by _count desc
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -82,7 +89,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: historical
 pseudo_logic: "1 Windows User Created Event\nWhere the Event ID is in [624, 4720, 626, 4722]\nWhere the Destination User Domain\
   \ is NOT in the Company AD Domains List\n\nFollowed By\n\n1 Windows User Added to Security Group Event\nWhere the Event\
@@ -97,8 +104,8 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'
-- "Examine the parent \u2192 child process tree, command line arguments, and code-signing status to assess whether the entry\
-  \ vector is consistent with this technique."
+- Examine the parent → child process tree, command line arguments, and code-signing status to assess whether the entry vector
+  is consistent with this technique.
 - Cross-reference with email gateway, web proxy, and EDR telemetry in the 30 minutes around the alert for related delivery
   activity.
 - 'Pivot on the user / host: look for follow-on execution, persistence, or credential-access events in the next 24h.'

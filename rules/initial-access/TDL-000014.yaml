@@ -17,65 +17,67 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: 'index=windows
-
-    | where (EventCode=4728 OR EventCode=4732 OR EventCode=4756 OR EventCode=4728)
-
-    | table _time, host, Account_Name, IpAddress, LogonType'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | where EventID in (4728, 4732, 4756, 4728)
-
-    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
-  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
-    \ events\nWHERE eventid IN (4728, 4732, 4756)\n  AND INOFFSET(starttime, LAST 300 SECONDS)\nGROUP BY username, hostname,\
-    \ QIDNAME(qid)\n\nORDER BY starttime DESC"
-  yara_l: "rule zs_auth_000014 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized Addition to HVT Group\"\n\
-    \    severity = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n\n  events:\n    $event.metadata.event_type\
-    \ = \"GENERIC_EVENT\"\n    $event.metadata.product_event_type = \"4728\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
-    \ = $user\n\n  match:\n    $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN (''4728'', ''4732'', ''4756'')
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT event_count DESC'
-  leql: 'where(event_id IN [4728, 4732, 4756])
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)'
-  crowdstrike: 'event_simpleName=SecurityEvent
-
-    | where EventCode=4728 OR EventCode=4732 OR EventCode=4756
-
-    | table ComputerName, UserName, CommandLine, ContextTimeStamp'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = "PROCESS" and action_evtlog_event_id in (4728, 4732, 4756)
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time
-
-    | sort desc _time'
-  lucene: event_id:(4728 OR 4732 OR 4756)
-  sumo: '_sourceCategory=*ids*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1078*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+  spl: |
+    index=network sourcetype=firewall OR sourcetype=ids
+    | search network.protocol="*tcp*"
+    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
+    | where count >= 1
+    | sort - bytes_out
+  kql: |
+    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+    | where TimeGenerated > ago(1d)
+    | where network.protocol matches regex "tcp"
+    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+    | order by Bytes desc
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+    FROM flows
+    WHERE "network.protocol" LIKE '%tcp%'
+    GROUP BY sourceip, destinationip, destinationport
+    LAST 1 HOURS
+  yara_l: |
+    rule tdl_tdl_auth_000014 {
+      meta:
+        author = "TDL"
+        description = "Unauthorized Addition to HVT Group"
+        severity = "HIGH"
+        tactic = "TA0001"
+        technique = "T1078"
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.protocol = /tcp/
+        $src = $e.principal.ip
+      match:
+        $src over 10m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network*,logs-endpoint*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+    | SORT bytes_out DESC
+  leql: |
+    where(logset = "Network Activity" AND network.protocol=/tcp/)
+    groupby(source_ip, destination_ip, destination_port)
+    calculate(count, sum(bytes_out))
+  crowdstrike: |
+    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
+    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
+    | sort -bytes_out
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
+    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
+    | sort desc bytes_out
+  lucene: |
+    event.category:"network" AND network.protocol:*tcp*
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+    | where network.protocol matches "*tcp*"
+    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+    | sort by bytes_out desc
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -85,7 +87,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: historical
 pseudo_logic: "1 Windows User Added to Security Group Event\nWhere the Event ID is in [632, 4728, 636, 4732, 660, 4756]\n\
   OR\n          Where the Group Name is in the High Value Target Groups List\n\n          Where Group Name is in [Group Policy\

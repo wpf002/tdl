@@ -16,77 +16,73 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 50
 queries:
-  spl: 'index=network sourcetype=firewall OR sourcetype=ids
-
-    | search http.request.body="*b64-body*"
-
+  spl: |
+    index=network sourcetype=firewall OR sourcetype=ids
+    | search network.protocol="*http*"
     | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-
     | where count >= 1
-
-    | sort - bytes_out'
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
+    | sort - bytes_out
+  kql: |
+    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
     | where TimeGenerated > ago(1d)
-
-    | where http.request.body matches regex "b64-body"
-
+    | where network.protocol matches regex "http"
     | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc'
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+    | order by Bytes desc
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
     FROM flows
-
-    WHERE "http.request.body" LIKE ''%b64-body%''
-
+    WHERE "network.protocol" LIKE '%http%'
     GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS'
-  yara_l: "rule tdl_tdl_c2_000797 {\n  meta:\n    author = \"TDL\"\n    description = \"High-Entropy Base64 Body in Outbound\
-    \ HTTP\"\n    severity = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1132\"\n  events:\n    $e.metadata.event_type\
-    \ = \"NETWORK_CONNECTION\"\n    $e.http.request.body = /b64-body/\n    $src = $e.principal.ip\n  match:\n    $src over\
-    \ 10m\n  condition:\n    $e\n}"
-  esql: 'FROM logs-network*,logs-endpoint*
-
+    LAST 1 HOURS
+  yara_l: |
+    rule tdl_tdl_c2_000797 {
+      meta:
+        author = "TDL"
+        description = "High-Entropy Base64 Body in Outbound HTTP"
+        severity = "MEDIUM"
+        tactic = "TA0011"
+        technique = "T1132"
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.protocol = /http/
+        $src = $e.principal.ip
+      match:
+        $src over 10m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network*,logs-endpoint*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND http.request.body LIKE "%b64-body%"
-
+    | WHERE event.category == "network" AND network.protocol LIKE "%http%"
     | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC'
-  leql: 'where(logset = "Network Activity" AND http.request.body=/b64-body/)
-
+    | SORT bytes_out DESC
+  leql: |
+    where(logset = "Network Activity" AND network.protocol=/http/)
     groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))'
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND http.request.body=*b64-body*
-
+    calculate(count, sum(bytes_out))
+  crowdstrike: |
+    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*http*
     | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND http.request.body ~= "b64-body"
-
+    | sort -bytes_out
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.NETWORK AND network.protocol ~= "http"
     | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out'
-  lucene: event.category:"network" AND http.request.body:*b64-body*
-  sumo: '_sourceCategory=*ids*
-
-    | where technique="T1132" OR _raw matches "*T1132*"
-
-    | count, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc'
+    | sort desc bytes_out
+  lucene: |
+    event.category:"network" AND network.protocol:*http*
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+    | where network.protocol matches "*http*"
+    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+    | sort by bytes_out desc
 pseudo_logic: HTTP body with Shannon entropy > 5.0 and length > 256 sent to non-cdn destinations. Encoded C2 traffic.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: "Proposed rule generated from ATT&CK gap analysis \u2014 review the pseudo_logic, scope filters to the right\
-  \ asset group, and refine thresholds using \u22657 days of telemetry before promoting."
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
+  group, and refine thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - base64
@@ -97,14 +93,13 @@ references:
 - https://attack.mitre.org/techniques/T1132/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'
-- "Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints \u2014 verify beaconing characteristics (interval,\
-  \ jitter, request size, server response code)."
-- "Pull WHOIS / TLS / passive-DNS context on the destination \u2014 newly registered or low-reputation infrastructure raises\
-  \ confidence."
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — verify beaconing characteristics (interval,
+  jitter, request size, server response code).
+- Pull WHOIS / TLS / passive-DNS context on the destination — newly registered or low-reputation infrastructure raises confidence.
 - Identify the originating process and trace it back to its install / launch event (initial access / persistence stage).
 - 'Decide TP / FP: FP for sanctioned OOB management agents (allowlist them); TP for unattended periodic egress to new infrastructure.'
 - 'If TP: block the destination at egress, isolate the host, capture network PCAP / memory while session is live, and escalate

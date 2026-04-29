@@ -13,98 +13,68 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 80
 queries:
-  spl: 'index=windows sourcetype=WinEventLog:Security EventCode=4625
-
-    | bucket _time span=30m
-
-    | stats dc(Account_Name) as accounts, count as failures by _time, IpAddress
-
-    | where accounts >= 10
-
-    | eval ratio=round(failures/accounts,2)
-
-    | where ratio <= 3
-
-    | table _time, IpAddress, accounts, failures, ratio'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | where EventID == 4625
-
-    | summarize UniqueAccounts = dcount(TargetUserName), Failures = count() by IpAddress, bin(TimeGenerated, 30m)
-
-    | where UniqueAccounts >= 10
-
-    | extend Ratio = Failures / UniqueAccounts
-
-    | where Ratio <= 3'
-  aql: "SELECT username, sourceip, COUNT(*) AS failure_count, UNIQUECOUNT(username) AS unique_accounts\nFROM events\nWHERE\
-    \ LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'\n  AND eventid IN (4625, 529, 4776)\n  AND INOFFSET(starttime, LAST\
-    \ 300 SECONDS)\nGROUP BY sourceip\nHAVING unique_accounts >= 10 AND (failure_count / unique_accounts) <= 3\nORDER BY failure_count\
-    \ DESC\nSTART '2026-04-27 00:00:00'"
-  yara_l: "rule tdl_ca_003 {\n  meta:\n    author = \"TDL\"\n    description = \"Password Spraying Against Active Directory\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0006\"\n    technique = \"T1110.003\"\n\n  events:\n    $login.metadata.event_type\
-    \ = \"USER_LOGIN\"\n    $login.metadata.product_name = \"Windows\"\n    $login.security_result.action = \"BLOCK\"\n  \
-    \  $login.principal.ip = $src_ip\n    $login.target.user.userid = $user\n\n  match:\n    $src_ip over 5m\n\n  condition:\n\
-    \    #login > 10 and\n    #user > 8\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
+  spl: |
+    index=windows sourcetype="WinEventLog:Security"
+    | search event_id IN ("4625")
+    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
+    | where count >= 1
+    | sort - count
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1d)
+    | where event_id in ("4625")
+    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
+      AND "event_id" IN ('4625')
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_ca_003 {
+      meta:
+        author = "TDL"
+        description = "Password Spraying Against Active Directory"
+        severity = "HIGH"
+        tactic = "TA0006"
+        technique = "T1110.003"
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.event_id = /(4625)/
+        $user = $e.target.user.userid
+      match:
+        $user over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.security*,logs-system.security*
     | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN ("4625", "529")
-
-    | STATS failure_count = COUNT(*), unique_accounts = COUNT_DISTINCT(winlog.event_data.TargetUserName) BY source.ip, @timestamp
-    = BUCKET(@timestamp, 5m)
-
-    | WHERE unique_accounts >= 10
-
-    | EVAL ratio = failure_count / unique_accounts
-
-    | WHERE ratio <= 3
-
-    | SORT failure_count DESC'
-  leql: 'where(event_id IN [4625, 529] AND logset = "Active Directory")
-
-    groupby(source_ip)
-
-    calculate(unique_count:destination_account AS unique_accounts)
-
-    calculate(count AS total_failures)
-
-    having(unique_accounts >= 10)
-
-    having(total_failures / unique_accounts <= 3)'
-  crowdstrike: 'event_simpleName=UserLogonFailed2
-
-    | stats count(TargetUserName) as failures, dc(TargetUserName) as unique_accounts by RemoteIP
-
-    | where unique_accounts >= 10 AND failures/unique_accounts <= 3
-
-    | sort -unique_accounts'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = "PROCESS" and action_evtlog_event_id = 4625
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | comp count() as failure_count, dc(actor_effective_username) as unique_accounts by src_ip
-
-    | filter unique_accounts >= 10
-
-    | fields src_ip, failure_count, unique_accounts'
-  lucene: 'event_id:(4625 OR 529) AND log_source_type:"Windows Security"
-
-    AND NOT user_name:("ANONYMOUS LOGON" OR "*$")'
-  sumo: '_sourceCategory=*windows*
-
+    | WHERE event.category == "authentication" AND event_id IN ("4625")
+    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+    | SORT count DESC
+  leql: |
+    where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4625])
+    groupby(destination_account, source_ip, asset)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4625)
+    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+    | sort -auth_events
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.LOGIN AND event_id in ("4625")
+    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+    | sort desc logins
+  lucene: |
+    event.category:"authentication" AND event_id:(4625)
+  sumo: |
+    _sourceCategory=*windows*security* OR _sourceCategory=*ad*
     | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1110.003*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | where event_id IN ("4625")
+    | count by host, user, src_ip, logon_type, event_id
+    | sort by _count desc
 false_positives:
 - Misconfigured applications
 - VDI spin-up
@@ -115,11 +85,11 @@ tags:
 author: TDL
 created: '2024-02-03'
 test_method: historical
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- "Inspect the source IP, geo / ASN, authentication method, and prior sign-in pattern for the user \u2014 verify the read\
-  \ / dump / brute-force pattern is consistent with this technique."
+- Inspect the source IP, geo / ASN, authentication method, and prior sign-in pattern for the user — verify the read / dump
+  / brute-force pattern is consistent with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
 - 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
   kerberos tickets).'

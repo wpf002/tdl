@@ -17,65 +17,68 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: 'index=windows
-
-    | where (EventCode=4688 OR EventCode=4104 OR EventCode=4688 OR EventCode=4104)
-
-    | table _time, host, user, ProcessName, CommandLine'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | where EventID in (4688, 4104, 4688, 4104)
-
-    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
-  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
-    \ events\nWHERE eventid IN (4688, 4104)\n  AND INOFFSET(starttime, LAST 300 SECONDS)\nGROUP BY username, hostname, QIDNAME(qid)\n\
-    \nORDER BY starttime DESC"
-  yara_l: "rule zs_exe_000510 {\n  meta:\n    author = \"TDL\"\n    description = \"PowerUp Commandlet Activity\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\
-    \n    $event.metadata.product_event_type = \"4688\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
-    \ = $user\n\n  match:\n    $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN (''4688'', ''4104'')
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT event_count DESC'
-  leql: 'where(event_id IN [4688, 4104])
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)'
-  crowdstrike: 'event_simpleName=SecurityEvent
-
-    | where EventCode=4688 OR EventCode=4104
-
-    | table ComputerName, UserName, CommandLine, ContextTimeStamp'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = "PROCESS" and action_evtlog_event_id in (4688, 4104)
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time
-
-    | sort desc _time'
-  lucene: event_id:(4688 OR 4104)
-  sumo: '_sourceCategory=*ids*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1204*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+  spl: |
+    index=endpoint sourcetype=Sysmon (EventCode=12 OR EventCode=13 OR EventCode=14)
+    | search registry_key="*.+*"
+    | stats count, values(host) as hosts by user, target_object, details, image
+    | sort - count
+  kql: |
+    DeviceRegistryEvents
+    | where TimeGenerated > ago(1d)
+    | where registry_key matches regex ".+"
+    | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "Registry Key", "Registry Value Name", "Registry Value Data", "Process Name"
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" IN ('12','13','14')
+      AND "registry_key" LIKE '%.+%'
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_exe_000510 {
+      meta:
+        author = "TDL"
+        description = "PowerUp Commandlet Activity"
+        severity = "HIGH"
+        tactic = "TA0002"
+        technique = "T1204"
+      events:
+        $e.metadata.event_type = "REGISTRY_MODIFICATION"
+        $e.registry_key = /.+/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "registry" AND registry_key LIKE "%.+%"
+    | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/.+/)
+    groupby(asset, registry_key, registry_value)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*.+*
+    | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
+    | sort -changes
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.REGISTRY AND registry_key ~= ".+"
+    | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
+    | sort desc changes
+  lucene: |
+    event.category:"registry" AND registry_key:*.+*
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id IN ("12","13","14") AND registry_key matches "*.+*"
+    | count by host, user, registry_key, registry_value, image
+    | sort by _count desc
 false_positives:
 - Security software
 - Authorized admin tools
@@ -85,7 +88,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe\n\
   Where Command matches the regex \".*\\b(?:get-serviceunquoted|get-servicefilepermission|get-servicepermission|invoke-serviceabuse|install-servicebinary|get-regautologon|get-vulnautorun|get-vulnschtask|get-unattendedinstallfile|get-webconfig|get-applicationhost|get-regalwaysinstallelevated|invoke-kerberoast|get-registryautologon|get-registryautorun|find-processdllhijack|get-modifiablescheduledtaskfile|powerup|install-ssp|get-microphoneaudio|find-avsignature|new-userpersistenceoption|get-timedscreenshot|invoke-wmicommand|invoke-dllinjection|invoke-reflectivepeinjection|get-vaultcredential)\\\
@@ -94,8 +97,8 @@ pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592
   b.*\""
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'
-- "Inspect the parent \u2192 child process tree, command line arguments, and code-signing status \u2014 pay attention to short-lived\
-  \ processes, encoded arguments, and unusual parents (Office, browser, services)."
+- Inspect the parent → child process tree, command line arguments, and code-signing status — pay attention to short-lived
+  processes, encoded arguments, and unusual parents (Office, browser, services).
 - Pull EDR process tree for the alert PID; check the parent / grandparent and any child processes spawned within 5 minutes.
 - 'Compare against the host''s baseline: is the binary / interpreter normally invoked here, by this user, at this time?'
 - 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software

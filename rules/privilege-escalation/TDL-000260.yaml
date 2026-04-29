@@ -16,67 +16,69 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: 'index=windows
-
-    | where (EventCode=5136 OR EventCode=5136)
-
-    | table _time, host, Account_Name, IpAddress, LogonType'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | where EventID in (5136, 5136)
-
-    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
-  aql: 'SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
-
+  spl: |
+    index=endpoint sourcetype=Sysmon EventCode=1
+    | search event_id IN ("5136")
+    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
+    | where count >= 1
+    | sort - count
+  kql: |
+    DeviceProcessEvents
+    | where TimeGenerated > ago(1d)
+    | where event_id in ("5136")
+    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
     FROM events
-
-    WHERE INOFFSET(starttime, LAST 300 SECONDS)
-
-    GROUP BY username, hostname, QIDNAME(qid)
-
-    ORDER BY starttime DESC'
-  yara_l: "rule zs_pe_000260 {\n  meta:\n    author = \"TDL\"\n    description = \"Change in GPO by Unauthorized User\"\n\
-    \    severity = \"HIGH\"\n    tactic = \"TA0004\"\n    technique = \"T1484\"\n\n  events:\n    $event.metadata.event_type\
-    \ = \"GENERIC_EVENT\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n \
-    \   $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT @timestamp DESC'
-  leql: 'where(logset = "Endpoint Activity")
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)
-
-    having(event_count >= 1)'
-  crowdstrike: 'event_simpleName=ProcessRollup2
-
-    | stats count as proc_count by ComputerName, FileName
-
-    | where proc_count >= 1
-
-    | sort -proc_count'
-  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
-    \ _time"
-  lucene: event_id:* AND log_type:"security"
-  sumo: '_sourceCategory=*ids*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1484*"
-
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" = '1'
+      AND "event_id" IN ('5136')
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_pe_000260 {
+      meta:
+        author = "TDL"
+        description = "Change in GPO by Unauthorized User"
+        severity = "HIGH"
+        tactic = "TA0004"
+        technique = "T1484"
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.event_id = /(5136)/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*,logs-windows*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "process" AND event_id IN ("5136")
+    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND event_id IN [5136])
+    groupby(asset, process_name, parent_process_name)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 AND event_id IN (5136)
+    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+    | sort -occurrences
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.PROCESS AND event_id in ("5136")
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+    | sort desc occurrences
+  lucene: |
+    event.category:"process" AND event_id:(5136)
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id="1" AND event_id IN ("5136")
     | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | sort by _count desc
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -86,7 +88,7 @@ tags:
 - privilege-escalation
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 pseudo_logic: '1 Windows Security
 
@@ -98,8 +100,8 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, source user, and (if visible) the resulting privileged context.'
-- "Inspect the source IP, geo / ASN, authentication method, and prior sign-in pattern for the user \u2014 verify the privilege\
-  \ gain was not part of an approved elevation flow (UAC consent, sudo, PAM ticket)."
+- Inspect the source IP, geo / ASN, authentication method, and prior sign-in pattern for the user — verify the privilege gain
+  was not part of an approved elevation flow (UAC consent, sudo, PAM ticket).
 - 'Pull preceding 1h of activity for the source user: was there earlier credential-access / discovery / exploit telemetry?'
 - 'Validate token / session changes: new SeImpersonate-style privileges, new IAM role assumption, or a SYSTEM-level child
   process from a user-level parent.'

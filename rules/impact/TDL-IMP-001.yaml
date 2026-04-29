@@ -14,78 +14,69 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 100
 queries:
-  spl: 'index=windows sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=11
-
-    | bucket _time span=1m
-
-    | stats dc(TargetFilename) as files by host, Image, _time
-
-    | where files >= 50
-
-    | table _time, host, Image, files'
-  kql: 'DeviceFileEvents
-
-    | where TimeGenerated >= ago(1d)
-
-    | where ActionType in ("FileCreated","FileModified","FileRenamed")
-
-    | summarize FileCount = count(), Extensions = make_set(tostring(split(FileName,".")[-1])) by DeviceName, InitiatingProcessFileName,
-    bin(TimeGenerated, 1m)
-
-    | where FileCount >= 50 and array_length(Extensions) >= 3'
-  aql: 'SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
-
+  spl: |
+    index=endpoint sourcetype=Sysmon EventCode=1
+    | search process_name="*.+*"
+    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
+    | where count >= 1
+    | sort - count
+  kql: |
+    DeviceProcessEvents
+    | where TimeGenerated > ago(1d)
+    | where process_name matches regex ".+"
+    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
     FROM events
-
-    WHERE INOFFSET(starttime, LAST 300 SECONDS)
-
-    GROUP BY username, hostname, QIDNAME(qid)
-
-    ORDER BY starttime DESC'
-  yara_l: "rule tdl_imp_001 {\n  meta:\n    author = \"TDL\"\n    description = \"Ransomware Staging - Mass File Rename\"\n\
-    \    severity = \"CRITICAL\"\n    tactic = \"TA0040\"\n    technique = \"T1486\"\n\n  events:\n    $event.metadata.event_type\
-    \ = \"GENERIC_EVENT\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n \
-    \   $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT @timestamp DESC'
-  leql: 'where(logset = "Endpoint Activity")
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)
-
-    having(event_count >= 1)'
-  crowdstrike: 'event_simpleName=BootstrapProcess OR event_simpleName=SuspiciousFilesWithOperation
-
-    | where FileOperation IN ("WRITE","RENAME","DELETE")
-
-    | stats count(FileName) as file_count, dc(FileExtension) as ext_count by ComputerName, FileName_parent
-
-    | where file_count >= 50 AND ext_count >= 3
-
-    | sort -file_count'
-  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
-    \ _time"
-  lucene: 'source_name:Microsoft-Windows-Sysmon AND event_id:11
-
-    AND NOT file_extension:(tmp OR log OR ini)'
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint/edr*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("11","23","26") AND _raw matches "*T1486*"
-
-    | count by host, user, target_filename, image
-
-    | sort by _count desc'
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" = '1'
+      AND "process_name" LIKE '%.+%'
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_imp_001 {
+      meta:
+        author = "TDL"
+        description = "Ransomware Staging - Mass File Rename"
+        severity = "CRITICAL"
+        tactic = "TA0040"
+        technique = "T1486"
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.process_name = /.+/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*,logs-windows*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND process_name=/.+/)
+    groupby(asset, process_name, parent_process_name)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 AND process_name=*.+*
+    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+    | sort -occurrences
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+    | sort desc occurrences
+  lucene: |
+    event.category:"process" AND process_name:*.+*
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id="1" AND process_name matches "*.+*"
+    | count by host, user, parent_process_name, command_line
+    | sort by _count desc
 false_positives:
 - File sync clients during bulk sync
 tags:
@@ -95,14 +86,14 @@ tags:
 author: TDL
 created: '2024-03-01'
 test_method: synthetic
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'
-- "Inspect the file path, file hash, parent process, and any prior network/email delivery \u2014 characterize the destructive\
-  \ action (encrypt, delete, lockout, disable, reboot)."
+- Inspect the file path, file hash, parent process, and any prior network/email delivery — characterize the destructive action
+  (encrypt, delete, lockout, disable, reboot).
 - 'Determine spread: is this a single host or a coordinated multi-host event? Pull file / service telemetry across the fleet.'
-- "Trigger your major-incident bridge if scope is multi-host or business-critical \u2014 early activation buys time."
+- Trigger your major-incident bridge if scope is multi-host or business-critical — early activation buys time.
 - 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this
   severity.'
-- "If TP: execute your IR runbook \u2014 isolate, preserve evidence, restore from backup if appropriate, hunt for adversary\
-  \ persistence to prevent recurrence."
+- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence
+  to prevent recurrence.'

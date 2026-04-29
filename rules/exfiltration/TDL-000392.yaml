@@ -15,63 +15,67 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: 'index=aws sourcetype=aws:cloudtrail
-
-    | table _time, host, user, _raw'
-  kql: 'AWSCloudTrail
-
-    | where TimeGenerated >= ago(1d)
-
-    | project TimeGenerated, Computer, Account, Activity'
-  aql: 'SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
-
+  spl: |
+    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
+    | search eventName="*GuardDuty*"
+    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
+    | where count >= 1
+    | sort - count
+  kql: |
+    union AWSCloudTrail, AzureActivity, AuditLogs
+    | where TimeGenerated > ago(1d)
+    | where eventName matches regex "GuardDuty"
+    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
     FROM events
-
-    WHERE INOFFSET(starttime, LAST 300 SECONDS)
-
-    GROUP BY username, hostname, QIDNAME(qid)
-
-    ORDER BY starttime DESC'
-  yara_l: "rule zs_exf_000392 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Request to Malicious IP - GuardDuty\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0010\"\n    technique = \"T1071\"\n\n  events:\n    $event.metadata.event_type\
-    \ = \"GENERIC_EVENT\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n \
-    \   $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-aws.cloudtrail*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT @timestamp DESC'
-  leql: 'where(logset = "Endpoint Activity")
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)
-
-    having(event_count >= 1)'
-  crowdstrike: 'event_simpleName=ProcessRollup2
-
-    | stats count as proc_count by ComputerName, FileName
-
-    | where proc_count >= 1
-
-    | sort -proc_count'
-  xql: "dataset = cloud_audit_log\n| filter event_type = \"CLOUD\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\"\
-    )\n| fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort\
-    \ desc _time"
-  lucene: event_id:* AND log_type:"security"
-  sumo: '_sourceCategory=*aws*
-
-    | parse regex "\"userIdentity\":\{\"arn\":\"(?<actor>[^\"]+)" nodrop
-
-    | where _raw matches "*T1071*"
-
-    | count by actor, eventName, sourceIPAddress
-
-    | sort by _count desc'
+    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
+      AND "eventName" LIKE '%GuardDuty%'
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_exf_000392 {
+      meta:
+        author = "TDL"
+        description = "AWS Request to Malicious IP - GuardDuty"
+        severity = "MEDIUM"
+        tactic = "TA0010"
+        technique = "T1071"
+      events:
+        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
+        $e.eventName = /GuardDuty/
+        $actor = $e.principal.user.userid
+      match:
+        $actor over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws*,logs-azure*,logs-gcp*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE eventName LIKE "%GuardDuty%"
+    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+    | SORT count DESC
+  leql: |
+    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
+    groupby(actor, event_name)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
+    | stats count as calls by Actor, ApiName, SourceIPAddress
+    | sort -calls
+  xql: |
+    dataset = cloud_audit_logs
+    | filter eventName ~= "GuardDuty"
+    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+    | sort desc calls
+  lucene: |
+    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
+  sumo: |
+    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+    | where eventName matches "*GuardDuty*"
+    | count by userIdentity_arn, eventName, sourceIPAddress
+    | sort by _count desc
 false_positives:
 - Authorized pen testing
 - Security research
@@ -81,7 +85,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Backdoor:EC2/C&CActivity.B\", \"Backdoor:Lambda/C&CActivity.B\"\
   , \"Backdoor:Runtime/C&CActivity.B\", \"Trojan:Lambda/DropPoint\", \"UnauthorizedAccess:Lambda/MaliciousIPCaller.Custom\"\
@@ -91,8 +95,8 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination, total bytes transferred, and the protocol used.'
-- "Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on \u2014 quantify the data\
-  \ volume vs the host's baseline outbound profile."
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — quantify the data volume
+  vs the host's baseline outbound profile.
 - 'Pivot to preceding collection / staging activity: archives, mailbox dumps, database extracts in the prior 24h on the same
   host.'
 - Identify what was likely exfiltrated (path patterns, file types, classification labels) and the user/process that produced

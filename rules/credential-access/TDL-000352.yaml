@@ -15,90 +15,67 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: 'index=aws sourcetype=aws:cloudtrail
-
-    | bucket _time span=5m
-
-    | stats count as failures, dc(Account_Name) as unique_users by _time, IpAddress
-
-    | where failures >= 10
-
-    | table _time, host, Account_Name, IpAddress, LogonType'
-  kql: 'AWSCloudTrail
-
-    | where TimeGenerated >= ago(1d)
-
-    | summarize Failures = count(), UniqueAccounts = dcount(TargetUserName) by IpAddress, bin(TimeGenerated, 5m)
-
-    | where Failures >= 10
-
-    | project TimeGenerated, Computer, Account, Activity'
-  aql: "SELECT username, sourceip, COUNT(*) AS failure_count, UNIQUECOUNT(username) AS unique_accounts\nFROM events\nWHERE\
-    \ LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'\n  AND eventid IN (4625, 529, 4776)\n  AND INOFFSET(starttime, LAST\
-    \ 300 SECONDS)\nGROUP BY sourceip\nHAVING unique_accounts >= 10 AND (failure_count / unique_accounts) <= 3\nORDER BY failure_count\
-    \ DESC\nSTART '2026-04-27 00:00:00'"
-  yara_l: "rule zs_ca_000352 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Brute Force Activity  - GuardDuty\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0006\"\n    technique = \"T1110\"\n\n  events:\n    $login.metadata.event_type\
-    \ = \"USER_LOGIN\"\n    $login.metadata.product_name = \"Windows\"\n    $login.security_result.action = \"BLOCK\"\n  \
-    \  $login.principal.ip = $src_ip\n    $login.target.user.userid = $user\n\n  match:\n    $src_ip over 5m\n\n  condition:\n\
-    \    #login > 10 and\n    #user > 8\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-aws.cloudtrail*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN ("4625", "529")
-
-    | STATS failure_count = COUNT(*), unique_accounts = COUNT_DISTINCT(winlog.event_data.TargetUserName) BY source.ip, @timestamp
-    = BUCKET(@timestamp, 5m)
-
-    | WHERE unique_accounts >= 10
-
-    | EVAL ratio = failure_count / unique_accounts
-
-    | WHERE ratio <= 3
-
-    | SORT failure_count DESC'
-  leql: 'where(event_id IN [4625, 529] AND logset = "Active Directory")
-
-    groupby(source_ip)
-
-    calculate(unique_count:destination_account AS unique_accounts)
-
-    calculate(count AS total_failures)
-
-    having(unique_accounts >= 10)
-
-    having(total_failures / unique_accounts <= 3)'
-  crowdstrike: 'event_simpleName=UserLogonFailed2
-
-    | stats count(TargetUserName) as failures, dc(TargetUserName) as unique_accounts by RemoteIP
-
-    | where unique_accounts >= 10 AND failures/unique_accounts <= 3
-
-    | sort -unique_accounts'
-  xql: 'dataset = cloud_audit_log
-
-    | filter event_type = "CLOUD" and action_evtlog_event_id = 4625
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | comp count() as failure_count, dc(actor_effective_username) as unique_accounts by src_ip
-
-    | filter unique_accounts >= 10
-
-    | fields src_ip, failure_count, unique_accounts'
-  lucene: 'event_id:(4625 OR 529) AND log_source_type:"Windows Security"
-
-    AND NOT user_name:("ANONYMOUS LOGON" OR "*$")'
-  sumo: '_sourceCategory=*aws*
-
-    | parse regex "\"userIdentity\":\{\"arn\":\"(?<actor>[^\"]+)" nodrop
-
-    | where _raw matches "*T1110*"
-
-    | count by actor, eventName, sourceIPAddress
-
-    | sort by _count desc'
+  spl: |
+    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
+    | search eventName="*GuardDuty*"
+    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
+    | where count >= 1
+    | sort - count
+  kql: |
+    union AWSCloudTrail, AzureActivity, AuditLogs
+    | where TimeGenerated > ago(1d)
+    | where eventName matches regex "GuardDuty"
+    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
+      AND "eventName" LIKE '%GuardDuty%'
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_ca_000352 {
+      meta:
+        author = "TDL"
+        description = "AWS Brute Force Activity  - GuardDuty"
+        severity = "LOW"
+        tactic = "TA0006"
+        technique = "T1110"
+      events:
+        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
+        $e.eventName = /GuardDuty/
+        $actor = $e.principal.user.userid
+      match:
+        $actor over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws*,logs-azure*,logs-gcp*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE eventName LIKE "%GuardDuty%"
+    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+    | SORT count DESC
+  leql: |
+    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
+    groupby(actor, event_name)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
+    | stats count as calls by Actor, ApiName, SourceIPAddress
+    | sort -calls
+  xql: |
+    dataset = cloud_audit_logs
+    | filter eventName ~= "GuardDuty"
+    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+    | sort desc calls
+  lucene: |
+    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
+  sumo: |
+    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+    | where eventName matches "*GuardDuty*"
+    | count by userIdentity_arn, eventName, sourceIPAddress
+    | sort by _count desc
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -108,7 +85,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Impact:EC2/WinRMBruteForce\", \"UnauthorizedAccess:EC2/RDPBruteForce\"\
   , \"UnauthorizedAccess:EC2/SSHBruteForce\"]"
@@ -117,8 +94,8 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- "Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on \u2014 verify the read\
-  \ / dump / brute-force pattern is consistent with this technique."
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — verify the read / dump
+  / brute-force pattern is consistent with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
 - 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
   kerberos tickets).'

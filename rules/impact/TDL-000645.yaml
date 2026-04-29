@@ -16,67 +16,69 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: 'index=windows
-
-    | table _time, host, user, ProcessName, CommandLine'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
-  aql: 'SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
-
+  spl: |
+    index=endpoint sourcetype=Sysmon (EventCode=11 OR EventCode=23 OR EventCode=26)
+    | search file_name="*.+*"
+    | stats count, values(host) as hosts by user, image, target_filename
+    | where count >= 1
+    | sort - count
+  kql: |
+    DeviceFileEvents
+    | where TimeGenerated > ago(1d)
+    | where file_name matches regex ".+"
+    | summarize Count=count() by DeviceName, InitiatingProcessFileName, FolderPath, FileName
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "File Path", "Process Name"
     FROM events
-
-    WHERE INOFFSET(starttime, LAST 300 SECONDS)
-
-    GROUP BY username, hostname, QIDNAME(qid)
-
-    ORDER BY starttime DESC'
-  yara_l: "rule zs_imp_000645 {\n  meta:\n    author = \"TDL\"\n    description = \"Possible Ransomware Detected - Varonis\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0040\"\n    technique = \"T1486\"\n\n  events:\n    $event.metadata.event_type\
-    \ = \"GENERIC_EVENT\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n \
-    \   $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT @timestamp DESC'
-  leql: 'where(logset = "Endpoint Activity")
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)
-
-    having(event_count >= 1)'
-  crowdstrike: 'event_simpleName=BootstrapProcess OR event_simpleName=SuspiciousFilesWithOperation
-
-    | where FileOperation IN ("WRITE","RENAME","DELETE")
-
-    | stats count(FileName) as file_count, dc(FileExtension) as ext_count by ComputerName, FileName_parent
-
-    | where file_count >= 50 AND ext_count >= 3
-
-    | sort -file_count'
-  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
-    \ _time"
-  lucene: 'source_name:Microsoft-Windows-Sysmon AND event_id:11
-
-    AND NOT file_extension:(tmp OR log OR ini)'
-  sumo: '_sourceCategory=*windows*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1486*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" IN ('11','23','26')
+      AND "file_name" LIKE '%.+%'
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_imp_000645 {
+      meta:
+        author = "TDL"
+        description = "Possible Ransomware Detected - Varonis"
+        severity = "HIGH"
+        tactic = "TA0040"
+        technique = "T1486"
+      events:
+        $e.metadata.event_type = "FILE_CREATION"
+        $e.file_name = /.+/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "file" AND file_name LIKE "%.+%"
+    | STATS count = COUNT(*) BY host.name, user.name, file.path, process.name
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND log_type = "file" AND file_name=/.+/)
+    groupby(asset, file_path, process_name)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName IN (FileWritten, NewExecutableWritten) AND file_name=*.+*
+    | stats count as writes by ComputerName, UserName, FileName, ImageFileName
+    | sort -writes
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.FILE AND file_name ~= ".+"
+    | comp count() as writes by agent_hostname, actor_effective_username, action_file_name, action_file_path
+    | sort desc writes
+  lucene: |
+    event.category:"file" AND file_name:*.+*
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id IN ("11","23","26") AND file_name matches "*.+*"
+    | count by host, user, target_filename, image
+    | sort by _count desc
 false_positives:
 - Security software
 - Authorized admin tools
@@ -86,7 +88,7 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: historical
 pseudo_logic: '1 VaronisDatAdvantage Alert
 
@@ -94,11 +96,11 @@ pseudo_logic: '1 VaronisDatAdvantage Alert
   ransomware intrusion activity","Potential encryption of multiple files"]'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'
-- "Inspect the parent \u2192 child process tree, command line arguments, and code-signing status \u2014 characterize the destructive\
-  \ action (encrypt, delete, lockout, disable, reboot)."
+- Inspect the parent → child process tree, command line arguments, and code-signing status — characterize the destructive
+  action (encrypt, delete, lockout, disable, reboot).
 - 'Determine spread: is this a single host or a coordinated multi-host event? Pull file / service telemetry across the fleet.'
-- "Trigger your major-incident bridge if scope is multi-host or business-critical \u2014 early activation buys time."
+- Trigger your major-incident bridge if scope is multi-host or business-critical — early activation buys time.
 - 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this
   severity.'
-- "If TP: execute your IR runbook \u2014 isolate, preserve evidence, restore from backup if appropriate, hunt for adversary\
-  \ persistence to prevent recurrence."
+- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence
+  to prevent recurrence.'

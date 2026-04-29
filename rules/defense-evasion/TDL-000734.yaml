@@ -18,73 +18,74 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: 'index=endpoint sourcetype=Sysmon EventCode=1
-
-    | search network.path="*asymmetric*"
-
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
-
+  spl: |
+    index=network sourcetype=firewall OR sourcetype=ids
+    | search network.protocol="*tcp*"
+    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
     | where count >= 1
-
-    | sort - count'
-  kql: 'DeviceProcessEvents
-
+    | sort - bytes_out
+  kql: |
+    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
     | where TimeGenerated > ago(1d)
-
-    | where network.path matches regex "asymmetric"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc'
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE\
-    \ LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"network.path\" LIKE '%asymmetric%'\n\
-    LAST 24 HOURS"
-  yara_l: "rule tdl_tdl_de_000734 {\n  meta:\n    author = \"TDL\"\n    description = \"Asymmetric Traffic Across Trust Boundary\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1599\"\n  events:\n    $e.metadata.event_type =\
-    \ \"PROCESS_LAUNCH\"\n    $e.network.path = /asymmetric/\n    $host = $e.principal.hostname\n  match:\n    $host over\
-    \ 30m\n  condition:\n    $e\n}"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
+    | where network.protocol matches regex "tcp"
+    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+    | order by Bytes desc
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+    FROM flows
+    WHERE "network.protocol" LIKE '%tcp%'
+    GROUP BY sourceip, destinationip, destinationport
+    LAST 1 HOURS
+  yara_l: |
+    rule tdl_tdl_de_000734 {
+      meta:
+        author = "TDL"
+        description = "Asymmetric Traffic Across Trust Boundary"
+        severity = "HIGH"
+        tactic = "TA0005"
+        technique = "T1599"
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.protocol = /tcp/
+        $src = $e.principal.ip
+      match:
+        $src over 10m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network*,logs-endpoint*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND network.path LIKE "%asymmetric%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC'
-  leql: 'where(logset = "Endpoint Activity" AND network.path=/asymmetric/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)'
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND network.path=*asymmetric*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND network.path ~= "asymmetric"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences'
-  lucene: event.category:"process" AND network.path:*asymmetric*
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids*
-
-    | where technique="T1599" OR _raw matches "*T1599*"
-
-    | count, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc'
+    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+    | SORT bytes_out DESC
+  leql: |
+    where(logset = "Network Activity" AND network.protocol=/tcp/)
+    groupby(source_ip, destination_ip, destination_port)
+    calculate(count, sum(bytes_out))
+  crowdstrike: |
+    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
+    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
+    | sort -bytes_out
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
+    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
+    | sort desc bytes_out
+  lucene: |
+    event.category:"network" AND network.protocol:*tcp*
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+    | where network.protocol matches "*tcp*"
+    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+    | sort by bytes_out desc
 pseudo_logic: TCP sessions where reply path differs from request path crossing a security boundary, or NAT'd flows bypassing
   the egress firewall. Indicates rogue route/bridge.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: "Proposed rule generated from ATT&CK gap analysis \u2014 review the pseudo_logic, scope filters to the right\
-  \ asset group, and refine thresholds using \u22657 days of telemetry before promoting."
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
+  group, and refine thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - network
@@ -95,12 +96,12 @@ references:
 - https://attack.mitre.org/techniques/T1599/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
-- "Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints \u2014 distinguish administrative tooling from\
-  \ adversary tradecraft (LOLBins, signed binary proxies, masquerading paths)."
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — distinguish administrative tooling from adversary
+  tradecraft (LOLBins, signed binary proxies, masquerading paths).
 - 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log channel state to see what was suppressed.'
 - 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same
   minute.'

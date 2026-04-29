@@ -19,61 +19,69 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: 'index=linux
-
-    | table _time, host, user, ProcessName, CommandLine'
-  kql: 'Syslog
-
-    | where TimeGenerated >= ago(1d)
-
-    | project TimeGenerated, Computer, Account, Activity'
-  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
-    \ events\nWHERE eventid = 4688\n  AND INOFFSET(starttime, LAST 300 SECONDS)\nGROUP BY username, hostname, QIDNAME(qid)\n\
-    \nORDER BY starttime DESC"
-  yara_l: "rule zs_de_000185 {\n  meta:\n    author = \"TDL\"\n    description = \"Code Compiling\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0005\"\n    technique = \"T1027\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\n\
-    \    $event.metadata.product_event_type = \"4688\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
-    \ = $user\n\n  match:\n    $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-system.syslog*,logs-auditd*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN (''4688'')
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT event_count DESC'
-  leql: 'where(event_id IN [4688])
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)'
-  crowdstrike: 'event_simpleName=SecurityEvent
-
-    | where EventCode=4688
-
-    | table ComputerName, UserName, CommandLine, ContextTimeStamp'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = "PROCESS" and action_evtlog_event_id in (4688)
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time
-
-    | sort desc _time'
-  lucene: event_id:(4688)
-  sumo: '_sourceCategory=*ids*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1027*"
-
+  spl: |
+    index=endpoint sourcetype=Sysmon EventCode=1
+    | search event_id IN ("4688")
+    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
+    | where count >= 1
+    | sort - count
+  kql: |
+    DeviceProcessEvents
+    | where TimeGenerated > ago(1d)
+    | where event_id in ("4688")
+    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" = '1'
+      AND "event_id" IN ('4688')
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_de_000185 {
+      meta:
+        author = "TDL"
+        description = "Code Compiling"
+        severity = "LOW"
+        tactic = "TA0005"
+        technique = "T1027"
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.event_id = /(4688)/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*,logs-windows*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "process" AND event_id IN ("4688")
+    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND event_id IN [4688])
+    groupby(asset, process_name, parent_process_name)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 AND event_id IN (4688)
+    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+    | sort -occurrences
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.PROCESS AND event_id in ("4688")
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+    | sort desc occurrences
+  lucene: |
+    event.category:"process" AND event_id:(4688)
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id="1" AND event_id IN ("4688")
     | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | sort by _count desc
 false_positives:
 - 'Old Regex for the command line: \b(gcc|g\+\+|cc|c\+\+|javac)\b
 
@@ -88,7 +96,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Destination Hostname is\
   \ NOT on a High Value Target Host List\nWhere the Command matches the regex \"(?:(?:^[\\\"\\s]{0,1}(gcc|g\\+\\+|cc|c\\+\\\
@@ -105,8 +113,8 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
-- "Inspect the parent \u2192 child process tree, command line arguments, and code-signing status \u2014 distinguish administrative\
-  \ tooling from adversary tradecraft (LOLBins, signed binary proxies, masquerading paths)."
+- Inspect the parent → child process tree, command line arguments, and code-signing status — distinguish administrative tooling
+  from adversary tradecraft (LOLBins, signed binary proxies, masquerading paths).
 - 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log channel state to see what was suppressed.'
 - 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same
   minute.'

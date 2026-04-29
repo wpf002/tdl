@@ -1,8 +1,8 @@
 rule_id: TDL-CA-000750
 v4_id: '000750'
 name: MFA Code Replayed From Multiple Source IPs
-description: "Same TOTP / push code accepted from \u22652 distinct source IPs within 90s for the same user. MFA proxy / interception.\
-  \ Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1111 under Credential Access)."
+description: Same TOTP / push code accepted from ≥2 distinct source IPs within 90s for the same user. MFA proxy / interception.
+  Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1111 under Credential Access).
 tactic: Credential Access
 tactic_id: TA0006
 technique_id: T1111
@@ -17,73 +17,73 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: 'index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-
-    | search user.name="*mfa-replay*"
-
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-
+  spl: |
+    index=network sourcetype=firewall OR sourcetype=ids
+    | search network.protocol="*tcp*"
+    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
     | where count >= 1
-
-    | sort - count'
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
+    | sort - bytes_out
+  kql: |
+    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
     | where TimeGenerated > ago(1d)
-
-    | where user.name matches regex "mfa-replay"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId,
-    ResourceProvider))
-
-    | order by Count desc'
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"user.name\" LIKE '%mfa-replay%'\nLAST 24 HOURS"
-  yara_l: "rule tdl_tdl_ca_000750 {\n  meta:\n    author = \"TDL\"\n    description = \"MFA Code Replayed From Multiple Source\
-    \ IPs\"\n    severity = \"HIGH\"\n    tactic = \"TA0006\"\n    technique = \"T1111\"\n  events:\n    $e.metadata.event_type\
-    \ = \"USER_RESOURCE_ACCESS\"\n    $e.user.name = /mfa-replay/\n    $actor = $e.principal.user.userid\n  match:\n    $actor\
-    \ over 30m\n  condition:\n    $e\n}"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
+    | where network.protocol matches regex "tcp"
+    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+    | order by Bytes desc
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+    FROM flows
+    WHERE "network.protocol" LIKE '%tcp%'
+    GROUP BY sourceip, destinationip, destinationport
+    LAST 1 HOURS
+  yara_l: |
+    rule tdl_tdl_ca_000750 {
+      meta:
+        author = "TDL"
+        description = "MFA Code Replayed From Multiple Source IPs"
+        severity = "HIGH"
+        tactic = "TA0006"
+        technique = "T1111"
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.protocol = /tcp/
+        $src = $e.principal.ip
+      match:
+        $src over 10m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network*,logs-endpoint*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE user.name LIKE "%mfa-replay%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC'
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND user.name=/mfa-replay/)
-
-    groupby(actor, event_name)
-
-    calculate(count)'
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND user.name=*mfa-replay*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls'
-  xql: 'dataset = cloud_audit_logs
-
-    | filter user.name ~= "mfa-replay"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls'
-  lucene: event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND user.name:*mfa-replay*
-  sumo: '_sourceCategory=*auth*
-
-    | parse regex "\"userIdentity\":\{\"arn\":\"(?<actor>[^\"]+)" nodrop
-
-    | where _raw matches "*T1111*"
-
-    | count by actor, eventName, sourceIPAddress
-
-    | sort by _count desc'
-pseudo_logic: "Same TOTP / push code accepted from \u22652 distinct source IPs within 90s for the same user. MFA proxy / interception."
+    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+    | SORT bytes_out DESC
+  leql: |
+    where(logset = "Network Activity" AND network.protocol=/tcp/)
+    groupby(source_ip, destination_ip, destination_port)
+    calculate(count, sum(bytes_out))
+  crowdstrike: |
+    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
+    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
+    | sort -bytes_out
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
+    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
+    | sort desc bytes_out
+  lucene: |
+    event.category:"network" AND network.protocol:*tcp*
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+    | where network.protocol matches "*tcp*"
+    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+    | sort by bytes_out desc
+pseudo_logic: Same TOTP / push code accepted from ≥2 distinct source IPs within 90s for the same user. MFA proxy / interception.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: "Proposed rule generated from ATT&CK gap analysis \u2014 review the pseudo_logic, scope filters to the right\
-  \ asset group, and refine thresholds using \u22657 days of telemetry before promoting."
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
+  group, and refine thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - mfa
@@ -94,12 +94,12 @@ references:
 - https://attack.mitre.org/techniques/T1111/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- "Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints \u2014 verify the read / dump / brute-force pattern\
-  \ is consistent with this technique."
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — verify the read / dump / brute-force pattern
+  is consistent with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
 - 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
   kerberos tickets).'

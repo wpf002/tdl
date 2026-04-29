@@ -1,13 +1,13 @@
 rule_id: TDL-CA-000202
 v4_id: '000202'
 name: Credential Dumping
-description: "Detects the dumping of memory or registry hives to gain credentials. The tool Procdump or Task Manager can be\
-  \ used to dump the memory of the lsass.exe. The lsass process is responsible for the authentication of users on a Windows\
-  \ host. Procdump is a tool that can dump a process\u2019 memory to a file. The Task Manager can also be used to dump any\
-  \ process\u2019 memory in the GUI. By dumping the memory of lsass.exe, an attacker can search the memory for plaintext passwords\
-  \ that were inputted during authentication and compromise the accounts. Alternatively, an attacker can use reg.exe to download\
-  \ the Security Account Manager (SAM) registry hive, which contains user password hashes. These hashes can then be cracked\
-  \ or used in pass-the-hash attacks at a later time."
+description: Detects the dumping of memory or registry hives to gain credentials. The tool Procdump or Task Manager can be
+  used to dump the memory of the lsass.exe. The lsass process is responsible for the authentication of users on a Windows
+  host. Procdump is a tool that can dump a process’ memory to a file. The Task Manager can also be used to dump any process’
+  memory in the GUI. By dumping the memory of lsass.exe, an attacker can search the memory for plaintext passwords that were
+  inputted during authentication and compromise the accounts. Alternatively, an attacker can use reg.exe to download the Security
+  Account Manager (SAM) registry hive, which contains user password hashes. These hashes can then be cracked or used in pass-the-hash
+  attacks at a later time.
 tactic: Credential Access
 tactic_id: TA0006
 technique_id: T1003
@@ -22,65 +22,68 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: 'index=windows
-
-    | where (EventCode=4688 OR EventCode=4688 OR EventCode=4657)
-
-    | table _time, host, user, ProcessName, CommandLine'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | where EventID in (4688, 4688, 4657)
-
-    | project TimeGenerated, Computer, Account, IpAddress, EventID, Activity'
-  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
-    \ events\nWHERE eventid IN (4688, 4657)\n  AND INOFFSET(starttime, LAST 300 SECONDS)\nGROUP BY username, hostname, QIDNAME(qid)\n\
-    \nORDER BY starttime DESC"
-  yara_l: "rule zs_ca_000202 {\n  meta:\n    author = \"TDL\"\n    description = \"Credential Dumping\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0006\"\n    technique = \"T1003\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\
-    \n    $event.metadata.product_event_type = \"4688\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
-    \ = $user\n\n  match:\n    $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN (''4688'', ''4657'')
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT event_count DESC'
-  leql: 'where(event_id IN [4688, 4657])
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)'
-  crowdstrike: 'event_simpleName=SecurityEvent
-
-    | where EventCode=4688 OR EventCode=4657
-
-    | table ComputerName, UserName, CommandLine, ContextTimeStamp'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = "PROCESS" and action_evtlog_event_id in (4688, 4657)
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time
-
-    | sort desc _time'
-  lucene: event_id:(4688 OR 4657)
-  sumo: '_sourceCategory=*ids*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("12","13","14") AND _raw matches "*T1003*"
-
+  spl: |
+    index=endpoint sourcetype=Sysmon (EventCode=12 OR EventCode=13 OR EventCode=14)
+    | search registry_key="*save hklm\system*"
+    | stats count, values(host) as hosts by user, target_object, details, image
+    | sort - count
+  kql: |
+    DeviceRegistryEvents
+    | where TimeGenerated > ago(1d)
+    | where registry_key matches regex "save hklm\system"
+    | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "Registry Key", "Registry Value Name", "Registry Value Data", "Process Name"
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" IN ('12','13','14')
+      AND "registry_key" LIKE '%save hklm\system%'
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_ca_000202 {
+      meta:
+        author = "TDL"
+        description = "Credential Dumping"
+        severity = "HIGH"
+        tactic = "TA0006"
+        technique = "T1003"
+      events:
+        $e.metadata.event_type = "REGISTRY_MODIFICATION"
+        $e.registry_key = /save hklm\system/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "registry" AND registry_key LIKE "%save hklm\system%"
+    | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/save hklm\system/)
+    groupby(asset, registry_key, registry_value)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*save hklm\system*
+    | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
+    | sort -changes
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.REGISTRY AND registry_key ~= "save hklm\system"
+    | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
+    | sort desc changes
+  lucene: |
+    event.category:"registry" AND registry_key:*save hklm\system*
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id IN ("12","13","14") AND registry_key matches "*save hklm\system*"
     | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc'
+    | sort by _count desc
 false_positives:
 - Security software
 - Authorized admin tools
@@ -90,7 +93,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 pseudo_logic: "1 Windows Process Creation Event\nWhere the Event ID is in [592, 4688]\nWhere Destination Host is a Domain\
   \ Controller\nOR\n    Where Process Name equals \"reg.exe\"\n\tOR\n\t\tWhere Command Line contains \"save hklm\\system\"\
@@ -116,8 +119,8 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- "Inspect the parent \u2192 child process tree, command line arguments, and code-signing status \u2014 verify the read /\
-  \ dump / brute-force pattern is consistent with this technique."
+- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force
+  pattern is consistent with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
 - 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
   kerberos tickets).'

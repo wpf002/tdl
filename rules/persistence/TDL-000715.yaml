@@ -21,78 +21,74 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 50
 queries:
-  spl: 'index=network sourcetype=firewall OR sourcetype=ids
-
-    | search source.ip="*knock*"
-
+  spl: |
+    index=network sourcetype=firewall OR sourcetype=ids
+    | search network.protocol="*tcp*"
     | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-
     | where count >= 1
-
-    | sort - bytes_out'
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
+    | sort - bytes_out
+  kql: |
+    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
     | where TimeGenerated > ago(1d)
-
-    | where source.ip matches regex "knock"
-
+    | where network.protocol matches regex "tcp"
     | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc'
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+    | order by Bytes desc
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
     FROM flows
-
-    WHERE "source.ip" LIKE ''%knock%''
-
+    WHERE "network.protocol" LIKE '%tcp%'
     GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS'
-  yara_l: "rule tdl_tdl_per_000715 {\n  meta:\n    author = \"TDL\"\n    description = \"Inbound Connection Following Unusual\
-    \ UDP Knock Sequence\"\n    severity = \"MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1205\"\n  events:\n   \
-    \ $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.source.ip = /knock/\n    $src = $e.principal.ip\n  match:\n\
-    \    $src over 10m\n  condition:\n    $e\n}"
-  esql: 'FROM logs-network*,logs-endpoint*
-
+    LAST 1 HOURS
+  yara_l: |
+    rule tdl_tdl_per_000715 {
+      meta:
+        author = "TDL"
+        description = "Inbound Connection Following Unusual UDP Knock Sequence"
+        severity = "MEDIUM"
+        tactic = "TA0003"
+        technique = "T1205"
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.protocol = /tcp/
+        $src = $e.principal.ip
+      match:
+        $src over 10m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network*,logs-endpoint*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND source.ip LIKE "%knock%"
-
+    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
     | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC'
-  leql: 'where(logset = "Network Activity" AND source.ip=/knock/)
-
+    | SORT bytes_out DESC
+  leql: |
+    where(logset = "Network Activity" AND network.protocol=/tcp/)
     groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))'
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND source.ip=*knock*
-
+    calculate(count, sum(bytes_out))
+  crowdstrike: |
+    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
     | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND source.ip ~= "knock"
-
+    | sort -bytes_out
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
     | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out'
-  lucene: event.category:"network" AND source.ip:*knock*
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*sysmon*
-
-    | where technique="T1205" OR _raw matches "*T1205*"
-
-    | count, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc'
+    | sort desc bytes_out
+  lucene: |
+    event.category:"network" AND network.protocol:*tcp*
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+    | where network.protocol matches "*tcp*"
+    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+    | sort by bytes_out desc
 pseudo_logic: Sequence of small UDP packets to closed ports immediately followed by a TCP connection from the same source
   to a high port. Classic port-knock backdoor activation.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: "Proposed rule generated from ATT&CK gap analysis \u2014 review the pseudo_logic, scope filters to the right\
-  \ asset group, and refine thresholds using \u22657 days of telemetry before promoting."
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
+  group, and refine thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - port-knock
@@ -104,17 +100,17 @@ references:
 - https://attack.mitre.org/techniques/T1205/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service
   / config).'
-- "Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints \u2014 verify the persistence target points to\
-  \ an unusual location or unsigned binary."
-- "Determine when the artifact was created and which process/account performed the write \u2014 pivot on that process for\
-  \ the original attack chain."
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — verify the persistence target points to an unusual
+  location or unsigned binary.
+- Determine when the artifact was created and which process/account performed the write — pivot on that process for the original
+  attack chain.
 - 'Look for prior child-process activity from the persistence target: did anything actually launch from it?'
-- "Decide TP / FP: FP for sanctioned management software (RMM, vendor agents, custom installers) \u2014 verify against the\
-  \ asset register."
+- 'Decide TP / FP: FP for sanctioned management software (RMM, vendor agents, custom installers) — verify against the asset
+  register.'
 - 'If TP: remove the persistence artifact, isolate the host, hunt for the same artifact across the fleet, and rotate any credentials
   touched by the persistent process.'

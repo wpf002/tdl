@@ -13,71 +13,69 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 70
 queries:
-  spl: 'index=windows sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13
-
-    | where match(TargetObject, "(?i)(\\CurrentVersion\\Run|RunOnce)")
-
-    | where NOT match(Image, "(?i)(\\windows\\system32\\")
-
-    | table _time, host, user, Image, TargetObject, Details'
-  kql: 'DeviceRegistryEvents
-
-    | where TimeGenerated >= ago(1d)
-
-    | where RegistryKey matches regex @"(?i)(\\CurrentVersion\\Run|RunOnce)"
-
-    | where InitiatingProcessFolderPath !startswith "C:\\Windows\\"
-
-    | project TimeGenerated, DeviceName, InitiatingProcessAccountName, RegistryKey, RegistryValueData'
-  aql: 'SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount
-
+  spl: |
+    index=endpoint sourcetype=Sysmon EventCode=1
+    | search process_name="*.+*"
+    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
+    | where count >= 1
+    | sort - count
+  kql: |
+    DeviceProcessEvents
+    | where TimeGenerated > ago(1d)
+    | where process_name matches regex ".+"
+    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
     FROM events
-
-    WHERE INOFFSET(starttime, LAST 300 SECONDS)
-
-    GROUP BY username, hostname, QIDNAME(qid)
-
-    ORDER BY starttime DESC'
-  yara_l: "rule tdl_per_001 {\n  meta:\n    author = \"TDL\"\n    description = \"Registry Run Key Persistence Added\"\n \
-    \   severity = \"HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1547.001\"\n\n  events:\n    $event.metadata.event_type\
-    \ = \"GENERIC_EVENT\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n \
-    \   $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT @timestamp DESC'
-  leql: 'where(logset = "Endpoint Activity")
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)
-
-    having(event_count >= 1)'
-  crowdstrike: 'event_simpleName=ProcessRollup2
-
-    | stats count as proc_count by ComputerName, FileName
-
-    | where proc_count >= 1
-
-    | sort -proc_count'
-  xql: "dataset = xdr_data\n| filter event_type = \"PROCESS\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
-    \ _time"
-  lucene: event_id:* AND log_type:"security"
-  sumo: '_sourceCategory=*sysmon*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("12","13","14") AND _raw matches "*T1547.001*"
-
-    | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc'
+    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
+      AND "EventID" = '1'
+      AND "process_name" LIKE '%.+%'
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_per_001 {
+      meta:
+        author = "TDL"
+        description = "Registry Run Key Persistence Added"
+        severity = "HIGH"
+        tactic = "TA0003"
+        technique = "T1547.001"
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.process_name = /.+/
+        $host = $e.principal.hostname
+      match:
+        $host over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint*,logs-windows*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+    | SORT count DESC
+  leql: |
+    where(logset = "Endpoint Activity" AND process_name=/.+/)
+    groupby(asset, process_name, parent_process_name)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 AND process_name=*.+*
+    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+    | sort -occurrences
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+    | sort desc occurrences
+  lucene: |
+    event.category:"process" AND process_name:*.+*
+  sumo: |
+    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+    | parse "EventID=*\"" as event_id
+    | where event_id="1" AND process_name matches "*.+*"
+    | count by host, user, parent_process_name, command_line
+    | sort by _count desc
 false_positives:
 - Software installers adding legitimate startup entries
 tags:
@@ -87,16 +85,16 @@ tags:
 author: TDL
 created: '2024-01-20'
 test_method: synthetic
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service
   / config).'
-- "Inspect the registry hive, key path, value name, and writing process \u2014 verify the persistence target points to an\
-  \ unusual location or unsigned binary."
-- "Determine when the artifact was created and which process/account performed the write \u2014 pivot on that process for\
-  \ the original attack chain."
+- Inspect the registry hive, key path, value name, and writing process — verify the persistence target points to an unusual
+  location or unsigned binary.
+- Determine when the artifact was created and which process/account performed the write — pivot on that process for the original
+  attack chain.
 - 'Look for prior child-process activity from the persistence target: did anything actually launch from it?'
-- "Decide TP / FP: FP for sanctioned management software (RMM, vendor agents, custom installers) \u2014 verify against the\
-  \ asset register."
+- 'Decide TP / FP: FP for sanctioned management software (RMM, vendor agents, custom installers) — verify against the asset
+  register.'
 - 'If TP: remove the persistence artifact, isolate the host, hunt for the same artifact across the fleet, and rotate any credentials
   touched by the persistent process.'

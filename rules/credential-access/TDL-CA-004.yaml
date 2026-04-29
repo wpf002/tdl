@@ -13,72 +13,68 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 95
 queries:
-  spl: 'index=windows sourcetype=WinEventLog:Security EventCode=4662
-
-    | where Properties="1131f6aa-9c07-11d1-f79f-00c04fc2dcd2" OR Properties="1131f6ab-9c07-11d1-f79f-00c04fc2dcd2"
-
-    | where NOT match(SubjectUserName,"\\$$")
-
-    | table _time, host, SubjectUserName, Properties'
-  kql: 'SecurityEvent
-
-    | where TimeGenerated >= ago(1d)
-
-    | where EventID == 4662
-
-    | where Properties has_any ("1131f6aa-9c07-11d1-f79f-00c04fc2dcd2","1131f6ab-9c07-11d1-f79f-00c04fc2dcd2")
-
-    | where SubjectUserName !endswith "$"
-
-    | project TimeGenerated, Computer, SubjectUserName, Properties'
-  aql: "SELECT username AS subject_user, hostname AS dc_name, QIDNAME(qid) AS event_name,\n       \"Object Properties\" AS\
-    \ properties\nFROM events\nWHERE eventid = 4662\n  AND \"Object Properties\" ILIKE '%1131f6aa-9c07-11d1-f79f-00c04fc2dcd2%'\n\
-    \     OR \"Object Properties\" ILIKE '%1131f6ab-9c07-11d1-f79f-00c04fc2dcd2%'\n  AND username NOT LIKE '%$'\n  AND INOFFSET(starttime,\
-    \ LAST 86400 SECONDS)\nORDER BY starttime DESC"
-  yara_l: "rule tdl_ca_004 {\n  meta:\n    author = \"TDL\"\n    description = \"DCSync Attack - Replication Rights Abuse\"\
-    \n    severity = \"CRITICAL\"\n    tactic = \"TA0006\"\n    technique = \"T1003.006\"\n\n  events:\n    $event.metadata.event_type\
-    \ = \"GENERIC_EVENT\"\n    $event.metadata.product_event_type = \"4662\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
-    \ = $user\n\n  match:\n    $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-windows.sysmon_operational*,logs-system.security*
-
+  spl: |
+    index=windows sourcetype="WinEventLog:Security"
+    | search event_id IN ("4662")
+    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
+    | where count >= 1
+    | sort - count
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1d)
+    | where event_id in ("4662")
+    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
+      AND "event_id" IN ('4662')
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_ca_004 {
+      meta:
+        author = "TDL"
+        description = "DCSync Attack - Replication Rights Abuse"
+        severity = "CRITICAL"
+        tactic = "TA0006"
+        technique = "T1003.006"
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.event_id = /(4662)/
+        $user = $e.target.user.userid
+      match:
+        $user over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.security*,logs-system.security*
     | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN (''4662'')
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT event_count DESC'
-  leql: 'where(event_id IN [4662])
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)'
-  crowdstrike: 'event_simpleName=SecurityEvent
-
-    | where EventCode=4662
-
-    | table ComputerName, UserName, CommandLine, ContextTimeStamp'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = "PROCESS" and action_evtlog_event_id in (4662)
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time
-
-    | sort desc _time'
-  lucene: event_id:(4662)
-  sumo: '_sourceCategory=*windows*
-
+    | WHERE event.category == "authentication" AND event_id IN ("4662")
+    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+    | SORT count DESC
+  leql: |
+    where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4662])
+    groupby(destination_account, source_ip, asset)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4662)
+    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+    | sort -auth_events
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.LOGIN AND event_id in ("4662")
+    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+    | sort desc logins
+  lucene: |
+    event.category:"authentication" AND event_id:(4662)
+  sumo: |
+    _sourceCategory=*windows*security* OR _sourceCategory=*ad*
     | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1003.006*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | where event_id IN ("4662")
+    | count by host, user, src_ip, logon_type, event_id
+    | sort by _count desc
 false_positives:
 - Azure AD Connect
 - Backup solutions with AD replication permissions
@@ -90,11 +86,11 @@ tags:
 author: TDL
 created: '2024-02-04'
 test_method: purple_team
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- "Inspect the parent \u2192 child process tree, command line arguments, and code-signing status \u2014 verify the read /\
-  \ dump / brute-force pattern is consistent with this technique."
+- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force
+  pattern is consistent with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
 - 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
   kerberos tickets).'

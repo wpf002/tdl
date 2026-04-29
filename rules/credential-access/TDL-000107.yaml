@@ -21,77 +21,68 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: 'index=linux
-
-    | bucket _time span=3m
-
-    | stats count by src_ip, Account_Name, _time
-
-    | where count >= 5
-
-    | table _time, host, Account_Name, IpAddress, LogonType'
-  kql: 'Syslog
-
-    | where TimeGenerated >= ago(1d)
-
-    | summarize Count = count() by Account, IpAddress, bin(TimeGenerated, 3m)
-
-    | where Count >= 5
-
-    | project TimeGenerated, Computer, Account, Activity'
-  aql: "SELECT LOGSOURCENAME(logsourceid) AS log_source, username, hostname, QIDNAME(qid) AS event_name, eventcount\nFROM\
-    \ events\nWHERE eventid IN (4625, 4776)\n  AND INOFFSET(starttime, LAST 180 SECONDS)\nGROUP BY username, hostname, QIDNAME(qid)\n\
-    HAVING event_count >= 5\nORDER BY starttime DESC"
-  yara_l: "rule zs_ca_000107 {\n  meta:\n    author = \"TDL\"\n    description = \"Distributed Account Guessing\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1110\"\n\n  events:\n    $event.metadata.event_type = \"GENERIC_EVENT\"\
-    \n    $event.metadata.product_event_type = \"4625\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid\
-    \ = $user\n\n  match:\n    $host over 3m\n\n  condition:\n    #event >= 5\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-system.syslog*,logs-auditd*
-
+  spl: |
+    index=windows sourcetype="WinEventLog:Security"
+    | search event_id IN ("4625", "4776")
+    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
+    | where count >= 1
+    | sort - count
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1d)
+    | where event_id in ("4625", "4776")
+    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+    | order by Count desc
+  aql: |
+    SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
+      AND "event_id" IN ('4625', '4776')
+    LAST 24 HOURS
+  yara_l: |
+    rule tdl_tdl_ca_000107 {
+      meta:
+        author = "TDL"
+        description = "Distributed Account Guessing"
+        severity = "MEDIUM"
+        tactic = "TA0006"
+        technique = "T1110"
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.event_id = /(4625|4776)/
+        $user = $e.target.user.userid
+      match:
+        $user over 30m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.security*,logs-system.security*
     | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.code IN (''4625'', ''4776'')
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, event.code, @timestamp = BUCKET(@timestamp, 3m)
-
-    | WHERE event_count >= 5
-
-    | SORT event_count DESC'
-  leql: 'where(event_id IN [4625, 4776])
-
-    groupby(source_ip, username, hostname)
-
-    calculate(count AS event_count)
-
-    having(event_count >= 5)'
-  crowdstrike: 'event_simpleName=SecurityEvent
-
-    | where EventCode=4625 OR EventCode=4776
-
-    | stats count as events by ComputerName, UserName
-
-    | where events >= 5'
-  xql: 'dataset = xdr_data
-
-    | filter event_type = "PROCESS" and action_evtlog_event_id in (4625, 4776)
-
-    | filter _time > to_timestamp(now() - 86400, "epoch")
-
-    | comp count() as event_count by hostname, actor_effective_username
-
-    | filter event_count >= 5
-
-    | fields hostname, actor_effective_username, event_count'
-  lucene: event_id:(4625 OR 4776)
-  sumo: '_sourceCategory=*ids*
-
+    | WHERE event.category == "authentication" AND event_id IN ("4625", "4776")
+    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+    | SORT count DESC
+  leql: |
+    where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4625, 4776])
+    groupby(destination_account, source_ip, asset)
+    calculate(count)
+  crowdstrike: |
+    event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4625, 4776)
+    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+    | sort -auth_events
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.LOGIN AND event_id in ("4625", "4776")
+    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+    | sort desc logins
+  lucene: |
+    event.category:"authentication" AND event_id:(4625 OR 4776)
+  sumo: |
+    _sourceCategory=*windows*security* OR _sourceCategory=*ad*
     | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id="1" AND _raw matches "*T1110*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc'
+    | where event_id IN ("4625", "4776")
+    | count by host, user, src_ip, logon_type, event_id
+    | sort by _count desc
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -101,7 +92,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: historical
 pseudo_logic: "5 Windows Authentication Failure Events \nFrom the same internal Source Hostname to the multiple Destination\n\
   Where the Event ID in [529, 4625, 4776, 680, 681]\nWhere the Failure Code is \"0xC0000064\"\nWhere the Destination Username\
@@ -113,8 +104,8 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- "Inspect the parent \u2192 child process tree, command line arguments, and code-signing status \u2014 verify the read /\
-  \ dump / brute-force pattern is consistent with this technique."
+- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force
+  pattern is consistent with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
 - 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
   kerberos tickets).'

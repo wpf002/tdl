@@ -1,7 +1,7 @@
 rule_id: TDL-LM-000482
 v4_id: 000482
 name: First Seen Allowed Inbound SMB Traffic
-description: "A rule that detects allowed inbound SMB traffic from an IP that hasn\u2019t been seen in the last 90 days"
+description: A rule that detects allowed inbound SMB traffic from an IP that hasn’t been seen in the last 90 days
 tactic: Lateral Movement
 tactic_id: TA0008
 technique_id: T1021
@@ -15,61 +15,67 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: 'index=network
-
-    | table _time, src_ip, dest_ip, dest_port, action'
-  kql: 'CommonSecurityLog
-
-    | where TimeGenerated >= ago(1d)
-
-    | project TimeGenerated, SourceIP, DestinationIP, DestinationPort, DeviceAction'
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(flowCount) AS total_flows
-
+  spl: |
+    index=network sourcetype=firewall OR sourcetype=ids
+    | search application="*smb*"
+    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
+    | where count >= 1
+    | sort - bytes_out
+  kql: |
+    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+    | where TimeGenerated > ago(1d)
+    | where application matches regex "smb"
+    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+    | order by Bytes desc
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
     FROM flows
-
-    WHERE INOFFSET(starttime, LAST 300 SECONDS)
-
+    WHERE "application" LIKE '%smb%'
     GROUP BY sourceip, destinationip, destinationport
-
-    ORDER BY starttime DESC'
-  yara_l: "rule zs_lm_000482 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Allowed Inbound SMB Traffic\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0008\"\n    technique = \"T1021\"\n\n  events:\n    $event.metadata.event_type\
-    \ = \"GENERIC_EVENT\"\n    $event.principal.hostname = $host\n    $event.principal.user.userid = $user\n\n  match:\n \
-    \   $host over 5m\n\n  condition:\n    #event >= 1\n\n  outcome:\n    $risk_score = max(50)\n}"
-  esql: 'FROM logs-network*,logs-firewall*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | STATS event_count = COUNT(*) BY host.name, user.name, @timestamp = BUCKET(@timestamp, 5m)
-
-    | WHERE event_count >= 1
-
-    | SORT @timestamp DESC'
-  leql: 'where(logset = "Endpoint Activity")
-
-    groupby(hostname, username)
-
-    calculate(count AS event_count)
-
-    having(event_count >= 1)'
-  crowdstrike: 'event_simpleName=ProcessRollup2
-
-    | stats count as proc_count by ComputerName, FileName
-
-    | where proc_count >= 1
-
-    | sort -proc_count'
-  xql: "dataset = xdr_data\n| filter event_type = \"NETWORK\" \n| filter _time > to_timestamp(now() - 86400, \"epoch\")\n\
-    | fields hostname, actor_effective_username, action_process_image_name, action_process_command_line, _time\n| sort desc\
-    \ _time"
-  lucene: event_id:* AND log_type:"security"
-  sumo: '_sourceCategory=*firewall*
-
-    | where technique="T1021" OR _raw matches "*T1021*"
-
-    | count, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc'
+    LAST 1 HOURS
+  yara_l: |
+    rule tdl_tdl_lm_000482 {
+      meta:
+        author = "TDL"
+        description = "First Seen Allowed Inbound SMB Traffic"
+        severity = "LOW"
+        tactic = "TA0008"
+        technique = "T1021"
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.application = /smb/
+        $src = $e.principal.ip
+      match:
+        $src over 10m
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network*,logs-endpoint*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.category == "network" AND application LIKE "%smb%"
+    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+    | SORT bytes_out DESC
+  leql: |
+    where(logset = "Network Activity" AND application=/smb/)
+    groupby(source_ip, destination_ip, destination_port)
+    calculate(count, sum(bytes_out))
+  crowdstrike: |
+    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*smb*
+    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
+    | sort -bytes_out
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.NETWORK AND application ~= "smb"
+    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
+    | sort desc bytes_out
+  lucene: |
+    event.category:"network" AND application:*smb*
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+    | where application matches "*smb*"
+    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+    | sort by bytes_out desc
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -79,16 +85,16 @@ tags:
 - lateral-movement
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-27'
+last_modified: '2026-04-28'
 test_method: none
 pseudo_logic: "1 Firewall Event \nFrom one external source to one internal destination (Inbound)\nWhere the Action is Allowed\n\
   OR\n    Where the Destination Port IN (\"139\", \"445\")\n\n    Where the Application contains \"smb\"\n\n    Where the\
   \ Application contains \"samba\"\n\nBaseline Learning: 30 Days\nRetention: 90 Days\n\nNew Value: Source IP"
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, target host, and the protocol / credential used.'
-- "Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints \u2014 confirm the cross-host action (SMB write,\
-  \ WinRM exec, RDP session, kubectl exec) and the auth context."
-- "Pull a graph of the source identity's recent host touches \u2014 adversaries hop quickly across multiple endpoints."
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — confirm the cross-host action (SMB write, WinRM
+  exec, RDP session, kubectl exec) and the auth context.
+- Pull a graph of the source identity's recent host touches — adversaries hop quickly across multiple endpoints.
 - 'Validate against change tickets and admin patterns: is this admin-bastion traffic or worker-to-worker movement that has
   no business justification?'
 - 'Decide TP / FP: FP for sanctioned admin / vulnerability-scan / RMM activity; TP for movement that crosses security zones

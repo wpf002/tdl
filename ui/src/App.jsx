@@ -33,6 +33,20 @@ const TACTIC_ORDER = [
   'Command and Control','Collection','Exfiltration','Impact'
 ]
 
+// Kill Chain stages that have ATT&CK tactic mappings (pre-attack stages —
+// Reconnaissance, Weaponization — are excluded since the rule library has no
+// rules for them). Order mirrors KILL_CHAIN.
+const KC_FILTER_STAGES = KILL_CHAIN.filter(s => s.attack_tactics.length > 0).map(s => s.name)
+
+// Reverse map: ATT&CK tactic name → Kill Chain stage name (the stage whose
+// attack_tactics list contains the tactic). Each tactic maps to exactly one
+// stage in the current data model.
+const TACTIC_TO_KC = (() => {
+  const m = {}
+  KILL_CHAIN.forEach(s => s.attack_tactics.forEach(t => { m[t] = s.name }))
+  return m
+})()
+
 // Tactic palette — three bands across the kill-chain progression, tuned to
 // read well on near-black panels:
 //   red    = early-stage (gain access, execute, escalate)
@@ -459,6 +473,9 @@ input  { font-family: var(--sans); }
   background: var(--bg2); transition: border-color .15s, box-shadow .15s, transform .15s;
 }
 .kc-stage:hover { box-shadow: var(--shadow); transform: translateY(-1px); }
+.kc-stage-clickable { cursor: pointer; outline: none; }
+.kc-stage-clickable:hover { border-color: rgba(168,85,247,.55); }
+.kc-stage-clickable:focus-visible { box-shadow: 0 0 0 2px var(--purple); }
 .kc-stage.kc-cov { border-color: rgba(124,58,237,.50); background: linear-gradient(180deg, var(--purple-lt) 0%, var(--bg0) 70%); }
 .kc-stage.kc-gap { border-color: rgba(220,38,38,.40); background: linear-gradient(180deg, var(--red-lt) 0%, var(--bg0) 70%); }
 .kc-stage.kc-pre { border-color: var(--border); background: var(--bg1); opacity: .80; }
@@ -842,12 +859,14 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile }) {
   const [fTactic, setFTactic]     = useState('All')
   const [fSev, setFSev]           = useState('All')
   const [fFid, setFid]            = useState('All')
+  const [fKc, setFKc]             = useState('All')
 
   // Apply a cross-view handoff (e.g., dashboard tile click) once, then clear it.
   useEffect(() => {
     if (!pendingFilter) return
     if (pendingFilter.tactic) setFTactic(pendingFilter.tactic)
     if (pendingFilter.severity) setFSev(pendingFilter.severity)
+    if (pendingFilter.killChain) setFKc(pendingFilter.killChain)
     if (pendingFilter.ruleId) {
       const r = rules.find(x => x.rule_id === pendingFilter.ruleId)
       if (r) setSelected(r)
@@ -862,11 +881,12 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile }) {
     return mq &&
       (fTactic==='All'||r.tactic===fTactic) &&
       (fSev==='All'||r.severity===fSev) &&
-      (fFid==='All'||r.fidelity===fFid)
-  }), [rules, search, fTactic, fSev, fFid])
+      (fFid==='All'||r.fidelity===fFid) &&
+      (fKc==='All'||TACTIC_TO_KC[r.tactic]===fKc)
+  }), [rules, search, fTactic, fSev, fFid, fKc])
 
-  const clearAll = () => { setSearch(''); setFTactic('All'); setFSev('All'); setFid('All') }
-  const dirty = search||fTactic!=='All'||fSev!=='All'||fFid!=='All'
+  const clearAll = () => { setSearch(''); setFTactic('All'); setFSev('All'); setFid('All'); setFKc('All') }
+  const dirty = search||fTactic!=='All'||fSev!=='All'||fFid!=='All'||fKc!=='All'
 
   return (
     <>
@@ -897,6 +917,13 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile }) {
             <button key={f} className={`chip${fFid===f?' on':''}`} onClick={()=>setFid(f)}>{f}</button>
           ))}
           {dirty && <button className="chip clear" style={{marginLeft:'auto'}} onClick={clearAll}><X size={10} style={{marginRight:3}} />Clear</button>}
+        </div>
+        <div className="filter-row">
+          <span className="chip-label">Kill Chain</span>
+          <button className={`chip${fKc==='All'?' on':''}`} onClick={()=>setFKc('All')}>All</button>
+          {KC_FILTER_STAGES.map(s=>(
+            <button key={s} className={`chip${fKc===s?' on':''}`} onClick={()=>setFKc(s)} style={{ fontSize:10 }}>{s}</button>
+          ))}
         </div>
       </div>
       <div className="content">
@@ -1216,7 +1243,7 @@ function MatrixView({ rules, onSelectRule, isMobile }) {
 
 // ─── CHAINS VIEW ─────────────────────────────────────────────────────────────
 
-function ChainsView({ rules }) {
+function ChainsView({ rules, onNavigate }) {
   // Per-tactic rule counts for Kill Chain stage coverage
   const byTactic = useMemo(() => {
     const m = new Map()
@@ -1244,9 +1271,18 @@ function ChainsView({ rules }) {
           const { count, status } = stageCoverage(stage)
           const isPre = status === 'pre'
           const isGap = status === 'gap'
+          const clickable = !isPre && count > 0
+          const goToFiltered = () => onNavigate && onNavigate({ killChain: stage.name })
           return (
             <div key={stage.id} className="kc-wrap">
-              <div className={`kc-stage ${isPre?'kc-pre':isGap?'kc-gap':'kc-cov'}`}>
+              <div
+                className={`kc-stage ${isPre?'kc-pre':isGap?'kc-gap':'kc-cov'}${clickable?' kc-stage-clickable':''}`}
+                role={clickable ? 'button' : undefined}
+                tabIndex={clickable ? 0 : undefined}
+                onClick={clickable ? goToFiltered : undefined}
+                onKeyDown={clickable ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goToFiltered() } } : undefined}
+                title={clickable ? `Show ${count} rule${count===1?'':'s'} in ${stage.name}` : undefined}
+              >
                 <div className="kc-stage-num">{stage.stage}</div>
                 <div className="kc-stage-name">{stage.name}</div>
                 <div className="kc-stage-desc">{stage.description}</div>
@@ -1456,7 +1492,7 @@ export default function App() {
                 <span className="topbar-title">Kill Chain &amp; Attack Chains</span>
                 <span className="topbar-sub">Lockheed Cyber Kill Chain · {chainCount} TDL internal chains</span>
               </div>
-              <ChainsView rules={rules} />
+              <ChainsView rules={rules} onNavigate={navigateToRules} />
             </>
           )}
           {view === 'recommend' && (

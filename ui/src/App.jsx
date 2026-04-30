@@ -6,6 +6,7 @@ import {
   Terminal, Zap, GitBranch, Map as MapIcon, Award, Eye, Lock, Cpu,
   ArrowRight, Circle, Minus
 } from 'lucide-react'
+import { UserButton, useAuth } from '@clerk/clerk-react'
 import RULES_RAW from './data/rules.json'
 import { ATTACK_MATRIX, KILL_CHAIN, TACTIC_ORDER_MATRIX } from './data/attack-matrix.js'
 
@@ -1400,8 +1401,9 @@ const buildViews = (ruleCount, techCount, chainCount) => [
   { id:'recommend', label:'Log Sources',      icon:<TrendingUp size={14} /> },
 ]
 
-export default function App() {
+export default function App({ orgProfile = null }) {
   const isMobile = useMediaQuery('(max-width: 768px)')
+  const { getToken } = useAuth()
   const [view, setView] = useState('dashboard')
   const [rules, setRules] = useState(RULES_RAW)
   const [source, setSource] = useState('bundled')
@@ -1416,18 +1418,25 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false
-    fetch('/api/rules')
-      .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
-      .then(data => {
+    ;(async () => {
+      try {
+        const token = await getToken()
+        const r = await fetch('/api/rules', {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        })
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        const data = await r.json()
         if (cancelled) return
         if (Array.isArray(data) && data.length) {
           setRules(data)
           setSource('api')
         }
-      })
-      .catch(() => { /* keep bundled fallback */ })
+      } catch {
+        /* keep bundled fallback */
+      }
+    })()
     return () => { cancelled = true }
-  }, [])
+  }, [getToken])
 
   // Unique top-level techniques *in the canonical ATT&CK Enterprise matrix*
   // that have at least one rule. Matches the matrix view's coverage stat so
@@ -1465,6 +1474,28 @@ export default function App() {
               </div>
             ))}
           </nav>
+          <div style={{
+            borderTop: '1px solid var(--border)',
+            padding: '12px 18px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+          }}>
+            <UserButton afterSignOutUrl="/" />
+            {orgProfile?.org_name && (
+              <div style={{ overflow: 'hidden' }}>
+                <div style={{ fontSize: 12, color: 'var(--muted)' }}>Organization</div>
+                <div style={{
+                  fontSize: 13,
+                  fontWeight: 600,
+                  color: 'var(--text)',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                }}>{orgProfile.org_name}</div>
+              </div>
+            )}
+          </div>
         </aside>
 
         <div className="main">

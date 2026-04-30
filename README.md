@@ -5,6 +5,35 @@ for 9 SIEM platforms (SPL, KQL, AQL, YARA-L, ES|QL, LEQL, CrowdStrike, XQL, Luce
 pipeline, Sigma export, attack chain correlation, log source recommendation engine, and a
 React/Vite dashboard backed by a Flask API.
 
+## Authentication
+
+The dashboard and `/api/*` routes (except `/api/health`) are gated behind
+[Clerk](https://clerk.com). On first sign-in users complete a one-screen org
+setup (org name, primary SIEM, deployed log sources) saved to localStorage.
+
+Required env vars:
+
+| Variable                       | Where                            | Purpose                                       |
+|--------------------------------|----------------------------------|-----------------------------------------------|
+| `VITE_CLERK_PUBLISHABLE_KEY`   | `ui/.env.local` + Railway        | Frontend Clerk SDK init (Vite needs `VITE_`)  |
+| `CLERK_SECRET_KEY`             | Railway only                     | Reserved for backend Clerk SDK calls          |
+| `CLERK_JWT_ISSUER`             | Railway (and locally if running Flask) | JWKS endpoint host for JWT verification |
+
+One-time setup:
+
+1. Create an app at [clerk.com](https://clerk.com) → React quickstart.
+2. Copy the publishable key into `ui/.env.local`:
+   ```
+   VITE_CLERK_PUBLISHABLE_KEY=pk_test_...
+   ```
+3. For the Flask API to verify tokens locally, also export `CLERK_JWT_ISSUER`
+   (the "Frontend API" URL from Clerk dashboard, e.g.
+   `https://kind-bear-42.clerk.accounts.dev`) before running `./run`.
+4. In production (Railway), set all three env vars under Project → Variables.
+5. In Clerk dashboard → Domains, add your Railway URL as an allowed origin.
+
+`/api/health` is intentionally left unauthenticated for uptime probes.
+
 ## Quick start
 
 ```bash

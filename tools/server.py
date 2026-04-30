@@ -20,7 +20,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, request, send_from_directory
+import jwt
+from jwt import PyJWKClient
+from flask import Flask, abort, g, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,6 +34,52 @@ MATRIX = ROOT / "matrix"
 
 app = Flask(__name__, static_folder=None)
 CORS(app)
+
+# ── Auth (Clerk JWT verification on /api/* except /api/health) ──────────────
+CLERK_JWT_ISSUER = (os.environ.get("CLERK_JWT_ISSUER") or "").rstrip("/")
+PUBLIC_API_PATHS = {"/api/health"}
+_jwks_client = None
+
+
+def _get_jwks_client():
+    global _jwks_client
+    if _jwks_client is None:
+        if not CLERK_JWT_ISSUER:
+            raise RuntimeError("CLERK_JWT_ISSUER env var is not set")
+        _jwks_client = PyJWKClient(f"{CLERK_JWT_ISSUER}/.well-known/jwks.json")
+    return _jwks_client
+
+
+def _verify_clerk_jwt(token):
+    signing_key = _get_jwks_client().get_signing_key_from_jwt(token)
+    return jwt.decode(
+        token,
+        signing_key.key,
+        algorithms=["RS256"],
+        issuer=CLERK_JWT_ISSUER,
+        options={"verify_aud": False},  # Clerk session tokens omit `aud` by default
+    )
+
+
+@app.before_request
+def _auth_gate():
+    path = request.path or ""
+    if not path.startswith("/api/"):
+        return None
+    if path in PUBLIC_API_PATHS:
+        return None
+    if not CLERK_JWT_ISSUER:
+        return jsonify(error="server auth misconfigured: CLERK_JWT_ISSUER unset"), 503
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return jsonify(error="missing bearer token"), 401
+    token = auth[7:].strip()
+    try:
+        payload = _verify_clerk_jwt(token)
+    except Exception as e:
+        return jsonify(error=f"invalid token: {type(e).__name__}"), 401
+    g.clerk_user_id = payload.get("sub")
+    return None
 
 _rules_cache = None
 

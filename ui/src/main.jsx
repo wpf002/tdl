@@ -1,4 +1,21 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import App from './App.jsx'
-ReactDOM.createRoot(document.getElementById('root')).render(<React.StrictMode><App /></React.StrictMode>)
+import { ClerkProvider } from '@clerk/clerk-react'
+import AppShell from './AppShell.jsx'
+
+const PUBLISHABLE_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY
+
+if (!PUBLISHABLE_KEY) {
+  throw new Error(
+    'Missing VITE_CLERK_PUBLISHABLE_KEY. Set it in ui/.env.local for local dev, ' +
+    'or in Railway environment variables for production.'
+  )
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <ClerkProvider publishableKey={PUBLISHABLE_KEY} afterSignOutUrl="/">
+      <AppShell />
+    </ClerkProvider>
+  </React.StrictMode>
+)

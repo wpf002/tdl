@@ -6,7 +6,7 @@ import {
   Terminal, Zap, GitBranch, Map as MapIcon, Award, Eye, Lock, Cpu,
   ArrowRight, Circle, Minus
 } from 'lucide-react'
-import { UserButton, useAuth } from '@clerk/clerk-react'
+import { UserButton, useAuth } from '@clerk/react'
 import RULES_RAW from './data/rules.json'
 import { ATTACK_MATRIX, KILL_CHAIN, TACTIC_ORDER_MATRIX } from './data/attack-matrix.js'
 

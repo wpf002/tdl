@@ -1,12 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import {
-  ClerkLoaded,
-  ClerkLoading,
-  SignedIn,
-  SignedOut,
-  SignIn,
-  useUser,
-} from '@clerk/clerk-react'
+import { Show, SignIn, useUser } from '@clerk/react'
 import App from './App.jsx'
 import OrgSetup from './OrgSetup.jsx'
 
@@ -15,19 +8,14 @@ export const orgProfileKey = (userId) => `tdl_org_${userId}`
 export default function AppShell() {
   return (
     <>
-      <ClerkLoading>
-        <CenteredMessage>Loading…</CenteredMessage>
-      </ClerkLoading>
-      <ClerkLoaded>
-        <SignedOut>
-          <CenteredAuth>
-            <SignIn routing="hash" />
-          </CenteredAuth>
-        </SignedOut>
-        <SignedIn>
-          <AuthedRoot />
-        </SignedIn>
-      </ClerkLoaded>
+      <Show when="signed-out">
+        <CenteredAuth>
+          <SignIn routing="hash" />
+        </CenteredAuth>
+      </Show>
+      <Show when="signed-in">
+        <AuthedRoot />
+      </Show>
     </>
   )
 }

@@ -25,12 +25,26 @@ from jwt import PyJWKClient
 from flask import Flask, abort, g, jsonify, request, send_from_directory
 from flask_cors import CORS
 
+from tools.db import db_enabled, session_scope
+from tools.models import Rule
+
 ROOT = Path(__file__).resolve().parent.parent
 RULES_DIR = ROOT / "rules"
 RULES_JSON = ROOT / "ui" / "src" / "data" / "rules.json"
 DIST = ROOT / "ui" / "dist"
 EXPORTS = ROOT / "exports"
 MATRIX = ROOT / "matrix"
+
+RULE_COLUMNS = (
+    "rule_id", "name", "description",
+    "tactic", "tactic_id", "technique_id", "technique_name",
+    "platform", "data_sources",
+    "severity", "fidelity", "lifecycle", "risk_score",
+    "queries", "pseudo_logic", "false_positives", "triage_steps", "tags",
+    "test_method", "tuning_guidance",
+    "author", "created", "last_modified",
+    "org_id", "is_custom",
+)
 
 app = Flask(__name__, static_folder=None)
 CORS(app)
@@ -84,8 +98,22 @@ def _auth_gate():
 _rules_cache = None
 
 
+def _row_to_dict(row):
+    return {col: getattr(row, col) for col in RULE_COLUMNS}
+
+
 def load_rules(force=False):
+    """Read rules from Postgres if DATABASE_URL is set; else from rules.json.
+
+    Cached in-process; pass force=True to refresh. Postgres-backed reads always
+    bypass the cache so edits made through the API are visible immediately.
+    """
     global _rules_cache
+    if db_enabled():
+        with session_scope() as s:
+            rows = s.query(Rule).order_by(Rule.rule_id).all()
+            return [_row_to_dict(r) for r in rows]
+
     if _rules_cache is not None and not force:
         return _rules_cache
     if not RULES_JSON.exists() or force:
@@ -100,7 +128,15 @@ def load_rules(force=False):
 
 
 def load_full_rule(rule_id):
-    """Load a single rule directly from YAML (no truncation)."""
+    """Load a single rule with full (untruncated) fields.
+
+    With Postgres: reads the row directly. Without: reads from YAML.
+    """
+    if db_enabled():
+        with session_scope() as s:
+            row = s.query(Rule).filter(Rule.rule_id == rule_id).one_or_none()
+            return _row_to_dict(row) if row else None
+
     import yaml
     for path in RULES_DIR.rglob("*.yaml"):
         with path.open("r", encoding="utf-8") as f:

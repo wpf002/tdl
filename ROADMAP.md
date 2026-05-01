@@ -1,24 +1,61 @@
 # TDL Playbook — Roadmap
 
 Living document. Move items between sections as work progresses; delete what's
-done, edit freely. Last updated: 2026-04-30.
+done, edit freely. Last updated: 2026-05-01.
 
 ---
 
 ## Now (in-flight)
 
+- **SaaS productization track.** Six-phase plan to take TDL Playbook from
+  static rule library to multi-tenant SaaS. Phase 1 (Postgres) shipped; phases
+  2–6 sequenced in the next section, each with explicit checkpoint and (for
+  phases 4–6) cost gate.
+
 - **SIEM-query audit** — Batch `msgbatch_01FDEGAN3kfKzebipgmH4hbN` submitted
-  2026-04-30. Scores all 715 rules' 10 queries against `pseudo_logic`.
-  - [ ] `audit-fetch` once Anthropic finishes processing
+  2026-04-30, **frozen** pending cost approval. Will be re-evaluated once the
+  SaaS phases land — fixes flow YAML → re-seed → Postgres.
+  - [ ] (paused) `audit-fetch` once cost is approved
   - [ ] Review `audit_summary.json`, pick scope for regen
   - [ ] `regen-extract` / `regen-submit` / `regen-fetch` / `apply` for flagged rules
-  - [ ] `git diff rules/` review + commit
 
 ---
 
-## Next (near-term cleanup)
+## Next — SaaS productization (sequenced, gated)
+
+Each phase is a separate commit; each one ends in an explicit checkpoint
+before the next begins. Phases 4–6 also have cost gates.
+
+- [x] **Phase 1 — PostgreSQL data layer.** SQLAlchemy models, idempotent
+      migration, YAML→Postgres seeder that skips `is_custom=true` rules so user
+      edits survive re-seed. `tools/db.py`, `tools/migrate.py`, `tools/seed_db.py`.
+      `./run prod` migrates + seeds before booting.
+- [ ] **Phase 2 — Coverage report export.** PDF (reportlab), CSV, JSON
+      endpoints; Export dropdown in Dashboard. No DB writes, no LLM. Free.
+- [ ] **Phase 3 — Rule editor.** `PUT /api/rules/<id>`, soft `DELETE` (sets
+      `lifecycle=Retired`), `POST /duplicate`. Inline edit in the rule detail
+      pane. Adds `tools/dump_db.py` so audit/regen tooling keeps working
+      against YAML round-tripped from Postgres. Free.
+- [ ] **Phase 4 — AI rule builder. ⚠ COST GATE.** Sonnet 4.5 generates a full
+      TDL rule + all 10 SIEM queries from a prompt. Per-Generate spend ~$0.03–
+      0.05. Adds `ai_usage` table for actual-spend telemetry. Soft per-org
+      daily cap. **Requires explicit cost-analysis approval before first call.**
+- [ ] **Phase 5 — Rule import (Sigma + SPL). ⚠ COST GATE.** Sync mode capped at
+      50 Sigma rules per upload. Per-rule Claude call ~$0.02–0.04. Larger
+      uploads route to deferred Phase 5b (Batch API). **Requires approval.**
+- [ ] **Phase 5b** *(optional)* **— Sigma bulk import via Batch API.** Only if
+      real-world usage demands it.
+- [ ] **Phase 6 — Stripe paywall. ⚠ COST GATE (real $).** Free / Pro / Team
+      tiers. **Phase 6a test-mode only** until end-to-end checkout is
+      demonstrated; **6b live keys** only after explicit approval and a $1
+      live-card validation.
+
+---
+
+## Next — Library hygiene (independent of SaaS track)
 
 ### Library hygiene
+
 - [ ] **Backfill `pseudo_logic` on the 106 rules missing it** (821 total − 715
       with). Without it they're invisible to the audit pipeline and the regen
       tooling can't reason about them. Alternative: document why specific rules
@@ -33,6 +70,7 @@ done, edit freely. Last updated: 2026-04-30.
       themselves. Decide a policy: regen blindly, or fix upstream first.
 
 ### Tooling
+
 - [ ] **CI check that Sigma export stays in sync** — `npm run sigma` regenerates
       `sigma/` but nothing prevents drift. Either commit the regenerated files
       and verify in CI, or generate on-demand and stop committing.
@@ -55,14 +93,14 @@ done, edit freely. Last updated: 2026-04-30.
 - **Rule provenance** — surface which audit run a rule's queries came from
   (model, batch ID, date) so we can re-audit selectively when the model
   improves.
-- **Auth on the hosted Railway instance** — currently public. If the library
-  ever contains anything sensitive (custom rules, environment-specific
-  pseudo-logic), add a gate.
 
 ---
 
 ## Done (recent, for context)
 
+- PostgreSQL data layer — SQLAlchemy models, idempotent migration + YAML seed,
+  `./run prod` boots `migrate → seed → server` (Phase 1 of the SaaS track)
+- Clerk auth on the hosted Railway instance — `0e75564`
 - Batch API audit/regen pipeline (`tools/regen/batch.py`) — `a84f1cb`
 - Regenerated all 10 SIEM queries from `data_sources` + `pseudo_logic` — `b27fab9`
 - Backfilled `risk_score` on 121 rules + Kill Chain phase filter — `d6bf6f0`

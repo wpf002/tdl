@@ -10,7 +10,7 @@ export default function AppShell() {
     <>
       <Show when="signed-out">
         <CenteredAuth>
-          <SignIn routing="hash" />
+          <SignIn routing="hash" appearance={signInAppearance} />
         </CenteredAuth>
       </Show>
       <Show when="signed-in">
@@ -47,6 +47,46 @@ function AuthedRoot() {
   }
 
   return <App orgProfile={profile} />
+}
+
+const signInAppearance = {
+  variables: {
+    colorBackground: '#15161D',
+    colorInputBackground: '#0B0B11',
+    colorText: '#E6E7EE',
+    colorTextSecondary: '#9598A8',
+    colorInputText: '#E6E7EE',
+    colorPrimary: '#7C5CFF',
+    colorNeutral: '#E6E7EE',
+    colorDanger: '#F87171',
+    borderRadius: '8px',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  elements: {
+    card: { backgroundColor: '#15161D', border: '1px solid #262833', boxShadow: 'none' },
+    rootBox: { background: 'transparent' },
+    headerTitle: { color: '#E6E7EE' },
+    headerSubtitle: { color: '#9598A8' },
+    socialButtonsBlockButton: {
+      backgroundColor: '#0B0B11',
+      border: '1px solid #262833',
+      color: '#E6E7EE',
+    },
+    socialButtonsBlockButtonText: { color: '#E6E7EE' },
+    dividerLine: { backgroundColor: '#262833' },
+    dividerText: { color: '#9598A8' },
+    formFieldLabel: { color: '#E6E7EE' },
+    formFieldInput: {
+      backgroundColor: '#0B0B11',
+      border: '1px solid #262833',
+      color: '#E6E7EE',
+    },
+    footer: { backgroundColor: '#15161D', borderTop: '1px solid #262833' },
+    footerAction: { backgroundColor: 'transparent' },
+    footerActionText: { color: '#9598A8' },
+    footerActionLink: { color: '#7C5CFF' },
+    formButtonPrimary: { backgroundColor: '#7C5CFF', color: '#fff' },
+  },
 }
 
 function CenteredAuth({ children }) {

@@ -948,6 +948,13 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile }) {
           ))}
         </div>
         <div className="filter-row">
+          <span className="chip-label">Kill Chain</span>
+          <button className={`chip${fKc==='All'?' on':''}`} onClick={()=>setFKc('All')}>All</button>
+          {KC_FILTER_STAGES.map(s=>(
+            <button key={s} className={`chip${fKc===s?' on':''}`} onClick={()=>setFKc(s)} style={{ fontSize:10 }}>{s}</button>
+          ))}
+        </div>
+        <div className="filter-row">
           <span className="chip-label">Severity</span>
           {['All','Critical','High','Medium','Low'].map(s=>(
             <button key={s} className={`chip${fSev===s?' on':''}`} onClick={()=>setFSev(s)}>{s}</button>
@@ -958,13 +965,6 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile }) {
             <button key={f} className={`chip${fFid===f?' on':''}`} onClick={()=>setFid(f)}>{f}</button>
           ))}
           {dirty && <button className="chip clear" style={{marginLeft:'auto'}} onClick={clearAll}><X size={10} style={{marginRight:3}} />Clear</button>}
-        </div>
-        <div className="filter-row">
-          <span className="chip-label">Kill Chain</span>
-          <button className={`chip${fKc==='All'?' on':''}`} onClick={()=>setFKc('All')}>All</button>
-          {KC_FILTER_STAGES.map(s=>(
-            <button key={s} className={`chip${fKc===s?' on':''}`} onClick={()=>setFKc(s)} style={{ fontSize:10 }}>{s}</button>
-          ))}
         </div>
       </div>
       <div className="content">

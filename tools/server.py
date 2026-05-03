@@ -6,6 +6,7 @@ Endpoints:
   GET  /api/stats                 dashboard counts
   GET  /api/rules                 list rules (filters: tactic, severity, lifecycle, q)
   GET  /api/rules/<rule_id>       single rule (full, untruncated)
+  GET  /api/rules/export          rule library as zip of YAML files (DaaC export)
   GET  /api/tactics               counts grouped by tactic
   GET  /api/coverage              ATT&CK coverage report
   GET  /api/coverage/export       coverage report as JSON / CSV / PDF (?format=)
@@ -21,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -213,6 +215,86 @@ def get_rule(rule_id):
         if r.get("rule_id") == rule_id:
             return jsonify(r)
     abort(404)
+
+
+def _load_full_rules():
+    """Full rule dicts including pseudo_logic + all SIEM queries.
+
+    DB-backed when DATABASE_URL is set (forward-compatible with Phase 3
+    edits); falls back to reading source YAML files in rules/.
+    """
+    import yaml
+    if db_enabled():
+        with session_scope() as s:
+            rows = s.query(Rule).order_by(Rule.rule_id).all()
+            return [_row_to_dict(r) for r in rows]
+    out = []
+    for path in sorted(RULES_DIR.rglob("*.yaml")):
+        with path.open("r", encoding="utf-8") as f:
+            doc = yaml.safe_load(f)
+        if isinstance(doc, dict):
+            out.append(doc)
+    return out
+
+
+@app.get("/api/rules/export")
+def rules_export():
+    fmt = (request.args.get("format") or "yaml").lower()
+    if fmt != "yaml":
+        abort(400, description="format must be: yaml")
+
+    import yaml
+
+    rules = _load_full_rules()
+
+    tactic = request.args.get("tactic")
+    severity = request.args.get("severity")
+    lifecycle = request.args.get("lifecycle")
+    q = (request.args.get("q") or "").lower().strip()
+
+    if tactic and tactic != "All":
+        rules = [r for r in rules if r.get("tactic") == tactic]
+    if severity and severity != "All":
+        rules = [r for r in rules if r.get("severity") == severity]
+    if lifecycle and lifecycle != "All":
+        rules = [r for r in rules if r.get("lifecycle") == lifecycle]
+    if q:
+        def _matches(r):
+            return (
+                q in (r.get("name") or "").lower()
+                or q in (r.get("rule_id") or "").lower()
+                or q in (r.get("technique_id") or "").lower()
+                or any(q in (t or "").lower() for t in (r.get("tags") or []))
+            )
+        rules = [r for r in rules if _matches(r)]
+
+    if not rules:
+        abort(404, description="no rules match the supplied filters")
+
+    drop_keys = {"org_id", "is_custom"}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for r in rules:
+            payload = {
+                k: v for k, v in r.items()
+                if k not in drop_keys and v is not None and v != ""
+            }
+            tactic_slug = (r.get("tactic") or "uncategorized").lower().replace(" ", "-")
+            arcname = f"rules/{tactic_slug}/{r['rule_id']}.yaml"
+            zf.writestr(
+                arcname,
+                yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+            )
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    filtered = bool(tactic or severity or lifecycle or q)
+    suffix = f"-filtered-{len(rules)}" if filtered else f"-all-{len(rules)}"
+    filename = f"tdl-rules{suffix}-{stamp}.zip"
+    return Response(
+        buf.getvalue(),
+        mimetype="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/tactics")

@@ -245,10 +245,15 @@ input  { font-family: var(--sans); }
 .export-btn:disabled { opacity: 0.6; cursor: default; }
 .export-pop {
   position: absolute; right: 0; top: calc(100% + 4px); z-index: 30;
-  min-width: 180px; background: var(--bg0); border: 1px solid var(--border);
+  min-width: 200px; background: var(--bg0); border: 1px solid var(--border);
   border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.35); padding: 4px;
   display: flex; flex-direction: column;
 }
+.export-section-label {
+  padding: 7px 10px 4px; font-size: 9.5px; font-family: var(--mono);
+  color: var(--text3); font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+}
+.export-divider { height: 1px; background: var(--border); margin: 4px 0; }
 .export-item {
   text-align: left; padding: 7px 10px; font-size: 12px; color: var(--text);
   background: transparent; border: 0; border-radius: 4px; cursor: pointer;
@@ -1027,27 +1032,27 @@ function CoverageExportMenu() {
     }
   }, [open])
 
-  const download = async (fmt) => {
-    setBusy(fmt)
+  const download = async (key, url, fallbackFilename) => {
+    setBusy(key)
     setError(null)
     try {
       const token = await getToken()
-      const r = await fetch(`/api/coverage/export?format=${fmt}`, {
+      const r = await fetch(url, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       })
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       const blob = await r.blob()
       const cd = r.headers.get('Content-Disposition') || ''
       const m = /filename="([^"]+)"/.exec(cd)
-      const filename = m ? m[1] : `tdl-coverage.${fmt}`
-      const url = URL.createObjectURL(blob)
+      const filename = m ? m[1] : fallbackFilename
+      const objUrl = URL.createObjectURL(blob)
       const a = document.createElement('a')
-      a.href = url
+      a.href = objUrl
       a.download = filename
       document.body.appendChild(a)
       a.click()
       a.remove()
-      URL.revokeObjectURL(url)
+      URL.revokeObjectURL(objUrl)
       setOpen(false)
     } catch (e) {
       setError(e.message || 'Export failed')
@@ -1055,6 +1060,28 @@ function CoverageExportMenu() {
       setBusy(null)
     }
   }
+
+  const COVERAGE = [
+    { key: 'cov-pdf',  label: 'PDF',  url: '/api/coverage/export?format=pdf',  fallback: 'tdl-coverage.pdf'  },
+    { key: 'cov-csv',  label: 'CSV',  url: '/api/coverage/export?format=csv',  fallback: 'tdl-coverage.csv'  },
+    { key: 'cov-json', label: 'JSON', url: '/api/coverage/export?format=json', fallback: 'tdl-coverage.json' },
+  ]
+  const LIBRARY = [
+    { key: 'rules-yaml', label: 'YAML', url: '/api/rules/export?format=yaml', fallback: 'tdl-rules.zip' },
+  ]
+
+  const renderItem = (opt) => (
+    <button
+      key={opt.key}
+      type="button"
+      role="menuitem"
+      className="export-item"
+      disabled={busy !== null}
+      onClick={() => download(opt.key, opt.url, opt.fallback)}
+    >
+      {busy === opt.key ? 'Downloading…' : opt.label}
+    </button>
+  )
 
   return (
     <div ref={wrapRef} className="export-menu">
@@ -1064,7 +1091,7 @@ function CoverageExportMenu() {
         onClick={() => setOpen(o => !o)}
         aria-haspopup="menu"
         aria-expanded={open}
-        title="Export coverage report"
+        title="Export"
       >
         <Download size={12} style={{ marginRight: 6, verticalAlign: '-2px' }} />
         Export
@@ -1072,22 +1099,11 @@ function CoverageExportMenu() {
       </button>
       {open && (
         <div className="export-pop" role="menu">
-          {[
-            { fmt: 'pdf',  label: 'PDF'  },
-            { fmt: 'csv',  label: 'CSV'  },
-            { fmt: 'json', label: 'JSON' },
-          ].map(opt => (
-            <button
-              key={opt.fmt}
-              type="button"
-              role="menuitem"
-              className="export-item"
-              disabled={busy !== null}
-              onClick={() => download(opt.fmt)}
-            >
-              {busy === opt.fmt ? 'Downloading…' : opt.label}
-            </button>
-          ))}
+          <div className="export-section-label">Coverage report</div>
+          {COVERAGE.map(renderItem)}
+          <div className="export-divider" />
+          <div className="export-section-label">Rule library · DaaC</div>
+          {LIBRARY.map(renderItem)}
           {error && <div className="export-err">{error}</div>}
         </div>
       )}

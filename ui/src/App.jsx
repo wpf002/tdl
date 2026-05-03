@@ -511,7 +511,7 @@ input  { font-family: var(--sans); }
 .kc-pre-cluster {
   display: flex; flex-direction: column;
   flex: 2 1 460px; min-width: 440px;
-  gap: 16px;
+  gap: 8px;
 }
 .kc-pre-row { display: flex; align-items: stretch; gap: 6px; }
 .kc-pre-row .kc-stage { flex: 1 1 0; min-width: 0; }
@@ -733,7 +733,7 @@ input  { font-family: var(--sans); }
   .kc-wrap   { flex-direction: column; flex: 0 0 auto; min-width: 0; width: 100%; align-items: stretch; }
   .kc-stage  { min-height: auto; padding: 12px 14px; }
   .kc-arrow  { transform: rotate(90deg); margin: 6px auto; }
-  .kc-pre-cluster { flex: 0 0 auto; min-width: 0; width: 100%; gap: 12px; }
+  .kc-pre-cluster { flex: 0 0 auto; min-width: 0; width: 100%; gap: 6px; }
   .kc-pre-row { flex-direction: column; gap: 0; }
   .kc-pre-row .kc-arrow { transform: rotate(90deg); margin: 6px auto; }
 
@@ -928,7 +928,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile }) {
     <>
       <div className="topbar">
         <span className="topbar-title">Detection Rules</span>
-        <span className="topbar-sub">{rules.length} rules · 9 SIEM platforms</span>
+        <span className="topbar-sub">{rules.length} Rules · 9 SIEM Platforms</span>
         <div className="search-wrap">
           <Search size={13} className="search-icon" />
           <input className="search-input" placeholder="Search rules, IDs, techniques, tags…"
@@ -1073,9 +1073,9 @@ function CoverageExportMenu() {
       {open && (
         <div className="export-pop" role="menu">
           {[
-            { fmt: 'pdf',  label: 'PDF report'  },
-            { fmt: 'csv',  label: 'CSV (rows)'  },
-            { fmt: 'json', label: 'JSON (raw)'  },
+            { fmt: 'pdf',  label: 'PDF'  },
+            { fmt: 'csv',  label: 'CSV'  },
+            { fmt: 'json', label: 'JSON' },
           ].map(opt => (
             <button
               key={opt.fmt}
@@ -1260,10 +1260,6 @@ function MatrixView({ rules, onSelectRule, isMobile }) {
 
   return (
     <>
-      <div className="topbar">
-        <span className="topbar-title">MITRE ATT&CK</span>
-        <a className="topbar-link" href="https://attack.mitre.org/matrices/enterprise/" target="_blank" rel="noreferrer">attack.mitre.org ↗</a>
-      </div>
       <div className="matrix-stats">
         <div className="matrix-stat">
           <div className="matrix-stat-num" style={{color:'#A855F7'}}>{coveredTechs}</div>
@@ -1648,6 +1644,7 @@ export default function App({ orgProfile = null }) {
             <>
               <div className="topbar">
                 <span className="topbar-title">MITRE ATT&CK</span>
+                <a className="topbar-link" href="https://attack.mitre.org/matrices/enterprise/" target="_blank" rel="noreferrer">attack.mitre.org ↗</a>
               </div>
               <MatrixView rules={rules} onSelectRule={(rid) => navigateToRules({ ruleId: rid })} isMobile={isMobile} />
             </>

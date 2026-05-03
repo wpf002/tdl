@@ -8,6 +8,9 @@ Postgres just works).
 
 import sys
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from tools.db import Base, db_enabled, get_engine
 from tools import models  # noqa: F401  (registers tables on Base.metadata)
 

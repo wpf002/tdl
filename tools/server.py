@@ -8,21 +8,28 @@ Endpoints:
   GET  /api/rules/<rule_id>       single rule (full, untruncated)
   GET  /api/tactics               counts grouped by tactic
   GET  /api/coverage              ATT&CK coverage report
+  GET  /api/coverage/export       coverage report as JSON / CSV / PDF (?format=)
   GET  /api/chains                attack chain coverage
   GET  /api/recommendations       log-source recommendations (default profile)
 
 Production mode also serves ui/dist/ so the SPA loads from the same origin.
 """
 
+import csv
+import io
 import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import jwt
 from jwt import PyJWKClient
-from flask import Flask, abort, g, jsonify, request, send_from_directory
+from flask import Flask, Response, abort, g, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 from tools.db import db_enabled, session_scope
@@ -240,6 +247,166 @@ def coverage():
         subprocess.run(["node", str(ROOT / "tools" / "coverage.js")], check=True, cwd=ROOT)
     with p.open("r", encoding="utf-8") as f:
         return jsonify(json.load(f))
+
+
+@app.get("/api/coverage/export")
+def coverage_export():
+    fmt = (request.args.get("format") or "json").lower()
+    if fmt not in ("json", "csv", "pdf"):
+        abort(400, description="format must be one of: json, csv, pdf")
+
+    p = MATRIX / "coverage_report.json"
+    if not p.exists():
+        subprocess.run(["node", str(ROOT / "tools" / "coverage.js")], check=True, cwd=ROOT)
+    with p.open("r", encoding="utf-8") as f:
+        report = json.load(f)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    base = f"tdl-coverage-{stamp}"
+
+    if fmt == "json":
+        body = json.dumps(report, indent=2)
+        return Response(
+            body,
+            mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{base}.json"'},
+        )
+
+    if fmt == "csv":
+        return Response(
+            _coverage_csv(report),
+            mimetype="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{base}.csv"'},
+        )
+
+    return Response(
+        _coverage_pdf(report),
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{base}.pdf"'},
+    )
+
+
+def _coverage_csv(report):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["section", "key", "metric", "value"])
+
+    summary = report.get("summary", {}) or {}
+    for k, v in summary.items():
+        w.writerow(["summary", "", k, v])
+
+    by_tactic = report.get("by_tactic", {}) or {}
+    for tactic, stats in by_tactic.items():
+        for k, v in (stats or {}).items():
+            w.writerow(["by_tactic", tactic, k, v])
+
+    buf.write("\n")
+    w.writerow(["technique_id", "technique_name", "tactic", "rule_count", "rules"])
+    for t in report.get("by_technique", []) or []:
+        w.writerow([
+            t.get("technique_id", ""),
+            t.get("technique_name", ""),
+            t.get("tactic", ""),
+            t.get("rule_count", 0),
+            ";".join(t.get("rules", []) or []),
+        ])
+    return buf.getvalue()
+
+
+def _coverage_pdf(report):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+    )
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=LETTER,
+        leftMargin=0.6 * inch, rightMargin=0.6 * inch,
+        topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+        title="TDL Playbook · Coverage Report",
+    )
+    styles = getSampleStyleSheet()
+    story = []
+
+    summary = report.get("summary", {}) or {}
+    generated = report.get("generated_at") or datetime.now(timezone.utc).isoformat()
+
+    story.append(Paragraph("TDL Playbook — Coverage Report", styles["Title"]))
+    story.append(Paragraph(f"Generated: {generated}", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Summary", styles["Heading2"]))
+    sum_rows = [["Metric", "Value"]] + [[k, str(v)] for k, v in summary.items()]
+    sum_tbl = Table(sum_rows, hAlign="LEFT", colWidths=[2.5 * inch, 1.5 * inch])
+    sum_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F2937")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+    ]))
+    story.append(sum_tbl)
+    story.append(Spacer(1, 18))
+
+    story.append(Paragraph("Coverage by Tactic", styles["Heading2"]))
+    tac_rows = [["Tactic", "Total", "Deployed", "Proposed", "Unique Techniques"]]
+    for tactic, s in (report.get("by_tactic", {}) or {}).items():
+        s = s or {}
+        tac_rows.append([
+            tactic,
+            str(s.get("total", 0)),
+            str(s.get("deployed", 0)),
+            str(s.get("proposed", 0)),
+            str(s.get("unique_techniques", 0)),
+        ])
+    tac_tbl = Table(tac_rows, hAlign="LEFT", repeatRows=1)
+    tac_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F2937")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+    ]))
+    story.append(tac_tbl)
+    story.append(PageBreak())
+
+    story.append(Paragraph("Coverage by Technique", styles["Heading2"]))
+    story.append(Paragraph(
+        "One row per ATT&CK technique with at least one rule. "
+        "Rule count reflects the current TDL library.",
+        styles["Italic"],
+    ))
+    story.append(Spacer(1, 6))
+    tech_rows = [["Technique ID", "Name", "Tactic", "Rules"]]
+    for t in report.get("by_technique", []) or []:
+        tech_rows.append([
+            t.get("technique_id", ""),
+            t.get("technique_name", ""),
+            t.get("tactic", ""),
+            str(t.get("rule_count", 0)),
+        ])
+    tech_tbl = Table(
+        tech_rows, hAlign="LEFT", repeatRows=1,
+        colWidths=[1.0 * inch, 2.6 * inch, 2.0 * inch, 0.7 * inch],
+    )
+    tech_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F2937")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 1), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("ALIGN", (3, 1), (3, -1), "RIGHT"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+    ]))
+    story.append(tech_tbl)
+
+    doc.build(story)
+    return buf.getvalue()
 
 
 @app.get("/api/chains")

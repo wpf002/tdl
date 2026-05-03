@@ -1,10 +1,10 @@
-import React, { useState, useMemo, useCallback, useEffect } from 'react'
+import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react'
 import {
   Shield, Search, ChevronRight, X, AlertTriangle, CheckCircle,
   Activity, Database, Target, Filter, Tag, Copy, Check,
   BarChart3, Layers, Crosshair, Clock, TrendingUp, ChevronDown,
   Terminal, Zap, GitBranch, Map as MapIcon, Award, Eye, Lock, Cpu,
-  ArrowRight, Circle, Minus
+  ArrowRight, Circle, Minus, Download
 } from 'lucide-react'
 import { UserButton, useAuth } from '@clerk/react'
 import RULES_RAW from './data/rules.json'
@@ -239,6 +239,27 @@ input  { font-family: var(--sans); }
 .topbar-sub   { font-size: 11px; color: var(--text2); font-family: var(--mono); }
 .topbar-link  { margin-left: auto; font-size: 11px; font-family: var(--mono); color: var(--purple); text-decoration: none; font-weight: 600; padding: 5px 10px; border: 1px solid var(--border); border-radius: 5px; transition: all .12s; }
 .topbar-link:hover { border-color: var(--purple); background: var(--purple-lt); }
+
+.export-menu { position: relative; display: inline-block; }
+.export-btn { margin-left: 0; cursor: pointer; background: transparent; }
+.export-btn:disabled { opacity: 0.6; cursor: default; }
+.export-pop {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 30;
+  min-width: 180px; background: var(--bg0); border: 1px solid var(--border);
+  border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.35); padding: 4px;
+  display: flex; flex-direction: column;
+}
+.export-item {
+  text-align: left; padding: 7px 10px; font-size: 12px; color: var(--text);
+  background: transparent; border: 0; border-radius: 4px; cursor: pointer;
+  font-family: inherit;
+}
+.export-item:hover:not(:disabled) { background: var(--purple-lt); color: var(--purple); }
+.export-item:disabled { opacity: 0.6; cursor: default; }
+.export-err {
+  padding: 6px 10px; font-size: 11px; color: var(--danger, #EF4444);
+  font-family: var(--mono); border-top: 1px solid var(--border); margin-top: 4px;
+}
 
 .search-wrap { position: relative; margin-left: auto; }
 .search-icon { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--text3); pointer-events: none; }
@@ -971,6 +992,95 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile }) {
   )
 }
 
+// ─── COVERAGE EXPORT MENU ───────────────────────────────────────────────────
+
+function CoverageExportMenu() {
+  const { getToken } = useAuth()
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(null)
+  const [error, setError] = useState(null)
+  const wrapRef = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false) }
+    const onKey = (e) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', onDoc)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  const download = async (fmt) => {
+    setBusy(fmt)
+    setError(null)
+    try {
+      const token = await getToken()
+      const r = await fetch(`/api/coverage/export?format=${fmt}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const blob = await r.blob()
+      const cd = r.headers.get('Content-Disposition') || ''
+      const m = /filename="([^"]+)"/.exec(cd)
+      const filename = m ? m[1] : `tdl-coverage.${fmt}`
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+      setOpen(false)
+    } catch (e) {
+      setError(e.message || 'Export failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <div ref={wrapRef} className="export-menu">
+      <button
+        type="button"
+        className="topbar-link export-btn"
+        onClick={() => setOpen(o => !o)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title="Export coverage report"
+      >
+        <Download size={12} style={{ marginRight: 6, verticalAlign: '-2px' }} />
+        Export
+        <ChevronDown size={12} style={{ marginLeft: 6, verticalAlign: '-2px' }} />
+      </button>
+      {open && (
+        <div className="export-pop" role="menu">
+          {[
+            { fmt: 'pdf',  label: 'PDF report'  },
+            { fmt: 'csv',  label: 'CSV (rows)'  },
+            { fmt: 'json', label: 'JSON (raw)'  },
+          ].map(opt => (
+            <button
+              key={opt.fmt}
+              type="button"
+              role="menuitem"
+              className="export-item"
+              disabled={busy !== null}
+              onClick={() => download(opt.fmt)}
+            >
+              {busy === opt.fmt ? 'Downloading…' : opt.label}
+            </button>
+          ))}
+          {error && <div className="export-err">{error}</div>}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── DASHBOARD VIEW ─────────────────────────────────────────────────────────
 
 function DashboardView({ rules, onNavigate }) {
@@ -1505,6 +1615,9 @@ export default function App({ orgProfile = null }) {
               <div className="topbar">
                 <span className="topbar-title">Dashboard</span>
                 <span className="topbar-sub">TDL Playbook · Threat Detection Library</span>
+                <div style={{ marginLeft: 'auto' }}>
+                  <CoverageExportMenu />
+                </div>
               </div>
               <DashboardView rules={rules} onNavigate={navigateToRules} />
             </>

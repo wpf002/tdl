@@ -1,7 +1,7 @@
 # TDL Playbook — Roadmap
 
 Living document. Move items between sections as work progresses; delete what's
-done, edit freely. Last updated: 2026-05-01.
+done, edit freely. Last updated: 2026-05-03.
 
 ---
 
@@ -36,6 +36,13 @@ before the next begins. Phases 4–6 also have cost gates.
       `lifecycle=Retired`), `POST /duplicate`. Inline edit in the rule detail
       pane. Adds `tools/dump_db.py` so audit/regen tooling keeps working
       against YAML round-tripped from Postgres. Free.
+- [ ] **Phase 3.5 — Org profile in Postgres + settings page.** Promote the
+      onboarding profile (org name, primary SIEM, deployed log sources) from
+      browser localStorage to a Postgres `org_profile` table keyed off Clerk
+      user id. Add a `/settings` route to view and edit it. Migrate existing
+      localStorage profiles on first authenticated load. No LLM. Free.
+      Prerequisite for Phase 4 (per-org AI spend caps need a real org row)
+      and Phase 6 (Stripe tier needs to attach to an org).
 - [ ] **Phase 4 — AI rule builder. ⚠ COST GATE.** Sonnet 4.5 generates a full
       TDL rule + all 10 SIEM queries from a prompt. Per-Generate spend ~$0.03–
       0.05. Adds `ai_usage` table for actual-spend telemetry. Soft per-org
@@ -82,11 +89,11 @@ before the next begins. Phases 4–6 also have cost gates.
 
 ## Later (bigger bets, not committed)
 
-- **User-editable profile in the UI** — `profiles/default.yaml` is a
-  hypothetical environment for the recommender. Letting a user toggle
-  `log_sources[].deployed` in-browser would make the Recommendations view
-  reflect *their* stack, not the default. Persistence: localStorage first,
-  account/server-side only if needed.
+- **Log-source toggles in Recommendations view** — `profiles/default.yaml` is
+  a hypothetical environment for the recommender. Once Phase 3.5 lands, the
+  user's deployed log sources will live in Postgres; this item is the
+  Recommendations-side surface that reads from the org profile so the view
+  reflects *their* stack, not the default.
 - **Coverage diff view** — given two profiles (or two points in time), show
   which rules light up / go dark. Useful for "what would deploying X log
   source actually buy us?"

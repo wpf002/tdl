@@ -14,6 +14,9 @@ Safe to run on every deploy. No-op if DATABASE_URL is unset.
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import yaml
 from sqlalchemy.dialects.postgresql import insert
 

@@ -508,9 +508,20 @@ input  { font-family: var(--sans); }
 .kc-tactics { display: flex; flex-wrap: wrap; gap: 4px; }
 .kc-tactic-pill { font-size: 9px; padding: 2px 7px; border-radius: 3px; border: 1px solid; font-weight: 600; }
 .kc-count { font-size: 11px; font-family: var(--mono); font-weight: 700; }
-.kc-pre-tag { font-size: 10px; color: var(--text3); font-weight: 600; line-height: 1.3; }
-.kc-pre-sub { font-size: 9.5px; color: var(--text3); line-height: 1.45; opacity: .85; }
-.kc-arrow { color: var(--text3); flex-shrink: 0; margin: 0 -2px; }
+.kc-pre-cluster {
+  display: flex; flex-direction: column;
+  flex: 2 1 460px; min-width: 440px;
+  gap: 16px;
+}
+.kc-pre-row { display: flex; align-items: stretch; gap: 6px; }
+.kc-pre-row .kc-stage { flex: 1 1 0; min-width: 0; }
+.kc-pre-callout {
+  background: var(--bg1); border: 1px solid var(--border);
+  border-radius: 8px; padding: 14px 16px;
+}
+.kc-pre-callout-tag { font-size: 10.5px; color: var(--text3); font-weight: 700; letter-spacing: .04em; margin-bottom: 5px; text-transform: uppercase; }
+.kc-pre-callout-body { font-size: 11.5px; color: var(--text2); line-height: 1.55; }
+.kc-arrow { color: var(--text3); flex-shrink: 0; margin: 0 -2px; align-self: center; }
 
 /* Chains */
 .chains-grid { display: flex; flex-direction: column; gap: 14px; }
@@ -722,6 +733,9 @@ input  { font-family: var(--sans); }
   .kc-wrap   { flex-direction: column; flex: 0 0 auto; min-width: 0; width: 100%; align-items: stretch; }
   .kc-stage  { min-height: auto; padding: 12px 14px; }
   .kc-arrow  { transform: rotate(90deg); margin: 6px auto; }
+  .kc-pre-cluster { flex: 0 0 auto; min-width: 0; width: 100%; gap: 12px; }
+  .kc-pre-row { flex-direction: column; gap: 0; }
+  .kc-pre-row .kc-arrow { transform: rotate(90deg); margin: 6px auto; }
 
   /* Attack chains: vertical step list */
   .chain-head { flex-wrap: wrap; padding: 14px 16px; }
@@ -1248,7 +1262,6 @@ function MatrixView({ rules, onSelectRule, isMobile }) {
     <>
       <div className="topbar">
         <span className="topbar-title">MITRE ATT&CK</span>
-        <span className="topbar-sub">Enterprise · v15</span>
         <a className="topbar-link" href="https://attack.mitre.org/matrices/enterprise/" target="_blank" rel="noreferrer">attack.mitre.org ↗</a>
       </div>
       <div className="matrix-stats">
@@ -1378,16 +1391,35 @@ function ChainsView({ rules, onNavigate }) {
       </div>
 
       <div className="killchain">
-        {KILL_CHAIN.map((stage, i) => {
+        <div className="kc-pre-cluster">
+          <div className="kc-pre-row">
+            {KILL_CHAIN.slice(0, 2).map((stage, i) => (
+              <React.Fragment key={stage.id}>
+                <div className="kc-stage kc-pre">
+                  <div className="kc-stage-num">{stage.stage}</div>
+                  <div className="kc-stage-name">{stage.name}</div>
+                  <div className="kc-stage-desc">{stage.description}</div>
+                </div>
+                {i === 0 && <ArrowRight size={16} className="kc-arrow" />}
+              </React.Fragment>
+            ))}
+          </div>
+          <div className="kc-pre-callout">
+            <div className="kc-pre-callout-tag">Pre-compromise · external to your network</div>
+            <div className="kc-pre-callout-body">Adversary acts on their own infrastructure. Detection requires threat intel feeds, not endpoint logs — outside the scope of this rule library.</div>
+          </div>
+        </div>
+        <ArrowRight size={16} className="kc-arrow" />
+        {KILL_CHAIN.slice(2).map((stage, idx) => {
+          const i = idx + 2
           const { count, status } = stageCoverage(stage)
-          const isPre = status === 'pre'
           const isGap = status === 'gap'
-          const clickable = !isPre && count > 0
+          const clickable = count > 0
           const goToFiltered = () => onNavigate && onNavigate({ killChain: stage.name })
           return (
             <div key={stage.id} className="kc-wrap">
               <div
-                className={`kc-stage ${isPre?'kc-pre':isGap?'kc-gap':'kc-cov'}${clickable?' kc-stage-clickable':''}`}
+                className={`kc-stage ${isGap?'kc-gap':'kc-cov'}${clickable?' kc-stage-clickable':''}`}
                 role={clickable ? 'button' : undefined}
                 tabIndex={clickable ? 0 : undefined}
                 onClick={clickable ? goToFiltered : undefined}
@@ -1398,20 +1430,12 @@ function ChainsView({ rules, onNavigate }) {
                 <div className="kc-stage-name">{stage.name}</div>
                 <div className="kc-stage-desc">{stage.description}</div>
                 <div className="kc-stage-meta">
-                  {isPre
-                    ? <>
-                        <span className="kc-pre-tag">Pre-compromise · external to your network</span>
-                        <span className="kc-pre-sub">Adversary acts on their own infrastructure. Detection requires threat intel feeds, not endpoint logs — outside the scope of this rule library.</span>
-                      </>
-                    : <>
-                        <div className="kc-tactics">{stage.attack_tactics.map(t => (
-                          <span key={t} className="kc-tactic-pill" style={{borderColor: TACTIC_COLOR[t]+'66', color:TACTIC_COLOR[t]}}>{t}</span>
-                        ))}</div>
-                        <div className="kc-count" style={{color: isGap?'var(--red)':'var(--purple)'}}>
-                          {count} rule{count===1?'':'s'}
-                        </div>
-                      </>
-                  }
+                  <div className="kc-tactics">{stage.attack_tactics.map(t => (
+                    <span key={t} className="kc-tactic-pill" style={{borderColor: TACTIC_COLOR[t]+'66', color:TACTIC_COLOR[t]}}>{t}</span>
+                  ))}</div>
+                  <div className="kc-count" style={{color: isGap?'var(--red)':'var(--purple)'}}>
+                    {count} rule{count===1?'':'s'}
+                  </div>
                 </div>
               </div>
               {i < KILL_CHAIN.length - 1 && <ArrowRight size={16} className="kc-arrow" />}
@@ -1571,7 +1595,6 @@ export default function App({ orgProfile = null }) {
               <div className="logo-icon"><Shield size={15} color="white" /></div>
               <div>
                 <div className="logo-text">TDL PLAYBOOK</div>
-                <div className="logo-ver">v2.0.0 · DaaC</div>
               </div>
             </div>
           </div>
@@ -1614,7 +1637,6 @@ export default function App({ orgProfile = null }) {
             <>
               <div className="topbar">
                 <span className="topbar-title">Dashboard</span>
-                <span className="topbar-sub">TDL Playbook · Threat Detection Library</span>
                 <div style={{ marginLeft: 'auto' }}>
                   <CoverageExportMenu />
                 </div>
@@ -1634,7 +1656,6 @@ export default function App({ orgProfile = null }) {
             <>
               <div className="topbar">
                 <span className="topbar-title">Kill Chain &amp; Attack Chains</span>
-                <span className="topbar-sub">Lockheed Cyber Kill Chain · {chainCount} TDL internal chains</span>
               </div>
               <ChainsView rules={rules} onNavigate={navigateToRules} />
             </>
@@ -1643,7 +1664,6 @@ export default function App({ orgProfile = null }) {
             <>
               <div className="topbar">
                 <span className="topbar-title">Recommendations</span>
-                <span className="topbar-sub">Log source ROI · Coverage gaps</span>
               </div>
               <RecommendView rules={rules} />
             </>

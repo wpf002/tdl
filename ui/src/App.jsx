@@ -1196,22 +1196,12 @@ function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
   const [phase, setPhase] = useState('compose') // compose | generating | preview | saving
   const [error, setError] = useState(null)
   const [preview, setPreview] = useState(null) // { rule, usage }
-  const [usageInfo, setUsageInfo] = useState(null) // { spent_today_usd, daily_cap_usd, remaining_usd }
 
   useEffect(() => {
     if (!open) return
     setPrompt(''); setTechniqueId(''); setPlatforms([])
     setPhase('compose'); setError(null); setPreview(null)
-    ;(async () => {
-      try {
-        const token = await getToken()
-        const r = await fetch('/api/ai-usage', {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
-        })
-        if (r.ok) setUsageInfo(await r.json())
-      } catch { /* non-fatal */ }
-    })()
-  }, [open, getToken])
+  }, [open])
 
   if (!open) return null
 
@@ -1305,13 +1295,6 @@ function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
           </button>
         </div>
 
-        {usageInfo && (
-          <div style={{ fontSize: 11, color: '#9598A8', marginBottom: 12 }}>
-            Today: ${usageInfo.spent_today_usd.toFixed(4)} of ${usageInfo.daily_cap_usd.toFixed(2)} cap
-            ({usageInfo.remaining_usd.toFixed(4)} remaining)
-          </div>
-        )}
-
         {phase === 'compose' && (
           <>
             <div style={labelStyle}>Describe the detection</div>
@@ -1352,7 +1335,7 @@ function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
               <button onClick={onClose} className="chip">Cancel</button>
               <button onClick={generate} className="chip on" style={{ background: '#7C5CFF', color: '#fff', borderColor: '#7C5CFF' }}>
-                Generate (~$0.05)
+                Generate
               </button>
             </div>
           </>
@@ -1366,11 +1349,6 @@ function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
 
         {phase === 'preview' && r && (
           <>
-            <div style={{ fontSize: 11, color: '#9598A8', marginBottom: 12 }}>
-              Generated · {preview.usage.input_tokens.toLocaleString()} in / {preview.usage.output_tokens.toLocaleString()} out
-              · ${preview.usage.cost_usd.toFixed(4)}
-            </div>
-
             <div style={{ background: '#0B0B11', border: '1px solid #262833', borderRadius: 6, padding: 14, marginBottom: 14 }}>
               <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>{r.name}</div>
               <div style={{ fontSize: 12, color: '#9598A8', marginBottom: 10 }}>{r.description}</div>

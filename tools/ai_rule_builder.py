@@ -1,76 +1,111 @@
 """Phase 4 — AI rule builder.
 
 Generates a full TDL rule (metadata + all 10 SIEM queries) from a natural-language
-prompt using Claude Sonnet 4.6. Per-Generate spend ~$0.03–0.05 estimated, $0.10
-hard-bounded by max_tokens.
+prompt using Claude Sonnet 4.6.
 
-Cost model (Sonnet 4.6, non-batch):
-    $3.00 / MTok input
-    $15.00 / MTok output
-
-Usage from server:
-    result = generate_rule(prompt, technique_id="T1078", platforms=["Windows"])
-    # result = {"rule": {...}, "usage": {"input_tokens": ..., "output_tokens": ..., "cost_usd": ...}}
+Uses Anthropic tool use with a strict JSON schema for the rule shape, which
+guarantees the model returns valid JSON matching the schema (no fragile parsing).
 
 Reads ANTHROPIC_API_KEY from env. Never logs or returns the key.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import re
 from datetime import datetime, timezone
 
 MODEL = os.environ.get("AI_BUILDER_MODEL", "claude-sonnet-4-6")
-MAX_OUTPUT_TOKENS = 4000
+MAX_OUTPUT_TOKENS = 8000
 INPUT_PRICE_PER_MTOK = 3.00
 OUTPUT_PRICE_PER_MTOK = 15.00
 
 QUERY_KEYS = ["spl", "kql", "aql", "yara_l", "esql", "leql",
               "crowdstrike", "xql", "lucene", "sumo"]
 
-VALID_TACTICS = {
+VALID_TACTICS = [
     "Initial Access", "Execution", "Persistence", "Privilege Escalation",
     "Defense Evasion", "Credential Access", "Discovery", "Lateral Movement",
     "Command and Control", "Collection", "Exfiltration", "Impact",
-}
-VALID_SEVERITY = {"Critical", "High", "Medium", "Low"}
-VALID_FIDELITY = {"High", "Medium", "Low"}
+]
+VALID_PLATFORMS = [
+    "Windows", "Linux", "macOS", "AWS", "Azure", "GCP",
+    "Okta", "Microsoft 365", "Network", "Kubernetes", "SaaS",
+]
+VALID_SEVERITY = ["Critical", "High", "Medium", "Low"]
+VALID_FIDELITY = ["High", "Medium", "Low"]
+VALID_TEST_METHOD = ["Atomic", "Caldera", "Manual", "none"]
 
 SYSTEM_PROMPT = """You are a senior detection engineer authoring rules for the TDL Playbook library.
 
-Output a single TDL detection rule as a strict JSON object. Do not include any prose, markdown fences, or commentary — only the JSON.
-
-Required keys:
-- name: short imperative title (≤80 chars)
-- description: 1–2 sentences on what this detects
-- tactic: one of: Initial Access, Execution, Persistence, Privilege Escalation, Defense Evasion, Credential Access, Discovery, Lateral Movement, Command and Control, Collection, Exfiltration, Impact
-- tactic_id: matching MITRE TA00xx code
-- technique_id: MITRE T-code (e.g. T1078, T1059.001)
-- technique_name: matching technique name
-- platform: list of platforms (Windows, Linux, macOS, AWS, Azure, GCP, Okta, Microsoft 365, Network, Kubernetes, SaaS)
-- data_sources: list of strings (log sources / event types)
-- severity: Critical | High | Medium | Low
-- fidelity: High | Medium | Low
-- risk_score: integer 1–100
-- pseudo_logic: plain-English description of the detection logic, including thresholds and exclusions
-- queries: object with these 10 keys, each containing a runnable query for that SIEM:
-    spl (Splunk), kql (Microsoft Sentinel/Defender), aql (IBM QRadar),
-    yara_l (Chronicle), esql (Elastic), leql (Rapid7),
-    crowdstrike (Falcon LogScale), xql (Palo XSIAM), lucene (generic), sumo (Sumo Logic)
-- false_positives: list of strings
-- triage_steps: list of 4–6 imperative analyst steps
-- tuning_guidance: 1–2 sentences on tuning
-- tags: list of short kebab-case tags
-- test_method: one of: Atomic, Caldera, Manual, none
+When the user describes a detection they want, call the `save_detection_rule` tool exactly once with a complete rule.
 
 Quality bar:
-- Queries must be syntactically valid for their respective SIEM.
+- Every SIEM query must be syntactically valid for that platform.
 - Use realistic field names from the data_sources you list.
-- Pseudo_logic must match the queries (same thresholds, same exclusions).
-- Severity/fidelity must match the realistic detection profile.
+- pseudo_logic must match the queries (same thresholds, same exclusions).
+- Severity / fidelity must reflect the realistic detection profile.
+- Triage steps should be 4–6 imperative analyst actions, ordered by what an analyst would actually do.
 """
+
+
+RULE_TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "Short imperative title (≤80 chars)"},
+        "description": {"type": "string", "description": "1–2 sentences describing what this detects"},
+        "tactic": {"type": "string", "enum": VALID_TACTICS},
+        "tactic_id": {"type": "string", "description": "MITRE TA00xx code matching the tactic"},
+        "technique_id": {"type": "string", "description": "MITRE T-code, e.g. T1078 or T1059.001"},
+        "technique_name": {"type": "string"},
+        "platform": {
+            "type": "array",
+            "items": {"type": "string", "enum": VALID_PLATFORMS},
+            "minItems": 1,
+        },
+        "data_sources": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+        },
+        "severity": {"type": "string", "enum": VALID_SEVERITY},
+        "fidelity": {"type": "string", "enum": VALID_FIDELITY},
+        "risk_score": {"type": "integer", "minimum": 1, "maximum": 100},
+        "pseudo_logic": {"type": "string", "description": "Plain-English detection logic with thresholds and exclusions"},
+        "queries": {
+            "type": "object",
+            "properties": {
+                "spl":         {"type": "string", "description": "Splunk SPL"},
+                "kql":         {"type": "string", "description": "Microsoft Sentinel/Defender KQL"},
+                "aql":         {"type": "string", "description": "IBM QRadar AQL"},
+                "yara_l":      {"type": "string", "description": "Chronicle YARA-L"},
+                "esql":        {"type": "string", "description": "Elastic ES|QL"},
+                "leql":        {"type": "string", "description": "Rapid7 LEQL"},
+                "crowdstrike": {"type": "string", "description": "CrowdStrike Falcon LogScale"},
+                "xql":         {"type": "string", "description": "Palo Alto XSIAM XQL"},
+                "lucene":      {"type": "string", "description": "Generic Lucene"},
+                "sumo":        {"type": "string", "description": "Sumo Logic"},
+            },
+            "required": QUERY_KEYS,
+        },
+        "false_positives": {"type": "array", "items": {"type": "string"}},
+        "triage_steps": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 4,
+            "maxItems": 6,
+        },
+        "tuning_guidance": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "test_method": {"type": "string", "enum": VALID_TEST_METHOD},
+    },
+    "required": [
+        "name", "description", "tactic", "tactic_id",
+        "technique_id", "technique_name", "platform", "data_sources",
+        "severity", "fidelity", "risk_score", "pseudo_logic",
+        "queries", "false_positives", "triage_steps",
+        "tuning_guidance", "tags", "test_method",
+    ],
+}
 
 
 def _user_prompt(prompt: str, technique_id: str | None, platforms: list[str] | None,
@@ -81,8 +116,7 @@ def _user_prompt(prompt: str, technique_id: str | None, platforms: list[str] | N
     if platforms:
         parts.append(f"\nTarget platforms: {', '.join(platforms)}")
     if primary_siem:
-        parts.append(f"\nThe analyst's primary SIEM is {primary_siem} — make that query especially strong.")
-    parts.append("\nReturn the rule as a single JSON object, nothing else.")
+        parts.append(f"\nPrimary SIEM: {primary_siem} — make that query especially strong.")
     return "".join(parts)
 
 
@@ -94,47 +128,8 @@ def estimate_cost(input_tokens: int, output_tokens: int) -> float:
 
 
 def max_call_cost() -> float:
-    """Hard upper bound for one generate call.
-
-    Assumes worst-case ~3000 tokens input (system + context) and the full
-    MAX_OUTPUT_TOKENS output ceiling.
-    """
+    """Upper bound for one generate call: ~3000 input + max_tokens output."""
     return estimate_cost(3000, MAX_OUTPUT_TOKENS)
-
-
-def _parse_rule_json(text: str) -> dict:
-    s = text.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```(?:json)?\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-    try:
-        return json.loads(s)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", s, re.DOTALL)
-        if m:
-            return json.loads(m.group(0))
-        raise
-
-
-def _validate_rule(rule: dict) -> None:
-    required = ["name", "description", "tactic", "technique_id", "technique_name",
-                "platform", "data_sources", "severity", "fidelity", "risk_score",
-                "pseudo_logic", "queries"]
-    missing = [k for k in required if not rule.get(k)]
-    if missing:
-        raise ValueError(f"generated rule missing required fields: {missing}")
-    if rule["tactic"] not in VALID_TACTICS:
-        raise ValueError(f"invalid tactic: {rule['tactic']!r}")
-    if rule["severity"] not in VALID_SEVERITY:
-        raise ValueError(f"invalid severity: {rule['severity']!r}")
-    if rule["fidelity"] not in VALID_FIDELITY:
-        raise ValueError(f"invalid fidelity: {rule['fidelity']!r}")
-    queries = rule.get("queries") or {}
-    if not isinstance(queries, dict):
-        raise ValueError("queries must be an object")
-    missing_q = [k for k in QUERY_KEYS if not queries.get(k)]
-    if missing_q:
-        raise ValueError(f"generated rule missing SIEM queries: {missing_q}")
 
 
 def generate_rule(
@@ -144,10 +139,10 @@ def generate_rule(
     platforms: list[str] | None = None,
     primary_siem: str | None = None,
 ) -> dict:
-    """Call Claude to generate a TDL rule. Returns {"rule": dict, "usage": dict}.
+    """Call Claude with tool use and return {"rule": dict, "usage": dict}.
 
-    Raises RuntimeError if ANTHROPIC_API_KEY is unset.
-    Raises ValueError if the model returns an invalid/incomplete rule.
+    The schema-driven tool guarantees the model emits valid JSON matching
+    the rule shape — no string parsing required.
     """
     if not (prompt or "").strip():
         raise ValueError("prompt is required")
@@ -170,13 +165,22 @@ def generate_rule(
             "text": SYSTEM_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }],
+        tools=[{
+            "name": "save_detection_rule",
+            "description": "Save a complete TDL detection rule to the library.",
+            "input_schema": RULE_TOOL_SCHEMA,
+        }],
+        tool_choice={"type": "tool", "name": "save_detection_rule"},
         messages=[{"role": "user", "content": user}],
     )
 
-    text_parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
-    raw = "".join(text_parts)
-    rule = _parse_rule_json(raw)
-    _validate_rule(rule)
+    rule = None
+    for block in resp.content:
+        if getattr(block, "type", None) == "tool_use" and block.name == "save_detection_rule":
+            rule = dict(block.input)
+            break
+    if rule is None:
+        raise ValueError("model did not return a save_detection_rule tool call")
 
     usage = resp.usage
     input_tok = (getattr(usage, "input_tokens", 0) or 0) + \
@@ -190,8 +194,6 @@ def generate_rule(
     rule.setdefault("last_modified", today)
     rule.setdefault("author", "AI")
     rule.setdefault("lifecycle", "Proposed")
-    rule.setdefault("test_method", rule.get("test_method") or "none")
-    rule.setdefault("tags", rule.get("tags") or [])
 
     return {
         "rule": rule,

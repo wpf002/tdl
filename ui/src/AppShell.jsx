@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { Show, SignIn, useUser } from '@clerk/react'
+import { Show, SignIn, useAuth, useUser } from '@clerk/react'
 import App from './App.jsx'
 import OrgSetup from './OrgSetup.jsx'
 
@@ -22,31 +22,94 @@ export default function AppShell() {
 
 function AuthedRoot() {
   const { user, isLoaded } = useUser()
+  const { getToken } = useAuth()
   const [profile, setProfile] = useState(null)
   const [hydrated, setHydrated] = useState(false)
 
   useEffect(() => {
     if (!isLoaded || !user) return
-    const raw = localStorage.getItem(orgProfileKey(user.id))
-    setProfile(raw ? JSON.parse(raw) : null)
-    setHydrated(true)
-  }, [isLoaded, user?.id])
+    let cancelled = false
+
+    ;(async () => {
+      const lsKey = orgProfileKey(user.id)
+      const readLocal = () => {
+        const raw = localStorage.getItem(lsKey)
+        return raw ? JSON.parse(raw) : null
+      }
+
+      let token = null
+      try { token = await getToken() } catch { /* offline / signed-out race */ }
+      const headers = token ? { Authorization: `Bearer ${token}` } : {}
+
+      try {
+        const r = await fetch('/api/org-profile', { headers })
+        if (r.ok) {
+          const data = await r.json()
+          if (cancelled) return
+          if (data && data.org_name) {
+            setProfile(data)
+            setHydrated(true)
+            return
+          }
+          // No row yet — migrate localStorage if present.
+          const local = readLocal()
+          if (local && local.org_name) {
+            try {
+              const put = await fetch('/api/org-profile', {
+                method: 'PUT',
+                headers: { ...headers, 'Content-Type': 'application/json' },
+                body: JSON.stringify(local),
+              })
+              if (put.ok) {
+                const migrated = await put.json()
+                if (cancelled) return
+                localStorage.removeItem(lsKey)
+                setProfile(migrated)
+                setHydrated(true)
+                return
+              }
+            } catch { /* fall through */ }
+          }
+          if (cancelled) return
+          setProfile(null)
+          setHydrated(true)
+          return
+        }
+      } catch { /* fall through to localStorage */ }
+
+      if (cancelled) return
+      setProfile(readLocal())
+      setHydrated(true)
+    })()
+
+    return () => { cancelled = true }
+  }, [isLoaded, user?.id, getToken])
 
   if (!isLoaded || !hydrated) return <CenteredMessage>Loading…</CenteredMessage>
 
-  if (!profile) {
-    return (
-      <OrgSetup
-        userId={user.id}
-        onComplete={(p) => {
-          localStorage.setItem(orgProfileKey(user.id), JSON.stringify(p))
-          setProfile(p)
-        }}
-      />
-    )
+  const persistProfile = async (p) => {
+    setProfile(p)
+    localStorage.setItem(orgProfileKey(user.id), JSON.stringify(p))
+    try {
+      const token = await getToken()
+      await fetch('/api/org-profile', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(p),
+      })
+      // Once we've confirmed it's in Postgres we don't need the localStorage copy.
+      localStorage.removeItem(orgProfileKey(user.id))
+    } catch { /* keep localStorage as offline fallback */ }
   }
 
-  return <App orgProfile={profile} />
+  if (!profile) {
+    return <OrgSetup userId={user.id} onComplete={persistProfile} />
+  }
+
+  return <App orgProfile={profile} onProfileChange={persistProfile} />
 }
 
 const signInAppearance = {

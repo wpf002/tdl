@@ -47,3 +47,14 @@ class Rule(Base):
 
 
 Index("ix_rules_org_lifecycle", Rule.org_id, Rule.lifecycle)
+
+
+class OrgProfile(Base):
+    __tablename__ = "org_profiles"
+
+    user_id = Column(String(64), primary_key=True)  # Clerk user id
+    org_name = Column(String(255), nullable=False)
+    primary_siem = Column(String(32))
+    log_sources_deployed = Column(JSONB)  # list[str]
+    created_at = Column(String(32))
+    updated_at = Column(String(32))

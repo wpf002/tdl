@@ -1,7 +1,7 @@
 # TDL Playbook — Roadmap
 
 Living document. Move items between sections as work progresses; delete what's
-done, edit freely. Last updated: 2026-05-03.
+done, edit freely. Last updated: 2026-05-04.
 
 ---
 
@@ -30,17 +30,17 @@ before the next begins. Phases 4–6 also have cost gates.
       migration, YAML→Postgres seeder that skips `is_custom=true` rules so user
       edits survive re-seed. `tools/db.py`, `tools/migrate.py`, `tools/seed_db.py`.
       `./run prod` migrates + seeds before booting.
-- [ ] **Phase 2 — Coverage report export.** PDF (reportlab), CSV, JSON
+- [x] **Phase 2 — Coverage report export.** PDF (reportlab), CSV, JSON
       endpoints; Export dropdown in Dashboard. No DB writes, no LLM. Free.
-- [ ] **Phase 3 — Rule editor.** `PUT /api/rules/<id>`, soft `DELETE` (sets
+- [x] **Phase 3 — Rule editor.** `PUT /api/rules/<id>`, soft `DELETE` (sets
       `lifecycle=Retired`), `POST /duplicate`. Inline edit in the rule detail
       pane. Adds `tools/dump_db.py` so audit/regen tooling keeps working
       against YAML round-tripped from Postgres. Free.
-- [ ] **Phase 3.5 — Org profile in Postgres + settings page.** Promote the
+- [x] **Phase 3.5 — Org profile in Postgres + settings page.** Promote the
       onboarding profile (org name, primary SIEM, deployed log sources) from
       browser localStorage to a Postgres `org_profile` table keyed off Clerk
-      user id. Add a `/settings` route to view and edit it. Migrate existing
-      localStorage profiles on first authenticated load. No LLM. Free.
+      user id. Adds a Settings nav entry; migrates existing localStorage
+      profiles on first authenticated load. No LLM. Free.
       Prerequisite for Phase 4 (per-org AI spend caps need a real org row)
       and Phase 6 (Stripe tier needs to attach to an org).
 - [ ] **Phase 4 — AI rule builder. ⚠ COST GATE.** Sonnet 4.5 generates a full

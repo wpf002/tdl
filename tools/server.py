@@ -2,16 +2,21 @@
 """TDL Playbook API server.
 
 Endpoints:
-  GET  /api/health                health probe
-  GET  /api/stats                 dashboard counts
-  GET  /api/rules                 list rules (filters: tactic, severity, lifecycle, q)
-  GET  /api/rules/<rule_id>       single rule (full, untruncated)
-  GET  /api/rules/export          rule library as zip of YAML files (DaaC export)
-  GET  /api/tactics               counts grouped by tactic
-  GET  /api/coverage              ATT&CK coverage report
-  GET  /api/coverage/export       coverage report as JSON / CSV / PDF (?format=)
-  GET  /api/chains                attack chain coverage
-  GET  /api/recommendations       log-source recommendations (default profile)
+  GET    /api/health                       health probe
+  GET    /api/stats                        dashboard counts
+  GET    /api/rules                        list rules (filters: tactic, severity, lifecycle, q)
+  GET    /api/rules/<rule_id>              single rule (full, untruncated)
+  PUT    /api/rules/<rule_id>              edit rule (Postgres-only; sets is_custom=true)
+  DELETE /api/rules/<rule_id>              soft delete (lifecycle=Retired)
+  POST   /api/rules/<rule_id>/duplicate    duplicate rule (new rule_id)
+  GET    /api/rules/export                 rule library as zip of YAML files (DaaC export)
+  GET    /api/tactics                      counts grouped by tactic
+  GET    /api/coverage                     ATT&CK coverage report
+  GET    /api/coverage/export              coverage report as JSON / CSV / PDF (?format=)
+  GET    /api/chains                       attack chain coverage
+  GET    /api/recommendations              log-source recommendations (default profile)
+  GET    /api/org-profile                  current user's org profile (or null)
+  PUT    /api/org-profile                  upsert current user's org profile
 
 Production mode also serves ui/dist/ so the SPA loads from the same origin.
 """
@@ -35,7 +40,7 @@ from flask import Flask, Response, abort, g, jsonify, request, send_from_directo
 from flask_cors import CORS
 
 from tools.db import db_enabled, session_scope
-from tools.models import Rule
+from tools.models import OrgProfile, Rule
 
 ROOT = Path(__file__).resolve().parent.parent
 RULES_DIR = ROOT / "rules"
@@ -215,6 +220,103 @@ def get_rule(rule_id):
         if r.get("rule_id") == rule_id:
             return jsonify(r)
     abort(404)
+
+
+# ── Rule mutations (Postgres-only) ──────────────────────────────────────────
+
+EDITABLE_RULE_FIELDS = {
+    "name", "description",
+    "tactic", "tactic_id", "technique_id", "technique_name",
+    "platform", "data_sources",
+    "severity", "fidelity", "lifecycle", "risk_score",
+    "queries", "pseudo_logic", "false_positives", "triage_steps", "tags",
+    "test_method", "tuning_guidance",
+}
+
+QUERY_KEYS = ("spl", "kql", "aql", "yara_l", "esql", "leql", "crowdstrike", "xql", "lucene", "sumo")
+
+
+def _today():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _require_db(reason):
+    if not db_enabled():
+        abort(503, description=f"{reason} requires Postgres (DATABASE_URL)")
+
+
+@app.put("/api/rules/<rule_id>")
+def update_rule(rule_id):
+    _require_db("rule edits")
+    body = request.get_json(silent=True) or {}
+    payload = {k: v for k, v in body.items() if k in EDITABLE_RULE_FIELDS}
+    if not payload:
+        abort(400, description="no editable fields in body")
+
+    if "queries" in payload:
+        if not isinstance(payload["queries"], dict):
+            abort(400, description="queries must be an object")
+        payload["queries"] = {k: v for k, v in payload["queries"].items() if k in QUERY_KEYS}
+
+    with session_scope() as s:
+        row = s.query(Rule).filter(Rule.rule_id == rule_id).one_or_none()
+        if row is None:
+            abort(404)
+        for k, v in payload.items():
+            setattr(row, k, v)
+        row.is_custom = True
+        row.last_modified = _today()
+        s.flush()
+        return jsonify(_row_to_dict(row))
+
+
+@app.delete("/api/rules/<rule_id>")
+def delete_rule(rule_id):
+    _require_db("rule deletes")
+    with session_scope() as s:
+        row = s.query(Rule).filter(Rule.rule_id == rule_id).one_or_none()
+        if row is None:
+            abort(404)
+        row.lifecycle = "Retired"
+        row.is_custom = True
+        row.last_modified = _today()
+        s.flush()
+        return jsonify(_row_to_dict(row))
+
+
+@app.post("/api/rules/<rule_id>/duplicate")
+def duplicate_rule(rule_id):
+    _require_db("rule duplicate")
+    with session_scope() as s:
+        src = s.query(Rule).filter(Rule.rule_id == rule_id).one_or_none()
+        if src is None:
+            abort(404)
+        base = f"{rule_id}-COPY"
+        n = 1
+        while s.query(Rule.id).filter(Rule.rule_id == f"{base}-{n}").first():
+            n += 1
+        new_rid = f"{base}-{n}"
+        copy = Rule(
+            rule_id=new_rid,
+            name=f"{src.name} (Copy)",
+            description=src.description,
+            tactic=src.tactic, tactic_id=src.tactic_id,
+            technique_id=src.technique_id, technique_name=src.technique_name,
+            platform=src.platform, data_sources=src.data_sources,
+            severity=src.severity, fidelity=src.fidelity, lifecycle="Proposed",
+            risk_score=src.risk_score,
+            queries=src.queries, pseudo_logic=src.pseudo_logic,
+            false_positives=src.false_positives, triage_steps=src.triage_steps,
+            tags=src.tags,
+            test_method=src.test_method, tuning_guidance=src.tuning_guidance,
+            author=src.author,
+            created=_today(),
+            last_modified=_today(),
+            is_custom=True,
+        )
+        s.add(copy)
+        s.flush()
+        return jsonify(_row_to_dict(copy)), 201
 
 
 def _load_full_rules():
@@ -520,6 +622,61 @@ def recommendations():
         ], check=True, cwd=ROOT)
     with out.open("r", encoding="utf-8") as f:
         return jsonify(json.load(f))
+
+
+# ── Org profile (Postgres-backed; Phase 3.5) ────────────────────────────────
+
+def _org_to_dict(row):
+    return {
+        "user_id": row.user_id,
+        "org_name": row.org_name,
+        "primary_siem": row.primary_siem,
+        "log_sources_deployed": row.log_sources_deployed or [],
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+@app.get("/api/org-profile")
+def get_org_profile():
+    user_id = g.get("clerk_user_id")
+    if not user_id:
+        abort(401)
+    _require_db("org profile")
+    with session_scope() as s:
+        row = s.query(OrgProfile).filter(OrgProfile.user_id == user_id).one_or_none()
+        if row is None:
+            return jsonify(None)
+        return jsonify(_org_to_dict(row))
+
+
+@app.put("/api/org-profile")
+def put_org_profile():
+    user_id = g.get("clerk_user_id")
+    if not user_id:
+        abort(401)
+    _require_db("org profile")
+    body = request.get_json(silent=True) or {}
+    org_name = (body.get("org_name") or "").strip()
+    if not org_name:
+        abort(400, description="org_name required")
+    primary_siem = body.get("primary_siem") or None
+    log_sources = body.get("log_sources_deployed") or []
+    if not isinstance(log_sources, list):
+        abort(400, description="log_sources_deployed must be a list")
+
+    now = datetime.now(timezone.utc).isoformat()
+    with session_scope() as s:
+        row = s.query(OrgProfile).filter(OrgProfile.user_id == user_id).one_or_none()
+        if row is None:
+            row = OrgProfile(user_id=user_id, created_at=now)
+            s.add(row)
+        row.org_name = org_name
+        row.primary_siem = primary_siem
+        row.log_sources_deployed = log_sources
+        row.updated_at = now
+        s.flush()
+        return jsonify(_org_to_dict(row))
 
 
 # ── Production: serve built SPA from same origin ────────────────────────────

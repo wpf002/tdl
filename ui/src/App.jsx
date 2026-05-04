@@ -4,11 +4,12 @@ import {
   Activity, Database, Target, Filter, Tag, Copy, Check,
   BarChart3, Layers, Crosshair, Clock, TrendingUp, ChevronDown,
   Terminal, Zap, GitBranch, Map as MapIcon, Award, Eye, Lock, Cpu,
-  ArrowRight, Circle, Minus, Download
+  ArrowRight, Circle, Minus, Download, Edit3, Trash2, Sliders
 } from 'lucide-react'
 import { UserButton, useAuth } from '@clerk/react'
 import RULES_RAW from './data/rules.json'
 import { ATTACK_MATRIX, KILL_CHAIN, TACTIC_ORDER_MATRIX } from './data/attack-matrix.js'
+import Settings from './Settings.jsx'
 
 // ─── HOOKS ──────────────────────────────────────────────────────────────────
 
@@ -392,6 +393,34 @@ input  { font-family: var(--sans); }
 .triage-item { display: flex; align-items: flex-start; gap: 10px; padding: 8px 12px; background: var(--bg1); border: 1px solid var(--border); border-radius: 4px; }
 .triage-num { flex-shrink: 0; width: 18px; height: 18px; border-radius: 50%; background: rgba(168,85,247,.18); color: #A855F7; font-size: 10px; font-weight: 700; font-family: var(--mono); display: flex; align-items: center; justify-content: center; margin-top: 1px; }
 .triage-text { font-size: 12px; line-height: 1.55; color: var(--text2); }
+
+/* ── INLINE RULE EDITOR ── */
+.rule-actions { display: flex; gap: 6px; align-items: center; margin: 6px 0 14px; flex-wrap: wrap; }
+.rule-btn {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; font-family: var(--mono); font-weight: 600;
+  padding: 5px 10px; border-radius: 5px;
+  background: var(--bg0); color: var(--text2);
+  border: 1px solid var(--border);
+  cursor: pointer; transition: all .12s;
+}
+.rule-btn:hover:not(:disabled) { border-color: var(--purple); color: var(--purple); background: var(--purple-lt); }
+.rule-btn:disabled { opacity: .45; cursor: not-allowed; }
+.rule-btn-primary { background: var(--purple); color: #fff; border-color: var(--purple); }
+.rule-btn-primary:hover:not(:disabled) { background: var(--purple); color: #fff; opacity: .9; }
+.rule-btn-danger:hover:not(:disabled) { border-color: #F87171; color: #F87171; background: rgba(248,113,113,.08); }
+.rule-err { font-size: 11px; color: #F87171; font-family: var(--mono); margin-left: 6px; }
+
+.edit-input, .edit-textarea {
+  width: 100%; box-sizing: border-box;
+  background: var(--bg1); border: 1px solid var(--border); border-radius: 5px;
+  color: var(--text); font-size: 13px; font-family: var(--sans);
+  padding: 8px 10px; outline: none; transition: border-color .12s;
+}
+.edit-input:focus, .edit-textarea:focus { border-color: var(--purple); }
+.edit-input-lg { font-size: 18px; font-weight: 600; padding: 8px 10px; }
+.edit-textarea { resize: vertical; min-height: 56px; line-height: 1.5; }
+.edit-mono { font-family: var(--mono); font-size: 12px; }
 
 /* ── VIEWS ── */
 .view { flex: 1; overflow-y: auto; padding: 28px; background: var(--bg0); }
@@ -784,52 +813,238 @@ function CopyBtn({ text }) {
 
 // ─── RULE DETAIL ─────────────────────────────────────────────────────────────
 
-function RuleDetail({ rule }) {
-  const [tab, setTab] = useState('spl')
-  const platforms = Object.keys(rule.queries || {}).filter(k => rule.queries[k])
+const SIEM_KEYS = ['spl','kql','aql','yara_l','esql','leql','crowdstrike','xql','lucene','sumo']
 
+const linesToList = (s) => (s || '').split('\n').map(x => x.trim()).filter(Boolean)
+const listToLines = (xs) => (xs || []).join('\n')
+
+function RuleDetail({ rule, onUpdated, onDuplicated }) {
+  const { getToken } = useAuth()
+  const [tab, setTab] = useState('spl')
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+
+  const platforms = Object.keys(rule.queries || {}).filter(k => rule.queries[k])
   const rc = SEV_COLOR[rule.severity] || '#888'
+
+  const startEdit = () => {
+    setDraft({
+      name: rule.name || '',
+      description: rule.description || '',
+      severity: rule.severity || 'Medium',
+      fidelity: rule.fidelity || 'Medium',
+      lifecycle: rule.lifecycle || 'Proposed',
+      risk_score: rule.risk_score ?? 0,
+      pseudo_logic: rule.pseudo_logic || '',
+      tuning_guidance: rule.tuning_guidance || '',
+      tags: listToLines(rule.tags),
+      false_positives: listToLines(rule.false_positives),
+      triage_steps: listToLines(rule.triage_steps),
+      queries: { ...(rule.queries || {}) },
+    })
+    setError(null)
+    setEditing(true)
+  }
+
+  const cancelEdit = () => {
+    setEditing(false)
+    setDraft(null)
+    setError(null)
+  }
+
+  const updateDraft = (k, v) => setDraft(d => ({ ...d, [k]: v }))
+  const updateQuery = (key, v) => setDraft(d => ({ ...d, queries: { ...d.queries, [key]: v } }))
+
+  const apiCall = async (path, opts = {}) => {
+    const token = await getToken()
+    return fetch(path, {
+      ...opts,
+      headers: {
+        ...(opts.headers || {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    })
+  }
+
+  const save = async () => {
+    if (!draft) return
+    setBusy(true)
+    setError(null)
+    try {
+      const payload = {
+        name: draft.name,
+        description: draft.description,
+        severity: draft.severity,
+        fidelity: draft.fidelity,
+        lifecycle: draft.lifecycle,
+        risk_score: Number.isFinite(+draft.risk_score) ? +draft.risk_score : 0,
+        pseudo_logic: draft.pseudo_logic,
+        tuning_guidance: draft.tuning_guidance,
+        tags: linesToList(draft.tags),
+        false_positives: linesToList(draft.false_positives),
+        triage_steps: linesToList(draft.triage_steps),
+        queries: draft.queries,
+      }
+      const r = await apiCall(`/api/rules/${encodeURIComponent(rule.rule_id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const updated = await r.json()
+      onUpdated && onUpdated(updated)
+      setEditing(false)
+      setDraft(null)
+    } catch (e) {
+      setError(e.message || 'Save failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const remove = async () => {
+    if (!confirm(`Retire rule ${rule.rule_id}? It will be marked lifecycle=Retired.`)) return
+    setBusy(true)
+    setError(null)
+    try {
+      const r = await apiCall(`/api/rules/${encodeURIComponent(rule.rule_id)}`, { method: 'DELETE' })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const updated = await r.json()
+      onUpdated && onUpdated(updated)
+    } catch (e) {
+      setError(e.message || 'Delete failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const duplicate = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      const r = await apiCall(`/api/rules/${encodeURIComponent(rule.rule_id)}/duplicate`, { method: 'POST' })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const created = await r.json()
+      onDuplicated && onDuplicated(created)
+    } catch (e) {
+      setError(e.message || 'Duplicate failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const queryTab = editing ? (draft.queries[tab] ?? '') : (rule.queries?.[tab] ?? '')
 
   return (
     <div className="detail">
       <div className="detail-rid">{rule.rule_id} · {rule.technique_id}</div>
-      <div className="detail-name">{rule.name}</div>
+
+      {editing ? (
+        <input className="edit-input edit-input-lg" value={draft.name}
+               onChange={e => updateDraft('name', e.target.value)} />
+      ) : (
+        <div className="detail-name">{rule.name}</div>
+      )}
+
       <div className="detail-badges">
         <SevBadge s={rule.severity} />
         <span className="pill pill-tactic">{rule.tactic}</span>
         <span className="pill pill-lc">{(rule.platform||[]).join(' · ')}</span>
+        {rule.is_custom && <span className="pill" style={{background:'rgba(124,92,255,.18)', color:'#C4B5FD'}}>Custom</span>}
+      </div>
+
+      <div className="rule-actions">
+        {!editing && (
+          <>
+            <button className="rule-btn" onClick={startEdit} disabled={busy}>
+              <Edit3 size={11} /> Edit
+            </button>
+            <button className="rule-btn" onClick={duplicate} disabled={busy}>
+              <Copy size={11} /> Duplicate
+            </button>
+            <button className="rule-btn rule-btn-danger" onClick={remove} disabled={busy || rule.lifecycle === 'Retired'}>
+              <Trash2 size={11} /> {rule.lifecycle === 'Retired' ? 'Retired' : 'Retire'}
+            </button>
+          </>
+        )}
+        {editing && (
+          <>
+            <button className="rule-btn rule-btn-primary" onClick={save} disabled={busy}>
+              {busy ? 'Saving…' : 'Save'}
+            </button>
+            <button className="rule-btn" onClick={cancelEdit} disabled={busy}>Cancel</button>
+          </>
+        )}
+        {error && <span className="rule-err">{error}</span>}
       </div>
 
       <div className="grid2">
         <div className="card">
           <div className="card-label">Risk Score</div>
-          <div className="card-value" style={{ color: rc }}>{rule.risk_score}/100</div>
-          <div className="risk-bar"><div className="risk-fill" style={{ width:`${rule.risk_score}%`, background:rc }} /></div>
+          {editing ? (
+            <input type="number" min="0" max="100" className="edit-input"
+                   value={draft.risk_score}
+                   onChange={e => updateDraft('risk_score', e.target.value)} />
+          ) : (
+            <>
+              <div className="card-value" style={{ color: rc }}>{rule.risk_score}/100</div>
+              <div className="risk-bar"><div className="risk-fill" style={{ width:`${rule.risk_score}%`, background:rc }} /></div>
+            </>
+          )}
+        </div>
+        <div className="card">
+          <div className="card-label">Severity</div>
+          {editing ? (
+            <select className="edit-input" value={draft.severity}
+                    onChange={e => updateDraft('severity', e.target.value)}>
+              {['Critical','High','Medium','Low'].map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          ) : (
+            <div className="card-value" style={{ color: rc }}>{rule.severity}</div>
+          )}
         </div>
         <div className="card">
           <div className="card-label">Fidelity</div>
-          <div className="card-value" style={{ color: rule.fidelity==='High'?'#7C3AED':rule.fidelity==='Medium'?'#2563EB':'#6E6E7C' }}>{rule.fidelity}</div>
+          {editing ? (
+            <select className="edit-input" value={draft.fidelity}
+                    onChange={e => updateDraft('fidelity', e.target.value)}>
+              {['High','Medium','Low'].map(f => <option key={f} value={f}>{f}</option>)}
+            </select>
+          ) : (
+            <div className="card-value" style={{ color: rule.fidelity==='High'?'#7C3AED':rule.fidelity==='Medium'?'#2563EB':'#6E6E7C' }}>{rule.fidelity}</div>
+          )}
         </div>
         <div className="card">
-          <div className="card-label">Tactic</div>
-          <div className="card-value" style={{ fontSize:12, color:'#aaa' }}>{rule.tactic}</div>
-        </div>
-        <div className="card">
-          <div className="card-label">Technique</div>
-          <div className="card-value" style={{ fontSize:12, color:'#aaa' }}>{rule.technique_name}</div>
+          <div className="card-label">Lifecycle</div>
+          {editing ? (
+            <select className="edit-input" value={draft.lifecycle}
+                    onChange={e => updateDraft('lifecycle', e.target.value)}>
+              {['Deployed','Proposed','Tested','Retired'].map(l => <option key={l} value={l}>{l}</option>)}
+            </select>
+          ) : (
+            <div className="card-value" style={{ fontSize:12, color:'#aaa' }}>{rule.lifecycle}</div>
+          )}
         </div>
       </div>
 
       <div className="section">
         <div className="section-title"><Activity size={11} />Description</div>
-        <div className="desc-box">{rule.description || 'No description available.'}</div>
+        {editing ? (
+          <textarea className="edit-textarea" rows={3}
+                    value={draft.description}
+                    onChange={e => updateDraft('description', e.target.value)} />
+        ) : (
+          <div className="desc-box">{rule.description || 'No description available.'}</div>
+        )}
       </div>
 
-      {platforms.length > 0 && (
+      {(platforms.length > 0 || editing) && (
         <div className="section">
           <div className="section-title"><Terminal size={11} />Detection Queries</div>
           <div className="qtabs">
-            {platforms.map(p => (
+            {(editing ? SIEM_KEYS : platforms).map(p => (
               <button key={p} className={`qtab${tab===p?' active':''}`} onClick={()=>setTab(p)}>
                 {p}
               </button>
@@ -838,14 +1053,34 @@ function RuleDetail({ rule }) {
           <div className="qblock">
             <div className="qblock-head">
               <span className="qblock-lang">{SIEM_LABELS[tab] || tab.toUpperCase()}</span>
-              <CopyBtn text={rule.queries[tab]} />
+              {!editing && <CopyBtn text={queryTab} />}
             </div>
-            <div className="qcode">{rule.queries[tab]}</div>
+            {editing ? (
+              <textarea className="edit-textarea edit-mono" rows={8}
+                        value={queryTab}
+                        onChange={e => updateQuery(tab, e.target.value)}
+                        placeholder={`${SIEM_LABELS[tab] || tab} query…`} />
+            ) : (
+              <div className="qcode">{queryTab}</div>
+            )}
           </div>
         </div>
       )}
 
-      {rule.data_sources?.length > 0 && (
+      {(rule.pseudo_logic || editing) && (
+        <div className="section">
+          <div className="section-title"><Cpu size={11} />Pseudo Logic</div>
+          {editing ? (
+            <textarea className="edit-textarea edit-mono" rows={4}
+                      value={draft.pseudo_logic}
+                      onChange={e => updateDraft('pseudo_logic', e.target.value)} />
+          ) : (
+            <div className="qcode">{rule.pseudo_logic}</div>
+          )}
+        </div>
+      )}
+
+      {rule.data_sources?.length > 0 && !editing && (
         <div className="section">
           <div className="section-title"><Database size={11} />Data Sources</div>
           <div className="list-items">
@@ -854,39 +1089,76 @@ function RuleDetail({ rule }) {
         </div>
       )}
 
-      {rule.false_positives?.length > 0 && (
+      {(rule.false_positives?.length > 0 || editing) && (
         <div className="section">
           <div className="section-title"><AlertTriangle size={11} />False Positives</div>
-          <div className="list-items">
-            {rule.false_positives.map((fp,i) => <div key={i} className="list-item"><div className="list-dot" />{fp}</div>)}
-          </div>
+          {editing ? (
+            <textarea className="edit-textarea" rows={3}
+                      placeholder="One per line"
+                      value={draft.false_positives}
+                      onChange={e => updateDraft('false_positives', e.target.value)} />
+          ) : (
+            <div className="list-items">
+              {rule.false_positives.map((fp,i) => <div key={i} className="list-item"><div className="list-dot" />{fp}</div>)}
+            </div>
+          )}
         </div>
       )}
 
-      {rule.tags?.length > 0 && (
+      {(rule.tags?.length > 0 || editing) && (
         <div className="section">
           <div className="section-title"><Tag size={11} />Tags</div>
-          <div className="tags-row">{rule.tags.map(t=><span key={t} className="tag">{t}</span>)}</div>
+          {editing ? (
+            <textarea className="edit-textarea" rows={2}
+                      placeholder="One tag per line"
+                      value={draft.tags}
+                      onChange={e => updateDraft('tags', e.target.value)} />
+          ) : (
+            <div className="tags-row">{rule.tags.map(t=><span key={t} className="tag">{t}</span>)}</div>
+          )}
         </div>
       )}
 
-      {rule.triage_steps?.length > 0 && (
+      {(rule.triage_steps?.length > 0 || editing) && (
         <div className="section">
           <div className="section-title"><Crosshair size={11} />Triage Steps</div>
-          <ol className="triage-list">
-            {rule.triage_steps.map((s,i) => (
-              <li key={i} className="triage-item">
-                <span className="triage-num">{i+1}</span>
-                <span className="triage-text">{s}</span>
-              </li>
-            ))}
-          </ol>
+          {editing ? (
+            <textarea className="edit-textarea" rows={4}
+                      placeholder="One step per line"
+                      value={draft.triage_steps}
+                      onChange={e => updateDraft('triage_steps', e.target.value)} />
+          ) : (
+            <ol className="triage-list">
+              {rule.triage_steps.map((s,i) => (
+                <li key={i} className="triage-item">
+                  <span className="triage-num">{i+1}</span>
+                  <span className="triage-text">{s}</span>
+                </li>
+              ))}
+            </ol>
+          )}
         </div>
       )}
 
-      <div style={{ marginTop:8, paddingTop:10, borderTop:'1px solid var(--border)', display:'flex', gap:16 }}>
+      {(rule.tuning_guidance || editing) && (
+        <div className="section">
+          <div className="section-title"><Sliders size={11} />Tuning Guidance</div>
+          {editing ? (
+            <textarea className="edit-textarea" rows={3}
+                      value={draft.tuning_guidance}
+                      onChange={e => updateDraft('tuning_guidance', e.target.value)} />
+          ) : (
+            <div className="desc-box">{rule.tuning_guidance}</div>
+          )}
+        </div>
+      )}
+
+      <div style={{ marginTop:8, paddingTop:10, borderTop:'1px solid var(--border)', display:'flex', gap:16, flexWrap:'wrap' }}>
         <span style={{ fontSize:11, color:'var(--text3)', fontFamily:'var(--mono)' }}>Author: {rule.author}</span>
         <span style={{ fontSize:11, color:'var(--text3)', fontFamily:'var(--mono)' }}>Created: {rule.created}</span>
+        {rule.last_modified && rule.last_modified !== rule.created && (
+          <span style={{ fontSize:11, color:'var(--text3)', fontFamily:'var(--mono)' }}>Modified: {rule.last_modified}</span>
+        )}
       </div>
     </div>
   )
@@ -894,7 +1166,7 @@ function RuleDetail({ rule }) {
 
 // ─── RULES VIEW ──────────────────────────────────────────────────────────────
 
-function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile }) {
+function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleUpdated, onRuleAdded }) {
   const [selected, setSelected]   = useState(null)
   const [search, setSearch]       = useState('')
   const [fTactic, setFTactic]     = useState('All')
@@ -928,6 +1200,15 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile }) {
 
   const clearAll = () => { setSearch(''); setFTactic('All'); setFSev('All'); setFid('All'); setFKc('All') }
   const dirty = search||fTactic!=='All'||fSev!=='All'||fFid!=='All'||fKc!=='All'
+
+  const handleUpdated = (updated) => {
+    onRuleUpdated && onRuleUpdated(updated)
+    setSelected(updated)
+  }
+  const handleDuplicated = (added) => {
+    onRuleAdded && onRuleAdded(added)
+    setSelected(added)
+  }
 
   return (
     <>
@@ -984,7 +1265,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile }) {
           ))}
         </div>
         {!isMobile && (selected
-          ? <RuleDetail rule={selected} />
+          ? <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} />
           : <div className="detail empty-state">
               <div className="empty-inner">
                 <Shield size={48} />
@@ -1003,7 +1284,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile }) {
             </button>
           </div>
           <div className="mobile-detail-body">
-            <RuleDetail rule={selected} />
+            <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} />
           </div>
         </div>
       )}
@@ -1545,9 +1826,10 @@ const buildViews = (ruleCount, techCount, chainCount) => [
   { id:'matrix',    label:'MITRE ATT&CK',     icon:<MapIcon size={14} />,   badge:techCount },
   { id:'chains',    label:'Kill Chain',       icon:<GitBranch size={14} />, badge:chainCount },
   { id:'recommend', label:'Log Sources',      icon:<TrendingUp size={14} /> },
+  { id:'settings',  label:'Settings',         icon:<Sliders size={14} /> },
 ]
 
-export default function App({ orgProfile = null }) {
+export default function App({ orgProfile = null, onProfileChange }) {
   const isMobile = useMediaQuery('(max-width: 768px)')
   const { getToken } = useAuth()
   const [view, setView] = useState('dashboard')
@@ -1561,6 +1843,13 @@ export default function App({ orgProfile = null }) {
     setPendingRulesFilter(filter || {})
     setView('rules')
   }
+
+  const replaceRule = useCallback((updated) => {
+    setRules(prev => prev.map(r => r.rule_id === updated.rule_id ? updated : r))
+  }, [])
+  const addRule = useCallback((added) => {
+    setRules(prev => [...prev, added])
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -1644,7 +1933,7 @@ export default function App({ orgProfile = null }) {
         </aside>
 
         <div className="main">
-          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} />}
+          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} onRuleUpdated={replaceRule} onRuleAdded={addRule} />}
           {view === 'dashboard' && (
             <>
               <div className="topbar">
@@ -1679,6 +1968,14 @@ export default function App({ orgProfile = null }) {
                 <span className="topbar-title">Recommendations</span>
               </div>
               <RecommendView rules={rules} />
+            </>
+          )}
+          {view === 'settings' && (
+            <>
+              <div className="topbar">
+                <span className="topbar-title">Settings</span>
+              </div>
+              <Settings profile={orgProfile} onSave={onProfileChange} />
             </>
           )}
         </div>

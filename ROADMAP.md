@@ -47,11 +47,12 @@ before the next begins. Phases 4–6 also have cost gates.
       TDL rule + all 10 SIEM queries from a prompt. Per-Generate spend ~$0.03–
       0.05. Adds `ai_usage` table for actual-spend telemetry. Soft per-org
       daily cap. **Requires explicit cost-analysis approval before first call.**
-- [ ] **Phase 5 — Rule import (Sigma + SPL). ⚠ COST GATE.** Sync mode capped at
-      50 Sigma rules per upload. Per-rule Claude call ~$0.02–0.04. Larger
-      uploads route to deferred Phase 5b (Batch API). **Requires approval.**
-- [ ] **Phase 5b** *(optional)* **— Sigma bulk import via Batch API.** Only if
-      real-world usage demands it.
+- [ ] **Phase 5 — Rule import (Sigma + SPL). ⚠ COST GATE.** Upload Sigma YAML
+      or SPL; per-rule Claude call (~$0.02–0.04) translates each into TDL
+      format with all 10 SIEM queries. Two modes in one phase: sync (≤50 rules
+      per upload, immediate results) and batch (>50 rules, Anthropic Batch API
+      for 50% off, results pulled when ready). Reuses `ai_usage` table and
+      daily cap from Phase 4. **Requires approval.**
 - [ ] **Phase 6 — Stripe paywall. ⚠ COST GATE (real $).** Free / Pro / Team
       tiers. **Phase 6a test-mode only** until end-to-end checkout is
       demonstrated; **6b live keys** only after explicit approval and a $1

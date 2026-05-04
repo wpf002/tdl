@@ -70,7 +70,7 @@ export default function Settings({ profile, onSave }) {
   }
 
   return (
-    <div style={S.page}>
+    <div className="view" style={S.page}>
       <form onSubmit={submit} style={S.card}>
         <h1 style={S.h1}>Organization Settings</h1>
         <p style={S.sub}>Drives recommendations and (later) per-org tier limits.</p>

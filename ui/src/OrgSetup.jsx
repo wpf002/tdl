@@ -38,6 +38,7 @@ export default function OrgSetup({ userId, onComplete }) {
   const [primarySiem, setPrimarySiem] = useState('spl')
   const [logSources, setLogSources] = useState(new Set())
   const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState(null)
 
   const toggle = (id) => {
     const next = new Set(logSources)
@@ -45,18 +46,24 @@ export default function OrgSetup({ userId, onComplete }) {
     setLogSources(next)
   }
 
-  const submit = (e) => {
+  const submit = async (e) => {
     e.preventDefault()
     if (!orgName.trim()) return
     setSubmitting(true)
-    onComplete({
-      version: 1,
-      org_name: orgName.trim(),
-      primary_siem: primarySiem,
-      log_sources_deployed: Array.from(logSources),
-      created_at: new Date().toISOString(),
-      created_by_user_id: userId,
-    })
+    setError(null)
+    try {
+      await onComplete({
+        version: 1,
+        org_name: orgName.trim(),
+        primary_siem: primarySiem,
+        log_sources_deployed: Array.from(logSources),
+        created_at: new Date().toISOString(),
+        created_by_user_id: userId,
+      })
+    } catch (err) {
+      setError(err?.message || 'Save failed')
+      setSubmitting(false)
+    }
   }
 
   return (
@@ -113,6 +120,8 @@ export default function OrgSetup({ userId, onComplete }) {
             })}
           </div>
         </div>
+
+        {error && <div style={S.error}>{error}</div>}
 
         <div style={S.footer}>
           <span style={S.count}>{logSources.size} of {LOG_SOURCES.length} log sources selected</span>
@@ -194,6 +203,14 @@ const S = {
     borderTop: '1px solid #262833',
   },
   count: { color: '#9598A8', fontSize: 13 },
+  error: {
+    background: 'rgba(248,113,113,.08)',
+    border: '1px solid rgba(248,113,113,.4)',
+    color: '#F87171',
+    borderRadius: 6,
+    padding: '10px 12px',
+    fontSize: 13,
+  },
   button: {
     background: '#7C5CFF',
     color: '#fff',

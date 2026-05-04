@@ -363,24 +363,25 @@ def get_ai_usage():
 def generate_rule_endpoint():
     user_id = g.get("clerk_user_id")
     if not user_id:
-        abort(401)
-    _require_db("ai rule generation")
+        return jsonify(error="not signed in"), 401
+    if not db_enabled():
+        return jsonify(error="DATABASE_URL is not set on the server"), 503
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        abort(503, description="ANTHROPIC_API_KEY not configured on the server")
+        return jsonify(error="ANTHROPIC_API_KEY is not set on the server"), 503
 
     body = request.get_json(silent=True) or {}
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
-        abort(400, description="prompt is required")
+        return jsonify(error="prompt is required"), 400
     if len(prompt) > 2000:
-        abort(400, description="prompt is too long (max 2000 chars)")
+        return jsonify(error="prompt is too long (max 2000 chars)"), 400
 
     technique_id = body.get("technique_id") or None
     platforms = body.get("platforms") or None
     primary_siem = body.get("primary_siem") or None
     if platforms is not None and not isinstance(platforms, list):
-        abort(400, description="platforms must be a list")
+        return jsonify(error="platforms must be a list"), 400
 
     with session_scope() as s:
         spent = _ai_spent_today(s, user_id)

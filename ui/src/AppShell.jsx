@@ -88,11 +88,15 @@ function AuthedRoot() {
   if (!isLoaded || !hydrated) return <CenteredMessage>Loading…</CenteredMessage>
 
   const persistProfile = async (p) => {
-    setProfile(p)
+    // Stash locally first — if the network fails mid-save, a refresh recovers.
     localStorage.setItem(orgProfileKey(user.id), JSON.stringify(p))
+
+    let token = null
+    try { token = await getToken() } catch { /* signed-out race */ }
+
+    let r
     try {
-      const token = await getToken()
-      await fetch('/api/org-profile', {
+      r = await fetch('/api/org-profile', {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -100,9 +104,23 @@ function AuthedRoot() {
         },
         body: JSON.stringify(p),
       })
-      // Once we've confirmed it's in Postgres we don't need the localStorage copy.
-      localStorage.removeItem(orgProfileKey(user.id))
-    } catch { /* keep localStorage as offline fallback */ }
+    } catch (e) {
+      console.warn('[org-profile] PUT network error:', e)
+      throw new Error('Could not reach the server. Try again.')
+    }
+
+    if (!r.ok) {
+      let detail = ''
+      try { detail = (await r.json()).error || '' } catch { /* non-JSON */ }
+      console.warn('[org-profile] PUT failed:', r.status, detail)
+      throw new Error(`Save failed (HTTP ${r.status})${detail ? `: ${detail}` : ''}`)
+    }
+
+    const saved = await r.json().catch(() => p)
+    setProfile(saved)
+    // Postgres has it now → drop the localStorage copy.
+    localStorage.removeItem(orgProfileKey(user.id))
+    return saved
   }
 
   if (!profile) {

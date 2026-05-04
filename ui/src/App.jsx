@@ -1168,6 +1168,26 @@ function RuleDetail({ rule, onUpdated, onDuplicated }) {
 
 // ─── AI RULE BUILDER MODAL (Phase 4) ────────────────────────────────────────
 
+// Extract a readable error from a non-OK fetch response, regardless of whether
+// the server returned JSON ({error: "..."}) or HTML (Flask's default abort).
+async function readErr(r) {
+  const ct = r.headers.get('Content-Type') || ''
+  if (ct.includes('application/json')) {
+    try {
+      const j = await r.json()
+      if (j && j.error) return j.error
+    } catch { /* fall through */ }
+  }
+  try {
+    const t = await r.text()
+    // Flask's HTML errors look like "<p>Description</p>"; pull the message out.
+    const m = t.match(/<p>([\s\S]*?)<\/p>/)
+    if (m) return `HTTP ${r.status}: ${m[1].trim()}`
+    if (t && t.length < 200) return `HTTP ${r.status}: ${t.trim()}`
+  } catch { /* ignore */ }
+  return `HTTP ${r.status}`
+}
+
 function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
   const { getToken } = useAuth()
   const [prompt, setPrompt] = useState('')
@@ -1218,8 +1238,7 @@ function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
         }),
       })
       if (!r.ok) {
-        const body = await r.json().catch(() => ({}))
-        throw new Error(body.error || `HTTP ${r.status}`)
+        throw new Error(await readErr(r))
       }
       const data = await r.json()
       setPreview(data)
@@ -1244,8 +1263,7 @@ function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
         body: JSON.stringify({ rule: preview.rule }),
       })
       if (!r.ok) {
-        const body = await r.json().catch(() => ({}))
-        throw new Error(body.error || `HTTP ${r.status}`)
+        throw new Error(await readErr(r))
       }
       const saved = await r.json()
       onSaved && onSaved(saved)

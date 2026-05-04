@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models for TDL Playbook."""
 
-from sqlalchemy import Boolean, Column, Index, Integer, String, Text
+from sqlalchemy import Boolean, Column, Float, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from tools.db import Base
@@ -58,3 +58,21 @@ class OrgProfile(Base):
     log_sources_deployed = Column(JSONB)  # list[str]
     created_at = Column(String(32))
     updated_at = Column(String(32))
+
+
+class AIUsage(Base):
+    __tablename__ = "ai_usage"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    org_id = Column(String(64), index=True, nullable=True)
+    feature = Column(String(32), index=True, nullable=False)  # 'rule_generate', 'sigma_import', etc.
+    model = Column(String(64), nullable=False)
+    input_tokens = Column(Integer, nullable=False, default=0)
+    output_tokens = Column(Integer, nullable=False, default=0)
+    cost_usd = Column(Float, nullable=False, default=0.0)
+    rule_id = Column(String(64), nullable=True)  # set if a rule was saved from this call
+    created_at = Column(String(32), index=True, nullable=False)
+
+
+Index("ix_ai_usage_user_day", AIUsage.user_id, AIUsage.created_at)

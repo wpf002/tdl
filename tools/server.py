@@ -17,6 +17,9 @@ Endpoints:
   GET    /api/recommendations              log-source recommendations (default profile)
   GET    /api/org-profile                  current user's org profile (or null)
   PUT    /api/org-profile                  upsert current user's org profile
+  POST   /api/rules/generate               AI rule builder — returns preview + usage (Phase 4 ⚠ cost)
+  POST   /api/rules                        save a (typically AI-generated) rule
+  GET    /api/ai-usage                     current user's AI spend today + cap
 
 Production mode also serves ui/dist/ so the SPA loads from the same origin.
 """
@@ -40,7 +43,7 @@ from flask import Flask, Response, abort, g, jsonify, request, send_from_directo
 from flask_cors import CORS
 
 from tools.db import db_enabled, session_scope
-from tools.models import OrgProfile, Rule
+from tools.models import AIUsage, OrgProfile, Rule
 
 ROOT = Path(__file__).resolve().parent.parent
 RULES_DIR = ROOT / "rules"
@@ -317,6 +320,163 @@ def duplicate_rule(rule_id):
         s.add(copy)
         s.flush()
         return jsonify(_row_to_dict(copy)), 201
+
+
+# ── AI rule builder (Phase 4 — cost-gated) ──────────────────────────────────
+
+AI_DAILY_CAP_USD = float(os.environ.get("AI_DAILY_CAP_USD", "5.00"))
+
+
+def _ai_spent_today(session, user_id):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    rows = session.query(AIUsage.cost_usd).filter(
+        AIUsage.user_id == user_id,
+        AIUsage.created_at.like(f"{today}%"),
+    ).all()
+    return sum((r[0] or 0.0) for r in rows)
+
+
+def _next_custom_rule_id(session):
+    base = "TDL-AI"
+    n = 1
+    while session.query(Rule.id).filter(Rule.rule_id == f"{base}-{n:06d}").first():
+        n += 1
+    return f"{base}-{n:06d}"
+
+
+@app.get("/api/ai-usage")
+def get_ai_usage():
+    user_id = g.get("clerk_user_id")
+    if not user_id:
+        abort(401)
+    _require_db("ai usage")
+    with session_scope() as s:
+        spent = _ai_spent_today(s, user_id)
+        return jsonify(
+            spent_today_usd=round(spent, 4),
+            daily_cap_usd=AI_DAILY_CAP_USD,
+            remaining_usd=round(max(0.0, AI_DAILY_CAP_USD - spent), 4),
+        )
+
+
+@app.post("/api/rules/generate")
+def generate_rule_endpoint():
+    user_id = g.get("clerk_user_id")
+    if not user_id:
+        abort(401)
+    _require_db("ai rule generation")
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        abort(503, description="ANTHROPIC_API_KEY not configured on the server")
+
+    body = request.get_json(silent=True) or {}
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        abort(400, description="prompt is required")
+    if len(prompt) > 2000:
+        abort(400, description="prompt is too long (max 2000 chars)")
+
+    technique_id = body.get("technique_id") or None
+    platforms = body.get("platforms") or None
+    primary_siem = body.get("primary_siem") or None
+    if platforms is not None and not isinstance(platforms, list):
+        abort(400, description="platforms must be a list")
+
+    with session_scope() as s:
+        spent = _ai_spent_today(s, user_id)
+        from tools.ai_rule_builder import max_call_cost
+        if spent + max_call_cost() > AI_DAILY_CAP_USD:
+            return jsonify(
+                error="daily AI spend cap reached",
+                spent_today_usd=round(spent, 4),
+                daily_cap_usd=AI_DAILY_CAP_USD,
+            ), 429
+
+    try:
+        from tools.ai_rule_builder import generate_rule
+        result = generate_rule(
+            prompt,
+            technique_id=technique_id,
+            platforms=platforms,
+            primary_siem=primary_siem,
+        )
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    except Exception as e:
+        return jsonify(error=f"generation failed: {type(e).__name__}: {e}"), 502
+
+    now = datetime.now(timezone.utc).isoformat()
+    with session_scope() as s:
+        s.add(AIUsage(
+            user_id=user_id,
+            feature="rule_generate",
+            model=result["usage"]["model"],
+            input_tokens=result["usage"]["input_tokens"],
+            output_tokens=result["usage"]["output_tokens"],
+            cost_usd=result["usage"]["cost_usd"],
+            created_at=now,
+        ))
+
+    return jsonify(rule=result["rule"], usage=result["usage"])
+
+
+@app.post("/api/rules")
+def create_rule():
+    user_id = g.get("clerk_user_id")
+    if not user_id:
+        abort(401)
+    _require_db("rule creation")
+
+    body = request.get_json(silent=True) or {}
+    rule = body.get("rule") or body  # accept either {rule:{...}} or the rule directly
+    if not isinstance(rule, dict):
+        abort(400, description="rule body must be an object")
+
+    payload = {k: v for k, v in rule.items() if k in EDITABLE_RULE_FIELDS}
+    if "queries" in payload and not isinstance(payload["queries"], dict):
+        abort(400, description="queries must be an object")
+    if "queries" in payload:
+        payload["queries"] = {k: v for k, v in payload["queries"].items() if k in QUERY_KEYS}
+
+    with session_scope() as s:
+        rule_id = (rule.get("rule_id") or "").strip() or _next_custom_rule_id(s)
+        if s.query(Rule.id).filter(Rule.rule_id == rule_id).first():
+            abort(409, description=f"rule_id {rule_id} already exists")
+
+        row = Rule(
+            rule_id=rule_id,
+            name=payload.get("name") or "Untitled rule",
+            description=payload.get("description"),
+            tactic=payload.get("tactic"), tactic_id=payload.get("tactic_id"),
+            technique_id=payload.get("technique_id"), technique_name=payload.get("technique_name"),
+            platform=payload.get("platform"), data_sources=payload.get("data_sources"),
+            severity=payload.get("severity"), fidelity=payload.get("fidelity"),
+            lifecycle=payload.get("lifecycle") or "Proposed",
+            risk_score=payload.get("risk_score"),
+            queries=payload.get("queries"),
+            pseudo_logic=payload.get("pseudo_logic"),
+            false_positives=payload.get("false_positives"),
+            triage_steps=payload.get("triage_steps"),
+            tags=payload.get("tags"),
+            test_method=payload.get("test_method"),
+            tuning_guidance=payload.get("tuning_guidance"),
+            author=rule.get("author") or "AI",
+            created=rule.get("created") or _today(),
+            last_modified=_today(),
+            is_custom=True,
+        )
+        s.add(row)
+        s.flush()
+
+        usage_id = body.get("ai_usage_id")
+        if usage_id:
+            usage_row = s.query(AIUsage).filter(
+                AIUsage.id == usage_id, AIUsage.user_id == user_id
+            ).one_or_none()
+            if usage_row is not None:
+                usage_row.rule_id = row.rule_id
+
+        return jsonify(_row_to_dict(row)), 201
 
 
 def _load_full_rules():

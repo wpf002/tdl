@@ -4,7 +4,7 @@ import {
   Activity, Database, Target, Filter, Tag, Copy, Check,
   BarChart3, Layers, Crosshair, Clock, TrendingUp, ChevronDown,
   Terminal, Zap, GitBranch, Map as MapIcon, Award, Eye, Lock, Cpu,
-  ArrowRight, Circle, Minus, Download, Edit3, Trash2, Sliders
+  ArrowRight, Circle, Minus, Download, Edit3, Trash2, Sliders, Sparkles
 } from 'lucide-react'
 import { UserButton, useAuth } from '@clerk/react'
 import RULES_RAW from './data/rules.json'
@@ -1166,13 +1166,246 @@ function RuleDetail({ rule, onUpdated, onDuplicated }) {
 
 // ─── RULES VIEW ──────────────────────────────────────────────────────────────
 
-function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleUpdated, onRuleAdded }) {
+// ─── AI RULE BUILDER MODAL (Phase 4) ────────────────────────────────────────
+
+function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
+  const { getToken } = useAuth()
+  const [prompt, setPrompt] = useState('')
+  const [techniqueId, setTechniqueId] = useState('')
+  const [platforms, setPlatforms] = useState([])
+  const [phase, setPhase] = useState('compose') // compose | generating | preview | saving
+  const [error, setError] = useState(null)
+  const [preview, setPreview] = useState(null) // { rule, usage }
+  const [usageInfo, setUsageInfo] = useState(null) // { spent_today_usd, daily_cap_usd, remaining_usd }
+
+  useEffect(() => {
+    if (!open) return
+    setPrompt(''); setTechniqueId(''); setPlatforms([])
+    setPhase('compose'); setError(null); setPreview(null)
+    ;(async () => {
+      try {
+        const token = await getToken()
+        const r = await fetch('/api/ai-usage', {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        })
+        if (r.ok) setUsageInfo(await r.json())
+      } catch { /* non-fatal */ }
+    })()
+  }, [open, getToken])
+
+  if (!open) return null
+
+  const togglePlatform = (p) => {
+    setPlatforms(prev => prev.includes(p) ? prev.filter(x => x !== p) : [...prev, p])
+  }
+
+  const generate = async () => {
+    if (!prompt.trim()) { setError('Describe what you want to detect'); return }
+    setPhase('generating'); setError(null)
+    try {
+      const token = await getToken()
+      const r = await fetch('/api/rules/generate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({
+          prompt: prompt.trim(),
+          technique_id: techniqueId || null,
+          platforms: platforms.length ? platforms : null,
+          primary_siem: primarySiem || null,
+        }),
+      })
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}))
+        throw new Error(body.error || `HTTP ${r.status}`)
+      }
+      const data = await r.json()
+      setPreview(data)
+      setPhase('preview')
+    } catch (e) {
+      setError(e.message || 'Generation failed')
+      setPhase('compose')
+    }
+  }
+
+  const save = async () => {
+    if (!preview) return
+    setPhase('saving'); setError(null)
+    try {
+      const token = await getToken()
+      const r = await fetch('/api/rules', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ rule: preview.rule }),
+      })
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}))
+        throw new Error(body.error || `HTTP ${r.status}`)
+      }
+      const saved = await r.json()
+      onSaved && onSaved(saved)
+      onClose()
+    } catch (e) {
+      setError(e.message || 'Save failed')
+      setPhase('preview')
+    }
+  }
+
+  const overlayStyle = {
+    position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', zIndex: 50,
+    display: 'grid', placeItems: 'center', padding: 24,
+  }
+  const modalStyle = {
+    width: '100%', maxWidth: 720, maxHeight: '90vh', overflow: 'auto',
+    background: '#15161D', border: '1px solid #262833', borderRadius: 8,
+    color: '#E6E7EE', padding: 20,
+  }
+  const labelStyle = { fontSize: 11, color: '#9598A8', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 6 }
+  const fieldStyle = {
+    width: '100%', background: '#0B0B11', border: '1px solid #262833',
+    color: '#E6E7EE', borderRadius: 6, padding: '8px 10px', fontSize: 13,
+    fontFamily: 'inherit',
+  }
+
+  const r = preview?.rule
+
+  return (
+    <div style={overlayStyle} onClick={onClose} role="dialog" aria-modal="true">
+      <div style={modalStyle} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Sparkles size={16} color="#7C5CFF" />
+            <span style={{ fontWeight: 600 }}>Generate Rule with AI</span>
+          </div>
+          <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: '#9598A8', cursor: 'pointer' }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        {usageInfo && (
+          <div style={{ fontSize: 11, color: '#9598A8', marginBottom: 12 }}>
+            Today: ${usageInfo.spent_today_usd.toFixed(4)} of ${usageInfo.daily_cap_usd.toFixed(2)} cap
+            ({usageInfo.remaining_usd.toFixed(4)} remaining)
+          </div>
+        )}
+
+        {phase === 'compose' && (
+          <>
+            <div style={labelStyle}>Describe the detection</div>
+            <textarea
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              placeholder="e.g. Detect lateral movement via SMB admin shares using compromised credentials, focus on Windows event 5140 and 4624 type 3"
+              rows={5}
+              style={{ ...fieldStyle, marginBottom: 14 }}
+              maxLength={2000}
+            />
+
+            <div style={labelStyle}>MITRE Technique (optional)</div>
+            <input
+              value={techniqueId}
+              onChange={(e) => setTechniqueId(e.target.value.trim())}
+              placeholder="T1078, T1021.002…"
+              style={{ ...fieldStyle, marginBottom: 14 }}
+            />
+
+            <div style={labelStyle}>Platforms (optional)</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 18 }}>
+              {PLATFORMS.map(p => (
+                <button
+                  key={p}
+                  type="button"
+                  className={`chip${platforms.includes(p) ? ' on' : ''}`}
+                  onClick={() => togglePlatform(p)}
+                  style={{ fontSize: 11 }}
+                >
+                  {p}
+                </button>
+              ))}
+            </div>
+
+            {error && <div style={{ color: '#F87171', fontSize: 12, marginBottom: 12 }}>{error}</div>}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button onClick={onClose} className="chip">Cancel</button>
+              <button onClick={generate} className="chip on" style={{ background: '#7C5CFF', color: '#fff', borderColor: '#7C5CFF' }}>
+                Generate (~$0.05)
+              </button>
+            </div>
+          </>
+        )}
+
+        {phase === 'generating' && (
+          <div style={{ padding: '40px 0', textAlign: 'center', color: '#9598A8' }}>
+            Generating rule with Claude Sonnet 4.6…
+          </div>
+        )}
+
+        {phase === 'preview' && r && (
+          <>
+            <div style={{ fontSize: 11, color: '#9598A8', marginBottom: 12 }}>
+              Generated · {preview.usage.input_tokens.toLocaleString()} in / {preview.usage.output_tokens.toLocaleString()} out
+              · ${preview.usage.cost_usd.toFixed(4)}
+            </div>
+
+            <div style={{ background: '#0B0B11', border: '1px solid #262833', borderRadius: 6, padding: 14, marginBottom: 14 }}>
+              <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>{r.name}</div>
+              <div style={{ fontSize: 12, color: '#9598A8', marginBottom: 10 }}>{r.description}</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, fontSize: 11 }}>
+                <span className="pill pill-tactic">{r.tactic}</span>
+                <SevBadge s={r.severity} />
+                <span className={`pill pill-fid-${r.fidelity}`}>{r.fidelity}</span>
+                <span className="pill" style={{ background: 'rgba(124,92,255,.15)', color: '#A78BFA' }}>{r.technique_id}</span>
+              </div>
+            </div>
+
+            <details style={{ marginBottom: 12 }}>
+              <summary style={{ cursor: 'pointer', fontSize: 12, color: '#9598A8' }}>Pseudo logic</summary>
+              <pre style={{ background: '#0B0B11', border: '1px solid #262833', borderRadius: 6, padding: 10, fontSize: 11, whiteSpace: 'pre-wrap', marginTop: 6 }}>{r.pseudo_logic}</pre>
+            </details>
+
+            <details style={{ marginBottom: 14 }}>
+              <summary style={{ cursor: 'pointer', fontSize: 12, color: '#9598A8' }}>SIEM queries ({Object.keys(r.queries || {}).length})</summary>
+              {Object.entries(r.queries || {}).map(([k, v]) => (
+                <div key={k} style={{ marginTop: 8 }}>
+                  <div style={{ fontSize: 10, color: '#7C5CFF', textTransform: 'uppercase', marginBottom: 2 }}>{SIEM_LABELS[k] || k}</div>
+                  <pre style={{ background: '#0B0B11', border: '1px solid #262833', borderRadius: 6, padding: 10, fontSize: 11, whiteSpace: 'pre-wrap', overflow: 'auto' }}>{v}</pre>
+                </div>
+              ))}
+            </details>
+
+            {error && <div style={{ color: '#F87171', fontSize: 12, marginBottom: 12 }}>{error}</div>}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button onClick={() => setPhase('compose')} className="chip">Discard & retry</button>
+              <button onClick={save} className="chip on" style={{ background: '#7C5CFF', color: '#fff', borderColor: '#7C5CFF' }}>
+                Save to library
+              </button>
+            </div>
+          </>
+        )}
+
+        {phase === 'saving' && (
+          <div style={{ padding: '40px 0', textAlign: 'center', color: '#9598A8' }}>Saving…</div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleUpdated, onRuleAdded, primarySiem }) {
   const [selected, setSelected]   = useState(null)
   const [search, setSearch]       = useState('')
   const [fTactic, setFTactic]     = useState('All')
   const [fSev, setFSev]           = useState('All')
   const [fFid, setFid]            = useState('All')
   const [fKc, setFKc]             = useState('All')
+  const [aiOpen, setAiOpen]       = useState(false)
 
   // Apply a cross-view handoff (e.g., dashboard tile click) once, then clear it.
   useEffect(() => {
@@ -1220,6 +1453,16 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
           <input className="search-input" placeholder="Search rules, IDs, techniques, tags…"
             value={search} onChange={e=>setSearch(e.target.value)} />
         </div>
+        <button
+          type="button"
+          className="topbar-link"
+          onClick={() => setAiOpen(true)}
+          title="Generate a new rule with AI"
+          style={{ marginLeft: 8 }}
+        >
+          <Sparkles size={12} style={{ marginRight: 6, verticalAlign: '-2px', color: '#7C5CFF' }} />
+          Generate with AI
+        </button>
       </div>
       <div className="filterbar">
         <div className="filter-row">
@@ -1288,6 +1531,16 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
           </div>
         </div>
       )}
+
+      <GenerateRuleModal
+        open={aiOpen}
+        onClose={() => setAiOpen(false)}
+        primarySiem={primarySiem}
+        onSaved={(saved) => {
+          onRuleAdded && onRuleAdded(saved)
+          setSelected(saved)
+        }}
+      />
     </>
   )
 }
@@ -1933,7 +2186,7 @@ export default function App({ orgProfile = null, onProfileChange }) {
         </aside>
 
         <div className="main">
-          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} onRuleUpdated={replaceRule} onRuleAdded={addRule} />}
+          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} onRuleUpdated={replaceRule} onRuleAdded={addRule} primarySiem={orgProfile?.primary_siem} />}
           {view === 'dashboard' && (
             <>
               <div className="topbar">

@@ -30,6 +30,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +66,19 @@ RULE_COLUMNS = (
 
 app = Flask(__name__, static_folder=None)
 CORS(app)
+
+# Process-start timestamp + build commit, surfaced via /api/health so the
+# deploy pipeline can verify the running pod is actually the freshly-built
+# image (a stale pod will report an old started_at + old commit).
+_STARTED_AT = time.time()
+
+
+def _build_commit():
+    return (
+        os.environ.get("RAILWAY_GIT_COMMIT_SHA")
+        or os.environ.get("BUILD_COMMIT")
+        or "unknown"
+    )[:12]
 
 # ── Auth (Clerk JWT verification on /api/* except /api/health) ──────────────
 CLERK_JWT_ISSUER = (os.environ.get("CLERK_JWT_ISSUER") or "").rstrip("/")
@@ -165,7 +179,12 @@ def load_full_rule(rule_id):
 
 @app.get("/api/health")
 def health():
-    return jsonify(status="ok", rules=len(load_rules()))
+    return jsonify(
+        status="ok",
+        rules=len(load_rules()),
+        commit=_build_commit(),
+        started_at=_STARTED_AT,
+    )
 
 
 @app.get("/api/stats")

@@ -14,68 +14,89 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 90
 queries:
-  spl: |
-    index=windows sourcetype="WinEventLog:Security"
+  spl: 'index=windows sourcetype="WinEventLog:Security"
+
     | search event_id IN ("4688")
+
     | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
+
     | where count >= 1
+
     | sort - count
-  kql: |
-    SecurityEvent
+
+    '
+  kql: 'SecurityEvent
+
     | where TimeGenerated > ago(1d)
+
     | where event_id in ("4688")
+
     | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
-      AND "event_id" IN ('4688')
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_exe_005 {
-      meta:
-        author = "TDL"
-        description = "Regsvr32 Executing Remote SCT Scriptlet (Squiblydoo)"
-        severity = "CRITICAL"
-        tactic = "TA0002"
-        technique = "T1218.010"
-      events:
-        $e.metadata.event_type = "USER_LOGIN"
-        $e.event_id = /(4688)/
-        $user = $e.target.user.userid
-      match:
-        $user over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-windows.security*,logs-system.security*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type,\
+    \ eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'\n\
+    \  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_exe_005 {\n  meta:\n    author = \"TDL\"\n    description\
+    \ = \"Regsvr32 Executing Remote SCT Scriptlet (Squiblydoo)\"\n    severity = \"\
+    CRITICAL\"\n    tactic = \"TA0002\"\n    technique = \"T1218.010\"\n  events:\n\
+    \    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(4688)/\n   \
+    \ $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n\
+    \    $e\n}\n"
+  esql: 'FROM logs-windows.security*,logs-system.security*
+
     | WHERE @timestamp > NOW() - 1 day
+
     | WHERE event.category == "authentication" AND event_id IN ("4688")
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+
+    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType,
+    event.code
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4688])
+
+    '
+  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id
+    IN [4688])
+
     groupby(destination_account, source_ip, asset)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4688)
+
+    '
+  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp)
+    AND event_id IN (4688)
+
     | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+
     | sort -auth_events
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.LOGIN AND event_id in ("4688")
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+
+    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip,
+    action_logon_type
+
     | sort desc logins
-  lucene: |
-    event.category:"authentication" AND event_id:(4688)
-  sumo: |
-    _sourceCategory=*windows*security* OR _sourceCategory=*ad*
+
+    '
+  lucene: 'event.category:"authentication" AND event_id:(4688)
+
+    '
+  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
+
     | parse "EventID=*\"" as event_id nodrop
+
     | where event_id IN ("4688")
+
     | count by host, user, src_ip, logon_type, event_id
+
     | sort by _count desc
+
+    '
 false_positives:
 - Extremely rare in production
 tags:
@@ -88,11 +109,31 @@ test_method: purple_team
 last_modified: '2026-04-28'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — pay attention to short-lived
-  processes, encoded arguments, and unusual parents (Office, browser, services).
-- Pull EDR process tree for the alert PID; check the parent / grandparent and any child processes spawned within 5 minutes.
-- 'Compare against the host''s baseline: is the binary / interpreter normally invoked here, by this user, at this time?'
-- 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software
-  install, or scheduled job.'
-- 'If TP: contain the host, kill the offending process, snapshot memory if possible, and escalate to IR with the process tree
-  attached.'
+- Inspect the parent → child process tree, command line arguments, and code-signing
+  status — pay attention to short-lived processes, encoded arguments, and unusual
+  parents (Office, browser, services).
+- Pull EDR process tree for the alert PID; check the parent / grandparent and any
+  child processes spawned within 5 minutes.
+- 'Compare against the host''s baseline: is the binary / interpreter normally invoked
+  here, by this user, at this time?'
+- 'Decide TP / FP: TP if the execution chain has no business justification; FP if
+  it traces to a packaging script, software install, or scheduled job.'
+- 'If TP: contain the host, kill the offending process, snapshot memory if possible,
+  and escalate to IR with the process tree attached.'
+pseudo_logic: '1 Instance within any time window of a Windows Security Event ID 4688
+  (Process Creation) event indicating Regsvr32 executing a remote SCT scriptlet (Squiblydoo
+  technique).
+
+
+  From index=windows sourcetype="WinEventLog:Security"
+
+  Where event_id is 4688
+
+  With process name or command line referencing regsvr32.exe invoking a remote SCT
+  scriptlet URL
+
+  With fields captured including user, IpAddress, LogonType, and EventCode
+
+
+  With the same user and IpAddress as the correlation key, deduplicated per unique
+  host occurrence with a minimum threshold of 1 instance before triggering.'

@@ -1,8 +1,9 @@
 rule_id: TDL-DE-000368
 v4_id: 000368
 name: Suspicious EC2 Access Key Detected - AWS
-description: Detects the creation or modification of access keys to an EC2 instance. An attacker may attempt to manipulate
-  access or escalate privileges further to EC2 instances.
+description: Detects the creation or modification of access keys to an EC2 instance.
+  An attacker may attempt to manipulate access or escalate privileges further to EC2
+  instances.
 tactic: Defense Evasion
 tactic_id: TA0005
 technique_id: T1578
@@ -16,67 +17,85 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
+  spl: 'index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
+
     | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
+
+    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName,
+    resources{}.ARN
+
     | where count >= 1
+
     | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+
+    '
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
+    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName),
+    Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_de_000368 {
-      meta:
-        author = "TDL"
-        description = "Suspicious EC2 Access Key Detected - AWS"
-        severity = "LOW"
-        tactic = "TA0005"
-        technique = "T1578"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\
+    \nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure\
+    \ Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_de_000368 {\n  meta:\n    author = \"TDL\"\n    description\
+    \ = \"Suspicious EC2 Access Key Detected - AWS\"\n    severity = \"LOW\"\n   \
+    \ tactic = \"TA0005\"\n    technique = \"T1578\"\n  events:\n    $e.metadata.event_type\
+    \ = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n\
+    \  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
+    | comp count() as calls by actor_effective_username, action_evtlog_event_name,
+    action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -95,13 +114,34 @@ suppression:
   - src_user
 tuning_period: 30 days
 triage_steps:
-- 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
-- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — distinguish administrative tooling from adversary
-  tradecraft (LOLBins, signed binary proxies, masquerading paths).
-- 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log channel state to see what was suppressed.'
-- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same
-  minute.'
-- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts for it; TP if it''s unattended and
-  pairs with other malicious telemetry.'
-- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out of retention, isolate the host, and escalate
-  to IR.'
+- 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process
+  / DLL / log clear / service stop).'
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — distinguish
+  administrative tooling from adversary tradecraft (LOLBins, signed binary proxies,
+  masquerading paths).
+- 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log
+  channel state to see what was suppressed.'
+- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence
+  / cred-access action in the same minute.'
+- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts
+  for it; TP if it''s unattended and pairs with other malicious telemetry.'
+- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out
+  of retention, isolate the host, and escalate to IR.'
+pseudo_logic: '1 Instance over any time window of an AWS CloudTrail event where the
+  event name matches a key creation or modification pattern.
+
+
+  From index=cloud sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit
+
+  Where eventName matches the pattern "*.+*" indicating an access key creation or
+  modification action against an EC2 instance
+
+  With count of matching events greater than or equal to 1
+
+
+  Excludes events attributed to known legitimate admin activity or authorized service
+  accounts.
+
+
+  With the same userIdentity.arn, eventName, and resources{}.ARN as the correlation
+  key, sorted by descending event count.'

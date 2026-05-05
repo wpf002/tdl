@@ -1770,8 +1770,17 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
       <div className="filterbar">
         <div className="filter-row">
           <span className="chip-label">Tactic</span>
-          {['All',...TACTIC_ORDER].map(t=>(
-            <button key={t} className={`chip${fTactic===t?' on':''}`} onClick={()=>setFTactic(t)} style={{ fontSize:10 }}>{t==='All' ? t : tacticLabel(t)}</button>
+          <button className={`chip${fTactic==='All'?' on':''}`} onClick={()=>setFTactic('All')} style={{ fontSize:10 }}>All</button>
+          {TACTIC_ORDER.slice(0, 8).map(t=>(
+            <button key={t} className={`chip${fTactic===t?' on':''}`} onClick={()=>setFTactic(t)} style={{ fontSize:10 }}>{tacticLabel(t)}</button>
+          ))}
+        </div>
+        <div className="filter-row">
+          {/* Invisible spacers align "Command and Control" vertically under "Initial Access". */}
+          <span className="chip-label" aria-hidden="true" style={{ visibility: 'hidden' }}>Tactic</span>
+          <button aria-hidden="true" tabIndex={-1} className="chip" style={{ fontSize:10, visibility: 'hidden' }}>All</button>
+          {TACTIC_ORDER.slice(8).map(t=>(
+            <button key={t} className={`chip${fTactic===t?' on':''}`} onClick={()=>setFTactic(t)} style={{ fontSize:10 }}>{tacticLabel(t)}</button>
           ))}
         </div>
         <div className="filter-row">

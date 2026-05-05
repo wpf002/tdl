@@ -6,7 +6,7 @@ import {
   Terminal, Zap, GitBranch, Map as MapIcon, Award, Eye, Lock, Cpu,
   ArrowRight, Circle, Minus, Download, Edit3, Trash2, Sliders, Sparkles
 } from 'lucide-react'
-import { UserButton, useAuth } from '@clerk/react'
+import { LogOut } from 'lucide-react'
 import RULES_RAW from './data/rules.json'
 import { ATTACK_MATRIX, KILL_CHAIN, TACTIC_ORDER_MATRIX } from './data/attack-matrix.js'
 import Settings from './Settings.jsx'
@@ -895,7 +895,6 @@ const linesToList = (s) => (s || '').split('\n').map(x => x.trim()).filter(Boole
 const listToLines = (xs) => (xs || []).join('\n')
 
 function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted }) {
-  const { getToken } = useAuth()
   const [tab, setTab] = useState('spl')
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(null)
@@ -934,13 +933,10 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted }) {
   const updateQuery = (key, v) => setDraft(d => ({ ...d, queries: { ...d.queries, [key]: v } }))
 
   const apiCall = async (path, opts = {}) => {
-    const token = await getToken()
     return fetch(path, {
       ...opts,
-      headers: {
-        ...(opts.headers || {}),
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
+      credentials: 'include',
+      headers: { ...(opts.headers || {}) },
     })
   }
 
@@ -1274,7 +1270,6 @@ async function readErr(r) {
 }
 
 function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
-  const { getToken } = useAuth()
   const [prompt, setPrompt] = useState('')
   const [techniqueId, setTechniqueId] = useState('')
   const [platforms, setPlatforms] = useState([])
@@ -1298,13 +1293,10 @@ function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
     if (!prompt.trim()) { setError('Describe what you want to detect'); return }
     setPhase('generating'); setError(null)
     try {
-      const token = await getToken()
       const r = await fetch('/api/rules/generate', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           prompt: prompt.trim(),
           technique_id: techniqueId || null,
@@ -1328,13 +1320,10 @@ function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
     if (!preview) return
     setPhase('saving'); setError(null)
     try {
-      const token = await getToken()
       const r = await fetch('/api/rules', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rule: preview.rule }),
       })
       if (!r.ok) {
@@ -1496,7 +1485,6 @@ const SOURCE_TYPES = [
 ]
 
 function ImportRulesModal({ open, onClose, onApplied }) {
-  const { getToken } = useAuth()
   const [sourceType, setSourceType] = useState('sigma')
   const [content, setContent] = useState('')
   const [phase, setPhase] = useState('compose') // compose | running | review | applying
@@ -1516,9 +1504,8 @@ function ImportRulesModal({ open, onClose, onApplied }) {
     let cancelled = false
     const tick = async () => {
       try {
-        const token = await getToken()
         const r = await fetch(`/api/import-jobs/${job.id}`, {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
+          credentials: 'include',
         })
         if (!r.ok) throw new Error(await readErr(r))
         const data = await r.json()
@@ -1541,7 +1528,7 @@ function ImportRulesModal({ open, onClose, onApplied }) {
     const id = setInterval(tick, 3000)
     tick()
     return () => { cancelled = true; clearInterval(id) }
-  }, [job?.id, phase, getToken])
+  }, [job?.id, phase])
 
   if (!open) return null
 
@@ -1549,13 +1536,10 @@ function ImportRulesModal({ open, onClose, onApplied }) {
     if (!content.trim()) { setError('Paste content to import'); return }
     setError(null); setPhase('running')
     try {
-      const token = await getToken()
       const r = await fetch('/api/rules/import', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ source_type: sourceType, content }),
       })
       if (!r.ok) throw new Error(await readErr(r))
@@ -1578,13 +1562,10 @@ function ImportRulesModal({ open, onClose, onApplied }) {
     if (!job || selected.size === 0) return
     setPhase('applying'); setError(null)
     try {
-      const token = await getToken()
       const r = await fetch(`/api/import-jobs/${job.id}/apply`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ selected_indexes: Array.from(selected).sort((a,b) => a-b) }),
       })
       if (!r.ok) throw new Error(await readErr(r))
@@ -1592,9 +1573,8 @@ function ImportRulesModal({ open, onClose, onApplied }) {
       // Pull the saved rule rows so the parent list updates
       const ids = finished.created_rule_ids || []
       const fetched = await Promise.all(ids.map(async (rid) => {
-        const tok = await getToken()
         const rr = await fetch(`/api/rules/${rid}?full=1`, {
-          headers: tok ? { Authorization: `Bearer ${tok}` } : {},
+          credentials: 'include',
         })
         return rr.ok ? rr.json() : null
       }))
@@ -1939,7 +1919,6 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
 // ─── COVERAGE EXPORT MENU ───────────────────────────────────────────────────
 
 function CoverageExportMenu() {
-  const { getToken } = useAuth()
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(null)
   const [error, setError] = useState(null)
@@ -1961,10 +1940,7 @@ function CoverageExportMenu() {
     setBusy(key)
     setError(null)
     try {
-      const token = await getToken()
-      const r = await fetch(url, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      })
+      const r = await fetch(url, { credentials: 'include' })
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       const blob = await r.blob()
       const cd = r.headers.get('Content-Disposition') || ''
@@ -2523,6 +2499,82 @@ function RecommendView({ rules, orgProfile }) {
 
 // ─── APP ─────────────────────────────────────────────────────────────────────
 
+function UserMenu({ user, onSignOut }) {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const wrapRef = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false) }
+    const onKey = (e) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', onDoc)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  const signOut = async () => {
+    setBusy(true)
+    try {
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' })
+    } catch { /* still log out client-side */ }
+    setBusy(false)
+    onSignOut && onSignOut()
+  }
+
+  const initial = (user?.email?.[0] || '?').toUpperCase()
+
+  return (
+    <div ref={wrapRef} style={{ position: 'relative' }}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        title={user?.email || 'Account'}
+        style={{
+          width: 28, height: 28, borderRadius: '50%',
+          background: '#7C5CFF', color: '#fff',
+          border: 'none', cursor: 'pointer',
+          display: 'grid', placeItems: 'center',
+          fontSize: 12, fontWeight: 700,
+        }}
+      >{initial}</button>
+      {open && (
+        <div style={{
+          position: 'absolute', bottom: '100%', left: 0, marginBottom: 8,
+          background: '#15161D', border: '1px solid #262833',
+          borderRadius: 8, minWidth: 220, padding: 6,
+          boxShadow: '0 8px 24px rgba(0,0,0,0.4)', zIndex: 100,
+        }}>
+          <div style={{ padding: '8px 10px', borderBottom: '1px solid #262833', marginBottom: 4 }}>
+            <div style={{ fontSize: 11, color: '#9598A8' }}>Signed in as</div>
+            <div style={{
+              fontSize: 13, color: '#E6E7EE',
+              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+            }}>{user?.email || 'unknown'}</div>
+          </div>
+          <button
+            onClick={signOut}
+            disabled={busy}
+            style={{
+              width: '100%', textAlign: 'left',
+              background: 'transparent', border: 'none', color: '#E6E7EE',
+              padding: '8px 10px', borderRadius: 6, cursor: 'pointer',
+              fontSize: 13, display: 'flex', alignItems: 'center', gap: 8,
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.background = '#1E2030'}
+            onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+          >
+            <LogOut size={14} />
+            {busy ? 'Signing out…' : 'Sign out'}
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 const buildViews = (ruleCount, techCount, chainCount) => [
   { id:'dashboard', label:'Dashboard',        icon:<BarChart3 size={14} /> },
   { id:'rules',     label:'Detection Rules',  icon:<Shield size={14} />,   badge:ruleCount },
@@ -2532,9 +2584,8 @@ const buildViews = (ruleCount, techCount, chainCount) => [
   { id:'settings',  label:'Settings',         icon:<Sliders size={14} /> },
 ]
 
-export default function App({ orgProfile = null, onProfileChange }) {
+export default function App({ user = null, orgProfile = null, onProfileChange, onSignOut }) {
   const isMobile = useMediaQuery('(max-width: 768px)')
-  const { getToken } = useAuth()
   const [view, setView] = useState('dashboard')
   const [rules, setRules] = useState(RULES_RAW)
   const [source, setSource] = useState('bundled')
@@ -2562,10 +2613,7 @@ export default function App({ orgProfile = null, onProfileChange }) {
     let cancelled = false
     ;(async () => {
       try {
-        const token = await getToken()
-        const r = await fetch('/api/rules', {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
-        })
+        const r = await fetch('/api/rules', { credentials: 'include' })
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         const data = await r.json()
         if (cancelled) return
@@ -2578,7 +2626,7 @@ export default function App({ orgProfile = null, onProfileChange }) {
       }
     })()
     return () => { cancelled = true }
-  }, [getToken])
+  }, [])
 
   // Unique top-level techniques *in the canonical ATT&CK Enterprise matrix*
   // that have at least one rule. Matches the matrix view's coverage stat so
@@ -2622,7 +2670,7 @@ export default function App({ orgProfile = null, onProfileChange }) {
             alignItems: 'center',
             gap: 10,
           }}>
-            <UserButton afterSignOutUrl="/" />
+            <UserMenu user={user} onSignOut={onSignOut} />
             {orgProfile?.org_name && (
               <div style={{ overflow: 'hidden' }}>
                 <div style={{ fontSize: 12, color: 'var(--muted)' }}>Organization</div>

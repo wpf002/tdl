@@ -42,13 +42,16 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 
-import jwt
-from jwt import PyJWKClient
-from flask import Flask, Response, abort, g, jsonify, request, send_from_directory
+import uuid
+
+from flask import Flask, Response, abort, g, jsonify, make_response, request, send_from_directory
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 from tools.db import db_enabled, session_scope
-from tools.models import AIUsage, DeletedRule, ImportJob, OrgProfile, Rule
+from tools.models import AIUsage, AuthToken, DeletedRule, ImportJob, OrgProfile, Rule, User
+from tools import auth as authlib
 
 ROOT = Path(__file__).resolve().parent.parent
 RULES_DIR = ROOT / "rules"
@@ -69,7 +72,17 @@ RULE_COLUMNS = (
 )
 
 app = Flask(__name__, static_folder=None)
-CORS(app)
+# Cookies must be sent on cross-origin requests (vite dev server → flask api),
+# so CORS needs supports_credentials and an explicit origin (cannot be '*').
+_DEV_ORIGINS = [o.strip() for o in (os.environ.get("CORS_ORIGINS") or "http://localhost:5173").split(",") if o.strip()]
+CORS(app, supports_credentials=True, origins=_DEV_ORIGINS)
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=[],  # no global limit; auth endpoints opt-in below
+    storage_uri="memory://",
+)
 
 # Process-start timestamp + build commit, surfaced via /api/health so the
 # deploy pipeline can verify the running pod is actually the freshly-built
@@ -84,30 +97,15 @@ def _build_commit():
         or "unknown"
     )[:12]
 
-# ── Auth (Clerk JWT verification on /api/* except /api/health) ──────────────
-CLERK_JWT_ISSUER = (os.environ.get("CLERK_JWT_ISSUER") or "").rstrip("/")
-PUBLIC_API_PATHS = {"/api/health"}
-_jwks_client = None
-
-
-def _get_jwks_client():
-    global _jwks_client
-    if _jwks_client is None:
-        if not CLERK_JWT_ISSUER:
-            raise RuntimeError("CLERK_JWT_ISSUER env var is not set")
-        _jwks_client = PyJWKClient(f"{CLERK_JWT_ISSUER}/.well-known/jwks.json")
-    return _jwks_client
-
-
-def _verify_clerk_jwt(token):
-    signing_key = _get_jwks_client().get_signing_key_from_jwt(token)
-    return jwt.decode(
-        token,
-        signing_key.key,
-        algorithms=["RS256"],
-        issuer=CLERK_JWT_ISSUER,
-        options={"verify_aud": False},  # Clerk session tokens omit `aud` by default
-    )
+# ── Auth (session-cookie gate on /api/* except public paths) ────────────────
+PUBLIC_API_PATHS = {
+    "/api/health",
+    "/api/auth/register",
+    "/api/auth/login",
+    "/api/auth/forgot-password",
+    "/api/auth/reset-password",
+    "/api/auth/verify-email",
+}
 
 
 @app.before_request
@@ -117,18 +115,243 @@ def _auth_gate():
         return None
     if path in PUBLIC_API_PATHS:
         return None
-    if not CLERK_JWT_ISSUER:
-        return jsonify(error="server auth misconfigured: CLERK_JWT_ISSUER unset"), 503
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return jsonify(error="missing bearer token"), 401
-    token = auth[7:].strip()
-    try:
-        payload = _verify_clerk_jwt(token)
-    except Exception as e:
-        return jsonify(error=f"invalid token: {type(e).__name__}"), 401
-    g.clerk_user_id = payload.get("sub")
+    cookie = request.cookies.get(authlib.SESSION_COOKIE_NAME, "")
+    user_id = authlib.read_session_cookie(cookie)
+    if not user_id:
+        return jsonify(error="unauthenticated"), 401
+    g.user_id = user_id
     return None
+
+
+# ── /api/auth/* endpoints ────────────────────────────────────────────────────
+
+def _user_to_dict(u: User):
+    return {
+        "id": u.id,
+        "email": u.email,
+        "email_verified": u.email_verified,
+        "created_at": u.created_at,
+        "last_login_at": u.last_login_at,
+    }
+
+
+def _set_session_cookie(resp, user_id: str):
+    resp.set_cookie(
+        authlib.SESSION_COOKIE_NAME,
+        authlib.issue_session_cookie(user_id),
+        **authlib.session_cookie_kwargs(),
+    )
+
+
+def _clear_session_cookie(resp):
+    resp.set_cookie(
+        authlib.SESSION_COOKIE_NAME, "",
+        max_age=0, httponly=True,
+        secure=authlib.session_cookie_kwargs().get("secure", False),
+        samesite="Lax", path="/",
+    )
+
+
+@app.post("/api/auth/register")
+@limiter.limit("10 per hour")
+def auth_register():
+    _require_db("registration")
+    body = request.get_json(silent=True) or {}
+    email = authlib.normalize_email(body.get("email") or "")
+    password = body.get("password") or ""
+    if not authlib.looks_like_email(email):
+        return jsonify(error="Please enter a valid email address."), 400
+    err = authlib.validate_password_strength(password)
+    if err:
+        return jsonify(error=err), 400
+
+    with session_scope() as s:
+        existing = s.query(User).filter(User.email == email).one_or_none()
+        if existing is not None:
+            # Don't leak which emails are registered. Behave like success but
+            # send no email and return a generic message; the SignUp form will
+            # invite them to log in. We return 409 so the UI can hint at login.
+            return jsonify(error="An account with this email already exists."), 409
+
+        user_id = uuid.uuid4().hex
+        now = authlib._now_iso()
+        user = User(
+            id=user_id,
+            email=email,
+            password_hash=authlib.hash_password(password),
+            email_verified=False,
+            created_at=now,
+            last_login_at=now,
+        )
+        s.add(user)
+
+        plaintext, digest = authlib.generate_token()
+        s.add(AuthToken(
+            token_hash=digest,
+            user_id=user_id,
+            purpose="verify_email",
+            created_at=now,
+            expires_at=authlib.token_expiry("verify_email"),
+        ))
+        s.flush()
+        snapshot = _user_to_dict(user)
+
+    try:
+        authlib.send_verification_email(email, plaintext)
+    except Exception as e:
+        app.logger.warning("verification email failed: %s", e)
+
+    resp = make_response(jsonify(user=snapshot))
+    _set_session_cookie(resp, snapshot["id"])
+    return resp
+
+
+@app.post("/api/auth/login")
+@limiter.limit("20 per 5 minutes")
+def auth_login():
+    _require_db("login")
+    body = request.get_json(silent=True) or {}
+    email = authlib.normalize_email(body.get("email") or "")
+    password = body.get("password") or ""
+    if not email or not password:
+        return jsonify(error="Email and password are required."), 400
+
+    with session_scope() as s:
+        user = s.query(User).filter(User.email == email).one_or_none()
+        # Constant-ish-time: still call verify_password against a dummy hash
+        # when the user doesn't exist, to reduce email-enumeration via timing.
+        ok = False
+        if user is not None:
+            ok = authlib.verify_password(password, user.password_hash)
+        else:
+            authlib.verify_password(password, "$2b$12$" + "x" * 53)
+        if not user or not ok:
+            return jsonify(error="Invalid email or password."), 401
+        user.last_login_at = authlib._now_iso()
+        s.flush()
+        snapshot = _user_to_dict(user)
+
+    resp = make_response(jsonify(user=snapshot))
+    _set_session_cookie(resp, snapshot["id"])
+    return resp
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    resp = make_response(jsonify(ok=True))
+    _clear_session_cookie(resp)
+    return resp
+
+
+@app.get("/api/auth/me")
+def auth_me():
+    user_id = g.get("user_id")
+    if not user_id:
+        abort(401)
+    _require_db("auth")
+    with session_scope() as s:
+        user = s.query(User).filter(User.id == user_id).one_or_none()
+        if user is None:
+            # Stale cookie pointing at a deleted user — clear it.
+            resp = make_response(jsonify(error="user not found"), 401)
+            _clear_session_cookie(resp)
+            return resp
+        return jsonify(user=_user_to_dict(user))
+
+
+@app.post("/api/auth/forgot-password")
+@limiter.limit("5 per hour")
+def auth_forgot_password():
+    _require_db("password reset")
+    body = request.get_json(silent=True) or {}
+    email = authlib.normalize_email(body.get("email") or "")
+    # Always return ok to avoid email enumeration.
+    if not authlib.looks_like_email(email):
+        return jsonify(ok=True)
+
+    with session_scope() as s:
+        user = s.query(User).filter(User.email == email).one_or_none()
+        if user is None:
+            return jsonify(ok=True)
+        plaintext, digest = authlib.generate_token()
+        now = authlib._now_iso()
+        s.add(AuthToken(
+            token_hash=digest,
+            user_id=user.id,
+            purpose="reset_password",
+            created_at=now,
+            expires_at=authlib.token_expiry("reset_password"),
+        ))
+        s.flush()
+
+    try:
+        authlib.send_password_reset_email(email, plaintext)
+    except Exception as e:
+        app.logger.warning("reset email failed: %s", e)
+    return jsonify(ok=True)
+
+
+@app.post("/api/auth/reset-password")
+@limiter.limit("10 per hour")
+def auth_reset_password():
+    _require_db("password reset")
+    body = request.get_json(silent=True) or {}
+    token = body.get("token") or ""
+    password = body.get("password") or ""
+    if not token:
+        return jsonify(error="Missing token."), 400
+    err = authlib.validate_password_strength(password)
+    if err:
+        return jsonify(error=err), 400
+
+    digest = authlib.hash_token(token)
+    now = authlib._now_iso()
+    with session_scope() as s:
+        row = s.query(AuthToken).filter(
+            AuthToken.token_hash == digest,
+            AuthToken.purpose == "reset_password",
+        ).one_or_none()
+        if row is None or row.used_at is not None or authlib.is_token_expired(row.expires_at):
+            return jsonify(error="This reset link is invalid or has expired."), 400
+        user = s.query(User).filter(User.id == row.user_id).one_or_none()
+        if user is None:
+            return jsonify(error="This reset link is invalid or has expired."), 400
+        user.password_hash = authlib.hash_password(password)
+        row.used_at = now
+        s.flush()
+        snapshot = _user_to_dict(user)
+
+    resp = make_response(jsonify(user=snapshot))
+    _set_session_cookie(resp, snapshot["id"])
+    return resp
+
+
+@app.post("/api/auth/verify-email")
+@limiter.limit("20 per hour")
+def auth_verify_email():
+    _require_db("email verification")
+    body = request.get_json(silent=True) or {}
+    token = body.get("token") or ""
+    if not token:
+        return jsonify(error="Missing token."), 400
+
+    digest = authlib.hash_token(token)
+    now = authlib._now_iso()
+    with session_scope() as s:
+        row = s.query(AuthToken).filter(
+            AuthToken.token_hash == digest,
+            AuthToken.purpose == "verify_email",
+        ).one_or_none()
+        if row is None or row.used_at is not None or authlib.is_token_expired(row.expires_at):
+            return jsonify(error="This verification link is invalid or has expired."), 400
+        user = s.query(User).filter(User.id == row.user_id).one_or_none()
+        if user is None:
+            return jsonify(error="This verification link is invalid or has expired."), 400
+        user.email_verified = True
+        row.used_at = now
+        s.flush()
+        return jsonify(ok=True)
+
 
 _rules_cache = None
 
@@ -300,7 +523,7 @@ def update_rule(rule_id):
 def delete_rule(rule_id):
     """Hard-delete a rule and tombstone the rule_id so re-seeds skip it."""
     _require_db("rule deletes")
-    user_id = g.get("clerk_user_id")
+    user_id = g.get("user_id")
     with session_scope() as s:
         row = s.query(Rule).filter(Rule.rule_id == rule_id).one_or_none()
         if row is None:
@@ -376,7 +599,7 @@ def _next_custom_rule_id(session):
 
 @app.get("/api/ai-usage")
 def get_ai_usage():
-    user_id = g.get("clerk_user_id")
+    user_id = g.get("user_id")
     if not user_id:
         abort(401)
     _require_db("ai usage")
@@ -391,7 +614,7 @@ def get_ai_usage():
 
 @app.post("/api/rules/generate")
 def generate_rule_endpoint():
-    user_id = g.get("clerk_user_id")
+    user_id = g.get("user_id")
     if not user_id:
         return jsonify(error="not signed in"), 401
     if not db_enabled():
@@ -453,7 +676,7 @@ def generate_rule_endpoint():
 
 @app.post("/api/rules")
 def create_rule():
-    user_id = g.get("clerk_user_id")
+    user_id = g.get("user_id")
     if not user_id:
         abort(401)
     _require_db("rule creation")
@@ -616,7 +839,7 @@ def _run_sync_job(job_id, sources):
 
 @app.post("/api/rules/import")
 def create_import_job():
-    user_id = g.get("clerk_user_id")
+    user_id = g.get("user_id")
     if not user_id:
         return jsonify(error="not signed in"), 401
     if not db_enabled():
@@ -687,7 +910,7 @@ def create_import_job():
 
 @app.get("/api/import-jobs")
 def list_import_jobs():
-    user_id = g.get("clerk_user_id")
+    user_id = g.get("user_id")
     if not user_id:
         return jsonify(error="not signed in"), 401
     if not db_enabled():
@@ -703,7 +926,7 @@ def list_import_jobs():
 
 @app.get("/api/import-jobs/<int:job_id>")
 def get_import_job(job_id):
-    user_id = g.get("clerk_user_id")
+    user_id = g.get("user_id")
     if not user_id:
         return jsonify(error="not signed in"), 401
     if not db_enabled():
@@ -724,7 +947,7 @@ def apply_import_job(job_id):
     Body may include {selected_indexes: [0, 2, 4]} to apply a subset; default
     is apply all.
     """
-    user_id = g.get("clerk_user_id")
+    user_id = g.get("user_id")
     if not user_id:
         return jsonify(error="not signed in"), 401
     if not db_enabled():
@@ -1126,7 +1349,7 @@ def _org_to_dict(row):
 
 @app.get("/api/org-profile")
 def get_org_profile():
-    user_id = g.get("clerk_user_id")
+    user_id = g.get("user_id")
     if not user_id:
         abort(401)
     _require_db("org profile")
@@ -1139,7 +1362,7 @@ def get_org_profile():
 
 @app.put("/api/org-profile")
 def put_org_profile():
-    user_id = g.get("clerk_user_id")
+    user_id = g.get("user_id")
     if not user_id:
         abort(401)
     _require_db("org profile")

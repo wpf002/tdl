@@ -6,6 +6,33 @@ from sqlalchemy.dialects.postgresql import JSONB
 from tools.db import Base
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String(64), primary_key=True)  # uuid4 hex
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    email_verified = Column(Boolean, nullable=False, default=False, server_default="false")
+    created_at = Column(String(32), nullable=False)
+    last_login_at = Column(String(32), nullable=True)
+
+
+class AuthToken(Base):
+    """One-time tokens for email verification and password reset.
+
+    `token_hash` is sha256(plaintext) — the plaintext is only sent in email
+    and never persisted. `purpose` is 'verify_email' or 'reset_password'.
+    """
+    __tablename__ = "auth_tokens"
+
+    token_hash = Column(String(64), primary_key=True)
+    user_id = Column(String(64), nullable=False, index=True)
+    purpose = Column(String(32), nullable=False)
+    created_at = Column(String(32), nullable=False)
+    expires_at = Column(String(32), nullable=False)
+    used_at = Column(String(32), nullable=True)
+
+
 class Rule(Base):
     __tablename__ = "rules"
 
@@ -52,7 +79,7 @@ Index("ix_rules_org_lifecycle", Rule.org_id, Rule.lifecycle)
 class OrgProfile(Base):
     __tablename__ = "org_profiles"
 
-    user_id = Column(String(64), primary_key=True)  # Clerk user id
+    user_id = Column(String(64), primary_key=True)
     org_name = Column(String(255), nullable=False)
     primary_siem = Column(String(32))
     log_sources_deployed = Column(JSONB)  # list[str]

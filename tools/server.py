@@ -20,6 +20,10 @@ Endpoints:
   POST   /api/rules/generate               AI rule builder — returns preview + usage (Phase 4 ⚠ cost)
   POST   /api/rules                        save a (typically AI-generated) rule
   GET    /api/ai-usage                     current user's AI spend today + cap
+  POST   /api/rules/import                 import Sigma YAML or SIEM-dialect query → TDL rules (Phase 5 ⚠ cost)
+  GET    /api/import-jobs                  list current user's recent import jobs
+  GET    /api/import-jobs/<id>             check status of a specific import job
+  POST   /api/import-jobs/<id>/apply       review-and-apply: save staged rules (optional subset)
 
 Production mode also serves ui/dist/ so the SPA loads from the same origin.
 """
@@ -44,7 +48,7 @@ from flask import Flask, Response, abort, g, jsonify, request, send_from_directo
 from flask_cors import CORS
 
 from tools.db import db_enabled, session_scope
-from tools.models import AIUsage, OrgProfile, Rule
+from tools.models import AIUsage, ImportJob, OrgProfile, Rule
 
 ROOT = Path(__file__).resolve().parent.parent
 RULES_DIR = ROOT / "rules"
@@ -497,6 +501,302 @@ def create_rule():
                 usage_row.rule_id = row.rule_id
 
         return jsonify(_row_to_dict(row)), 201
+
+
+# ── Rule import (Phase 5 — Sigma + 10 SIEM dialects, sync + batch) ──────────
+
+SUPPORTED_SOURCE_TYPES = {"sigma"} | set(QUERY_KEYS)
+SYNC_RULE_LIMIT = 50          # ≤50 → sync mode; >50 → batch mode
+SYNC_PARALLEL_WORKERS = 4     # concurrent translator calls per sync job
+
+
+def _job_to_dict(j):
+    return {
+        "id": j.id,
+        "source_type": j.source_type,
+        "mode": j.mode,
+        "status": j.status,
+        "batch_api_id": j.batch_api_id,
+        "total_rules": j.total_rules,
+        "completed_rules": j.completed_rules,
+        "staged_rules": j.staged_rules or [],
+        "created_rule_ids": j.created_rule_ids or [],
+        "error": j.error,
+        "input_tokens": j.input_tokens or 0,
+        "output_tokens": j.output_tokens or 0,
+        "cost_usd": float(j.cost_usd or 0.0),
+        "created_at": j.created_at,
+        "completed_at": j.completed_at,
+        "applied_at": j.applied_at,
+    }
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_source_rules(source_type, content):
+    """Return list of source-rule payloads for the translator."""
+    from tools.sigma_parser import parse_sigma, parse_dialect_queries
+    if source_type == "sigma":
+        return [{"kind": "sigma", "rule": r} for r in parse_sigma(content or "")]
+    if source_type in QUERY_KEYS:
+        return [{"kind": "dialect", "query": q, "dialect": source_type}
+                for q in parse_dialect_queries(content or "")]
+    raise ValueError(f"unsupported source_type: {source_type!r}")
+
+
+def _run_sync_job(job_id, sources):
+    """Background worker for sync-mode imports.
+
+    Translates each source in parallel (small pool to stay under rate limits),
+    appends staged rules to the job row, updates progress as it goes.
+    Process restart will leave the job stuck in 'running' — operationally
+    acceptable for MVP; user can retry.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from tools.ai_rule_translator import translate_sigma_rule, translate_dialect_query
+
+    def translate_one(src):
+        if src["kind"] == "sigma":
+            return translate_sigma_rule(src["rule"])
+        return translate_dialect_query(src["query"], src["dialect"])
+
+    staged, total_in, total_out, total_cost = [], 0, 0, 0.0
+    failures = []
+
+    with ThreadPoolExecutor(max_workers=SYNC_PARALLEL_WORKERS) as ex:
+        futures = {ex.submit(translate_one, s): i for i, s in enumerate(sources)}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                result = fut.result()
+                staged.append(result["rule"])
+                total_in += result["usage"]["input_tokens"]
+                total_out += result["usage"]["output_tokens"]
+                total_cost += result["usage"]["cost_usd"]
+            except Exception as e:
+                failures.append({"index": idx, "error": f"{type(e).__name__}: {e}"})
+
+            # checkpoint after each completion so the UI can poll progress
+            with session_scope() as s:
+                row = s.query(ImportJob).filter(ImportJob.id == job_id).one_or_none()
+                if row is None:
+                    return
+                row.staged_rules = staged
+                row.completed_rules = len(staged) + len(failures)
+                row.input_tokens = total_in
+                row.output_tokens = total_out
+                row.cost_usd = round(total_cost, 6)
+
+    with session_scope() as s:
+        row = s.query(ImportJob).filter(ImportJob.id == job_id).one_or_none()
+        if row is None:
+            return
+        row.staged_rules = staged
+        row.input_tokens = total_in
+        row.output_tokens = total_out
+        row.cost_usd = round(total_cost, 6)
+        row.completed_at = _now_iso()
+        if not staged:
+            row.status = "failed"
+            row.error = f"all {len(sources)} translations failed: " + json.dumps(failures[:3])
+        else:
+            row.status = "awaiting_review"
+            if failures:
+                row.error = f"{len(failures)}/{len(sources)} failed; review staged rules"
+
+
+@app.post("/api/rules/import")
+def create_import_job():
+    user_id = g.get("clerk_user_id")
+    if not user_id:
+        return jsonify(error="not signed in"), 401
+    if not db_enabled():
+        return jsonify(error="DATABASE_URL is not set on the server"), 503
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return jsonify(error="ANTHROPIC_API_KEY is not set on the server"), 503
+
+    body = request.get_json(silent=True) or {}
+    source_type = (body.get("source_type") or "").strip()
+    content = body.get("content") or ""
+    if source_type not in SUPPORTED_SOURCE_TYPES:
+        return jsonify(error=f"source_type must be one of: {sorted(SUPPORTED_SOURCE_TYPES)}"), 400
+    if not content.strip():
+        return jsonify(error="content is required"), 400
+
+    try:
+        sources = _parse_source_rules(source_type, content)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+
+    if not sources:
+        return jsonify(error="no rules found in content"), 400
+
+    n = len(sources)
+    mode = "sync" if n <= SYNC_RULE_LIMIT else "batch"
+
+    # Cost ceiling check using Phase 4 daily cap
+    from tools.ai_rule_builder import max_call_cost
+    estimated_max = max_call_cost() * n
+    with session_scope() as s:
+        spent = _ai_spent_today(s, user_id)
+        if spent + estimated_max > AI_DAILY_CAP_USD:
+            return jsonify(
+                error=f"this import would exceed today's spend cap (would need ~${estimated_max:.2f}, only ${max(0, AI_DAILY_CAP_USD - spent):.2f} left)",
+                rules_in_request=n,
+            ), 429
+
+        job = ImportJob(
+            user_id=user_id,
+            source_type=source_type,
+            mode=mode,
+            status="running" if mode == "sync" else "pending",
+            total_rules=n,
+            completed_rules=0,
+            staged_rules=[],
+            created_at=_now_iso(),
+        )
+        s.add(job)
+        s.flush()
+        job_id = job.id
+        job_payload = _job_to_dict(job)
+
+    if mode == "sync":
+        import threading
+        threading.Thread(target=_run_sync_job, args=(job_id, sources), daemon=True).start()
+    else:
+        # Batch mode wired separately in the next commit; for now reject so
+        # frontend doesn't see a job that never makes progress.
+        with session_scope() as s:
+            row = s.query(ImportJob).filter(ImportJob.id == job_id).one_or_none()
+            if row is not None:
+                row.status = "failed"
+                row.error = "batch mode not yet implemented; cap requests at 50 rules"
+        return jsonify(error="batch mode not yet wired up; please cap input at 50 rules for now"), 501
+
+    return jsonify(job_payload), 202
+
+
+@app.get("/api/import-jobs")
+def list_import_jobs():
+    user_id = g.get("clerk_user_id")
+    if not user_id:
+        return jsonify(error="not signed in"), 401
+    if not db_enabled():
+        return jsonify(error="DATABASE_URL is not set on the server"), 503
+    with session_scope() as s:
+        rows = (s.query(ImportJob)
+                  .filter(ImportJob.user_id == user_id)
+                  .order_by(ImportJob.id.desc())
+                  .limit(50)
+                  .all())
+        return jsonify([_job_to_dict(r) for r in rows])
+
+
+@app.get("/api/import-jobs/<int:job_id>")
+def get_import_job(job_id):
+    user_id = g.get("clerk_user_id")
+    if not user_id:
+        return jsonify(error="not signed in"), 401
+    if not db_enabled():
+        return jsonify(error="DATABASE_URL is not set on the server"), 503
+    with session_scope() as s:
+        row = s.query(ImportJob).filter(
+            ImportJob.id == job_id, ImportJob.user_id == user_id
+        ).one_or_none()
+        if row is None:
+            return jsonify(error="not found"), 404
+        return jsonify(_job_to_dict(row))
+
+
+@app.post("/api/import-jobs/<int:job_id>/apply")
+def apply_import_job(job_id):
+    """Save the staged rules from a completed import to the library.
+
+    Body may include {selected_indexes: [0, 2, 4]} to apply a subset; default
+    is apply all.
+    """
+    user_id = g.get("clerk_user_id")
+    if not user_id:
+        return jsonify(error="not signed in"), 401
+    if not db_enabled():
+        return jsonify(error="DATABASE_URL is not set on the server"), 503
+
+    body = request.get_json(silent=True) or {}
+    selected = body.get("selected_indexes")
+
+    with session_scope() as s:
+        job = s.query(ImportJob).filter(
+            ImportJob.id == job_id, ImportJob.user_id == user_id
+        ).one_or_none()
+        if job is None:
+            return jsonify(error="not found"), 404
+        if job.status != "awaiting_review":
+            return jsonify(error=f"job status is {job.status!r}, must be 'awaiting_review' to apply"), 409
+
+        staged = list(job.staged_rules or [])
+        if selected is not None:
+            if not isinstance(selected, list) or any(not isinstance(i, int) for i in selected):
+                return jsonify(error="selected_indexes must be a list of ints"), 400
+            staged = [staged[i] for i in selected if 0 <= i < len(staged)]
+
+        if not staged:
+            return jsonify(error="no staged rules to apply"), 400
+
+        created_ids = []
+        for rule in staged:
+            rule_id = (rule.get("rule_id") or "").strip() or _next_custom_rule_id(s)
+            if s.query(Rule.id).filter(Rule.rule_id == rule_id).first():
+                rule_id = _next_custom_rule_id(s)
+
+            payload = {k: v for k, v in rule.items() if k in EDITABLE_RULE_FIELDS}
+            if "queries" in payload and isinstance(payload["queries"], dict):
+                payload["queries"] = {k: v for k, v in payload["queries"].items() if k in QUERY_KEYS}
+
+            row = Rule(
+                rule_id=rule_id,
+                name=payload.get("name") or "Untitled imported rule",
+                description=payload.get("description"),
+                tactic=payload.get("tactic"), tactic_id=payload.get("tactic_id"),
+                technique_id=payload.get("technique_id"), technique_name=payload.get("technique_name"),
+                platform=payload.get("platform"), data_sources=payload.get("data_sources"),
+                severity=payload.get("severity"), fidelity=payload.get("fidelity"),
+                lifecycle=payload.get("lifecycle") or "Proposed",
+                risk_score=payload.get("risk_score"),
+                queries=payload.get("queries"),
+                pseudo_logic=payload.get("pseudo_logic"),
+                false_positives=payload.get("false_positives"),
+                triage_steps=payload.get("triage_steps"),
+                tags=payload.get("tags"),
+                test_method=payload.get("test_method"),
+                tuning_guidance=payload.get("tuning_guidance"),
+                author=rule.get("author") or "AI (imported)",
+                created=rule.get("created") or _today(),
+                last_modified=_today(),
+                is_custom=True,
+            )
+            s.add(row)
+            s.flush()
+            created_ids.append(row.rule_id)
+
+        # Aggregate translator usage into ai_usage as a single import row.
+        if job.input_tokens or job.output_tokens:
+            s.add(AIUsage(
+                user_id=user_id,
+                feature=f"{job.source_type}_import",
+                model=os.environ.get("AI_BUILDER_MODEL", "claude-sonnet-4-6"),
+                input_tokens=job.input_tokens or 0,
+                output_tokens=job.output_tokens or 0,
+                cost_usd=float(job.cost_usd or 0.0),
+                created_at=_now_iso(),
+            ))
+
+        job.created_rule_ids = created_ids
+        job.status = "applied"
+        job.applied_at = _now_iso()
+        s.flush()
+        return jsonify(_job_to_dict(job))
 
 
 def _load_full_rules():

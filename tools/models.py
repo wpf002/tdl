@@ -76,3 +76,34 @@ class AIUsage(Base):
 
 
 Index("ix_ai_usage_user_day", AIUsage.user_id, AIUsage.created_at)
+
+
+class ImportJob(Base):
+    """Phase 5 — rule-import job (Sigma YAML or SIEM-dialect query → TDL rule).
+
+    Status state machine:
+        running          → translator threads/batch are processing
+        awaiting_review  → translation done, staged_rules populated, user can review + apply
+        applied          → user applied the import; created_rule_ids populated
+        failed           → terminal failure; check `error`
+    """
+    __tablename__ = "import_jobs"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    org_id = Column(String(64), nullable=True)
+    source_type = Column(String(32), nullable=False)  # 'sigma' | 'spl' | 'kql' | 'aql' | 'yara_l' | 'esql' | 'leql' | 'crowdstrike' | 'xql' | 'lucene' | 'sumo'
+    mode = Column(String(16), nullable=False)  # 'sync' | 'batch'
+    status = Column(String(16), index=True, nullable=False)
+    batch_api_id = Column(String(64), nullable=True)
+    total_rules = Column(Integer, nullable=False, default=0)
+    completed_rules = Column(Integer, nullable=False, default=0)
+    staged_rules = Column(JSONB)            # list[dict] — translated TDL rules, awaiting review
+    created_rule_ids = Column(JSONB)        # list[str] — saved rule_ids after apply
+    error = Column(Text)
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    cost_usd = Column(Float, default=0.0)
+    created_at = Column(String(32), nullable=False)
+    completed_at = Column(String(32))
+    applied_at = Column(String(32))

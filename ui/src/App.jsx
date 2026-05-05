@@ -1394,6 +1394,283 @@ function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
   )
 }
 
+// ─── IMPORT RULES MODAL (Phase 5) ───────────────────────────────────────────
+
+const SOURCE_TYPES = [
+  { id: 'sigma',       label: 'Sigma YAML' },
+  { id: 'spl',         label: 'Splunk SPL' },
+  { id: 'kql',         label: 'Microsoft KQL' },
+  { id: 'aql',         label: 'IBM QRadar AQL' },
+  { id: 'yara_l',      label: 'Chronicle YARA-L' },
+  { id: 'esql',        label: 'Elastic ES|QL' },
+  { id: 'leql',        label: 'Rapid7 LEQL' },
+  { id: 'crowdstrike', label: 'CrowdStrike' },
+  { id: 'xql',         label: 'Palo XSIAM XQL' },
+  { id: 'lucene',      label: 'Lucene' },
+  { id: 'sumo',        label: 'Sumo Logic' },
+]
+
+function ImportRulesModal({ open, onClose, onApplied }) {
+  const { getToken } = useAuth()
+  const [sourceType, setSourceType] = useState('sigma')
+  const [content, setContent] = useState('')
+  const [phase, setPhase] = useState('compose') // compose | running | review | applying
+  const [error, setError] = useState(null)
+  const [job, setJob] = useState(null) // { id, status, total_rules, completed_rules, staged_rules, ... }
+  const [selected, setSelected] = useState(new Set()) // indexes the user wants to apply
+
+  useEffect(() => {
+    if (!open) return
+    setContent(''); setSourceType('sigma')
+    setPhase('compose'); setError(null); setJob(null); setSelected(new Set())
+  }, [open])
+
+  // Poll the job while it's running
+  useEffect(() => {
+    if (!job?.id || phase !== 'running') return
+    let cancelled = false
+    const tick = async () => {
+      try {
+        const token = await getToken()
+        const r = await fetch(`/api/import-jobs/${job.id}`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        })
+        if (!r.ok) throw new Error(await readErr(r))
+        const data = await r.json()
+        if (cancelled) return
+        setJob(data)
+        if (data.status === 'awaiting_review') {
+          setSelected(new Set(data.staged_rules.map((_, i) => i)))
+          setPhase('review')
+        } else if (data.status === 'failed') {
+          setError(data.error || 'Import failed')
+          setPhase('compose')
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setError(e.message || 'Polling failed')
+          setPhase('compose')
+        }
+      }
+    }
+    const id = setInterval(tick, 3000)
+    tick()
+    return () => { cancelled = true; clearInterval(id) }
+  }, [job?.id, phase, getToken])
+
+  if (!open) return null
+
+  const submit = async () => {
+    if (!content.trim()) { setError('Paste content to import'); return }
+    setError(null); setPhase('running')
+    try {
+      const token = await getToken()
+      const r = await fetch('/api/rules/import', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ source_type: sourceType, content }),
+      })
+      if (!r.ok) throw new Error(await readErr(r))
+      setJob(await r.json())
+    } catch (e) {
+      setError(e.message || 'Import failed to start')
+      setPhase('compose')
+    }
+  }
+
+  const toggleIndex = (i) => {
+    setSelected(prev => {
+      const next = new Set(prev)
+      next.has(i) ? next.delete(i) : next.add(i)
+      return next
+    })
+  }
+
+  const apply = async () => {
+    if (!job || selected.size === 0) return
+    setPhase('applying'); setError(null)
+    try {
+      const token = await getToken()
+      const r = await fetch(`/api/import-jobs/${job.id}/apply`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ selected_indexes: Array.from(selected).sort((a,b) => a-b) }),
+      })
+      if (!r.ok) throw new Error(await readErr(r))
+      const finished = await r.json()
+      // Pull the saved rule rows so the parent list updates
+      const ids = finished.created_rule_ids || []
+      const fetched = await Promise.all(ids.map(async (rid) => {
+        const tok = await getToken()
+        const rr = await fetch(`/api/rules/${rid}?full=1`, {
+          headers: tok ? { Authorization: `Bearer ${tok}` } : {},
+        })
+        return rr.ok ? rr.json() : null
+      }))
+      onApplied && onApplied(fetched.filter(Boolean))
+      onClose()
+    } catch (e) {
+      setError(e.message || 'Apply failed')
+      setPhase('review')
+    }
+  }
+
+  const overlayStyle = {
+    position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', zIndex: 50,
+    display: 'grid', placeItems: 'center', padding: 24,
+  }
+  const modalStyle = {
+    width: '100%', maxWidth: 760, maxHeight: '90vh', overflow: 'auto',
+    background: '#15161D', border: '1px solid #262833', borderRadius: 8,
+    color: '#E6E7EE', padding: 20,
+  }
+  const labelStyle = { fontSize: 11, color: '#9598A8', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 6 }
+  const fieldStyle = {
+    width: '100%', background: '#0B0B11', border: '1px solid #262833',
+    color: '#E6E7EE', borderRadius: 6, padding: '8px 10px', fontSize: 13,
+    fontFamily: 'inherit',
+  }
+
+  return (
+    <div style={overlayStyle} onClick={onClose} role="dialog" aria-modal="true">
+      <div style={modalStyle} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Download size={16} color="#7C5CFF" style={{ transform: 'rotate(180deg)' }} />
+            <span style={{ fontWeight: 600 }}>Import Rules</span>
+          </div>
+          <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: '#9598A8', cursor: 'pointer' }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        {phase === 'compose' && (
+          <>
+            <div style={labelStyle}>Source format</div>
+            <select
+              value={sourceType}
+              onChange={(e) => setSourceType(e.target.value)}
+              style={{ ...fieldStyle, marginBottom: 14 }}
+            >
+              {SOURCE_TYPES.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+            </select>
+
+            <div style={labelStyle}>
+              {sourceType === 'sigma'
+                ? 'Paste Sigma YAML (one or more rules, separated by ---)'
+                : 'Paste detection queries (separate multiple with --- on its own line)'}
+            </div>
+            <textarea
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+              rows={14}
+              style={{ ...fieldStyle, marginBottom: 14, fontFamily: 'ui-monospace, monospace', fontSize: 12 }}
+              placeholder={
+                sourceType === 'sigma'
+                  ? 'title: Suspicious Process\ndescription: ...\nlogsource:\n  category: process_creation\n  product: windows\ndetection:\n  selection:\n    Image|endswith: \\\\powershell.exe\n  condition: selection\nlevel: medium'
+                  : 'index=windows EventCode=4625 | stats count by user, src_ip | where count > 5'
+              }
+            />
+
+            {error && <div style={{ color: '#F87171', fontSize: 12, marginBottom: 12 }}>{error}</div>}
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 11, color: '#9598A8' }}>≤50 rules per import</span>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button onClick={onClose} className="chip">Cancel</button>
+                <button onClick={submit} className="chip on" style={{ background: '#7C5CFF', color: '#fff', borderColor: '#7C5CFF' }}>
+                  Import
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+
+        {phase === 'running' && (
+          <div style={{ padding: '40px 0', textAlign: 'center', color: '#9598A8' }}>
+            <div style={{ marginBottom: 8 }}>Translating with Claude Sonnet 4.6…</div>
+            {job && (
+              <div style={{ fontSize: 12 }}>
+                {job.completed_rules} / {job.total_rules} rules done
+              </div>
+            )}
+          </div>
+        )}
+
+        {phase === 'review' && job && (
+          <>
+            <div style={{ fontSize: 12, color: '#9598A8', marginBottom: 12 }}>
+              Translated {(job.staged_rules || []).length} of {job.total_rules} rules.
+              Pick which to save to the library.
+              {job.error && <div style={{ color: '#F87171', marginTop: 4 }}>{job.error}</div>}
+            </div>
+
+            <div style={{ maxHeight: 360, overflow: 'auto', border: '1px solid #262833', borderRadius: 6, marginBottom: 14 }}>
+              {(job.staged_rules || []).map((rule, i) => (
+                <label
+                  key={i}
+                  style={{
+                    display: 'flex', alignItems: 'flex-start', gap: 10, padding: 12,
+                    borderBottom: '1px solid #262833', cursor: 'pointer',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={selected.has(i)}
+                    onChange={() => toggleIndex(i)}
+                    style={{ accentColor: '#7C5CFF', marginTop: 2 }}
+                  />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 2 }}>{rule.name}</div>
+                    <div style={{ fontSize: 11, color: '#9598A8', marginBottom: 6 }}>{rule.description}</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, fontSize: 10 }}>
+                      <span className="pill pill-tactic">{rule.tactic}</span>
+                      <SevBadge s={rule.severity} />
+                      <span className={`pill pill-fid-${rule.fidelity}`}>{rule.fidelity}</span>
+                      <span className="pill" style={{ background: 'rgba(124,92,255,.15)', color: '#A78BFA' }}>{rule.technique_id}</span>
+                    </div>
+                  </div>
+                </label>
+              ))}
+            </div>
+
+            {error && <div style={{ color: '#F87171', fontSize: 12, marginBottom: 12 }}>{error}</div>}
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 11, color: '#9598A8' }}>{selected.size} selected</span>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button onClick={() => setPhase('compose')} className="chip">Discard</button>
+                <button
+                  onClick={apply}
+                  disabled={selected.size === 0}
+                  className="chip on"
+                  style={{
+                    background: selected.size === 0 ? '#3a3a4a' : '#7C5CFF',
+                    color: '#fff',
+                    borderColor: selected.size === 0 ? '#3a3a4a' : '#7C5CFF',
+                  }}
+                >
+                  Save {selected.size > 0 ? `${selected.size} ` : ''}to library
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+
+        {phase === 'applying' && (
+          <div style={{ padding: '40px 0', textAlign: 'center', color: '#9598A8' }}>Saving…</div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleUpdated, onRuleAdded, primarySiem }) {
   const [selected, setSelected]   = useState(null)
   const [search, setSearch]       = useState('')
@@ -1402,6 +1679,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
   const [fFid, setFid]            = useState('All')
   const [fKc, setFKc]             = useState('All')
   const [aiOpen, setAiOpen]       = useState(false)
+  const [importOpen, setImportOpen] = useState(false)
 
   // Apply a cross-view handoff (e.g., dashboard tile click) once, then clear it.
   useEffect(() => {
@@ -1458,6 +1736,16 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
         >
           <Sparkles size={12} style={{ marginRight: 6, verticalAlign: '-2px', color: '#7C5CFF' }} />
           Generate with AI
+        </button>
+        <button
+          type="button"
+          className="topbar-link"
+          onClick={() => setImportOpen(true)}
+          title="Import Sigma or SIEM-dialect detection rules"
+          style={{ marginLeft: 6 }}
+        >
+          <Download size={12} style={{ marginRight: 6, verticalAlign: '-2px', color: '#7C5CFF', transform: 'rotate(180deg)' }} />
+          Import
         </button>
       </div>
       <div className="filterbar">
@@ -1535,6 +1823,15 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
         onSaved={(saved) => {
           onRuleAdded && onRuleAdded(saved)
           setSelected(saved)
+        }}
+      />
+
+      <ImportRulesModal
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        onApplied={(savedRules) => {
+          savedRules.forEach(r => onRuleAdded && onRuleAdded(r))
+          if (savedRules.length) setSelected(savedRules[0])
         }}
       />
     </>

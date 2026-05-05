@@ -8,16 +8,8 @@ done, edit freely. Last updated: 2026-05-04.
 ## Now (in-flight)
 
 - **SaaS productization track.** Six-phase plan to take TDL Playbook from
-  static rule library to multi-tenant SaaS. Phase 1 (Postgres) shipped; phases
-  2–6 sequenced in the next section, each with explicit checkpoint and (for
-  phases 4–6) cost gate.
-
-- **SIEM-query audit** — Batch `msgbatch_01FDEGAN3kfKzebipgmH4hbN` submitted
-  2026-04-30, **frozen** pending cost approval. Will be re-evaluated once the
-  SaaS phases land — fixes flow YAML → re-seed → Postgres.
-  - [ ] (paused) `audit-fetch` once cost is approved
-  - [ ] Review `audit_summary.json`, pick scope for regen
-  - [ ] `regen-extract` / `regen-submit` / `regen-fetch` / `apply` for flagged rules
+  static rule library to multi-tenant SaaS. Phases 1, 2, 3, 3.5, 4 shipped;
+  Phase 5 in build, Phase 6 deferred.
 
 ---
 
@@ -53,10 +45,9 @@ before the next begins. Phases 4–6 also have cost gates.
       per upload, immediate results) and batch (>50 rules, Anthropic Batch API
       for 50% off, results pulled when ready). Reuses `ai_usage` table and
       daily cap from Phase 4. **Requires approval.**
-- [ ] **Phase 6 — Stripe paywall. ⚠ COST GATE (real $).** Free / Pro / Team
-      tiers. **Phase 6a test-mode only** until end-to-end checkout is
-      demonstrated; **6b live keys** only after explicit approval and a $1
-      live-card validation.
+- [ ] **Phase 6 — Stripe paywall.** *(deferred — revisit once the app is
+      fully built out and there's a paying-customer rationale)* Free / Pro /
+      Team tiers, real-money cost gate, live-card validation gating.
 
 ---
 
@@ -65,17 +56,11 @@ before the next begins. Phases 4–6 also have cost gates.
 ### Library hygiene
 
 - [ ] **Backfill `pseudo_logic` on the 106 rules missing it** (821 total − 715
-      with). Without it they're invisible to the audit pipeline and the regen
-      tooling can't reason about them. Alternative: document why specific rules
-      are intentionally excluded.
+      with). Or document why specific rules are intentionally excluded.
 - [ ] **README accuracy pass**:
   - Hero line says "700 detection rules" — actual is 821
   - Hero line says "9 SIEM platforms" — actual is 10 (Sumo Logic added in
     `fa12da7`); the table lower down is already correct
-- [ ] **Audit-driven `pseudo_logic` cleanup** — for rules where the audit flags
-      queries as wrong, the fix often belongs in `pseudo_logic` (or in
-      `tools/regen_queries.py`'s family classifier), not in the queries
-      themselves. Decide a policy: regen blindly, or fix upstream first.
 
 ### Tooling
 
@@ -98,9 +83,6 @@ before the next begins. Phases 4–6 also have cost gates.
 - **Coverage diff view** — given two profiles (or two points in time), show
   which rules light up / go dark. Useful for "what would deploying X log
   source actually buy us?"
-- **Rule provenance** — surface which audit run a rule's queries came from
-  (model, batch ID, date) so we can re-audit selectively when the model
-  improves.
 
 ---
 

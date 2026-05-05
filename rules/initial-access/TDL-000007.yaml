@@ -21,25 +21,38 @@ lifecycle: Deployed
 risk_score: 30
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
+    (index=okta sourcetype="OktaIM2:log" eventType="user.mfa.okta_verify.deny_push")
+    OR (index=azure sourcetype="azure:aad:signin" "properties.status.errorCode"=500121)
+    | eval user=coalesce('actor.alternateId','properties.userPrincipalName')
+    | eval src_ip=coalesce('client.ipAddress','properties.ipAddress')
+    | bin _time span=5m
+    | stats count, values(src_ip) as src_ips by user, _time
+    | where count >= 5
     | sort - count
   kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
-    | where TimeGenerated > ago(1d)
-    | where eventName matches regex ".+"
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+    union
+      (SigninLogs
+        | where ResultType == "500121"
+        | extend User = UserPrincipalName, SrcIp = IPAddress),
+      (OktaSSO_CL
+        | where eventType_s == "user.mfa.okta_verify.deny_push"
+        | extend User = actor_alternateId_s, SrcIp = client_ipAddress_s)
+    | where TimeGenerated > ago(1h)
+    | summarize Count = count(), SrcIps = make_set(SrcIp) by User, bin(TimeGenerated, 5m)
+    | where Count >= 5
     | order by Count desc
   aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
+    SELECT username, sourceip, COUNT(*) as deny_count
     FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
+    WHERE (
+      (LOGSOURCETYPENAME(devicetype) ILIKE '%Okta%' AND "eventType" = 'user.mfa.okta_verify.deny_push')
+      OR (LOGSOURCETYPENAME(devicetype) ILIKE '%Azure Active Directory%' AND "errorCode" = '500121')
+    )
+    GROUP BY username
+    HAVING COUNT(*) >= 5
+    LAST 5 MINUTES
   yara_l: |
-    rule tdl_tdl_auth_000007 {
+    rule tdl_auth_000007_mfa_push_rejection_burst {
       meta:
         author = "TDL"
         description = "Multiple MFA Push Rejections Detected"
@@ -47,39 +60,65 @@ queries:
         tactic = "TA0001"
         technique = "T1078"
       events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
+        (
+          $e.metadata.product_name = "Okta"
+          and $e.metadata.product_event_type = "user.mfa.okta_verify.deny_push"
+        ) or (
+          $e.metadata.product_name = "Azure AD"
+          and $e.security_result.action_details = /500121/
+        )
+        $user = $e.principal.user.userid
       match:
-        $actor over 30m
+        $user over 5m
+      outcome:
+        $count = count_distinct($e.metadata.id)
       condition:
-        $e
+        $count >= 5
     }
   esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
-    | WHERE @timestamp > NOW() - 1 hour
-    | WHERE eventName LIKE "%.+%"
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-    | SORT count DESC
+    FROM logs-okta*,logs-azure.signinlogs*
+    | WHERE @timestamp > NOW() - 5 minutes
+    | WHERE event.action == "user.mfa.okta_verify.deny_push"
+         OR azure.signinlogs.properties.status.error_code == "500121"
+    | EVAL user = COALESCE(okta.actor.alternate_id, azure.signinlogs.properties.user_principal_name)
+    | STATS deny_count = COUNT(*) BY user
+    | WHERE deny_count >= 5
+    | SORT deny_count DESC
   leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-    groupby(actor, event_name)
+    where(
+      (logset="Okta" AND eventType=user.mfa.okta_verify.deny_push)
+      OR (logset="Azure AD Sign-In" AND errorCode=500121)
+    )
+    groupby(user)
     calculate(count)
+    having(count >= 5)
+    timeslice(5m)
   crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-    | sort -calls
+    (#vendor=okta eventType="user.mfa.okta_verify.deny_push")
+    OR (#vendor=microsoft properties.status.errorCode=500121)
+    | user := if(#vendor="okta", actor.alternateId, properties.userPrincipalName)
+    | groupBy([user, bucket(span=5m)], function=count())
+    | _count >= 5
+    | sort(_count, order=desc)
   xql: |
-    dataset = cloud_audit_logs
-    | filter eventName ~= ".+"
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-    | sort desc calls
+    dataset in (okta_raw, msft_azure_ad_signinlogs_raw)
+    | filter (event_type = "user.mfa.okta_verify.deny_push")
+          or (action_evtlog_message contains "500121")
+    | comp count() as fail_count by actor_effective_username, bin(_time, 5m)
+    | filter fail_count >= 5
+    | sort desc fail_count
   lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+    (event.dataset:"okta.system" AND okta.event_type:"user.mfa.okta_verify.deny_push")
+    OR (event.dataset:"azure.signinlogs" AND azure.signinlogs.properties.status.error_code:"500121")
   sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-    | where eventName matches "*.+*"
-    | count by userIdentity_arn, eventName, sourceIPAddress
+    (_sourceCategory=*okta* AND _raw="*user.mfa.okta_verify.deny_push*")
+    OR (_sourceCategory=*azure*signin* AND _raw="*\"errorCode\":500121*")
+    | parse "\"alternateId\":\"*\"" as okta_user nodrop
+    | parse "\"userPrincipalName\":\"*\"" as az_user nodrop
+    | if(!isEmpty(okta_user), okta_user, az_user) as user
+    | timeslice 5m
+    | count by user, _timeslice
+    | where _count >= 5
     | sort by _count desc
 false_positives:
 - Legitimate admin activity

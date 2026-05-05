@@ -123,25 +123,82 @@ const CHAINS = [
   { id:'CHAIN-005', name:'Initial Access → Persistence', threat:'General Threat Actor', window:'4h', severity:'High', steps:['Encoded PowerShell / WSH','Registry / Service / WMI Persist','C2 Beacon'], active:true },
 ]
 
+// Canonical log-source catalog used by the Log Sources view and the matrix
+// coverage calculation. The `id` here is the canonical key; OrgSetup uses
+// some slightly different ids that are aliased below.
 const LOG_SOURCES = [
-  { id:'windows_security_events', name:'Windows Security Events', criticality:'Critical', tier:1, deployed:true,  rules_unlocked:287 },
-  { id:'sysmon',                  name:'Sysmon',                  criticality:'Critical', tier:1, deployed:true,  rules_unlocked:210 },
-  { id:'edr',                     name:'EDR (CrowdStrike/S1/MDE)',criticality:'Critical', tier:1, deployed:true,  rules_unlocked:195 },
-  { id:'firewall',                name:'Firewall Logs',           criticality:'Critical', tier:1, deployed:true,  rules_unlocked:140 },
-  { id:'dns',                     name:'DNS Logs',                criticality:'High',     tier:1, deployed:true,  rules_unlocked:89  },
-  { id:'identity_provider',       name:'Identity Provider (IdP)', criticality:'Critical', tier:1, deployed:true,  rules_unlocked:156 },
-  { id:'proxy',                   name:'Web Proxy / SWG',        criticality:'High',     tier:2, deployed:false, rules_unlocked:63  },
-  { id:'email_security',          name:'Email Security Gateway',  criticality:'High',     tier:2, deployed:true,  rules_unlocked:44  },
-  { id:'cloud',                   name:'Cloud Infrastructure',    criticality:'High',     tier:2, deployed:true,  rules_unlocked:98  },
-  { id:'m365',                    name:'Microsoft 365 Audit',     criticality:'High',     tier:2, deployed:true,  rules_unlocked:71  },
-  { id:'linux',                   name:'Linux / auditd',          criticality:'High',     tier:2, deployed:false, rules_unlocked:55  },
-  { id:'vpn',                     name:'VPN / Remote Access',     criticality:'High',     tier:2, deployed:true,  rules_unlocked:38  },
-  { id:'dlp',                     name:'DLP',                     criticality:'Medium',   tier:3, deployed:false, rules_unlocked:29  },
-  { id:'waf',                     name:'WAF',                     criticality:'Medium',   tier:3, deployed:true,  rules_unlocked:22  },
-  { id:'saas',                    name:'SaaS / Productivity Apps',criticality:'Medium',   tier:3, deployed:false, rules_unlocked:47  },
-  { id:'kubernetes',              name:'Kubernetes',              criticality:'Medium',   tier:3, deployed:false, rules_unlocked:18  },
-  { id:'mfa',                     name:'MFA Logs',                criticality:'Medium',   tier:3, deployed:true,  rules_unlocked:31  },
+  { id:'windows_security_events', name:'Windows Security Events', criticality:'Critical', tier:1 },
+  { id:'sysmon',                  name:'Sysmon',                  criticality:'Critical', tier:1 },
+  { id:'edr',                     name:'EDR (CrowdStrike/S1/MDE)',criticality:'Critical', tier:1 },
+  { id:'firewall',                name:'Firewall Logs',           criticality:'Critical', tier:1 },
+  { id:'dns',                     name:'DNS Logs',                criticality:'High',     tier:1 },
+  { id:'identity_provider',       name:'Identity Provider (IdP)', criticality:'Critical', tier:1 },
+  { id:'proxy',                   name:'Web Proxy / SWG',         criticality:'High',     tier:2 },
+  { id:'email_security',          name:'Email Security Gateway',  criticality:'High',     tier:2 },
+  { id:'cloud',                   name:'Cloud Infrastructure',    criticality:'High',     tier:2 },
+  { id:'m365',                    name:'Microsoft 365 Audit',     criticality:'High',     tier:2 },
+  { id:'linux',                   name:'Linux / auditd',          criticality:'High',     tier:2 },
+  { id:'vpn',                     name:'VPN / Remote Access',     criticality:'High',     tier:2 },
+  { id:'dlp',                     name:'DLP',                     criticality:'Medium',   tier:3 },
+  { id:'waf',                     name:'WAF',                     criticality:'Medium',   tier:3 },
+  { id:'saas',                    name:'SaaS / Productivity Apps',criticality:'Medium',   tier:3 },
+  { id:'kubernetes',              name:'Kubernetes',              criticality:'Medium',   tier:3 },
+  { id:'mfa',                     name:'MFA Logs',                criticality:'Medium',   tier:3 },
 ]
+
+// Some OrgSetup form ids differ from the canonical ids above. Map them here.
+const ORG_TO_CANONICAL_LOG_SOURCE_ID = {
+  proxy_web_gateway: 'proxy',
+  cloud_infrastructure: 'cloud',
+  m365_audit: 'm365',
+  linux_os: 'linux',
+  saas_productivity: 'saas',
+}
+
+// Keywords matched against a rule's `data_sources` strings (lowercased) to
+// decide whether the rule is covered by a deployed log source.
+// Imperfect — some rules will be misclassified — but pragmatic for a coverage
+// view. Tunable as the library grows.
+const LOG_SOURCE_KEYWORDS = {
+  windows_security_events: ['windows', 'wineventlog', 'security event', 'event id', 'windows operating system'],
+  sysmon:                  ['sysmon'],
+  firewall:                ['firewall', 'palo alto', 'fortinet', 'pfsense', 'network perimeter'],
+  edr:                     ['edr', 'crowdstrike', 'sentinelone', 'mde', 'defender for endpoint', 'endpoint detection'],
+  dns:                     ['dns'],
+  identity_provider:       ['okta', 'azure ad', 'aad', 'duo', 'identity provider', 'idp'],
+  proxy:                   ['proxy', 'web gateway', 'swg', 'zscaler'],
+  email_security:          ['email', 'proofpoint', 'mimecast', 'defender for office'],
+  cloud:                   ['cloudtrail', 'aws', 'azure activity', 'azure audit', 'gcp audit', 'cloud audit', 'cloud infrastructure'],
+  m365:                    ['microsoft 365', 'm365', 'office 365', 'unified audit'],
+  linux:                   ['linux', 'auditd', 'syslog'],
+  vpn:                     ['vpn', 'remote access'],
+  dlp:                     ['dlp', 'data loss'],
+  waf:                     ['waf', 'web application firewall'],
+  saas:                    ['saas', 'salesforce', 'slack', 'github'],
+  kubernetes:              ['kubernetes', 'k8s', 'container'],
+  mfa:                     ['mfa', 'multi-factor', 'okta verify'],
+}
+
+// Convert orgProfile.log_sources_deployed → Set of canonical log-source ids.
+function deployedLogSourceIds(orgProfile) {
+  const raw = orgProfile?.log_sources_deployed || []
+  return new Set(raw.map(id => ORG_TO_CANONICAL_LOG_SOURCE_ID[id] || id))
+}
+
+// True if any of the rule's data_sources match a keyword for any deployed source.
+// If deployedSet is empty (no profile yet), treat all rules as covered.
+function ruleIsCovered(rule, deployedSet) {
+  if (!deployedSet || deployedSet.size === 0) return true
+  const text = ((rule.data_sources || []).join(' ') + ' ' + (rule.platform || []).join(' ')).toLowerCase()
+  if (!text.trim()) return false
+  for (const id of deployedSet) {
+    const kws = LOG_SOURCE_KEYWORDS[id] || []
+    for (const k of kws) {
+      if (text.includes(k)) return true
+    }
+  }
+  return false
+}
 
 // ─── CSS ─────────────────────────────────────────────────────────────────────
 
@@ -2051,16 +2108,24 @@ function DashboardView({ rules, onNavigate }) {
 // ─── ATT&CK MATRIX VIEW ──────────────────────────────────────────────────────
 // Column-per-tactic grid mirroring https://attack.mitre.org/matrices/enterprise.
 
-function MatrixView({ rules, onSelectRule, isMobile }) {
-  // Map technique_id (top-level) → number of rules covering it.
+function MatrixView({ rules, onSelectRule, isMobile, orgProfile }) {
+  const deployedSet = useMemo(() => deployedLogSourceIds(orgProfile), [orgProfile])
+  const profileApplied = deployedSet.size > 0
+
+  // Map technique_id (top-level) → { total: N, covered: M } where covered
+  // counts rules whose data_sources match a deployed log source.
   const ruleCount = useMemo(() => {
     const m = new Map()
     rules.forEach(r => {
       const tid = (r.technique_id || '').split('.')[0]
-      if (tid) m.set(tid, (m.get(tid) || 0) + 1)
+      if (!tid) return
+      const cur = m.get(tid) || { total: 0, covered: 0 }
+      cur.total += 1
+      if (ruleIsCovered(r, deployedSet)) cur.covered += 1
+      m.set(tid, cur)
     })
     return m
-  }, [rules])
+  }, [rules, deployedSet])
 
   // Expansion: which (tactic|techniqueId) cell currently shows its rule list.
   const [expandedKey, setExpandedKey] = useState(null)
@@ -2104,21 +2169,36 @@ function MatrixView({ rules, onSelectRule, isMobile }) {
   const pctCovered = totalTechs ? Math.round(coveredTechs / totalTechs * 100) : 0
 
   const renderCell = (tactic, t) => {
-    const c = ruleCount.get(t.id) || 0
-    const s = shade(c)
+    const stats = ruleCount.get(t.id) || { total: 0, covered: 0 }
+    const total = stats.total
+    const covered = stats.covered
+    // When a profile is set, color by *covered* rules. Without profile, color
+    // by total — matches the old behavior so unprofiled users see something useful.
+    const colorBy = profileApplied ? covered : total
+    const s = shade(colorBy)
+    const dim = profileApplied && covered === 0 && total > 0
     const key = `${tactic}|${t.id}`
     const expanded = expandedKey === key
     const cellRules = expanded ? rulesForCell(tactic, t.id) : []
+    const titleStr = total === 0
+      ? `${t.id} ${t.name} · not covered`
+      : profileApplied
+        ? `${t.id} ${t.name} · ${covered} of ${total} rule${total>1?'s':''} runnable on your stack`
+        : `${t.id} ${t.name} · ${total} rule${total>1?'s':''}`
     return (
       <div key={t.id} className={`attack-cell-wrap${expanded?' open':''}`}>
-        <div className="attack-cell" style={{background:s.background, borderColor:s.border}}
-             title={`${t.id} ${t.name}${c ? ` · ${c} rule${c>1?'s':''}` : ' · not covered'}`}>
+        <div className="attack-cell" style={{background:s.background, borderColor:s.border, opacity: dim ? 0.4 : 1}}
+             title={titleStr}>
           <a className="attack-cell-link" href={`https://attack.mitre.org/techniques/${t.id}/`} target="_blank" rel="noreferrer">
             <span className="attack-cell-id" style={{color:s.color}}>{t.id}</span>
             <span className="attack-cell-name" style={{color:s.name}}>{t.name}</span>
           </a>
-          {c > 0 && <span className="attack-cell-count">{c}</span>}
-          {c > 0 && (
+          {total > 0 && (
+            <span className="attack-cell-count">
+              {profileApplied ? `${covered}/${total}` : total}
+            </span>
+          )}
+          {total > 0 && (
             <button type="button" className={`attack-cell-toggle${expanded?' open':''}`}
                     aria-label={expanded ? 'Hide rules' : 'Show rules'}
                     onClick={(e) => { e.stopPropagation(); setExpandedKey(expanded ? null : key) }}>
@@ -2369,36 +2449,72 @@ function ChainsView({ rules, onNavigate }) {
 
 // ─── RECOMMEND VIEW ──────────────────────────────────────────────────────────
 
-function RecommendView({ rules }) {
+function RecommendView({ rules, orgProfile }) {
   const cCrit = { Critical:'#DC2626', High:'#7C3AED', Medium:'#2563EB', Low:'#6E6E7C' }
   const critOrder = { Critical:0, High:1, Medium:2, Low:3 }
-  const byCriticality = [...LOG_SOURCES].sort((a,b) =>
-    (critOrder[a.criticality] ?? 9) - (critOrder[b.criticality] ?? 9) || a.tier - b.tier || b.rules_unlocked - a.rules_unlocked
-  )
+
+  // Count how many rules each log source unlocks (rules whose data_sources
+  // match the keyword for that source).
+  const rulesPerSource = useMemo(() => {
+    const out = {}
+    for (const ls of LOG_SOURCES) out[ls.id] = 0
+    for (const r of rules) {
+      const text = ((r.data_sources || []).join(' ') + ' ' + (r.platform || []).join(' ')).toLowerCase()
+      if (!text.trim()) continue
+      for (const ls of LOG_SOURCES) {
+        const kws = LOG_SOURCE_KEYWORDS[ls.id] || []
+        if (kws.some(k => text.includes(k))) out[ls.id]++
+      }
+    }
+    return out
+  }, [rules])
+
+  const deployedSet = useMemo(() => deployedLogSourceIds(orgProfile), [orgProfile])
+
+  // Sort: deployed first, then by criticality, then tier, then rule count.
+  const sorted = useMemo(() => [...LOG_SOURCES].sort((a, b) => {
+    const ad = deployedSet.has(a.id) ? 0 : 1
+    const bd = deployedSet.has(b.id) ? 0 : 1
+    if (ad !== bd) return ad - bd
+    return (critOrder[a.criticality] ?? 9) - (critOrder[b.criticality] ?? 9)
+        || a.tier - b.tier
+        || (rulesPerSource[b.id] || 0) - (rulesPerSource[a.id] || 0)
+  }), [deployedSet, rulesPerSource])
+
+  const deployedCount = sorted.filter(ls => deployedSet.has(ls.id)).length
+  const totalRulesCovered = useMemo(() => {
+    if (deployedSet.size === 0) return 0
+    return rules.filter(r => ruleIsCovered(r, deployedSet)).length
+  }, [rules, deployedSet])
 
   return (
     <div className="view">
       <div className="section-header"><Database size={13} />Log Source Criticality Assessment</div>
+      <div style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 14 }}>
+        {deployedSet.size > 0
+          ? <>You have <strong>{deployedCount}</strong> of {LOG_SOURCES.length} log sources deployed, covering <strong>{totalRulesCovered}</strong> of {rules.length} rules.</>
+          : <>No org profile yet — set deployed log sources in <strong>Settings</strong> to see coverage.</>}
+      </div>
       <table className="log-source-table">
         <thead><tr>
-          <th>Criticality</th><th>Tier</th><th>Log Source</th><th>Rules</th>
+          <th>Status</th><th>Criticality</th><th>Tier</th><th>Log Source</th><th>Rules</th>
         </tr></thead>
         <tbody>
-          {byCriticality.map(ls => (
-            <tr key={ls.id}>
-              <td style={{color:cCrit[ls.criticality]||'var(--text2)'}}>{ls.criticality}</td>
-              <td style={{fontFamily:'var(--mono)',fontSize:11}}>T{ls.tier}</td>
-              <td>
-                <span
-                  className="status-dot status-dot-mobile"
-                  style={{background: ls.deployed ? '#7C3AED' : '#DC2626'}}
-                  aria-label={ls.deployed ? 'Deployed' : 'Not deployed'}
-                />
-                {ls.name}
-              </td>
-              <td style={{fontFamily:'var(--mono)',fontSize:12,color:'#7C3AED',fontWeight:700}}>{ls.rules_unlocked}</td>
-            </tr>
-          ))}
+          {sorted.map(ls => {
+            const isDeployed = deployedSet.has(ls.id)
+            const dim = deployedSet.size > 0 && !isDeployed
+            return (
+              <tr key={ls.id} style={{ opacity: dim ? 0.45 : 1 }}>
+                <td style={{ fontSize: 11, color: isDeployed ? '#10B981' : 'var(--text3)', fontFamily: 'var(--mono)' }}>
+                  {isDeployed ? '✓ Deployed' : '— Not deployed'}
+                </td>
+                <td style={{color:cCrit[ls.criticality]||'var(--text2)'}}>{ls.criticality}</td>
+                <td style={{fontFamily:'var(--mono)',fontSize:11}}>T{ls.tier}</td>
+                <td>{ls.name}</td>
+                <td style={{fontFamily:'var(--mono)',fontSize:12,color:'#7C3AED',fontWeight:700}}>{rulesPerSource[ls.id] || 0}</td>
+              </tr>
+            )
+          })}
         </tbody>
       </table>
     </div>
@@ -2542,7 +2658,7 @@ export default function App({ orgProfile = null, onProfileChange }) {
                 <span className="topbar-title">MITRE ATT&CK</span>
                 <a className="topbar-link" href="https://attack.mitre.org/matrices/enterprise/" target="_blank" rel="noreferrer">attack.mitre.org ↗</a>
               </div>
-              <MatrixView rules={rules} onSelectRule={(rid) => navigateToRules({ ruleId: rid })} isMobile={isMobile} />
+              <MatrixView rules={rules} onSelectRule={(rid) => navigateToRules({ ruleId: rid })} isMobile={isMobile} orgProfile={orgProfile} />
             </>
           )}
           {view === 'chains' && (
@@ -2558,7 +2674,7 @@ export default function App({ orgProfile = null, onProfileChange }) {
               <div className="topbar">
                 <span className="topbar-title">Recommendations</span>
               </div>
-              <RecommendView rules={rules} />
+              <RecommendView rules={rules} orgProfile={orgProfile} />
             </>
           )}
           {view === 'settings' && (

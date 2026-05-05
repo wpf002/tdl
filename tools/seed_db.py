@@ -21,7 +21,7 @@ import yaml
 from sqlalchemy.dialects.postgresql import insert
 
 from tools.db import db_enabled, session_scope
-from tools.models import Rule
+from tools.models import DeletedRule, Rule
 
 ROOT = Path(__file__).resolve().parent.parent
 RULES_DIR = ROOT / "rules"
@@ -85,16 +85,21 @@ def main():
     inserted = 0
     updated = 0
     skipped_custom = 0
+    skipped_deleted = 0
 
     with session_scope() as s:
         existing = {
             r.rule_id: r.is_custom
             for r in s.query(Rule.rule_id, Rule.is_custom).all()
         }
+        tombstoned = {r.rule_id for r in s.query(DeletedRule.rule_id).all()}
 
         rows_to_write = []
         for row in rows:
             rid = row["rule_id"]
+            if rid in tombstoned:
+                skipped_deleted += 1
+                continue
             if existing.get(rid) is True:
                 skipped_custom += 1
                 continue
@@ -113,7 +118,7 @@ def main():
 
         total = s.query(Rule).count()
 
-    print(f"Inserted: {inserted}  Updated: {updated}  Skipped (is_custom): {skipped_custom}")
+    print(f"Inserted: {inserted}  Updated: {updated}  Skipped (is_custom): {skipped_custom}  Skipped (deleted): {skipped_deleted}")
     print(f"Total rules in DB: {total}")
     return 0
 

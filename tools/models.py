@@ -78,6 +78,20 @@ class AIUsage(Base):
 Index("ix_ai_usage_user_day", AIUsage.user_id, AIUsage.created_at)
 
 
+class DeletedRule(Base):
+    """Tombstone for hard-deleted rules.
+
+    Hard-deleting a rule removes the row from `rules`, but the YAML file may
+    still be on disk under `rules/`. The seeder consults this table and skips
+    any rule_id present here, so the deletion survives re-seeds.
+    """
+    __tablename__ = "deleted_rules"
+
+    rule_id = Column(String(64), primary_key=True)
+    deleted_by_user_id = Column(String(64), nullable=True)
+    deleted_at = Column(String(32), nullable=False)
+
+
 class ImportJob(Base):
     """Phase 5 — rule-import job (Sigma YAML or SIEM-dialect query → TDL rule).
 

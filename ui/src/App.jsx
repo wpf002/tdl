@@ -837,7 +837,7 @@ const SIEM_KEYS = ['spl','kql','aql','yara_l','esql','leql','crowdstrike','xql',
 const linesToList = (s) => (s || '').split('\n').map(x => x.trim()).filter(Boolean)
 const listToLines = (xs) => (xs || []).join('\n')
 
-function RuleDetail({ rule, onUpdated, onDuplicated }) {
+function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted }) {
   const { getToken } = useAuth()
   const [tab, setTab] = useState('spl')
   const [editing, setEditing] = useState(false)
@@ -924,17 +924,15 @@ function RuleDetail({ rule, onUpdated, onDuplicated }) {
   }
 
   const remove = async () => {
-    if (!confirm(`Retire rule ${rule.rule_id}? It will be marked lifecycle=Retired.`)) return
+    if (!confirm(`Permanently delete ${rule.rule_id}?\n\nThis can't be undone — the rule will be removed from the library and won't come back on re-seed.`)) return
     setBusy(true)
     setError(null)
     try {
       const r = await apiCall(`/api/rules/${encodeURIComponent(rule.rule_id)}`, { method: 'DELETE' })
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
-      const updated = await r.json()
-      onUpdated && onUpdated(updated)
+      onDeleted && onDeleted(rule.rule_id)
     } catch (e) {
       setError(e.message || 'Delete failed')
-    } finally {
       setBusy(false)
     }
   }
@@ -982,9 +980,6 @@ function RuleDetail({ rule, onUpdated, onDuplicated }) {
             </button>
             <button className="rule-btn" onClick={duplicate} disabled={busy}>
               <Copy size={11} /> Duplicate
-            </button>
-            <button className="rule-btn rule-btn-danger" onClick={remove} disabled={busy || rule.lifecycle === 'Retired'}>
-              <Trash2 size={11} /> {rule.lifecycle === 'Retired' ? 'Retired' : 'Retire'}
             </button>
           </>
         )}
@@ -1179,6 +1174,20 @@ function RuleDetail({ rule, onUpdated, onDuplicated }) {
           <span style={{ fontSize:11, color:'var(--text3)', fontFamily:'var(--mono)' }}>Modified: {rule.last_modified}</span>
         )}
       </div>
+
+      {!editing && (
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 24 }}>
+          <button
+            className="rule-btn rule-btn-danger"
+            onClick={remove}
+            disabled={busy}
+            style={{ fontSize: 11 }}
+            title="Permanently delete this rule from the library"
+          >
+            <Trash2 size={11} /> Delete
+          </button>
+        </div>
+      )}
     </div>
   )
 }
@@ -1690,7 +1699,7 @@ function ImportRulesModal({ open, onClose, onApplied }) {
   )
 }
 
-function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleUpdated, onRuleAdded, primarySiem }) {
+function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleUpdated, onRuleAdded, onRuleDeleted, primarySiem }) {
   const [selected, setSelected]   = useState(null)
   const [search, setSearch]       = useState('')
   const [fTactic, setFTactic]     = useState('All')
@@ -1734,6 +1743,10 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
   const handleDuplicated = (added) => {
     onRuleAdded && onRuleAdded(added)
     setSelected(added)
+  }
+  const handleDeleted = (rule_id) => {
+    onRuleDeleted && onRuleDeleted(rule_id)
+    setSelected(null)
   }
 
   return (
@@ -1820,7 +1833,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
           ))}
         </div>
         {!isMobile && (selected
-          ? <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} />
+          ? <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} />
           : <div className="detail empty-state">
               <div className="empty-inner">
                 <Shield size={48} />
@@ -1839,7 +1852,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
             </button>
           </div>
           <div className="mobile-detail-body">
-            <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} />
+            <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} />
           </div>
         </div>
       )}
@@ -2418,6 +2431,10 @@ export default function App({ orgProfile = null, onProfileChange }) {
     setView('rules')
   }
 
+  const removeRule = useCallback((rule_id) => {
+    setRules(prev => prev.filter(r => r.rule_id !== rule_id))
+  }, [])
+
   const replaceRule = useCallback((updated) => {
     setRules(prev => prev.map(r => r.rule_id === updated.rule_id ? updated : r))
   }, [])
@@ -2507,7 +2524,7 @@ export default function App({ orgProfile = null, onProfileChange }) {
         </aside>
 
         <div className="main">
-          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} onRuleUpdated={replaceRule} onRuleAdded={addRule} primarySiem={orgProfile?.primary_siem} />}
+          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} onRuleUpdated={replaceRule} onRuleAdded={addRule} onRuleDeleted={removeRule} primarySiem={orgProfile?.primary_siem} />}
           {view === 'dashboard' && (
             <>
               <div className="topbar">

@@ -48,7 +48,7 @@ from flask import Flask, Response, abort, g, jsonify, request, send_from_directo
 from flask_cors import CORS
 
 from tools.db import db_enabled, session_scope
-from tools.models import AIUsage, ImportJob, OrgProfile, Rule
+from tools.models import AIUsage, DeletedRule, ImportJob, OrgProfile, Rule
 
 ROOT = Path(__file__).resolve().parent.parent
 RULES_DIR = ROOT / "rules"
@@ -298,16 +298,23 @@ def update_rule(rule_id):
 
 @app.delete("/api/rules/<rule_id>")
 def delete_rule(rule_id):
+    """Hard-delete a rule and tombstone the rule_id so re-seeds skip it."""
     _require_db("rule deletes")
+    user_id = g.get("clerk_user_id")
     with session_scope() as s:
         row = s.query(Rule).filter(Rule.rule_id == rule_id).one_or_none()
         if row is None:
             abort(404)
-        row.lifecycle = "Retired"
-        row.is_custom = True
-        row.last_modified = _today()
+        s.delete(row)
+        existing = s.query(DeletedRule).filter(DeletedRule.rule_id == rule_id).one_or_none()
+        if existing is None:
+            s.add(DeletedRule(
+                rule_id=rule_id,
+                deleted_by_user_id=user_id,
+                deleted_at=_now_iso(),
+            ))
         s.flush()
-        return jsonify(_row_to_dict(row))
+        return jsonify(deleted=rule_id)
 
 
 @app.post("/api/rules/<rule_id>/duplicate")

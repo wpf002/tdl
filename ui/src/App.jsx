@@ -35,6 +35,25 @@ const TACTIC_ORDER = [
   'Command and Control','Collection','Exfiltration','Impact'
 ]
 
+// Tactic → rule-id prefix (e.g. "Initial Access" → "AUTH" since rule IDs look
+// like TDL-AUTH-000289). Surfaced in the UI as "Initial Access (AUTH)".
+const TACTIC_PREFIX = {
+  'Initial Access':       'AUTH',
+  'Execution':            'EXE',
+  'Persistence':          'PER',
+  'Privilege Escalation': 'PE',
+  'Defense Evasion':      'DE',
+  'Credential Access':    'CA',
+  'Discovery':            'DIS',
+  'Lateral Movement':     'LM',
+  'Command and Control':  'C2',
+  'Collection':           'COL',
+  'Exfiltration':         'EXF',
+  'Impact':               'IMP',
+}
+
+const tacticLabel = (t) => TACTIC_PREFIX[t] ? `${t} (${TACTIC_PREFIX[t]})` : t
+
 // Kill Chain stages that have ATT&CK tactic mappings (pre-attack stages —
 // Reconnaissance, Weaponization — are excluded since the rule library has no
 // rules for them). Order mirrors KILL_CHAIN.
@@ -950,7 +969,7 @@ function RuleDetail({ rule, onUpdated, onDuplicated }) {
 
       <div className="detail-badges">
         <SevBadge s={rule.severity} />
-        <span className="pill pill-tactic">{rule.tactic}</span>
+        <span className="pill pill-tactic">{tacticLabel(rule.tactic)}</span>
         <span className="pill pill-lc">{(rule.platform||[]).join(' · ')}</span>
         {rule.is_custom && <span className="pill" style={{background:'rgba(124,92,255,.18)', color:'#C4B5FD'}}>Custom</span>}
       </div>
@@ -1353,7 +1372,7 @@ function GenerateRuleModal({ open, onClose, onSaved, primarySiem }) {
               <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>{r.name}</div>
               <div style={{ fontSize: 12, color: '#9598A8', marginBottom: 10 }}>{r.description}</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, fontSize: 11 }}>
-                <span className="pill pill-tactic">{r.tactic}</span>
+                <span className="pill pill-tactic">{tacticLabel(r.tactic)}</span>
                 <SevBadge s={r.severity} />
                 <span className={`pill pill-fid-${r.fidelity}`}>{r.fidelity}</span>
                 <span className="pill" style={{ background: 'rgba(124,92,255,.15)', color: '#A78BFA' }}>{r.technique_id}</span>
@@ -1630,7 +1649,7 @@ function ImportRulesModal({ open, onClose, onApplied }) {
                     <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 2 }}>{rule.name}</div>
                     <div style={{ fontSize: 11, color: '#9598A8', marginBottom: 6 }}>{rule.description}</div>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, fontSize: 10 }}>
-                      <span className="pill pill-tactic">{rule.tactic}</span>
+                      <span className="pill pill-tactic">{tacticLabel(rule.tactic)}</span>
                       <SevBadge s={rule.severity} />
                       <span className={`pill pill-fid-${rule.fidelity}`}>{rule.fidelity}</span>
                       <span className="pill" style={{ background: 'rgba(124,92,255,.15)', color: '#A78BFA' }}>{rule.technique_id}</span>
@@ -1752,7 +1771,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
         <div className="filter-row">
           <span className="chip-label">Tactic</span>
           {['All',...TACTIC_ORDER].map(t=>(
-            <button key={t} className={`chip${fTactic===t?' on':''}`} onClick={()=>setFTactic(t)} style={{ fontSize:10 }}>{t}</button>
+            <button key={t} className={`chip${fTactic===t?' on':''}`} onClick={()=>setFTactic(t)} style={{ fontSize:10 }}>{t==='All' ? t : tacticLabel(t)}</button>
           ))}
         </div>
         <div className="filter-row">
@@ -1784,7 +1803,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
               <div className="rule-rid">{r.rule_id} · {r.technique_id}</div>
               <div className="rule-name">{r.name}</div>
               <div className="rule-meta">
-                <span className="pill pill-tactic" style={{fontSize:9}}>{r.tactic}</span>
+                <span className="pill pill-tactic" style={{fontSize:9}}>{tacticLabel(r.tactic)}</span>
                 <SevBadge s={r.severity} />
                 <span className={`pill pill-fid-${r.fidelity}`}>{r.fidelity}</span>
               </div>
@@ -1975,7 +1994,7 @@ function DashboardView({ rules, onNavigate }) {
                 <div key={t} className="tactic-card tactic-card-clickable" onClick={() => onNavigate && onNavigate({ tactic: t })} role="button" tabIndex={0}
                      title={`Show ${c} ${t} rule${c===1?'':'s'}`}>
                   <div className="tactic-dot" style={{background:color}} />
-                  <div className="tactic-name" style={{color}}>{t}</div>
+                  <div className="tactic-name" style={{color}}>{tacticLabel(t)}</div>
                   <div className="tactic-bar"><div className="tactic-fill" style={{width:`${maxTactic?c/maxTactic*100:0}%`,background:color}} /></div>
                   <div className="tactic-stat">{c} rules</div>
                 </div>
@@ -2152,7 +2171,7 @@ function MatrixView({ rules, onSelectRule, isMobile }) {
                 }}
                 onClick={() => { setPickedTactic(tactic); setExpandedKey(null) }}
               >
-                {tactic}<span className="mt-pill-count">{covered}/{col.techniques.length}</span>
+                {tacticLabel(tactic)}<span className="mt-pill-count">{covered}/{col.techniques.length}</span>
               </button>
             )
           })}
@@ -2188,7 +2207,7 @@ function MatrixView({ rules, onSelectRule, isMobile }) {
               return (
                 <div key={tactic} className="attack-col">
                   <div className="attack-col-head" style={{borderTopColor:color}}>
-                    <div className="attack-col-tactic" style={{color}}>{tactic}</div>
+                    <div className="attack-col-tactic" style={{color}}>{tacticLabel(tactic)}</div>
                     <div className="attack-col-meta">{col.id} · {covered}/{techs.length}</div>
                   </div>
                   <div className="attack-col-body">

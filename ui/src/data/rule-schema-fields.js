@@ -1,0 +1,35 @@
+// TDL rule schema, flattened for the Documentation page table.
+// Mirrors schemas/rule.schema.json (DaaC schema v3). Keep in sync if the
+// canonical schema changes.
+
+export const RULE_SCHEMA_FIELDS = [
+  { name: 'rule_id', type: 'string', required: true, desc: 'Unique ID, e.g. TDL-CA-000123. Pattern-validated by tactic prefix.' },
+  { name: 'name', type: 'string', required: true, desc: 'Short imperative rule title (min 5 chars).' },
+  { name: 'description', type: 'string', required: false, desc: 'What the rule detects (min 20 chars).' },
+  { name: 'tactic', type: 'string (enum)', required: true, desc: 'MITRE ATT&CK tactic, e.g. "Credential Access".' },
+  { name: 'tactic_id', type: 'string', required: false, desc: 'MITRE tactic code, e.g. TA0006.' },
+  { name: 'technique_id', type: 'string', required: true, desc: 'MITRE technique/sub-technique, e.g. T1003.001.' },
+  { name: 'technique_name', type: 'string', required: true, desc: 'Human-readable technique name.' },
+  { name: 'platform', type: 'string[] (enum)', required: true, desc: 'Target platforms: Windows, Linux, macOS, AWS, Azure, GCP, Okta, Microsoft 365, Network, SaaS, Kubernetes.' },
+  { name: 'data_sources', type: 'string[]', required: true, desc: 'Log sources the rule reads (min 1).' },
+  { name: 'severity', type: 'string (enum)', required: true, desc: 'Low | Medium | High | Critical.' },
+  { name: 'fidelity', type: 'string (enum)', required: true, desc: 'Low | Medium | High — expected signal-to-noise.' },
+  { name: 'lifecycle', type: 'string (enum)', required: true, desc: 'Proposed | Tested | Deployed | Tuned | Retired.' },
+  { name: 'risk_score', type: 'integer', required: false, desc: '1–100 risk weighting.' },
+  { name: 'queries', type: 'object', required: true, desc: 'Per-language query strings: spl, kql, aql, yara_l, esql, leql, crowdstrike, xql, lucene, sumo, sigma. At least one required.' },
+  { name: 'pseudo_logic', type: 'string', required: false, desc: 'Human-readable detection intent — source of truth for translation.' },
+  { name: 'false_positives', type: 'string[]', required: true, desc: 'Known benign triggers.' },
+  { name: 'tuning_guidance', type: 'string', required: false, desc: 'How to tune the rule for a given environment.' },
+  { name: 'tuning_period', type: 'string', required: false, desc: 'Recommended baseline/tuning window.' },
+  { name: 'triage_steps', type: 'string[]', required: false, desc: 'Ordered analyst playbook for an alert.' },
+  { name: 'requirements', type: 'object', required: false, desc: 'Log sources + event IDs the rule needs (source → events[] with id, name, required).' },
+  { name: 'suppression', type: 'object', required: false, desc: 'Alert suppression { window, fields[] }.' },
+  { name: 'tags', type: 'string[]', required: false, desc: 'Free-form labels.' },
+  { name: 'references', type: 'string[]', required: false, desc: 'External URLs / citations.' },
+  { name: 'author', type: 'string', required: true, desc: 'Rule author.' },
+  { name: 'created', type: 'string (date)', required: true, desc: 'Creation date (YYYY-MM-DD).' },
+  { name: 'last_modified', type: 'string (date)', required: false, desc: 'Last edit date.' },
+  { name: 'test_method', type: 'string (enum)', required: false, desc: 'historical | synthetic | purple_team | none.' },
+  { name: 'simulation_id', type: 'string', required: false, desc: 'Linked simulation, e.g. SIM-001.' },
+  { name: 'related_rules', type: 'string[]', required: false, desc: 'rule_ids of complementary rules.' },
+]

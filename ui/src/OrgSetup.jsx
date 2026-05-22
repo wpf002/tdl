@@ -1,17 +1,5 @@
 import React, { useState } from 'react'
-
-const SIEMS = [
-  { id: 'spl',         name: 'Splunk SPL' },
-  { id: 'kql',         name: 'Microsoft KQL (Sentinel/Defender)' },
-  { id: 'aql',         name: 'IBM QRadar AQL' },
-  { id: 'yara_l',      name: 'Chronicle YARA-L' },
-  { id: 'esql',        name: 'Elastic ES|QL' },
-  { id: 'leql',        name: 'Rapid7 LEQL' },
-  { id: 'crowdstrike', name: 'CrowdStrike (Falcon LogScale)' },
-  { id: 'xql',         name: 'Palo Alto XSIAM XQL' },
-  { id: 'lucene',      name: 'Lucene (generic)' },
-  { id: 'sumo',        name: 'Sumo Logic' },
-]
+import { QUERY_LANGUAGES } from './data/query-languages.js'
 
 const LOG_SOURCES = [
   { id: 'windows_security_events', name: 'Windows Security Event Log' },
@@ -35,7 +23,7 @@ const LOG_SOURCES = [
 
 export default function OrgSetup({ userId, onComplete }) {
   const [orgName, setOrgName] = useState('')
-  const [primarySiem, setPrimarySiem] = useState('spl')
+  const [primaryLanguage, setPrimaryLanguage] = useState('spl')
   const [logSources, setLogSources] = useState(new Set())
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState(null)
@@ -55,7 +43,8 @@ export default function OrgSetup({ userId, onComplete }) {
       await onComplete({
         version: 1,
         org_name: orgName.trim(),
-        primary_siem: primarySiem,
+        primary_query_language: primaryLanguage,
+        primary_siem: primaryLanguage,
         log_sources_deployed: Array.from(logSources),
         created_at: new Date().toISOString(),
         created_by_user_id: userId,
@@ -86,14 +75,14 @@ export default function OrgSetup({ userId, onComplete }) {
         </label>
 
         <label style={S.label}>
-          Primary SIEM platform
+          Primary Query Language
           <select
-            value={primarySiem}
-            onChange={(e) => setPrimarySiem(e.target.value)}
+            value={primaryLanguage}
+            onChange={(e) => setPrimaryLanguage(e.target.value)}
             style={S.input}
           >
-            {SIEMS.map((s) => (
-              <option key={s.id} value={s.id}>{s.name}</option>
+            {QUERY_LANGUAGES.map((l) => (
+              <option key={l.key} value={l.key}>{l.selectLabel}</option>
             ))}
           </select>
         </label>

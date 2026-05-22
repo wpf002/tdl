@@ -1491,10 +1491,15 @@ def recommendations():
 # ── Org profile (Postgres-backed; Phase 3.5) ────────────────────────────────
 
 def _org_to_dict(row):
+    # primary_query_language is canonical; fall back to the legacy primary_siem
+    # value (which already held query-language keys) for old rows.
+    lang = row.primary_query_language or row.primary_siem
     return {
         "user_id": row.user_id,
         "org_name": row.org_name,
+        # keep primary_siem in the payload for any old client code still reading it
         "primary_siem": row.primary_siem,
+        "primary_query_language": lang,
         "log_sources_deployed": row.log_sources_deployed or [],
         "created_at": row.created_at,
         "updated_at": row.updated_at,
@@ -1524,7 +1529,8 @@ def put_org_profile():
     org_name = (body.get("org_name") or "").strip()
     if not org_name:
         abort(400, description="org_name required")
-    primary_siem = body.get("primary_siem") or None
+    # Accept the new field name, falling back to the legacy one.
+    primary_language = body.get("primary_query_language") or body.get("primary_siem") or None
     log_sources = body.get("log_sources_deployed") or []
     if not isinstance(log_sources, list):
         abort(400, description="log_sources_deployed must be a list")
@@ -1536,7 +1542,9 @@ def put_org_profile():
             row = OrgProfile(user_id=user_id, created_at=now)
             s.add(row)
         row.org_name = org_name
-        row.primary_siem = primary_siem
+        row.primary_query_language = primary_language
+        # mirror into legacy column so older reads stay consistent
+        row.primary_siem = primary_language
         row.log_sources_deployed = log_sources
         row.updated_at = now
         s.flush()

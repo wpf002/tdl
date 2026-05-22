@@ -4,11 +4,14 @@ import {
   Activity, Database, Target, Filter, Tag, Copy, Check,
   BarChart3, Layers, Crosshair, Clock, TrendingUp, ChevronDown,
   Terminal, Zap, GitBranch, Map as MapIcon, Award, Eye, Lock, Cpu,
-  ArrowRight, Circle, Minus, Download, Edit3, Trash2, Sliders, Sparkles
+  ArrowRight, Circle, Minus, Download, Edit3, Trash2, Sliders, Sparkles,
+  BookOpen, ExternalLink
 } from 'lucide-react'
 import { LogOut } from 'lucide-react'
 import RULES_RAW from './data/rules.json'
 import { ATTACK_MATRIX, KILL_CHAIN, TACTIC_ORDER_MATRIX } from './data/attack-matrix.js'
+import { QUERY_LANGUAGES } from './data/query-languages.js'
+import { RULE_SCHEMA_FIELDS } from './data/rule-schema-fields.js'
 import Settings from './Settings.jsx'
 
 // ─── HOOKS ──────────────────────────────────────────────────────────────────
@@ -894,14 +897,22 @@ const SIEM_KEYS = ['spl','kql','aql','yara_l','esql','leql','crowdstrike','xql',
 const linesToList = (s) => (s || '').split('\n').map(x => x.trim()).filter(Boolean)
 const listToLines = (xs) => (xs || []).join('\n')
 
-function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted }) {
-  const [tab, setTab] = useState('spl')
+function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage }) {
+  const platforms = Object.keys(rule.queries || {}).filter(k => rule.queries[k])
+  // Default the query tab to the org's primary query language when this rule
+  // actually has a query for it; otherwise fall back to spl (or whatever exists).
+  const defaultTab = (primaryLanguage && rule.queries?.[primaryLanguage])
+    ? primaryLanguage
+    : (rule.queries?.spl ? 'spl' : (platforms[0] || 'spl'))
+  const [tab, setTab] = useState(defaultTab)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
 
-  const platforms = Object.keys(rule.queries || {}).filter(k => rule.queries[k])
+  // When the user selects a different rule (or changes their primary language),
+  // reset the active tab to the preferred default for that rule.
+  useEffect(() => { setTab(defaultTab) }, [rule.rule_id, primaryLanguage])
   const rc = SEV_COLOR[rule.severity] || '#888'
 
   const startEdit = () => {
@@ -1736,7 +1747,7 @@ function ImportRulesModal({ open, onClose, onApplied }) {
   )
 }
 
-function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleUpdated, onRuleAdded, onRuleDeleted, primarySiem }) {
+function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleUpdated, onRuleAdded, onRuleDeleted, primaryLanguage }) {
   const [selected, setSelected]   = useState(null)
   const [search, setSearch]       = useState('')
   const [fTactic, setFTactic]     = useState('All')
@@ -1870,7 +1881,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
           ))}
         </div>
         {!isMobile && (selected
-          ? <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} />
+          ? <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} primaryLanguage={primaryLanguage} />
           : <div className="detail empty-state">
               <div className="empty-inner">
                 <Shield size={48} />
@@ -1889,7 +1900,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
             </button>
           </div>
           <div className="mobile-detail-body">
-            <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} />
+            <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} primaryLanguage={primaryLanguage} />
           </div>
         </div>
       )}
@@ -1897,7 +1908,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
       <GenerateRuleModal
         open={aiOpen}
         onClose={() => setAiOpen(false)}
-        primarySiem={primarySiem}
+        primarySiem={primaryLanguage}
         onSaved={(saved) => {
           onRuleAdded && onRuleAdded(saved)
           setSelected(saved)
@@ -2497,6 +2508,105 @@ function RecommendView({ rules, orgProfile }) {
   )
 }
 
+// ─── DOCUMENTATION ───────────────────────────────────────────────────────────
+
+function DocsView() {
+  const [tab, setTab] = useState('languages') // languages | schema
+  const tabs = [
+    { id: 'languages', label: 'Query Language Reference' },
+    { id: 'schema',    label: 'TDL Rule Schema' },
+  ]
+  return (
+    <div className="view" style={{ padding: 28 }}>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 22, flexWrap: 'wrap' }}>
+        {tabs.map(t => (
+          <button
+            key={t.id}
+            type="button"
+            className={`chip${tab === t.id ? ' on' : ''}`}
+            onClick={() => setTab(t.id)}
+            style={tab === t.id ? { background: '#7C5CFF', color: '#fff', borderColor: '#7C5CFF' } : {}}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'languages' && (
+        <section>
+          <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Query Language Reference</h2>
+          <p style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 18 }}>
+            TDL rules ship queries for all {QUERY_LANGUAGES.length} languages below. Each card links to the official reference docs.
+          </p>
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
+            gap: 14,
+          }}>
+            {QUERY_LANGUAGES.map(l => (
+              <div key={l.key} style={{
+                background: 'var(--bg2)', border: '1px solid var(--border)',
+                borderRadius: 10, padding: 16, display: 'flex', flexDirection: 'column', gap: 8,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--text)' }}>{l.cardName}</span>
+                  <span style={{ fontSize: 12, color: 'var(--text3)' }}>({l.cardSiem})</span>
+                </div>
+                <div style={{ fontSize: 12.5, color: 'var(--text2)', lineHeight: 1.5, flex: 1 }}>{l.desc}</div>
+                <a
+                  href={l.docsUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="chip"
+                  style={{ alignSelf: 'flex-start', display: 'inline-flex', alignItems: 'center', gap: 6, textDecoration: 'none' }}
+                >
+                  Open Docs <ExternalLink size={12} />
+                </a>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {tab === 'schema' && (
+        <section>
+          <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>TDL Rule Schema Reference</h2>
+          <p style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 18 }}>
+            Every rule conforms to <code style={{ fontFamily: 'var(--mono)' }}>schemas/rule.schema.json</code>.
+            Full field reference below.
+          </p>
+          <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 10 }}>
+            <table className="schema-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5 }}>
+              <thead>
+                <tr style={{ background: 'var(--bg1)', textAlign: 'left' }}>
+                  <th style={{ padding: '10px 12px', fontWeight: 600 }}>Field</th>
+                  <th style={{ padding: '10px 12px', fontWeight: 600 }}>Type</th>
+                  <th style={{ padding: '10px 12px', fontWeight: 600 }}>Required</th>
+                  <th style={{ padding: '10px 12px', fontWeight: 600 }}>Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {RULE_SCHEMA_FIELDS.map(f => (
+                  <tr key={f.name} style={{ borderTop: '1px solid var(--border)' }}>
+                    <td style={{ padding: '8px 12px', fontFamily: 'var(--mono)', color: '#A855F7', whiteSpace: 'nowrap' }}>{f.name}</td>
+                    <td style={{ padding: '8px 12px', fontFamily: 'var(--mono)', color: 'var(--text2)', whiteSpace: 'nowrap' }}>{f.type}</td>
+                    <td style={{ padding: '8px 12px' }}>
+                      {f.required
+                        ? <span style={{ color: '#F87171', fontWeight: 600 }}>required</span>
+                        : <span style={{ color: 'var(--text3)' }}>optional</span>}
+                    </td>
+                    <td style={{ padding: '8px 12px', color: 'var(--text2)', lineHeight: 1.5 }}>{f.desc}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+    </div>
+  )
+}
+
 // ─── APP ─────────────────────────────────────────────────────────────────────
 
 function UserMenu({ user, onSignOut }) {
@@ -2581,6 +2691,7 @@ const buildViews = (ruleCount, techCount, chainCount) => [
   { id:'matrix',    label:'MITRE ATT&CK',     icon:<MapIcon size={14} />,   badge:techCount },
   { id:'chains',    label:'Kill Chain',       icon:<GitBranch size={14} />, badge:chainCount },
   { id:'recommend', label:'Log Sources',      icon:<TrendingUp size={14} /> },
+  { id:'docs',      label:'Documentation',     icon:<BookOpen size={14} /> },
   { id:'settings',  label:'Settings',         icon:<Sliders size={14} /> },
 ]
 
@@ -2688,7 +2799,7 @@ export default function App({ user = null, orgProfile = null, onProfileChange, o
         </aside>
 
         <div className="main">
-          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} onRuleUpdated={replaceRule} onRuleAdded={addRule} onRuleDeleted={removeRule} primarySiem={orgProfile?.primary_siem} />}
+          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} onRuleUpdated={replaceRule} onRuleAdded={addRule} onRuleDeleted={removeRule} primaryLanguage={orgProfile?.primary_query_language || orgProfile?.primary_siem} />}
           {view === 'dashboard' && (
             <>
               <div className="topbar">
@@ -2725,6 +2836,14 @@ export default function App({ user = null, orgProfile = null, onProfileChange, o
               <RecommendView rules={rules} orgProfile={orgProfile} />
             </>
           )}
+          {view === 'docs' && (
+            <>
+              <div className="topbar">
+                <span className="topbar-title">Documentation</span>
+              </div>
+              <DocsView />
+            </>
+          )}
           {view === 'settings' && (
             <>
               <div className="topbar">
@@ -2746,7 +2865,7 @@ export default function App({ user = null, orgProfile = null, onProfileChange, o
               onClick={() => setView(v.id)}
             >
               <span className="bottom-tab-icon">{v.icon}</span>
-              <span className="bottom-tab-label">{v.label === 'Detection Rules' ? 'Rules' : v.label === 'MITRE ATT&CK' ? 'Matrix' : v.label === 'Kill Chain' ? 'Kill Chain' : v.label === 'Log Sources' ? 'Log Sources' : v.label}</span>
+              <span className="bottom-tab-label">{v.label === 'Detection Rules' ? 'Rules' : v.label === 'MITRE ATT&CK' ? 'Matrix' : v.label === 'Kill Chain' ? 'Kill Chain' : v.label === 'Log Sources' ? 'Log Sources' : v.label === 'Documentation' ? 'Docs' : v.label}</span>
             </button>
           ))}
         </nav>

@@ -1,17 +1,5 @@
-import React, { useState } from 'react'
-
-const SIEMS = [
-  { id: 'spl',         name: 'Splunk SPL' },
-  { id: 'kql',         name: 'Microsoft KQL (Sentinel/Defender)' },
-  { id: 'aql',         name: 'IBM QRadar AQL' },
-  { id: 'yara_l',      name: 'Chronicle YARA-L' },
-  { id: 'esql',        name: 'Elastic ES|QL' },
-  { id: 'leql',        name: 'Rapid7 LEQL' },
-  { id: 'crowdstrike', name: 'CrowdStrike (Falcon LogScale)' },
-  { id: 'xql',         name: 'Palo Alto XSIAM XQL' },
-  { id: 'lucene',      name: 'Lucene (generic)' },
-  { id: 'sumo',        name: 'Sumo Logic' },
-]
+import React, { useState, useEffect } from 'react'
+import { QUERY_LANGUAGES } from './data/query-languages.js'
 
 const LOG_SOURCES = [
   { id: 'windows_security_events', name: 'Windows Security Event Log' },
@@ -35,11 +23,22 @@ const LOG_SOURCES = [
 
 export default function Settings({ profile, onSave }) {
   const [orgName, setOrgName] = useState(profile?.org_name || '')
-  const [primarySiem, setPrimarySiem] = useState(profile?.primary_siem || 'spl')
+  const [primaryLanguage, setPrimaryLanguage] = useState(
+    profile?.primary_query_language || profile?.primary_siem || 'spl'
+  )
   const [logSources, setLogSources] = useState(new Set(profile?.log_sources_deployed || []))
   const [saving, setSaving] = useState(false)
   const [savedAt, setSavedAt] = useState(null)
   const [error, setError] = useState(null)
+
+  // Keep local form state in sync if the live org profile changes underneath us
+  // (single source of truth lives at the App root). Without this, the form could
+  // drift from what the matrix / other views render.
+  useEffect(() => {
+    setOrgName(profile?.org_name || '')
+    setPrimaryLanguage(profile?.primary_query_language || profile?.primary_siem || 'spl')
+    setLogSources(new Set(profile?.log_sources_deployed || []))
+  }, [profile])
 
   const toggle = (id) => {
     const next = new Set(logSources)
@@ -57,7 +56,9 @@ export default function Settings({ profile, onSave }) {
         ...(profile || {}),
         version: 1,
         org_name: orgName.trim(),
-        primary_siem: primarySiem,
+        primary_query_language: primaryLanguage,
+        // keep the legacy key populated for any old reader
+        primary_siem: primaryLanguage,
         log_sources_deployed: Array.from(logSources),
         updated_at: new Date().toISOString(),
       })
@@ -88,14 +89,14 @@ export default function Settings({ profile, onSave }) {
         </label>
 
         <label style={S.label}>
-          Primary SIEM platform
+          Primary Query Language
           <select
-            value={primarySiem}
-            onChange={(e) => setPrimarySiem(e.target.value)}
+            value={primaryLanguage}
+            onChange={(e) => setPrimaryLanguage(e.target.value)}
             style={S.input}
           >
-            {SIEMS.map((s) => (
-              <option key={s.id} value={s.id}>{s.name}</option>
+            {QUERY_LANGUAGES.map((l) => (
+              <option key={l.key} value={l.key}>{l.selectLabel}</option>
             ))}
           </select>
         </label>

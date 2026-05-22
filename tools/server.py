@@ -52,6 +52,7 @@ from flask_limiter.util import get_remote_address
 from tools.db import db_enabled, session_scope
 from tools.models import AIUsage, AuthToken, DeletedRule, ImportJob, OrgProfile, Rule, User
 from tools import auth as authlib
+from tools.agents.base_agent import AGENT_MODEL
 
 ROOT = Path(__file__).resolve().parent.parent
 RULES_DIR = ROOT / "rules"
@@ -516,7 +517,20 @@ def update_rule(rule_id):
         row.is_custom = True
         row.last_modified = _today()
         s.flush()
-        return jsonify(_row_to_dict(row))
+        saved = _row_to_dict(row)
+
+    # Optionally re-validate the saved rule's queries in the background.
+    user_id = g.get("user_id")
+    if body.get("validate") and user_id and os.environ.get("ANTHROPIC_API_KEY"):
+        import threading
+        snapshot = {"queries": saved.get("queries"), "pseudo_logic": saved.get("pseudo_logic")}
+        threading.Thread(
+            target=_run_background_validation,
+            args=(user_id, rule_id, snapshot),
+            daemon=True,
+        ).start()
+
+    return jsonify(saved)
 
 
 @app.delete("/api/rules/<rule_id>")
@@ -612,6 +626,26 @@ def get_ai_usage():
         )
 
 
+def _log_agent_usage(session, *, user_id, feature, usage_by_lang, rule_id=None):
+    """Persist one AIUsage row per specialist agent call.
+
+    `usage_by_lang` is {language_key: {model, input_tokens, output_tokens, cost_usd}}.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    for lang, u in (usage_by_lang or {}).items():
+        session.add(AIUsage(
+            user_id=user_id,
+            feature=feature,
+            model=u.get("model") or AGENT_MODEL,
+            language=lang,
+            input_tokens=u.get("input_tokens", 0) or 0,
+            output_tokens=u.get("output_tokens", 0) or 0,
+            cost_usd=u.get("cost_usd", 0.0) or 0.0,
+            rule_id=rule_id,
+            created_at=now,
+        ))
+
+
 @app.post("/api/rules/generate")
 def generate_rule_endpoint():
     user_id = g.get("user_id")
@@ -639,13 +673,17 @@ def generate_rule_endpoint():
     with session_scope() as s:
         spent = _ai_spent_today(s, user_id)
         from tools.ai_rule_builder import max_call_cost
-        if spent + max_call_cost() > AI_DAILY_CAP_USD:
+        from tools.agents.base_agent import estimate_cost as _agent_cost
+        # Budget: the metadata/builder call + 10 specialist generate calls.
+        agent_run_max = 10 * _agent_cost(3500, 1500)
+        if spent + max_call_cost() + agent_run_max > AI_DAILY_CAP_USD:
             return jsonify(
                 error="daily AI spend cap reached",
                 spent_today_usd=round(spent, 4),
                 daily_cap_usd=AI_DAILY_CAP_USD,
             ), 429
 
+    # Step 1 — generate rule metadata + pseudo_logic (and draft queries) with the builder.
     try:
         from tools.ai_rule_builder import generate_rule
         result = generate_rule(
@@ -659,19 +697,135 @@ def generate_rule_endpoint():
     except Exception as e:
         return jsonify(error=f"generation failed: {type(e).__name__}: {e}"), 502
 
+    rule = result["rule"]
+    builder_usage = result["usage"]
+
+    # Step 2 — hand the pseudo_logic to all 10 specialist agents to (re)generate
+    # each query with its language expert, in parallel. Falls back to the
+    # builder's draft query for any language that errors out.
+    agent_usage = {}
+    agent_total = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "agents": 0}
+    try:
+        from tools.agents import AgentOrchestrator
+        orch = AgentOrchestrator()
+        gen = orch.generate_all_queries(
+            pseudo_logic=rule.get("pseudo_logic") or prompt,
+            tactic=rule.get("tactic"),
+            technique=rule.get("technique_id") or rule.get("technique_name"),
+            platform=rule.get("platform"),
+            data_sources=rule.get("data_sources"),
+        )
+        draft = rule.get("queries") or {}
+        rule["queries"] = {
+            k: (gen["queries"].get(k) or draft.get(k) or "") for k in QUERY_KEYS
+        }
+        agent_usage = gen["usage"]
+        agent_total = gen["total"]
+    except Exception:
+        # Specialist pass failed entirely — keep the builder's draft queries.
+        pass
+
+    # Combined usage for the full run (builder + 10 agents).
+    combined = {
+        "model": builder_usage["model"],
+        "input_tokens": builder_usage["input_tokens"] + agent_total.get("input_tokens", 0),
+        "output_tokens": builder_usage["output_tokens"] + agent_total.get("output_tokens", 0),
+        "cost_usd": round(builder_usage["cost_usd"] + agent_total.get("cost_usd", 0.0), 6),
+        "agents": agent_total.get("agents", 0),
+        "builder_cost_usd": builder_usage["cost_usd"],
+        "agents_cost_usd": round(agent_total.get("cost_usd", 0.0), 6),
+        "per_language": agent_usage,
+    }
+
     now = datetime.now(timezone.utc).isoformat()
     with session_scope() as s:
+        # Builder call (metadata + pseudo_logic).
         s.add(AIUsage(
             user_id=user_id,
             feature="rule_generate",
-            model=result["usage"]["model"],
-            input_tokens=result["usage"]["input_tokens"],
-            output_tokens=result["usage"]["output_tokens"],
-            cost_usd=result["usage"]["cost_usd"],
+            model=builder_usage["model"],
+            input_tokens=builder_usage["input_tokens"],
+            output_tokens=builder_usage["output_tokens"],
+            cost_usd=builder_usage["cost_usd"],
             created_at=now,
         ))
+        # One row per specialist agent.
+        _log_agent_usage(s, user_id=user_id, feature="rule_generate_agent",
+                         usage_by_lang=agent_usage)
 
-    return jsonify(rule=result["rule"], usage=result["usage"])
+    return jsonify(rule=rule, usage=combined)
+
+
+@app.post("/api/rules/validate")
+def validate_rule_endpoint():
+    """Run each language specialist's validate_query against a rule's queries.
+
+    Accepts either {"rule_id": "..."} (validate a stored rule) or
+    {"rule": {...}} (validate an ad-hoc rule, e.g. a generate preview).
+    Returns per-language {valid, issues, score} plus an overall score.
+    """
+    user_id = g.get("user_id")
+    if not user_id:
+        return jsonify(error="not signed in"), 401
+    if not db_enabled():
+        return jsonify(error="DATABASE_URL is not set on the server"), 503
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return jsonify(error="ANTHROPIC_API_KEY is not set on the server"), 503
+
+    body = request.get_json(silent=True) or {}
+    rule = body.get("rule")
+    rule_id = body.get("rule_id")
+    if rule is None and rule_id:
+        rule = load_full_rule(rule_id)
+        if rule is None:
+            return jsonify(error=f"rule {rule_id} not found"), 404
+    if not isinstance(rule, dict):
+        return jsonify(error="provide rule_id or rule"), 400
+
+    with session_scope() as s:
+        spent = _ai_spent_today(s, user_id)
+        from tools.agents.base_agent import estimate_cost as _agent_cost
+        validate_run_max = 10 * _agent_cost(3500, 1200)
+        if spent + validate_run_max > AI_DAILY_CAP_USD:
+            return jsonify(
+                error="daily AI spend cap reached",
+                spent_today_usd=round(spent, 4),
+                daily_cap_usd=AI_DAILY_CAP_USD,
+            ), 429
+
+    try:
+        from tools.agents import AgentOrchestrator
+        result = AgentOrchestrator().validate_rule_queries(rule)
+    except Exception as e:
+        return jsonify(error=f"validation failed: {type(e).__name__}: {e}"), 502
+
+    with session_scope() as s:
+        _log_agent_usage(s, user_id=user_id, feature="rule_validate",
+                         usage_by_lang=result["usage"],
+                         rule_id=rule_id if isinstance(rule_id, str) else None)
+
+    return jsonify(
+        rule_id=rule_id,
+        overall_score=result["overall_score"],
+        results=result["results"],
+        usage=result["total"],
+    )
+
+
+def _run_background_validation(user_id, rule_id, rule_snapshot):
+    """Validate a rule's queries off the request path and log usage.
+
+    Best-effort: any error is swallowed (this is a background nicety, not a
+    correctness path). Needs its own app/session scope since it runs in a thread.
+    """
+    try:
+        from tools.agents import AgentOrchestrator
+        result = AgentOrchestrator().validate_rule_queries(rule_snapshot)
+        with session_scope() as s:
+            _log_agent_usage(s, user_id=user_id, feature="rule_validate",
+                             usage_by_lang=result["usage"], rule_id=rule_id)
+    except Exception:
+        pass
 
 
 @app.post("/api/rules")

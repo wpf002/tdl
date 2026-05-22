@@ -93,8 +93,9 @@ class AIUsage(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(String(64), index=True, nullable=False)
     org_id = Column(String(64), index=True, nullable=True)
-    feature = Column(String(32), index=True, nullable=False)  # 'rule_generate', 'sigma_import', etc.
+    feature = Column(String(32), index=True, nullable=False)  # 'rule_generate', 'rule_validate', 'rule_improve', 'rule_generate_agent', etc.
     model = Column(String(64), nullable=False)
+    language = Column(String(32), nullable=True)  # SIEM language key for per-agent rows (spl/kql/...)
     input_tokens = Column(Integer, nullable=False, default=0)
     output_tokens = Column(Integer, nullable=False, default=0)
     cost_usd = Column(Float, nullable=False, default=0.0)

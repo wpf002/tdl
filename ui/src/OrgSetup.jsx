@@ -231,7 +231,7 @@ export default function OrgSetup({ userId, onComplete }) {
             <div style={S.footer}>
               <span style={S.count}>{logSources.size} of {LOG_SOURCES.length} log sources selected</span>
               <button type="submit" disabled={!orgName.trim()} style={S.button}>
-                {deployedCanonical.length ? 'Next: pick event IDs →' : 'Continue to dashboard'}
+                {deployedCanonical.length ? 'Next: Pick Event IDs →' : 'Continue to Dashboard'}
               </button>
             </div>
           </>
@@ -292,7 +292,7 @@ export default function OrgSetup({ userId, onComplete }) {
             <div style={S.footer}>
               <button type="button" onClick={() => setStep('basics')} style={S.buttonGhost}>← Back</button>
               <button type="submit" disabled={submitting} style={S.button}>
-                {submitting ? 'Saving…' : 'Finish setup'}
+                {submitting ? 'Saving…' : 'Finish Setup'}
               </button>
             </div>
           </>

@@ -133,15 +133,17 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
             {savedAt && <span style={{ color: '#7C5CFF', marginLeft: 12 }}>Saved.</span>}
             {error && <span style={{ color: '#F87171', marginLeft: 12 }}>{error}</span>}
           </span>
-          {onRerunSetup && (
-            <button type="button" onClick={onRerunSetup}
-                    style={{ ...S.button, background: 'transparent', color: '#9598A8', border: '1px solid #262833', fontWeight: 500 }}>
-              Re-run setup
+          <div style={{ display: 'flex', gap: 8 }}>
+            {onRerunSetup && (
+              <button type="button" onClick={onRerunSetup}
+                      style={{ ...S.button, background: 'transparent', color: '#9598A8', border: '1px solid #262833', fontWeight: 500 }}>
+                Re-run Setup
+              </button>
+            )}
+            <button type="submit" disabled={saving || !orgName.trim()} style={S.button}>
+              {saving ? 'Saving…' : 'Save changes'}
             </button>
-          )}
-          <button type="submit" disabled={saving || !orgName.trim()} style={S.button}>
-            {saving ? 'Saving…' : 'Save changes'}
-          </button>
+          </div>
         </div>
       </form>
     </div>

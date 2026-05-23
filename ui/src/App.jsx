@@ -1260,23 +1260,24 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
           )}
           <div className="list-items">
             {rule.requirements.log_sources.map((ls, i) => (
-              <div key={i} style={{ marginBottom: 8 }}>
+              <div key={i} style={{ marginBottom: 10 }}>
                 <div className="list-item" style={{ fontWeight: 600 }}>
                   <div className="list-dot" />{ls.source}
                 </div>
                 {(ls.events || []).map((ev, j) => (
                   <div key={j} style={{
                     display: 'flex', alignItems: 'center', gap: 8,
-                    marginLeft: 18, fontSize: 12, color: 'var(--text2)', padding: '2px 0',
+                    marginLeft: 22, fontSize: 12, color: 'var(--text2)', padding: '2px 0',
                   }}>
                     <span style={{
-                      width: 8, height: 8, borderRadius: '50%',
-                      background: ev.required ? '#F87171' : '#3F3F46',
-                      flexShrink: 0,
-                    }} title={ev.required ? 'Required' : 'Optional'} />
+                      fontFamily: 'var(--mono)', color: 'var(--text3)', flexShrink: 0,
+                    }}>└─</span>
                     <span style={{ fontFamily: 'var(--mono)', color: '#A78BFA' }}>{ev.id}</span>
-                    <span>— {ev.name}</span>
-                    {ev.required && <span style={{ marginLeft: 'auto', fontSize: 10, color: '#F87171' }}>Required</span>}
+                    <span>{ev.name}</span>
+                    <span style={{
+                      marginLeft: 'auto', fontSize: 10, fontWeight: 600,
+                      color: ev.required ? '#F87171' : 'var(--text3)',
+                    }}>{ev.required ? 'Required' : 'Optional'}</span>
                   </div>
                 ))}
               </div>
@@ -1411,7 +1412,7 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
                   </span>
                   <span style={{ flex: 1, fontSize: 12 }}>{c.name}</span>
                   <span style={{ fontSize: 10, fontFamily: 'var(--mono)', color: 'var(--text3)' }}>
-                    risk {c.risk_score ?? '—'}
+                    Risk: {c.risk_score ?? '—'}
                   </span>
                 </button>
               ))}
@@ -2366,7 +2367,7 @@ function ExportModal({ open, onClose, allRules, filteredRules = null, selectedId
               {opt.id === 'selected' && !haveSelected && (
                 <button type="button" onClick={() => { onEnableSelectionMode && onEnableSelectionMode(); onClose() }}
                         className="chip" style={{ marginTop: 4, fontSize: 11 }}>
-                  Enable selection mode in Rules view →
+                  Enable Selection Mode in Rules View →
                 </button>
               )}
             </div>
@@ -2978,7 +2979,7 @@ function RecommendView({ rules, orgProfile }) {
                       fontSize: 11, fontFamily: 'var(--mono)',
                       color: isDeployed ? '#10B981' : 'var(--text3)',
                       minWidth: 96,
-                    }}>{isDeployed ? '✓ Deployed' : '✗ Not deployed'}</span>
+                    }}>{isDeployed ? '✓ Deployed' : '✗ Not Deployed'}</span>
                     <span style={{ flex: 1, fontWeight: 600 }}>{ls.name}</span>
                     <span style={{ fontSize: 11, color: cCrit[ls.criticality] || 'var(--text2)' }}>{ls.criticality}</span>
                     <span style={{
@@ -3004,20 +3005,24 @@ function RecommendView({ rules, orgProfile }) {
                               color: missingHint ? '#FBBF24' : 'var(--text2)',
                             }}>
                               <span style={{
-                                width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
-                                background: ev.required ? '#F87171' : '#3F3F46',
-                              }} title={ev.required ? 'Required' : 'Optional'} />
+                                fontFamily: 'var(--mono)', color: 'var(--text3)', flexShrink: 0,
+                              }}>└─</span>
                               <span style={{ fontFamily: 'var(--mono)', color: '#A78BFA', minWidth: 50 }}>{eid}</span>
                               <span style={{ flex: 1 }}>{ev.name}</span>
-                              <span style={{ fontSize: 11, color: 'var(--text3)' }}>
+                              <span style={{
+                                fontSize: 10, fontWeight: 600,
+                                color: ev.required ? '#F87171' : 'var(--text3)',
+                                minWidth: 64, textAlign: 'right',
+                              }}>{ev.required ? 'Required' : 'Optional'}</span>
+                              <span style={{ fontSize: 11, color: 'var(--text3)', minWidth: 120, textAlign: 'right' }}>
                                 Required by {ev.rule_ids.length} rule{ev.rule_ids.length === 1 ? '' : 's'}
                               </span>
                               <span style={{
                                 fontSize: 10, fontFamily: 'var(--mono)',
                                 color: present ? '#10B981' : missingHint ? '#FBBF24' : 'var(--text3)',
-                                minWidth: 64, textAlign: 'right',
+                                minWidth: 80, textAlign: 'right',
                               }}>
-                                {present ? '✓ collected' : missingHint ? '⚠ missing' : '— not set'}
+                                {present ? '✓ Collected' : missingHint ? '⚠ Missing' : '— Not set'}
                               </span>
                             </div>
                           )

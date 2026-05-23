@@ -1432,6 +1432,58 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
         )
       })()}
 
+      {!editing && rule.audit?.total > 0 && (() => {
+        const a = rule.audit
+        const all = [
+          ...(a.structural_issues || []).map(i => ({ ...i, source: 'structural' })),
+          ...(a.semantic_issues || []).map(i => ({ ...i, source: 'semantic' })),
+        ]
+        const sevRank = { critical: 0, major: 1, minor: 2 }
+        all.sort((x, y) => (sevRank[x.severity] ?? 9) - (sevRank[y.severity] ?? 9))
+        const sevColor = (s) => s === 'critical' ? '#EF4444' : s === 'major' ? '#F87171' : '#FBBF24'
+        const c = a.counts || {}
+        return (
+          <div className="section">
+            <div className="section-title">
+              <AlertTriangle size={11} />Audit Findings
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text3)', marginLeft: 6 }}>
+                {c.critical || 0}c · {c.major || 0}m · {c.minor || 0}n
+              </span>
+              {a.semantic_audited_at && (
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text3)', marginLeft: 'auto' }}>
+                  semantic: {a.semantic_audited_at.slice(0, 10)}
+                </span>
+              )}
+            </div>
+            <div style={{
+              display: 'grid', gap: 4, padding: '8px 12px',
+              border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg0)',
+            }}>
+              {all.map((i, idx) => (
+                <div key={idx} style={{
+                  display: 'flex', alignItems: 'flex-start', gap: 8,
+                  fontSize: 11.5, lineHeight: 1.45,
+                }}>
+                  <span style={{
+                    width: 8, height: 8, borderRadius: '50%',
+                    background: sevColor(i.severity), flexShrink: 0, marginTop: 5,
+                  }} />
+                  <span style={{ flex: 1, color: 'var(--text2)' }}>
+                    {i.message}
+                  </span>
+                  <span style={{
+                    fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text3)',
+                    padding: '1px 5px', border: '1px solid var(--border)', borderRadius: 3,
+                  }}>
+                    {i.source === 'semantic' ? 'AI' : 'lint'} · {i.code}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )
+      })()}
+
       {!editing && allRules?.length > 0 && (() => {
         const baseTech = (rule.technique_id || '').split('.')[0]
         const candidates = allRules
@@ -2197,6 +2249,22 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
                     background: qualityColor(q.score), flexShrink: 0,
                   }}
                 />
+                {(() => {
+                  const a = r.audit
+                  if (!a || !a.total) return null
+                  const c = a.counts || {}
+                  const dotColor = c.critical ? '#EF4444' : c.major ? '#F87171' : '#FBBF24'
+                  const title = `Audit: ${c.critical || 0} critical, ${c.major || 0} major, ${c.minor || 0} minor`
+                  return (
+                    <span
+                      title={title}
+                      style={{
+                        width: 8, height: 8, borderRadius: '50%',
+                        background: dotColor, flexShrink: 0,
+                      }}
+                    />
+                  )
+                })()}
                 {r.rule_id} · {r.technique_id}
               </div>
               <div className="rule-name"><Highlight text={r.name} query={search} /></div>

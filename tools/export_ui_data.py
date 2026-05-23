@@ -10,6 +10,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 RULES_DIR = ROOT / "rules"
 OUT_PATH = ROOT / "ui" / "src" / "data" / "rules.json"
+AUDIT_PATH = ROOT / "exports" / "audit_results.json"
 
 QUERY_KEYS = ["spl", "kql", "aql", "yara_l", "esql", "leql", "crowdstrike", "xql", "lucene", "sumo"]
 PSEUDO_MAX = 300
@@ -24,7 +25,18 @@ def truncate(value, limit):
     return value[: limit - 1].rstrip() + "…"
 
 
-def normalize(rule):
+def load_audit_index():
+    """Return {rule_id: audit_entry} or {} if no audit has been run."""
+    if not AUDIT_PATH.exists():
+        return {}
+    try:
+        doc = json.loads(AUDIT_PATH.read_text())
+    except json.JSONDecodeError:
+        return {}
+    return doc.get("rules") or {}
+
+
+def normalize(rule, audit_index):
     queries_in = rule.get("queries") or {}
     queries_out = {}
     for key in QUERY_KEYS:
@@ -34,8 +46,19 @@ def normalize(rule):
         elif v is not None:
             queries_out[key] = truncate(str(v), QUERY_MAX)
 
+    rid = rule.get("rule_id")
+    audit = audit_index.get(rid) or {}
+    structural = audit.get("structural_issues") or []
+    semantic = audit.get("semantic_issues") or []
+    all_issues = [*structural, *semantic]
+    counts = {"critical": 0, "major": 0, "minor": 0}
+    for i in all_issues:
+        sev = (i.get("severity") or "minor").lower()
+        if sev in counts:
+            counts[sev] += 1
+
     return {
-        "rule_id": rule.get("rule_id"),
+        "rule_id": rid,
         "name": rule.get("name"),
         "tactic": rule.get("tactic"),
         "tactic_id": rule.get("tactic_id"),
@@ -57,6 +80,13 @@ def normalize(rule):
         "author": rule.get("author"),
         "created": rule.get("created"),
         "test_method": rule.get("test_method"),
+        "audit": {
+            "structural_issues": structural,
+            "semantic_issues": semantic,
+            "counts": counts,
+            "total": len(all_issues),
+            "semantic_audited_at": audit.get("semantic_audited_at"),
+        },
     }
 
 
@@ -64,6 +94,8 @@ def main():
     if not RULES_DIR.exists():
         print(f"rules/ not found at {RULES_DIR}", file=sys.stderr)
         sys.exit(1)
+
+    audit_index = load_audit_index()
 
     rules = []
     for path in sorted(RULES_DIR.rglob("*.yaml")):
@@ -79,7 +111,7 @@ def main():
         if isinstance(rid, str) and rid.startswith("TDE-"):
             print(f"refusing to export legacy TDE- rule_id from {path}", file=sys.stderr)
             sys.exit(3)
-        rules.append(normalize(doc))
+        rules.append(normalize(doc, audit_index))
 
     rules.sort(key=lambda r: (r.get("rule_id") or ""))
 

@@ -20,9 +20,17 @@ import os
 # The spec pins the specialist agents to Sonnet 4.5; override via env if needed.
 AGENT_MODEL = os.environ.get("AGENT_MODEL", "claude-sonnet-4-5")
 
-# Sonnet pricing (USD per million tokens).
-INPUT_PRICE_PER_MTOK = 3.00
-OUTPUT_PRICE_PER_MTOK = 15.00
+# Per-MTok pricing. Picked by model family substring so AGENT_MODEL changes
+# automatically reprice. Override via AGENT_INPUT_PRICE / AGENT_OUTPUT_PRICE
+# env vars for one-off models.
+_PRICES = {
+    "haiku":  (1.00, 5.00),    # Claude Haiku 4.5
+    "sonnet": (3.00, 15.00),   # Claude Sonnet 4.5 / 4.6
+    "opus":   (15.00, 75.00),  # Claude Opus 4.x
+}
+_family = next((k for k in _PRICES if k in AGENT_MODEL.lower()), "sonnet")
+INPUT_PRICE_PER_MTOK = float(os.environ.get("AGENT_INPUT_PRICE", _PRICES[_family][0]))
+OUTPUT_PRICE_PER_MTOK = float(os.environ.get("AGENT_OUTPUT_PRICE", _PRICES[_family][1]))
 
 GENERATE_MAX_TOKENS = 1500
 VALIDATE_MAX_TOKENS = 1200
@@ -30,26 +38,38 @@ IMPROVE_MAX_TOKENS = 1500
 
 
 def estimate_cost(input_tokens: int, output_tokens: int) -> float:
+    """Plain estimate when token-bucket breakdown isn't available."""
     return (
         (input_tokens / 1_000_000) * INPUT_PRICE_PER_MTOK
         + (output_tokens / 1_000_000) * OUTPUT_PRICE_PER_MTOK
     )
 
 
+def actual_cost(base_in: int, cache_create: int, cache_read: int, output_tok: int) -> float:
+    """Real Anthropic billing: cache creation = 1.25x base, cache read = 0.10x base."""
+    return (
+        (base_in / 1_000_000) * INPUT_PRICE_PER_MTOK
+        + (cache_create / 1_000_000) * INPUT_PRICE_PER_MTOK * 1.25
+        + (cache_read / 1_000_000) * INPUT_PRICE_PER_MTOK * 0.10
+        + (output_tok / 1_000_000) * OUTPUT_PRICE_PER_MTOK
+    )
+
+
 def _usage_dict(resp, language_key: str) -> dict:
     u = resp.usage
-    input_tok = (
-        (getattr(u, "input_tokens", 0) or 0)
-        + (getattr(u, "cache_creation_input_tokens", 0) or 0)
-        + (getattr(u, "cache_read_input_tokens", 0) or 0)
-    )
+    base_in = getattr(u, "input_tokens", 0) or 0
+    cache_create = getattr(u, "cache_creation_input_tokens", 0) or 0
+    cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
     output_tok = getattr(u, "output_tokens", 0) or 0
     return {
         "language": language_key,
         "model": AGENT_MODEL,
-        "input_tokens": input_tok,
+        "input_tokens": base_in + cache_create + cache_read,
+        "base_input_tokens": base_in,
+        "cache_creation_input_tokens": cache_create,
+        "cache_read_input_tokens": cache_read,
         "output_tokens": output_tok,
-        "cost_usd": round(estimate_cost(input_tok, output_tok), 6),
+        "cost_usd": round(actual_cost(base_in, cache_create, cache_read, output_tok), 6),
     }
 
 
@@ -116,7 +136,10 @@ EXAMPLE QUERIES (study these patterns)
             from anthropic import Anthropic
         except ImportError:
             raise RuntimeError("anthropic SDK not installed — `pip install anthropic`")
-        return Anthropic()
+        # 2 retries with exponential backoff. More than that burns input tokens
+        # in proportion to the retries for rules that ultimately fail anyway —
+        # the lost rules are cheap to pick up later via --resume.
+        return Anthropic(max_retries=2)
 
     def _system_blocks(self):
         # Cache the (large, static per-language) system prompt across calls.

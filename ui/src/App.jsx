@@ -2956,6 +2956,23 @@ function RecommendView({ rules, orgProfile }) {
     return out
   }, [rules])
 
+  // Per-severity rule counts per log source for the inline breakdown badges.
+  const rulesPerSourceBySev = useMemo(() => {
+    const out = {}
+    for (const ls of LOG_SOURCES) out[ls.id] = { Critical: 0, High: 0, Medium: 0, Low: 0 }
+    for (const r of rules) {
+      const text = ((r.data_sources || []).join(' ') + ' ' + (r.platform || []).join(' ')).toLowerCase()
+      if (!text.trim()) continue
+      const sev = r.severity
+      if (!['Critical','High','Medium','Low'].includes(sev)) continue
+      for (const ls of LOG_SOURCES) {
+        const kws = LOG_SOURCE_KEYWORDS[ls.id] || []
+        if (kws.some(k => text.includes(k))) out[ls.id][sev] += 1
+      }
+    }
+    return out
+  }, [rules])
+
   // Event-level aggregation pulled from rule.requirements.
   const eventsBySource = useMemo(() => aggregateEventsBySource(rules, matchLogSourceId), [rules])
   const deployedSet = useMemo(() => deployedLogSourceIds(orgProfile), [orgProfile])
@@ -3028,10 +3045,29 @@ function RecommendView({ rules, orgProfile }) {
                     }}>{isDeployed ? '✓ Deployed' : '✗ Not Deployed'}</span>
                     <span style={{ flex: 1, fontWeight: 600 }}>{ls.name}</span>
                     <span style={{ fontSize: 11, color: cCrit[ls.criticality] || 'var(--text2)' }}>{ls.criticality}</span>
+                    <span aria-hidden="true" style={{ width: 1, height: 18, background: 'var(--border)' }} />
+                    {(() => {
+                      const bySev = rulesPerSourceBySev[ls.id] || {}
+                      const labels = { Critical: 'Crit', High: 'High', Medium: 'Med', Low: 'Low' }
+                      const order = ['Critical','High','Medium','Low']
+                      return (
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--mono)', fontSize: 11 }}>
+                          {order.map((sev, i) => (
+                            <React.Fragment key={sev}>
+                              {i > 0 && <span aria-hidden="true" style={{ width: 1, height: 12, background: 'var(--border)' }} />}
+                              <span style={{ color: cCrit[sev], minWidth: 42, textAlign: 'right' }}>
+                                {bySev[sev] || 0} {labels[sev]}
+                              </span>
+                            </React.Fragment>
+                          ))}
+                        </span>
+                      )
+                    })()}
+                    <span aria-hidden="true" style={{ width: 1, height: 18, background: 'var(--border)' }} />
                     <span style={{
                       fontFamily: 'var(--mono)', fontSize: 12, color: '#7C3AED',
-                      fontWeight: 700, minWidth: 50, textAlign: 'right',
-                    }}>{rulesPerSource[ls.id] || 0} rules</span>
+                      fontWeight: 700, minWidth: 60, textAlign: 'right',
+                    }}>{rulesPerSource[ls.id] || 0} Rules</span>
                   </div>
                   {expanded && (
                     <div style={{ padding: '4px 14px 12px 30px', borderTop: '1px solid var(--border)' }}>

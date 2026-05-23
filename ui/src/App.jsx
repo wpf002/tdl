@@ -12,6 +12,10 @@ import RULES_RAW from './data/rules.json'
 import { ATTACK_MATRIX, KILL_CHAIN, TACTIC_ORDER_MATRIX } from './data/attack-matrix.js'
 import { QUERY_LANGUAGES } from './data/query-languages.js'
 import { RULE_SCHEMA_FIELDS } from './data/rule-schema-fields.js'
+import {
+  aggregateEventsBySource, rulePerSourceRequirements,
+  ruleEventCoverage, ruleCoverageDetail,
+} from './data/requirements.js'
 import Settings from './Settings.jsx'
 
 // ─── HOOKS ──────────────────────────────────────────────────────────────────
@@ -186,6 +190,30 @@ const LOG_SOURCE_KEYWORDS = {
 function deployedLogSourceIds(orgProfile) {
   const raw = orgProfile?.log_sources_deployed || []
   return new Set(raw.map(id => ORG_TO_CANONICAL_LOG_SOURCE_ID[id] || id))
+}
+
+// Free-form rule.requirements log-source string → canonical log_source id.
+// Used by the event-level aggregation in data/requirements.js.
+function matchLogSourceId(text) {
+  const t = (text || '').toLowerCase()
+  if (!t.trim()) return null
+  for (const id of Object.keys(LOG_SOURCE_KEYWORDS)) {
+    for (const k of LOG_SOURCE_KEYWORDS[id]) {
+      if (t.includes(k)) return id
+    }
+  }
+  return null
+}
+
+// Convert orgProfile.events_deployed → { canonical_id: Set<event_id> }.
+function deployedEventsMap(orgProfile) {
+  const raw = orgProfile?.events_deployed || {}
+  const out = {}
+  for (const [id, evs] of Object.entries(raw)) {
+    const canonical = ORG_TO_CANONICAL_LOG_SOURCE_ID[id] || id
+    out[canonical] = Array.isArray(evs) ? evs.map(String) : []
+  }
+  return out
 }
 
 // True if any of the rule's data_sources match a keyword for any deployed source.
@@ -897,7 +925,7 @@ const SIEM_KEYS = ['spl','kql','aql','yara_l','esql','leql','crowdstrike','xql',
 const linesToList = (s) => (s || '').split('\n').map(x => x.trim()).filter(Boolean)
 const listToLines = (xs) => (xs || []).join('\n')
 
-function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage }) {
+function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage, orgProfile }) {
   const platforms = Object.keys(rule.queries || {}).filter(k => rule.queries[k])
   // Default the query tab to the org's primary query language when this rule
   // actually has a query for it; otherwise fall back to spl (or whatever exists).
@@ -1167,9 +1195,39 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage 
         </div>
       )}
 
-      {rule.requirements?.log_sources?.length > 0 && !editing && (
+      {rule.requirements?.log_sources?.length > 0 && !editing && (() => {
+        const deployedSet = deployedLogSourceIds(orgProfile)
+        const eventsDeployed = deployedEventsMap(orgProfile)
+        const coverage = ruleCoverageDetail(rule, deployedSet, eventsDeployed, matchLogSourceId)
+        // Pick a single status line summarising the worst issue.
+        let line = null
+        const profileApplied = deployedSet.size > 0
+        if (profileApplied && coverage.length) {
+          const undeployed = coverage.find(c => !c.deployed)
+          const missing = coverage.flatMap(c => c.missing.map(m => ({ ...m, src: c.sourceName })))
+          if (undeployed) {
+            line = { icon: '✗', color: '#F87171', text: `Log source not deployed: ${undeployed.sourceName}` }
+          } else if (missing.length) {
+            const m = missing[0]
+            line = { icon: '⚠', color: '#FBBF24',
+                     text: `Missing: ${m.id} (${m.name})${missing.length > 1 ? ` and ${missing.length - 1} more` : ''}` }
+          } else {
+            line = { icon: '✓', color: '#10B981', text: 'All required events deployed' }
+          }
+        }
+        return (
         <div className="section">
           <div className="section-title"><Layers size={11} />Requirements</div>
+          {line && (
+            <div style={{
+              fontSize: 12, padding: '6px 10px', marginBottom: 8,
+              background: 'rgba(255,255,255,.02)', border: '1px solid var(--border)',
+              borderRadius: 6, color: line.color, display: 'flex', gap: 8, alignItems: 'center',
+            }}>
+              <span style={{ fontWeight: 700 }}>{line.icon}</span>
+              <span>Coverage Status — {line.text}</span>
+            </div>
+          )}
           <div className="list-items">
             {rule.requirements.log_sources.map((ls, i) => (
               <div key={i} style={{ marginBottom: 8 }}>
@@ -1195,7 +1253,8 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage 
             ))}
           </div>
         </div>
-      )}
+        )
+      })()}
 
       {(rule.false_positives?.length > 0 || editing) && (
         <div className="section">
@@ -1777,7 +1836,7 @@ function ImportRulesModal({ open, onClose, onApplied }) {
   )
 }
 
-function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleUpdated, onRuleAdded, onRuleDeleted, primaryLanguage }) {
+function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleUpdated, onRuleAdded, onRuleDeleted, primaryLanguage, orgProfile }) {
   const [selected, setSelected]   = useState(null)
   const [search, setSearch]       = useState('')
   const [fTactic, setFTactic]     = useState('All')
@@ -1947,7 +2006,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
           ))}
         </div>
         {!isMobile && (selected
-          ? <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} primaryLanguage={primaryLanguage} />
+          ? <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} primaryLanguage={primaryLanguage} orgProfile={orgProfile} />
           : <div className="detail empty-state">
               <div className="empty-inner">
                 <Shield size={48} />
@@ -1966,7 +2025,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
             </button>
           </div>
           <div className="mobile-detail-body">
-            <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} primaryLanguage={primaryLanguage} />
+            <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} primaryLanguage={primaryLanguage} orgProfile={orgProfile} />
           </div>
         </div>
       )}
@@ -2329,22 +2388,28 @@ function DashboardView({ rules, onNavigate }) {
 
 function MatrixView({ rules, onSelectRule, isMobile, orgProfile }) {
   const deployedSet = useMemo(() => deployedLogSourceIds(orgProfile), [orgProfile])
+  const eventsDeployed = useMemo(() => deployedEventsMap(orgProfile), [orgProfile])
   const profileApplied = deployedSet.size > 0
 
-  // Map technique_id (top-level) → { total: N, covered: M } where covered
-  // counts rules whose data_sources match a deployed log source.
+  // Map technique_id (top-level) → { total, covered, partial } where covered
+  // counts rules whose required events are all present, and partial counts
+  // rules with some events present. Falls back to keyword-based coverage when
+  // a rule has no requirements field yet.
   const ruleCount = useMemo(() => {
     const m = new Map()
     rules.forEach(r => {
       const tid = (r.technique_id || '').split('.')[0]
       if (!tid) return
-      const cur = m.get(tid) || { total: 0, covered: 0 }
+      const cur = m.get(tid) || { total: 0, covered: 0, partial: 0 }
       cur.total += 1
-      if (ruleIsCovered(r, deployedSet)) cur.covered += 1
+      const eventStatus = ruleEventCoverage(r, deployedSet, eventsDeployed, matchLogSourceId)
+      if (eventStatus === 'full')       cur.covered += 1
+      else if (eventStatus === 'partial') cur.partial += 1
+      else if (eventStatus === null && ruleIsCovered(r, deployedSet)) cur.covered += 1
       m.set(tid, cur)
     })
     return m
-  }, [rules, deployedSet])
+  }, [rules, deployedSet, eventsDeployed])
 
   // Expansion: which (tactic|techniqueId) cell currently shows its rule list.
   const [expandedKey, setExpandedKey] = useState(null)
@@ -2388,14 +2453,20 @@ function MatrixView({ rules, onSelectRule, isMobile, orgProfile }) {
   const pctCovered = totalTechs ? Math.round(coveredTechs / totalTechs * 100) : 0
 
   const renderCell = (tactic, t) => {
-    const stats = ruleCount.get(t.id) || { total: 0, covered: 0 }
+    const stats = ruleCount.get(t.id) || { total: 0, covered: 0, partial: 0 }
     const total = stats.total
     const covered = stats.covered
+    const partial = stats.partial || 0
     // When a profile is set, color by *covered* rules. Without profile, color
     // by total — matches the old behavior so unprofiled users see something useful.
     const colorBy = profileApplied ? covered : total
     const s = shade(colorBy)
-    const dim = profileApplied && covered === 0 && total > 0
+    // Three-state dimming: fully bright if any rule fully runnable, 50% if any
+    // partial coverage, dimmed if no events present for any of the cell's rules.
+    let dimOpacity = 1
+    if (profileApplied && covered === 0 && total > 0) {
+      dimOpacity = partial > 0 ? 0.65 : 0.4
+    }
     const key = `${tactic}|${t.id}`
     const expanded = expandedKey === key
     const cellRules = expanded ? rulesForCell(tactic, t.id) : []
@@ -2406,7 +2477,7 @@ function MatrixView({ rules, onSelectRule, isMobile, orgProfile }) {
         : `${t.id} ${t.name} · ${total} rule${total>1?'s':''}`
     return (
       <div key={t.id} className={`attack-cell-wrap${expanded?' open':''}`}>
-        <div className="attack-cell" style={{background:s.background, borderColor:s.border, opacity: dim ? 0.4 : 1}}
+        <div className="attack-cell" style={{background:s.background, borderColor:s.border, opacity: dimOpacity}}
              title={titleStr}>
           <a className="attack-cell-link" href={`https://attack.mitre.org/techniques/${t.id}/`} target="_blank" rel="noreferrer">
             <span className="attack-cell-id" style={{color:s.color}}>{t.id}</span>
@@ -2670,10 +2741,7 @@ function ChainsView({ rules, onNavigate }) {
 
 function RecommendView({ rules, orgProfile }) {
   const cCrit = { Critical:'#DC2626', High:'#7C3AED', Medium:'#2563EB', Low:'#6E6E7C' }
-  const critOrder = { Critical:0, High:1, Medium:2, Low:3 }
 
-  // Count how many rules each log source unlocks (rules whose data_sources
-  // match the keyword for that source).
   const rulesPerSource = useMemo(() => {
     const out = {}
     for (const ls of LOG_SOURCES) out[ls.id] = 0
@@ -2688,54 +2756,128 @@ function RecommendView({ rules, orgProfile }) {
     return out
   }, [rules])
 
+  // Event-level aggregation pulled from rule.requirements.
+  const eventsBySource = useMemo(() => aggregateEventsBySource(rules, matchLogSourceId), [rules])
   const deployedSet = useMemo(() => deployedLogSourceIds(orgProfile), [orgProfile])
+  const eventsDeployed = useMemo(() => deployedEventsMap(orgProfile), [orgProfile])
 
-  // Sort: deployed first, then by criticality, then tier, then rule count.
-  const sorted = useMemo(() => [...LOG_SOURCES].sort((a, b) => {
-    const ad = deployedSet.has(a.id) ? 0 : 1
-    const bd = deployedSet.has(b.id) ? 0 : 1
-    if (ad !== bd) return ad - bd
-    return (critOrder[a.criticality] ?? 9) - (critOrder[b.criticality] ?? 9)
-        || a.tier - b.tier
-        || (rulesPerSource[b.id] || 0) - (rulesPerSource[a.id] || 0)
-  }), [deployedSet, rulesPerSource])
+  const [expandedId, setExpandedId] = useState(null)
 
-  const deployedCount = sorted.filter(ls => deployedSet.has(ls.id)).length
+  const deployedCount = LOG_SOURCES.filter(ls => deployedSet.has(ls.id)).length
   const totalRulesCovered = useMemo(() => {
     if (deployedSet.size === 0) return 0
     return rules.filter(r => ruleIsCovered(r, deployedSet)).length
   }, [rules, deployedSet])
+
+  // Group by tier so the view reads top-to-bottom by criticality.
+  const tiers = [1, 2, 3]
+  const byTier = {}
+  for (const t of tiers) byTier[t] = LOG_SOURCES.filter(ls => ls.tier === t)
+  const tierLabel = (t) => t === 1 ? 'Tier 1 — Critical' : t === 2 ? 'Tier 2 — High' : 'Tier 3 — Medium'
 
   return (
     <div className="view">
       <div className="section-header"><Database size={13} />Log Source Criticality Assessment</div>
       <div style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 14 }}>
         {deployedSet.size > 0
-          ? <>You have <strong>{deployedCount}</strong> of {LOG_SOURCES.length} log sources deployed, covering <strong>{totalRulesCovered}</strong> of {rules.length} rules.</>
+          ? <>You have <strong>{deployedCount}</strong> of {LOG_SOURCES.length} log sources deployed, covering <strong>{totalRulesCovered}</strong> of {rules.length} rules. Click a source to see the event IDs TDL rules require from it.</>
           : <>No org profile yet — set deployed log sources in <strong>Settings</strong> to see coverage.</>}
       </div>
-      <table className="log-source-table">
-        <thead><tr>
-          <th>Status</th><th>Criticality</th><th>Tier</th><th>Log Source</th><th>Rules</th>
-        </tr></thead>
-        <tbody>
-          {sorted.map(ls => {
-            const isDeployed = deployedSet.has(ls.id)
-            const dim = deployedSet.size > 0 && !isDeployed
-            return (
-              <tr key={ls.id} style={{ opacity: dim ? 0.45 : 1 }}>
-                <td style={{ fontSize: 11, color: isDeployed ? '#10B981' : 'var(--text3)', fontFamily: 'var(--mono)' }}>
-                  {isDeployed ? '✓ Deployed' : '— Not deployed'}
-                </td>
-                <td style={{color:cCrit[ls.criticality]||'var(--text2)'}}>{ls.criticality}</td>
-                <td style={{fontFamily:'var(--mono)',fontSize:11}}>T{ls.tier}</td>
-                <td>{ls.name}</td>
-                <td style={{fontFamily:'var(--mono)',fontSize:12,color:'#7C3AED',fontWeight:700}}>{rulesPerSource[ls.id] || 0}</td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
+
+      {tiers.map(tier => {
+        const sources = byTier[tier]
+        if (!sources.length) return null
+        const tierDeployed = sources.filter(ls => deployedSet.has(ls.id)).length
+        return (
+          <div key={tier} style={{ marginBottom: 18 }}>
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 8, padding: '8px 0',
+              fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
+              letterSpacing: '.08em', color: 'var(--text3)',
+              borderBottom: '1px solid var(--border)', marginBottom: 6,
+            }}>
+              <span>{tierLabel(tier)}</span>
+              <span style={{ color: 'var(--text2)', fontWeight: 500 }}>
+                · {tierDeployed} of {sources.length} deployed
+              </span>
+            </div>
+            {sources.map(ls => {
+              const isDeployed = deployedSet.has(ls.id)
+              const expanded = expandedId === ls.id
+              const events = eventsBySource[ls.id] || {}
+              const eventIds = Object.keys(events).sort((a, b) => (isNaN(+a) || isNaN(+b)) ? a.localeCompare(b) : +a - +b)
+              const have = new Set(eventsDeployed[ls.id] || [])
+              return (
+                <div key={ls.id} style={{
+                  border: '1px solid var(--border)', borderRadius: 6,
+                  marginBottom: 6, background: 'var(--bg2)',
+                  opacity: (deployedSet.size > 0 && !isDeployed) ? 0.55 : 1,
+                }}>
+                  <div onClick={() => setExpandedId(expanded ? null : ls.id)} style={{
+                    display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '10px 12px', cursor: 'pointer', userSelect: 'none',
+                  }}>
+                    <ChevronRight size={12} style={{
+                      transition: 'transform .15s', color: 'var(--text3)',
+                      transform: expanded ? 'rotate(90deg)' : 'rotate(0)',
+                    }} />
+                    <span style={{
+                      fontSize: 11, fontFamily: 'var(--mono)',
+                      color: isDeployed ? '#10B981' : 'var(--text3)',
+                      minWidth: 96,
+                    }}>{isDeployed ? '✓ Deployed' : '✗ Not deployed'}</span>
+                    <span style={{ flex: 1, fontWeight: 600 }}>{ls.name}</span>
+                    <span style={{ fontSize: 11, color: cCrit[ls.criticality] || 'var(--text2)' }}>{ls.criticality}</span>
+                    <span style={{
+                      fontFamily: 'var(--mono)', fontSize: 12, color: '#7C3AED',
+                      fontWeight: 700, minWidth: 50, textAlign: 'right',
+                    }}>{rulesPerSource[ls.id] || 0} rules</span>
+                  </div>
+                  {expanded && (
+                    <div style={{ padding: '4px 14px 12px 30px', borderTop: '1px solid var(--border)' }}>
+                      {eventIds.length === 0 ? (
+                        <div style={{ fontSize: 12, color: 'var(--text3)', padding: '8px 0' }}>
+                          No event-ID breakdown yet — rules haven't been backfilled with requirements.
+                        </div>
+                      ) : (
+                        eventIds.map(eid => {
+                          const ev = events[eid]
+                          const present = have.has(eid)
+                          const missingHint = isDeployed && !present
+                          return (
+                            <div key={eid} style={{
+                              display: 'flex', alignItems: 'center', gap: 10,
+                              padding: '4px 0', fontSize: 12,
+                              color: missingHint ? '#FBBF24' : 'var(--text2)',
+                            }}>
+                              <span style={{
+                                width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
+                                background: ev.required ? '#F87171' : '#3F3F46',
+                              }} title={ev.required ? 'Required' : 'Optional'} />
+                              <span style={{ fontFamily: 'var(--mono)', color: '#A78BFA', minWidth: 50 }}>{eid}</span>
+                              <span style={{ flex: 1 }}>{ev.name}</span>
+                              <span style={{ fontSize: 11, color: 'var(--text3)' }}>
+                                Required by {ev.rule_ids.length} rule{ev.rule_ids.length === 1 ? '' : 's'}
+                              </span>
+                              <span style={{
+                                fontSize: 10, fontFamily: 'var(--mono)',
+                                color: present ? '#10B981' : missingHint ? '#FBBF24' : 'var(--text3)',
+                                minWidth: 64, textAlign: 'right',
+                              }}>
+                                {present ? '✓ collected' : missingHint ? '⚠ missing' : '— not set'}
+                              </span>
+                            </div>
+                          )
+                        })
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -2988,7 +3130,7 @@ const buildViews = (ruleCount, techCount, chainCount) => [
   { id:'settings',  label:'Settings',         icon:<Sliders size={14} /> },
 ]
 
-export default function App({ user = null, orgProfile = null, onProfileChange, onSignOut }) {
+export default function App({ user = null, orgProfile = null, onProfileChange, onSignOut, onRerunSetup }) {
   const isMobile = useMediaQuery('(max-width: 768px)')
   const [view, setView] = useState('dashboard')
   const [rules, setRules] = useState(RULES_RAW)
@@ -3092,7 +3234,7 @@ export default function App({ user = null, orgProfile = null, onProfileChange, o
         </aside>
 
         <div className="main">
-          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} onRuleUpdated={replaceRule} onRuleAdded={addRule} onRuleDeleted={removeRule} primaryLanguage={orgProfile?.primary_query_language || orgProfile?.primary_siem} />}
+          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} onRuleUpdated={replaceRule} onRuleAdded={addRule} onRuleDeleted={removeRule} primaryLanguage={orgProfile?.primary_query_language || orgProfile?.primary_siem} orgProfile={orgProfile} />}
           {view === 'dashboard' && (
             <>
               <div className="topbar">
@@ -3142,7 +3284,7 @@ export default function App({ user = null, orgProfile = null, onProfileChange, o
               <div className="topbar">
                 <span className="topbar-title">Settings</span>
               </div>
-              <Settings profile={orgProfile} onSave={onProfileChange} />
+              <Settings profile={orgProfile} onSave={onProfileChange} onRerunSetup={onRerunSetup} />
             </>
           )}
         </div>

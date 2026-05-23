@@ -21,7 +21,7 @@ const LOG_SOURCES = [
   { id: 'mfa',                     name: 'MFA / Authentication App Logs' },
 ]
 
-export default function Settings({ profile, onSave }) {
+export default function Settings({ profile, onSave, onRerunSetup }) {
   const [orgName, setOrgName] = useState(profile?.org_name || '')
   const [primaryLanguage, setPrimaryLanguage] = useState(
     profile?.primary_query_language || profile?.primary_siem || 'spl'
@@ -60,6 +60,9 @@ export default function Settings({ profile, onSave }) {
         // keep the legacy key populated for any old reader
         primary_siem: primaryLanguage,
         log_sources_deployed: Array.from(logSources),
+        // Preserve any event-level inventory captured during onboarding; the
+        // per-event UI lives in the onboarding "Re-run setup" flow.
+        events_deployed: profile?.events_deployed || {},
         updated_at: new Date().toISOString(),
       })
       setSavedAt(new Date())
@@ -130,6 +133,12 @@ export default function Settings({ profile, onSave }) {
             {savedAt && <span style={{ color: '#7C5CFF', marginLeft: 12 }}>Saved.</span>}
             {error && <span style={{ color: '#F87171', marginLeft: 12 }}>{error}</span>}
           </span>
+          {onRerunSetup && (
+            <button type="button" onClick={onRerunSetup}
+                    style={{ ...S.button, background: 'transparent', color: '#9598A8', border: '1px solid #262833', fontWeight: 500 }}>
+              Re-run setup
+            </button>
+          )}
           <button type="submit" disabled={saving || !orgName.trim()} style={S.button}>
             {saving ? 'Saving…' : 'Save changes'}
           </button>

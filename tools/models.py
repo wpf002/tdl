@@ -85,6 +85,7 @@ class OrgProfile(Base):
     primary_siem = Column(String(32))  # legacy; kept for backward-compat reads
     primary_query_language = Column(String(32))  # canonical going forward (spl/kql/...)
     log_sources_deployed = Column(JSONB)  # list[str]
+    events_deployed = Column(JSONB)  # {log_source_id: [event_id, ...]}
     created_at = Column(String(32))
     updated_at = Column(String(32))
 

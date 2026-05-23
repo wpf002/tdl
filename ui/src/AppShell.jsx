@@ -212,7 +212,15 @@ function AuthedRoot({ user, onSignOut }) {
     return <OrgSetup userId={user.id} onComplete={persistProfile} />
   }
 
-  return <App user={user} orgProfile={profile} onProfileChange={persistProfile} onSignOut={onSignOut} />
+  return (
+    <App
+      user={user}
+      orgProfile={profile}
+      onProfileChange={persistProfile}
+      onSignOut={onSignOut}
+      onRerunSetup={() => setProfile(null)}
+    />
+  )
 }
 
 function CenteredMessage({ children }) {

@@ -1670,6 +1670,7 @@ def _org_to_dict(row):
         "primary_siem": row.primary_siem,
         "primary_query_language": lang,
         "log_sources_deployed": row.log_sources_deployed or [],
+        "events_deployed": row.events_deployed or {},
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -1703,6 +1704,9 @@ def put_org_profile():
     log_sources = body.get("log_sources_deployed") or []
     if not isinstance(log_sources, list):
         abort(400, description="log_sources_deployed must be a list")
+    events_deployed = body.get("events_deployed")
+    if events_deployed is not None and not isinstance(events_deployed, dict):
+        abort(400, description="events_deployed must be an object")
 
     now = datetime.now(timezone.utc).isoformat()
     with session_scope() as s:
@@ -1715,6 +1719,8 @@ def put_org_profile():
         # mirror into legacy column so older reads stay consistent
         row.primary_siem = primary_language
         row.log_sources_deployed = log_sources
+        if events_deployed is not None:
+            row.events_deployed = events_deployed
         row.updated_at = now
         s.flush()
         return jsonify(_org_to_dict(row))

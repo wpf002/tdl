@@ -193,6 +193,39 @@ function deployedLogSourceIds(orgProfile) {
   return new Set(raw.map(id => ORG_TO_CANONICAL_LOG_SOURCE_ID[id] || id))
 }
 
+// data_sources entries are often stored flat, e.g.
+//   ["Windows Active Directory", "Linux Operating System", "Event IDs: 4624"]
+// Visually they should nest: the "Event IDs: …" entries belong under their
+// owning log source (Windows IDs under Windows, Linux IDs under Linux, etc.).
+// Group them into [{ source, events: [string, …] }, …] for tiered rendering.
+const EVENT_ID_ENTRY_RE = /^\s*event\s*ids?\b/i
+const WINDOWS_EID_RE = /^(?:4\d{3}|1102|7045|11\d{2}|5140|5145|4104|4103)$/
+const SYSMON_EID_RE  = /^(?:1|3|7|8|10|11|12|13|14|22)$/
+function groupDataSources(items) {
+  const primaries = []
+  const events = []
+  for (const raw of items || []) {
+    const s = String(raw || '').trim()
+    if (!s) continue
+    if (EVENT_ID_ENTRY_RE.test(s)) events.push(s)
+    else primaries.push(s)
+  }
+  if (!primaries.length) return events.map(e => ({ source: e, events: [] }))
+  const groups = primaries.map(p => ({ source: p, events: [] }))
+  for (const ev of events) {
+    const ids = ev.match(/\d+/g) || []
+    const isWindowsEvent = ids.some(n => WINDOWS_EID_RE.test(n) || SYSMON_EID_RE.test(n))
+    let target = null
+    if (isWindowsEvent) {
+      target = groups.find(g => /windows|active directory|sysmon|microsoft/i.test(g.source))
+    }
+    if (!target) target = groups.find(g => /linux|syslog|auditd/i.test(g.source)) || null
+    if (!target) target = groups[0]
+    target.events.push(ev)
+  }
+  return groups
+}
+
 // Free-form rule.requirements log-source string → canonical log_source id.
 // Used by the event-level aggregation in data/requirements.js.
 function matchLogSourceId(text) {
@@ -1220,7 +1253,20 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
         <div className="section">
           <div className="section-title"><Database size={11} />Data Sources</div>
           <div className="list-items">
-            {rule.data_sources.map((s,i) => <div key={i} className="list-item"><div className="list-dot" />{s}</div>)}
+            {groupDataSources(rule.data_sources).map((g, i) => (
+              <div key={i} style={{ marginBottom: g.events.length ? 6 : 0 }}>
+                <div className="list-item"><div className="list-dot" />{g.source}</div>
+                {g.events.map((ev, j) => (
+                  <div key={j} style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    marginLeft: 22, fontSize: 12, color: 'var(--text2)', padding: '2px 0',
+                  }}>
+                    <span style={{ fontFamily: 'var(--mono)', color: 'var(--text3)', flexShrink: 0 }}>└─</span>
+                    <span>{ev}</span>
+                  </div>
+                ))}
+              </div>
+            ))}
           </div>
         </div>
       )}
@@ -2059,16 +2105,26 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
           <Sparkles size={12} style={{ marginRight: 6, verticalAlign: '-2px', color: '#7C5CFF' }} />
           Generate with AI
         </button>
+        <span aria-hidden="true" style={{
+          width: 1, alignSelf: 'stretch', background: 'var(--border)',
+          margin: '0 8px',
+        }} />
         <button
           type="button"
           className="topbar-link"
           onClick={() => setImportOpen(true)}
           title="Import Sigma or SIEM-dialect detection rules"
-          style={{ marginLeft: 6 }}
         >
           <Download size={12} style={{ marginRight: 6, verticalAlign: '-2px', color: '#7C5CFF', transform: 'rotate(180deg)' }} />
           Import
         </button>
+        <ExportButton
+          allRules={rules}
+          filteredRules={filtered}
+          selectedIds={[...selectedIds]}
+          onEnableSelectionMode={() => setSelectionMode(true)}
+          initialScope={selectedIds.size > 0 ? 'selected' : 'filtered'}
+        />
         <button
           type="button"
           className="topbar-link"
@@ -2078,13 +2134,6 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
         >
           {selectionMode ? `Selecting · ${selectedIds.size}` : 'Select'}
         </button>
-        <ExportButton
-          allRules={rules}
-          filteredRules={filtered}
-          selectedIds={[...selectedIds]}
-          onEnableSelectionMode={() => setSelectionMode(true)}
-          initialScope={selectedIds.size > 0 ? 'selected' : 'filtered'}
-        />
       </div>
       <div className="filterbar">
         <div className="filter-row">
@@ -2346,17 +2395,14 @@ function ExportModal({ open, onClose, allRules, filteredRules = null, selectedId
   return (
     <div style={overlay} onClick={onClose}>
       <div style={card} onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 4 }}>
-          <h2 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>Export rules</h2>
-          <button onClick={onClose} className="chip" style={{ marginLeft: 'auto' }}>Close</button>
-        </div>
+        <h2 style={{ fontSize: 16, fontWeight: 700, margin: 0, marginBottom: 4 }}>Export Rules</h2>
 
         <div style={section}>What to export</div>
         {[
           { id: 'filtered', label: `Current view${haveFiltered ? ` (${(filteredRules||allRules).length})` : ''}`, disabled: !filteredRules },
           { id: 'selected', label: `Selected rules${haveSelected ? ` (${selectedIds.length})` : ''}`, disabled: !haveSelected },
           { id: 'all',      label: `Entire library (${allRules.length})` },
-          { id: 'custom',   label: 'Custom — pick tactic / severity / lifecycle / tag' },
+          { id: 'custom',   label: 'Custom — Pick Tactic / Severity / Lifecycle / Tag' },
         ].map(opt => (
           <label key={opt.id} style={{ ...radioRow, opacity: opt.disabled ? 0.45 : 1 }}>
             <input type="radio" name="scope" value={opt.id}
@@ -3438,9 +3484,6 @@ export default function App({ user = null, orgProfile = null, onProfileChange, o
             <>
               <div className="topbar">
                 <span className="topbar-title">Dashboard</span>
-                <div style={{ marginLeft: 'auto' }}>
-                  <ExportButton allRules={rules} />
-                </div>
               </div>
               <DashboardView rules={rules} onNavigate={navigateToRules} />
             </>

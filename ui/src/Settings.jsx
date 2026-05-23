@@ -141,7 +141,7 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
               </button>
             )}
             <button type="submit" disabled={saving || !orgName.trim()} style={S.button}>
-              {saving ? 'Saving…' : 'Save changes'}
+              {saving ? 'Saving…' : 'Save Changes'}
             </button>
           </div>
         </div>

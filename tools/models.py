@@ -61,6 +61,7 @@ class Rule(Base):
     false_positives = Column(JSONB)
     triage_steps = Column(JSONB)
     tags = Column(JSONB)
+    requirements = Column(JSONB)  # {log_sources: [{source, events: [{id, name, required}]}]}
 
     test_method = Column(String(64))
     tuning_guidance = Column(Text)

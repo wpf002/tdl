@@ -1167,6 +1167,36 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage 
         </div>
       )}
 
+      {rule.requirements?.log_sources?.length > 0 && !editing && (
+        <div className="section">
+          <div className="section-title"><Layers size={11} />Requirements</div>
+          <div className="list-items">
+            {rule.requirements.log_sources.map((ls, i) => (
+              <div key={i} style={{ marginBottom: 8 }}>
+                <div className="list-item" style={{ fontWeight: 600 }}>
+                  <div className="list-dot" />{ls.source}
+                </div>
+                {(ls.events || []).map((ev, j) => (
+                  <div key={j} style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    marginLeft: 18, fontSize: 12, color: 'var(--text2)', padding: '2px 0',
+                  }}>
+                    <span style={{
+                      width: 8, height: 8, borderRadius: '50%',
+                      background: ev.required ? '#F87171' : '#3F3F46',
+                      flexShrink: 0,
+                    }} title={ev.required ? 'Required' : 'Optional'} />
+                    <span style={{ fontFamily: 'var(--mono)', color: '#A78BFA' }}>{ev.id}</span>
+                    <span>— {ev.name}</span>
+                    {ev.required && <span style={{ marginLeft: 'auto', fontSize: 10, color: '#F87171' }}>Required</span>}
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {(rule.false_positives?.length > 0 || editing) && (
         <div className="section">
           <div className="section-title"><AlertTriangle size={11} />False Positives</div>
@@ -1756,6 +1786,16 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
   const [fKc, setFKc]             = useState('All')
   const [aiOpen, setAiOpen]       = useState(false)
   const [importOpen, setImportOpen] = useState(false)
+  // Checkbox selection mode for selective export.
+  const [selectionMode, setSelectionMode] = useState(false)
+  const [selectedIds, setSelectedIds] = useState(() => new Set())
+  const toggleSelected = (rid) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      next.has(rid) ? next.delete(rid) : next.add(rid)
+      return next
+    })
+  }
 
   // Apply a cross-view handoff (e.g., dashboard tile click) once, then clear it.
   useEffect(() => {
@@ -1827,6 +1867,22 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
           <Download size={12} style={{ marginRight: 6, verticalAlign: '-2px', color: '#7C5CFF', transform: 'rotate(180deg)' }} />
           Import
         </button>
+        <button
+          type="button"
+          className="topbar-link"
+          onClick={() => { setSelectionMode(m => !m); if (selectionMode) setSelectedIds(new Set()) }}
+          title="Select rules to export"
+          style={{ marginLeft: 6, color: selectionMode ? '#7C5CFF' : undefined }}
+        >
+          {selectionMode ? `Selecting · ${selectedIds.size}` : 'Select'}
+        </button>
+        <ExportButton
+          allRules={rules}
+          filteredRules={filtered}
+          selectedIds={[...selectedIds]}
+          onEnableSelectionMode={() => setSelectionMode(true)}
+          initialScope={selectedIds.size > 0 ? 'selected' : 'filtered'}
+        />
       </div>
       <div className="filterbar">
         <div className="filter-row">
@@ -1869,7 +1925,17 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
           <div className="list-count">{filtered.length} rules</div>
           {filtered.map(r => (
             <div key={r.rule_id} className={`rule-row${selected?.rule_id===r.rule_id?' active':''}`}
-              onClick={()=>setSelected(r)}>
+              onClick={(e) => {
+                if (selectionMode) { toggleSelected(r.rule_id); e.preventDefault(); return }
+                setSelected(r)
+              }}>
+              {selectionMode && (
+                <input type="checkbox"
+                       checked={selectedIds.has(r.rule_id)}
+                       onClick={(e) => e.stopPropagation()}
+                       onChange={() => toggleSelected(r.rule_id)}
+                       style={{ accentColor: '#7C5CFF', marginRight: 8, verticalAlign: 'middle' }} />
+              )}
               <div className="rule-rid">{r.rule_id} · {r.technique_id}</div>
               <div className="rule-name">{r.name}</div>
               <div className="rule-meta">
@@ -1929,97 +1995,263 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
 
 // ─── COVERAGE EXPORT MENU ───────────────────────────────────────────────────
 
-function CoverageExportMenu() {
-  const [open, setOpen] = useState(false)
-  const [busy, setBusy] = useState(null)
+// ─── EXPORT MODAL ────────────────────────────────────────────────────────────
+// Selective export: scope (current view / selected / all / custom) ×
+// format (pdf / csv / json / sigma / yaml) × include_languages.
+
+const EXPORT_FORMATS = [
+  { id: 'pdf',   label: 'Coverage Report PDF' },
+  { id: 'csv',   label: 'Rules CSV' },
+  { id: 'json',  label: 'Rules JSON' },
+  { id: 'sigma', label: 'Sigma YAML (zip)' },
+  { id: 'yaml',  label: 'YAML Bundle (zip)' },
+]
+
+const TACTICS_ALL = [
+  'Initial Access','Execution','Persistence','Privilege Escalation','Defense Evasion',
+  'Credential Access','Discovery','Lateral Movement','Command and Control','Collection',
+  'Exfiltration','Impact',
+]
+const SEVERITIES_ALL = ['Critical','High','Medium','Low']
+const LIFECYCLES_ALL = ['Proposed','Tested','Deployed','Tuned','Retired']
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = filename
+  document.body.appendChild(a); a.click(); a.remove()
+  URL.revokeObjectURL(url)
+}
+
+function ExportModal({ open, onClose, allRules, filteredRules = null, selectedIds = [],
+                       initialScope = null, onEnableSelectionMode }) {
+  const haveFiltered = Array.isArray(filteredRules) && filteredRules.length !== allRules.length
+  const haveSelected = selectedIds.length > 0
+  const defaultScope = initialScope || (haveSelected ? 'selected' : (haveFiltered ? 'filtered' : 'all'))
+
+  const [scope, setScope] = useState(defaultScope)
+  const [fmt, setFmt] = useState('csv')
+  const [langs, setLangs] = useState(new Set(['spl','kql']))
+  const [customTactics, setCustomTactics] = useState(new Set())
+  const [customSevs, setCustomSevs] = useState(new Set())
+  const [customLifecycles, setCustomLifecycles] = useState(new Set())
+  const [customTag, setCustomTag] = useState('')
+  const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
-  const wrapRef = useRef(null)
 
   useEffect(() => {
     if (!open) return
-    const onDoc = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false) }
-    const onKey = (e) => { if (e.key === 'Escape') setOpen(false) }
-    document.addEventListener('mousedown', onDoc)
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('mousedown', onDoc)
-      document.removeEventListener('keydown', onKey)
-    }
+    setScope(defaultScope); setError(null)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
-  const download = async (key, url, fallbackFilename) => {
-    setBusy(key)
-    setError(null)
+  if (!open) return null
+
+  const toggle = (set, v) => {
+    const next = new Set(set)
+    next.has(v) ? next.delete(v) : next.add(v)
+    return next
+  }
+
+  // Resolve the rules that would be exported, for the preview count.
+  let previewCount = 0
+  if (scope === 'all') previewCount = allRules.length
+  else if (scope === 'selected') previewCount = selectedIds.length
+  else if (scope === 'filtered') previewCount = (filteredRules || allRules).length
+  else if (scope === 'custom') {
+    previewCount = allRules.filter(r => {
+      if (customTactics.size && !customTactics.has(r.tactic)) return false
+      if (customSevs.size && !customSevs.has(r.severity)) return false
+      if (customLifecycles.size && !customLifecycles.has(r.lifecycle)) return false
+      if (customTag.trim()) {
+        const tag = customTag.trim().toLowerCase()
+        if (!(r.tags || []).some(t => (t || '').toLowerCase().includes(tag))) return false
+      }
+      return true
+    }).length
+  }
+
+  const langApplies = fmt === 'json' || fmt === 'yaml'
+
+  const doExport = async () => {
+    setBusy(true); setError(null)
     try {
-      const r = await fetch(url, { credentials: 'include' })
-      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const body = { scope, format: fmt }
+      if (scope === 'selected') body.rule_ids = selectedIds
+      if (scope === 'filtered' && filteredRules) body.rule_ids = filteredRules.map(r => r.rule_id)
+      if (scope === 'filtered' && !filteredRules) body.scope = 'all'
+      if (scope === 'custom') {
+        body.filters = {
+          tactics: [...customTactics],
+          severities: [...customSevs],
+          lifecycles: [...customLifecycles],
+          tag: customTag.trim() || undefined,
+        }
+      }
+      if (langApplies) body.include_languages = [...langs]
+
+      // When scope=filtered we converted to selected via rule_ids — re-tag.
+      if (scope === 'filtered' && body.rule_ids) body.scope = 'selected'
+
+      const r = await fetch('/api/export', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!r.ok) {
+        const t = await r.text().catch(() => '')
+        throw new Error(`HTTP ${r.status}${t ? `: ${t.slice(0, 200)}` : ''}`)
+      }
       const blob = await r.blob()
       const cd = r.headers.get('Content-Disposition') || ''
       const m = /filename="([^"]+)"/.exec(cd)
-      const filename = m ? m[1] : fallbackFilename
-      const objUrl = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = objUrl
-      a.download = filename
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      URL.revokeObjectURL(objUrl)
-      setOpen(false)
+      downloadBlob(blob, m ? m[1] : `tdl-export.${fmt === 'sigma' || fmt === 'yaml' ? 'zip' : fmt}`)
+      onClose()
     } catch (e) {
       setError(e.message || 'Export failed')
     } finally {
-      setBusy(null)
+      setBusy(false)
     }
   }
 
-  const COVERAGE = [
-    { key: 'cov-pdf',  label: 'PDF',  url: '/api/coverage/export?format=pdf',  fallback: 'tdl-coverage.pdf'  },
-    { key: 'cov-csv',  label: 'CSV',  url: '/api/coverage/export?format=csv',  fallback: 'tdl-coverage.csv'  },
-    { key: 'cov-json', label: 'JSON', url: '/api/coverage/export?format=json', fallback: 'tdl-coverage.json' },
-  ]
-  const LIBRARY = [
-    { key: 'rules-yaml', label: 'YAML', url: '/api/rules/export?format=yaml', fallback: 'tdl-rules.zip' },
-  ]
-
-  const renderItem = (opt) => (
-    <button
-      key={opt.key}
-      type="button"
-      role="menuitem"
-      className="export-item"
-      disabled={busy !== null}
-      onClick={() => download(opt.key, opt.url, opt.fallback)}
-    >
-      {busy === opt.key ? 'Downloading…' : opt.label}
-    </button>
-  )
+  const overlay = { position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', zIndex: 60,
+                    display: 'grid', placeItems: 'center', padding: 16 }
+  const card = { width: '100%', maxWidth: 620, maxHeight: '88vh', overflowY: 'auto',
+                 background: '#15161D', border: '1px solid #262833', borderRadius: 10,
+                 color: '#E6E7EE', padding: 22 }
+  const section = { marginTop: 14, fontSize: 12, fontWeight: 600,
+                    textTransform: 'uppercase', letterSpacing: '.08em', color: 'var(--text3)' }
+  const radioRow = { display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13, marginTop: 6 }
+  const checkChip = (on) => ({
+    fontSize: 12, padding: '4px 10px', borderRadius: 6, cursor: 'pointer',
+    border: `1px solid ${on ? '#7C5CFF' : '#262833'}`,
+    background: on ? 'rgba(124,92,255,.12)' : '#0B0B11',
+    color: on ? '#A78BFA' : 'var(--text2)',
+    userSelect: 'none',
+  })
 
   return (
-    <div ref={wrapRef} className="export-menu">
-      <button
-        type="button"
-        className="topbar-link export-btn"
-        onClick={() => setOpen(o => !o)}
-        aria-haspopup="menu"
-        aria-expanded={open}
-        title="Export"
-      >
-        <Download size={12} style={{ marginRight: 6, verticalAlign: '-2px' }} />
-        Export
-        <ChevronDown size={12} style={{ marginLeft: 6, verticalAlign: '-2px' }} />
-      </button>
-      {open && (
-        <div className="export-pop" role="menu">
-          <div className="export-section-label">Coverage report</div>
-          {COVERAGE.map(renderItem)}
-          <div className="export-divider" />
-          <div className="export-section-label">Rule library · DaaC</div>
-          {LIBRARY.map(renderItem)}
-          {error && <div className="export-err">{error}</div>}
+    <div style={overlay} onClick={onClose}>
+      <div style={card} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 4 }}>
+          <h2 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>Export rules</h2>
+          <button onClick={onClose} className="chip" style={{ marginLeft: 'auto' }}>Close</button>
         </div>
-      )}
+
+        <div style={section}>What to export</div>
+        {[
+          { id: 'filtered', label: `Current view${haveFiltered ? ` (${(filteredRules||allRules).length})` : ''}`, disabled: !filteredRules },
+          { id: 'selected', label: `Selected rules${haveSelected ? ` (${selectedIds.length})` : ''}`, disabled: !haveSelected },
+          { id: 'all',      label: `Entire library (${allRules.length})` },
+          { id: 'custom',   label: 'Custom — pick tactic / severity / lifecycle / tag' },
+        ].map(opt => (
+          <label key={opt.id} style={{ ...radioRow, opacity: opt.disabled ? 0.45 : 1 }}>
+            <input type="radio" name="scope" value={opt.id}
+                   checked={scope === opt.id} disabled={opt.disabled}
+                   onChange={() => setScope(opt.id)} style={{ accentColor: '#7C5CFF', marginTop: 3 }} />
+            <div>
+              <div>{opt.label}</div>
+              {opt.id === 'selected' && !haveSelected && (
+                <button type="button" onClick={() => { onEnableSelectionMode && onEnableSelectionMode(); onClose() }}
+                        className="chip" style={{ marginTop: 4, fontSize: 11 }}>
+                  Enable selection mode in Rules view →
+                </button>
+              )}
+            </div>
+          </label>
+        ))}
+
+        {scope === 'custom' && (
+          <div style={{ marginTop: 8, padding: 12, border: '1px solid #262833', borderRadius: 6 }}>
+            <div style={{ fontSize: 11, color: 'var(--text3)', marginBottom: 4 }}>Tactics</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {TACTICS_ALL.map(t => (
+                <span key={t} style={checkChip(customTactics.has(t))}
+                      onClick={() => setCustomTactics(toggle(customTactics, t))}>{t}</span>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text3)', margin: '10px 0 4px' }}>Severity</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {SEVERITIES_ALL.map(s => (
+                <span key={s} style={checkChip(customSevs.has(s))}
+                      onClick={() => setCustomSevs(toggle(customSevs, s))}>{s}</span>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text3)', margin: '10px 0 4px' }}>Lifecycle</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {LIFECYCLES_ALL.map(l => (
+                <span key={l} style={checkChip(customLifecycles.has(l))}
+                      onClick={() => setCustomLifecycles(toggle(customLifecycles, l))}>{l}</span>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text3)', margin: '10px 0 4px' }}>Tag contains</div>
+            <input type="text" value={customTag} onChange={e => setCustomTag(e.target.value)}
+                   placeholder="e.g. ransomware"
+                   style={{ background: '#0B0B11', border: '1px solid #262833', borderRadius: 6,
+                            padding: '6px 10px', color: '#E6E7EE', fontSize: 12, width: '100%' }} />
+          </div>
+        )}
+
+        <div style={section}>Format</div>
+        {EXPORT_FORMATS.map(f => (
+          <label key={f.id} style={radioRow}>
+            <input type="radio" name="fmt" value={f.id} checked={fmt === f.id}
+                   onChange={() => setFmt(f.id)} style={{ accentColor: '#7C5CFF', marginTop: 3 }} />
+            {f.label}
+          </label>
+        ))}
+
+        <div style={{ ...section, opacity: langApplies ? 1 : 0.45 }}>
+          Query languages to include {langApplies ? '' : '(JSON / YAML only)'}
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6, opacity: langApplies ? 1 : 0.45 }}>
+          {QUERY_LANGUAGES.map(l => (
+            <span key={l.key} style={checkChip(langs.has(l.key))}
+                  onClick={() => langApplies && setLangs(toggle(langs, l.key))}>
+              {l.cardName}
+            </span>
+          ))}
+        </div>
+
+        <div style={{ marginTop: 18, padding: '10px 12px', background: '#0B0B11',
+                      border: '1px solid #262833', borderRadius: 6, fontSize: 12, color: 'var(--text2)' }}>
+          Exporting <strong style={{ color: 'var(--text)' }}>{previewCount}</strong> rule{previewCount === 1 ? '' : 's'} in <strong style={{ color: 'var(--text)' }}>{EXPORT_FORMATS.find(f => f.id === fmt)?.label}</strong> format.
+        </div>
+
+        {error && <div style={{ color: '#F87171', fontSize: 12, marginTop: 10 }}>{error}</div>}
+
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}>
+          <button onClick={onClose} className="chip" disabled={busy}>Cancel</button>
+          <button onClick={doExport} disabled={busy || previewCount === 0} className="chip on"
+                  style={{ background: '#7C5CFF', color: '#fff', borderColor: '#7C5CFF' }}>
+            {busy ? 'Exporting…' : 'Export'}
+          </button>
+        </div>
+      </div>
     </div>
+  )
+}
+
+function ExportButton({ allRules, filteredRules = null, selectedIds = [], onEnableSelectionMode,
+                        label = 'Export', initialScope = null }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <>
+      <button type="button" className="topbar-link export-btn"
+              onClick={() => setOpen(true)} title="Export">
+        <Download size={12} style={{ marginRight: 6, verticalAlign: '-2px' }} />
+        {label}
+      </button>
+      <ExportModal
+        open={open}
+        onClose={() => setOpen(false)}
+        allRules={allRules}
+        filteredRules={filteredRules}
+        selectedIds={selectedIds}
+        initialScope={initialScope}
+        onEnableSelectionMode={onEnableSelectionMode}
+      />
+    </>
   )
 }
 
@@ -2510,11 +2742,29 @@ function RecommendView({ rules, orgProfile }) {
 
 // ─── DOCUMENTATION ───────────────────────────────────────────────────────────
 
+const PORTABILITY_ROWS = [
+  { from: 'TDL YAML',  to: 'TDL Playbook',           path: 'direct',                             lossy: false },
+  { from: 'TDL YAML',  to: 'Sigma YAML',             path: 'tools/sigma_gen.to_sigma()',         lossy: true,  note: 'TDL-only fields dropped' },
+  { from: 'TDL YAML',  to: 'Splunk (SPL)',           path: 'queries.spl',                         lossy: false },
+  { from: 'TDL YAML',  to: 'Microsoft Sentinel (KQL)', path: 'queries.kql',                       lossy: false },
+  { from: 'TDL YAML',  to: 'IBM QRadar (AQL)',       path: 'queries.aql',                         lossy: false },
+  { from: 'TDL YAML',  to: 'Google Chronicle (YARA-L)', path: 'queries.yara_l',                   lossy: false },
+  { from: 'TDL YAML',  to: 'Elastic (ES|QL)',        path: 'queries.esql',                        lossy: false },
+  { from: 'TDL YAML',  to: 'Rapid7 (LEQL)',          path: 'queries.leql',                        lossy: false },
+  { from: 'TDL YAML',  to: 'CrowdStrike LogScale',   path: 'queries.crowdstrike',                 lossy: false },
+  { from: 'TDL YAML',  to: 'Palo Alto XSIAM (XQL)',  path: 'queries.xql',                         lossy: false },
+  { from: 'TDL YAML',  to: 'OpenSearch / Graylog',   path: 'queries.lucene',                      lossy: false },
+  { from: 'TDL YAML',  to: 'Sumo Logic',             path: 'queries.sumo',                        lossy: false },
+  { from: 'Sigma YAML',to: 'TDL YAML',               path: 'tools/sigma_parser + AI translator',  lossy: false, note: 'enriched on import' },
+  { from: 'Sigma YAML',to: 'Any vendor',             path: 'pysigma backends',                    lossy: false, note: 'per backend' },
+]
+
 function DocsView() {
-  const [tab, setTab] = useState('languages') // languages | schema
+  const [tab, setTab] = useState('languages') // languages | schema | portability
   const tabs = [
-    { id: 'languages', label: 'Query Language Reference' },
-    { id: 'schema',    label: 'TDL Rule Schema' },
+    { id: 'languages',   label: 'Query Language Reference' },
+    { id: 'schema',      label: 'TDL Rule Schema' },
+    { id: 'portability', label: 'Schema & Portability' },
   ]
   return (
     <div className="view" style={{ padding: 28 }}>
@@ -2564,6 +2814,49 @@ function DocsView() {
                 </a>
               </div>
             ))}
+          </div>
+        </section>
+      )}
+
+      {tab === 'portability' && (
+        <section>
+          <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Schema & Portability</h2>
+          <p style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 18, lineHeight: 1.6 }}>
+            TDL YAML is the canonical authoring format. <strong>Sigma</strong> is the
+            portability layer: every TDL rule converts to Sigma via{' '}
+            <code style={{ fontFamily: 'var(--mono)' }}>tools/sigma_gen.py</code>, and Sigma
+            rules import back via <code style={{ fontFamily: 'var(--mono)' }}>tools/sigma_parser.py</code>{' '}
+            (enriched by the agent system on the way in).
+            See <a href="https://github.com/wpf002/tdl/blob/main/docs/yaml-schema.md"
+                  target="_blank" rel="noreferrer" style={{ color: '#7C5CFF' }}>
+              docs/yaml-schema.md
+            </a>{' '}for the full field-by-field mapping.
+          </p>
+          <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 10 }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5 }}>
+              <thead>
+                <tr style={{ background: 'var(--bg1)', textAlign: 'left' }}>
+                  <th style={{ padding: '10px 12px', fontWeight: 600 }}>Source</th>
+                  <th style={{ padding: '10px 12px', fontWeight: 600 }}>Destination</th>
+                  <th style={{ padding: '10px 12px', fontWeight: 600 }}>Path</th>
+                  <th style={{ padding: '10px 12px', fontWeight: 600 }}>Lossy?</th>
+                </tr>
+              </thead>
+              <tbody>
+                {PORTABILITY_ROWS.map((row, i) => (
+                  <tr key={i} style={{ borderTop: '1px solid var(--border)' }}>
+                    <td style={{ padding: '8px 12px', color: 'var(--text)' }}>{row.from}</td>
+                    <td style={{ padding: '8px 12px', color: 'var(--text)' }}>{row.to}</td>
+                    <td style={{ padding: '8px 12px', fontFamily: 'var(--mono)', color: 'var(--text2)' }}>{row.path}</td>
+                    <td style={{ padding: '8px 12px' }}>
+                      {row.lossy
+                        ? <span style={{ color: '#F87171' }}>yes{row.note ? ` — ${row.note}` : ''}</span>
+                        : <span style={{ color: '#10B981' }}>no{row.note ? ` — ${row.note}` : ''}</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </section>
       )}
@@ -2805,7 +3098,7 @@ export default function App({ user = null, orgProfile = null, onProfileChange, o
               <div className="topbar">
                 <span className="topbar-title">Dashboard</span>
                 <div style={{ marginLeft: 'auto' }}>
-                  <CoverageExportMenu />
+                  <ExportButton allRules={rules} />
                 </div>
               </div>
               <DashboardView rules={rules} onNavigate={navigateToRules} />

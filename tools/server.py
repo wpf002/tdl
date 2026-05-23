@@ -67,6 +67,7 @@ RULE_COLUMNS = (
     "platform", "data_sources",
     "severity", "fidelity", "lifecycle", "risk_score",
     "queries", "pseudo_logic", "false_positives", "triage_steps", "tags",
+    "requirements",
     "test_method", "tuning_guidance",
     "author", "created", "last_modified",
     "org_id", "is_custom",
@@ -480,6 +481,7 @@ EDITABLE_RULE_FIELDS = {
     "platform", "data_sources",
     "severity", "fidelity", "lifecycle", "risk_score",
     "queries", "pseudo_logic", "false_positives", "triage_steps", "tags",
+    "requirements",
     "test_method", "tuning_guidance",
 }
 
@@ -1260,6 +1262,173 @@ def rules_export():
         buf.getvalue(),
         mimetype="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _as_list(v):
+    if v is None:
+        return []
+    return v if isinstance(v, list) else [v]
+
+
+def _select_export_rules(scope, rule_ids, filters, all_rules):
+    """Resolve the set of rules to export for a given scope.
+
+    scope: "all" | "selected" | "filtered" | "custom".
+    filters (filtered/custom): {tactic|tactics, severity|severities,
+                                lifecycle|lifecycles, tag, q}.
+    """
+    filters = filters or {}
+    if scope == "all":
+        return all_rules
+    if scope == "selected":
+        ids = set(rule_ids or [])
+        return [r for r in all_rules if r.get("rule_id") in ids]
+
+    # filtered / custom — multi-select aware
+    tactics = set(_as_list(filters.get("tactics") or filters.get("tactic")))
+    sevs = set(_as_list(filters.get("severities") or filters.get("severity")))
+    lifecycles = set(_as_list(filters.get("lifecycles") or filters.get("lifecycle")))
+    tag = (filters.get("tag") or "").lower().strip()
+    q = (filters.get("q") or "").lower().strip()
+    tactics.discard("All"); sevs.discard("All"); lifecycles.discard("All")
+
+    out = all_rules
+    if tactics:
+        out = [r for r in out if r.get("tactic") in tactics]
+    if sevs:
+        out = [r for r in out if r.get("severity") in sevs]
+    if lifecycles:
+        out = [r for r in out if r.get("lifecycle") in lifecycles]
+    if tag:
+        out = [r for r in out if any(tag in (t or "").lower() for t in (r.get("tags") or []))]
+    if q:
+        def _m(r):
+            return (q in (r.get("name") or "").lower()
+                    or q in (r.get("rule_id") or "").lower()
+                    or q in (r.get("technique_id") or "").lower()
+                    or any(q in (t or "").lower() for t in (r.get("tags") or [])))
+        out = [r for r in out if _m(r)]
+    return out
+
+
+def _filter_languages(rule, include_languages):
+    """Return a copy of rule with queries trimmed to include_languages."""
+    if not include_languages:
+        return rule
+    keep = set(include_languages)
+    r = dict(rule)
+    r["queries"] = {k: v for k, v in (rule.get("queries") or {}).items() if k in keep}
+    return r
+
+
+def _rules_csv(rules):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["rule_id", "name", "tactic", "technique_id", "technique_name",
+                "severity", "fidelity", "lifecycle", "platform", "data_sources", "tags"])
+    for r in rules:
+        w.writerow([
+            r.get("rule_id", ""), r.get("name", ""), r.get("tactic", ""),
+            r.get("technique_id", ""), r.get("technique_name", ""),
+            r.get("severity", ""), r.get("fidelity", ""), r.get("lifecycle", ""),
+            ";".join(r.get("platform") or []),
+            ";".join(r.get("data_sources") or []),
+            ";".join(r.get("tags") or []),
+        ])
+    return buf.getvalue()
+
+
+@app.post("/api/export")
+def export_rules():
+    """Selective export — scope + format + which query languages to include.
+
+    Body: { scope, rule_ids, filters, format, include_languages }
+      scope:   "filtered" | "selected" | "all" | "custom"
+      format:  "pdf" | "csv" | "json" | "sigma" | "yaml"
+      include_languages: query keys to keep in json/yaml exports
+    """
+    body = request.get_json(silent=True) or {}
+    scope = (body.get("scope") or "filtered").lower()
+    fmt = (body.get("format") or "json").lower()
+    rule_ids = body.get("rule_ids") or []
+    filters = body.get("filters") or {}
+    include_languages = [k for k in (body.get("include_languages") or []) if k in QUERY_KEYS]
+
+    if scope not in ("filtered", "selected", "all", "custom"):
+        abort(400, description="scope must be filtered|selected|all|custom")
+    if fmt not in ("pdf", "csv", "json", "sigma", "yaml"):
+        abort(400, description="format must be pdf|csv|json|sigma|yaml")
+
+    # Coverage PDF is library-wide and reuses the existing report.
+    if fmt == "pdf":
+        p = MATRIX / "coverage_report.json"
+        if not p.exists():
+            subprocess.run(["node", str(ROOT / "tools" / "coverage.js")], check=True, cwd=ROOT)
+        with p.open("r", encoding="utf-8") as f:
+            report = json.load(f)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+        return Response(
+            _coverage_pdf(report),
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="tdl-coverage-{stamp}.pdf"'},
+        )
+
+    rules = _select_export_rules(scope, rule_ids, filters, _load_full_rules())
+    if not rules:
+        abort(404, description="no rules match the export selection")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    n = len(rules)
+
+    if fmt == "csv":
+        return Response(
+            _rules_csv(rules),
+            mimetype="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="tdl-rules-{n}-{stamp}.csv"'},
+        )
+
+    if fmt == "json":
+        trimmed = [_filter_languages(r, include_languages) for r in rules]
+        return Response(
+            json.dumps(trimmed, indent=2, default=str),
+            mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="tdl-rules-{n}-{stamp}.json"'},
+        )
+
+    import yaml
+    drop_keys = {"org_id", "is_custom"}
+
+    if fmt == "yaml":
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for r in rules:
+                r = _filter_languages(r, include_languages)
+                payload = {k: v for k, v in r.items()
+                           if k not in drop_keys and v is not None and v != ""}
+                tactic_slug = (r.get("tactic") or "uncategorized").lower().replace(" ", "-")
+                zf.writestr(
+                    f"rules/{tactic_slug}/{r['rule_id']}.yaml",
+                    yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+                )
+        return Response(
+            buf.getvalue(), mimetype="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="tdl-yaml-{n}-{stamp}.zip"'},
+        )
+
+    # fmt == "sigma" — zip of Sigma .yml files
+    from tools.sigma_gen import to_sigma, sigma_to_yaml
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for r in rules:
+            try:
+                sigma_yaml = sigma_to_yaml(to_sigma(r))
+            except Exception as e:
+                sigma_yaml = f"# could not convert {r.get('rule_id')}: {e}\n"
+            zf.writestr(f"sigma/{r['rule_id']}.yml", sigma_yaml)
+    return Response(
+        buf.getvalue(), mimetype="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="tdl-sigma-{n}-{stamp}.zip"'},
     )
 
 

@@ -5,7 +5,7 @@ import {
   BarChart3, Layers, Crosshair, Clock, TrendingUp, ChevronDown,
   Terminal, Zap, GitBranch, Map as MapIcon, Award, Eye, Lock, Cpu,
   ArrowRight, Circle, Minus, Download, Edit3, Trash2, Sliders, Sparkles,
-  BookOpen, ExternalLink
+  BookOpen, ExternalLink, Sun, Moon
 } from 'lucide-react'
 import { LogOut } from 'lucide-react'
 import RULES_RAW from './data/rules.json'
@@ -16,6 +16,7 @@ import {
   aggregateEventsBySource, rulePerSourceRequirements,
   ruleEventCoverage, ruleCoverageDetail,
 } from './data/requirements.js'
+import { ruleQualityScore, qualityColor } from './data/quality.js'
 import Settings from './Settings.jsx'
 
 // ─── HOOKS ──────────────────────────────────────────────────────────────────
@@ -274,6 +275,27 @@ const CSS = `
 
   --mono:    'IBM Plex Mono', monospace;
   --sans:    'IBM Plex Sans', sans-serif;
+}
+
+/* Light theme — overrides the dark defaults when [data-theme="light"] is set
+   on the shell root. Keeps the same accent palette so colour-coded badges
+   stay consistent across themes. */
+[data-theme="light"] {
+  --bg0:      #F4F4F8;
+  --bg1:      #FFFFFF;
+  --bg2:      #FFFFFF;
+  --bg3:      #ECECF2;
+  --border:   #D8D8E1;
+  --border2:  #C2C2CE;
+  --text:     #1A1A22;
+  --text2:    #50505C;
+  --text3:    #7E7E8C;
+  --purple-lt: rgba(168,85,247,.14);
+  --red-lt:   rgba(239,68,68,.10);
+  --blue-lt:  rgba(59,130,246,.10);
+  --shadow-sm: 0 1px 2px rgba(20,20,40,.06);
+  --shadow:    0 2px 12px rgba(20,20,40,.08);
+  --shadow-lg: 0 12px 40px rgba(20,20,40,.12);
 }
 
 html, body, #root { height: 100%; background: var(--bg0); color: var(--text); font-family: var(--sans); overflow: hidden; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
@@ -908,12 +930,12 @@ function SevBadge({ s }) {
   )
 }
 
-function CopyBtn({ text }) {
+function CopyBtn({ text, label = 'Copy' }) {
   const [ok, setOk] = useState(false)
   const copy = () => { navigator.clipboard.writeText(text); setOk(true); setTimeout(()=>setOk(false),1400) }
   return (
     <button className="copy-btn" onClick={copy}>
-      {ok ? <><Check size={10} />Copied</> : <><Copy size={10} />Copy</>}
+      {ok ? <><Check size={10} />Copied</> : <><Copy size={10} />{label}</>}
     </button>
   )
 }
@@ -925,7 +947,7 @@ const SIEM_KEYS = ['spl','kql','aql','yara_l','esql','leql','crowdstrike','xql',
 const linesToList = (s) => (s || '').split('\n').map(x => x.trim()).filter(Boolean)
 const listToLines = (xs) => (xs || []).join('\n')
 
-function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage, orgProfile }) {
+function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage, orgProfile, allRules, onSelectRule }) {
   const platforms = Object.keys(rule.queries || {}).filter(k => rule.queries[k])
   // Default the query tab to the org's primary query language when this rule
   // actually has a query for it; otherwise fall back to spl (or whatever exists).
@@ -1149,6 +1171,14 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
       {(platforms.length > 0 || editing) && (
         <div className="section">
           <div className="section-title"><Terminal size={11} />Detection Queries</div>
+          {primaryLanguage && rule.queries?.[primaryLanguage] && !editing && (
+            <div style={{ marginBottom: 8 }}>
+              <CopyBtn
+                text={rule.queries[primaryLanguage]}
+                label={`Copy for ${SIEM_LABELS[primaryLanguage] || primaryLanguage.toUpperCase()}`}
+              />
+            </div>
+          )}
           <div className="qtabs">
             {(editing ? SIEM_KEYS : platforms).map(p => (
               <button key={p} className={`qtab${tab===p?' active':''}`} onClick={()=>setTab(p)}>
@@ -1319,6 +1349,76 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
           )}
         </div>
       )}
+
+      {!editing && (() => {
+        const q = ruleQualityScore(rule)
+        return (
+          <div className="section">
+            <div className="section-title"><Award size={11} />Rule Quality</div>
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px',
+              border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg0)',
+            }}>
+              <div style={{
+                width: 44, height: 44, borderRadius: '50%',
+                display: 'grid', placeItems: 'center',
+                background: 'transparent', border: `3px solid ${qualityColor(q.score)}`,
+                color: 'var(--text)', fontWeight: 700, fontSize: 13, fontFamily: 'var(--mono)',
+                flexShrink: 0,
+              }}>{q.score}</div>
+              <div style={{ flex: 1, display: 'grid', gap: 4 }}>
+                {q.breakdown.map(b => (
+                  <div key={b.key} style={{
+                    display: 'flex', alignItems: 'center', gap: 6,
+                    fontSize: 11.5, color: b.ok ? 'var(--text2)' : 'var(--text3)',
+                  }}>
+                    <span style={{ color: b.ok ? '#10B981' : '#7E7E8C', fontWeight: 700, width: 12 }}>
+                      {b.ok ? '✓' : '·'}
+                    </span>
+                    <span style={{ flex: 1 }}>{b.label}{b.detail ? ` (${b.detail})` : ''}</span>
+                    <span style={{ fontFamily: 'var(--mono)', color: 'var(--text3)' }}>+{b.weight}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
+      {!editing && allRules?.length > 0 && (() => {
+        const baseTech = (rule.technique_id || '').split('.')[0]
+        const candidates = allRules
+          .filter(r => r.rule_id !== rule.rule_id
+                       && (r.tactic === rule.tactic
+                           || (baseTech && (r.technique_id || '').split('.')[0] === baseTech)))
+          .sort((a, b) => (b.risk_score || 0) - (a.risk_score || 0))
+          .slice(0, 5)
+        if (!candidates.length) return null
+        return (
+          <div className="section">
+            <div className="section-title"><GitBranch size={11} />Related Rules</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {candidates.map(c => (
+                <button key={c.rule_id} type="button"
+                        onClick={() => onSelectRule && onSelectRule(c)}
+                        style={{
+                          textAlign: 'left', display: 'flex', alignItems: 'center', gap: 10,
+                          padding: '8px 10px', background: 'var(--bg0)', cursor: 'pointer',
+                          border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)',
+                        }}>
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: '#A78BFA', minWidth: 110 }}>
+                    {c.rule_id}
+                  </span>
+                  <span style={{ flex: 1, fontSize: 12 }}>{c.name}</span>
+                  <span style={{ fontSize: 10, fontFamily: 'var(--mono)', color: 'var(--text3)' }}>
+                    risk {c.risk_score ?? '—'}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )
+      })()}
 
       <div style={{ marginTop:8, paddingTop:10, borderTop:'1px solid var(--border)', display:'flex', gap:16, flexWrap:'wrap' }}>
         <span style={{ fontSize:11, color:'var(--text3)', fontFamily:'var(--mono)' }}>Author: {rule.author}</span>
@@ -1836,7 +1936,34 @@ function ImportRulesModal({ open, onClose, onApplied }) {
   )
 }
 
-function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleUpdated, onRuleAdded, onRuleDeleted, primaryLanguage, orgProfile }) {
+// Wraps any substring of `text` matching `query` in a highlighted <mark>.
+// Case-insensitive; first match only is enough for rule names.
+function Highlight({ text, query }) {
+  const s = String(text || '')
+  const q = String(query || '').trim()
+  if (!q) return s
+  const i = s.toLowerCase().indexOf(q.toLowerCase())
+  if (i < 0) return s
+  return (
+    <>
+      {s.slice(0, i)}
+      <mark style={{ background: 'rgba(168,85,247,.28)', color: 'inherit', padding: 0, borderRadius: 2 }}>
+        {s.slice(i, i + q.length)}
+      </mark>
+      {s.slice(i + q.length)}
+    </>
+  )
+}
+
+function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleUpdated, onRuleAdded, onRuleDeleted, primaryLanguage, orgProfile, onFilteredCountChange, searchFocusToken }) {
+  const searchRef = useRef(null)
+  useEffect(() => {
+    // Cmd/Ctrl+K from anywhere in the app bumps this token; we focus + select.
+    if (searchFocusToken && searchRef.current) {
+      searchRef.current.focus()
+      searchRef.current.select()
+    }
+  }, [searchFocusToken])
   const [selected, setSelected]   = useState(null)
   const [search, setSearch]       = useState('')
   const [fTactic, setFTactic]     = useState('All')
@@ -1871,14 +1998,24 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
 
   const filtered = useMemo(() => rules.filter(r => {
     const q = search.toLowerCase()
-    const mq = !q || r.name.toLowerCase().includes(q) || r.rule_id.toLowerCase().includes(q) ||
-               (r.technique_id||'').toLowerCase().includes(q) || (r.tags||[]).some(t=>t.includes(q))
+    const mq = !q
+      || r.name.toLowerCase().includes(q)
+      || r.rule_id.toLowerCase().includes(q)
+      || (r.technique_id || '').toLowerCase().includes(q)
+      || (r.description || '').toLowerCase().includes(q)
+      || (r.pseudo_logic || '').toLowerCase().includes(q)
+      || (r.tags || []).some(t => (t || '').toLowerCase().includes(q))
     return mq &&
       (fTactic==='All'||r.tactic===fTactic) &&
       (fSev==='All'||r.severity===fSev) &&
       (fFid==='All'||r.fidelity===fFid) &&
       (fKc==='All'||TACTIC_TO_KC[r.tactic]===fKc)
   }), [rules, search, fTactic, fSev, fFid, fKc])
+
+  // Notify App so the sidebar Detection Rules badge stays in sync.
+  useEffect(() => {
+    onFilteredCountChange && onFilteredCountChange(filtered.length)
+  }, [filtered.length, onFilteredCountChange])
 
   const clearAll = () => { setSearch(''); setFTactic('All'); setFSev('All'); setFid('All'); setFKc('All') }
   const dirty = search||fTactic!=='All'||fSev!=='All'||fFid!=='All'||fKc!=='All'
@@ -1903,8 +2040,13 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
         <span className="topbar-sub">{rules.length} Rules · 9 SIEM Platforms</span>
         <div className="search-wrap">
           <Search size={13} className="search-icon" />
-          <input className="search-input" placeholder="Search rules, IDs, techniques, tags…"
-            value={search} onChange={e=>setSearch(e.target.value)} />
+          <input
+            ref={searchRef}
+            className="search-input"
+            placeholder="Search rules, IDs, techniques, descriptions, pseudo-logic, tags… (⌘K)"
+            value={search}
+            onChange={e=>setSearch(e.target.value)}
+          />
         </div>
         <button
           type="button"
@@ -1982,7 +2124,9 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
       <div className="content">
         <div className="rule-list">
           <div className="list-count">{filtered.length} rules</div>
-          {filtered.map(r => (
+          {filtered.map(r => {
+            const q = ruleQualityScore(r)
+            return (
             <div key={r.rule_id} className={`rule-row${selected?.rule_id===r.rule_id?' active':''}`}
               onClick={(e) => {
                 if (selectionMode) { toggleSelected(r.rule_id); e.preventDefault(); return }
@@ -1995,18 +2139,27 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
                        onChange={() => toggleSelected(r.rule_id)}
                        style={{ accentColor: '#7C5CFF', marginRight: 8, verticalAlign: 'middle' }} />
               )}
-              <div className="rule-rid">{r.rule_id} · {r.technique_id}</div>
-              <div className="rule-name">{r.name}</div>
+              <div className="rule-rid" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span
+                  title={`Quality score: ${q.score}/100`}
+                  style={{
+                    width: 8, height: 8, borderRadius: '50%',
+                    background: qualityColor(q.score), flexShrink: 0,
+                  }}
+                />
+                {r.rule_id} · {r.technique_id}
+              </div>
+              <div className="rule-name"><Highlight text={r.name} query={search} /></div>
               <div className="rule-meta">
                 <span className="pill pill-tactic" style={{fontSize:9}}>{tacticLabel(r.tactic)}</span>
                 <SevBadge s={r.severity} />
                 <span className={`pill pill-fid-${r.fidelity}`}>{r.fidelity}</span>
               </div>
             </div>
-          ))}
+          )})}
         </div>
         {!isMobile && (selected
-          ? <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} primaryLanguage={primaryLanguage} orgProfile={orgProfile} />
+          ? <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} primaryLanguage={primaryLanguage} orgProfile={orgProfile} allRules={rules} onSelectRule={setSelected} />
           : <div className="detail empty-state">
               <div className="empty-inner">
                 <Shield size={48} />
@@ -2025,7 +2178,7 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
             </button>
           </div>
           <div className="mobile-detail-body">
-            <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} primaryLanguage={primaryLanguage} orgProfile={orgProfile} />
+            <RuleDetail rule={selected} onUpdated={handleUpdated} onDuplicated={handleDuplicated} onDeleted={handleDeleted} primaryLanguage={primaryLanguage} orgProfile={orgProfile} allRules={rules} onSelectRule={setSelected} />
           </div>
         </div>
       )}
@@ -3135,6 +3288,28 @@ export default function App({ user = null, orgProfile = null, onProfileChange, o
   const [view, setView] = useState('dashboard')
   const [rules, setRules] = useState(RULES_RAW)
   const [source, setSource] = useState('bundled')
+  // Theme (dark | light) — persisted to localStorage; CSS variables are
+  // overridden via the data-theme attribute on the shell root.
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem('tdl_theme') || 'dark' } catch { return 'dark' }
+  })
+  useEffect(() => { try { localStorage.setItem('tdl_theme', theme) } catch {} }, [theme])
+  // Live filtered count for the sidebar Detection Rules badge.
+  const [filteredRuleCount, setFilteredRuleCount] = useState(null)
+  // Cmd/Ctrl+K → switch to Rules view and focus its search input.
+  const [searchFocusToken, setSearchFocusToken] = useState(0)
+  useEffect(() => {
+    const onKey = (e) => {
+      const mod = e.metaKey || e.ctrlKey
+      if (mod && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault()
+        setView('rules')
+        setSearchFocusToken(t => t + 1)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
   // Cross-view filter handoff: dashboard tile / matrix tile click → Rules view
   // pre-filtered. Shape: { tactic?, severity?, ruleId? }. Cleared after Rules
   // applies it so subsequent in-view filter changes aren't overwritten.
@@ -3187,10 +3362,16 @@ export default function App({ user = null, orgProfile = null, onProfileChange, o
   }, [rules])
   const chainCount = 5
 
+  // Live rule count for the sidebar badge — filtered count if RulesView has
+  // narrowed the list, otherwise the full library size.
+  const sidebarRuleCount = (filteredRuleCount != null && filteredRuleCount !== rules.length)
+    ? `${filteredRuleCount} / ${rules.length}`
+    : rules.length
+
   return (
     <>
       <style>{CSS}</style>
-      <div className="shell">
+      <div className="shell" data-theme={theme}>
         <aside className="sidebar">
           <div className="sidebar-logo">
             <div className="logo-mark">
@@ -3202,7 +3383,7 @@ export default function App({ user = null, orgProfile = null, onProfileChange, o
           </div>
           <nav className="sidebar-nav">
             <div className="nav-label">Navigation</div>
-            {buildViews(rules.length, techCount, chainCount).map(v => (
+            {buildViews(sidebarRuleCount, techCount, chainCount).map(v => (
               <div key={v.id} className={`nav-item${view===v.id?' active':''}`} onClick={()=>setView(v.id)}>
                 {v.icon}{v.label}
                 {v.badge && <span className="nav-badge">{v.badge}</span>}
@@ -3218,7 +3399,7 @@ export default function App({ user = null, orgProfile = null, onProfileChange, o
           }}>
             <UserMenu user={user} onSignOut={onSignOut} />
             {orgProfile?.org_name && (
-              <div style={{ overflow: 'hidden' }}>
+              <div style={{ overflow: 'hidden', flex: 1 }}>
                 <div style={{ fontSize: 12, color: 'var(--muted)' }}>Organization</div>
                 <div style={{
                   fontSize: 13,
@@ -3230,11 +3411,24 @@ export default function App({ user = null, orgProfile = null, onProfileChange, o
                 }}>{orgProfile.org_name}</div>
               </div>
             )}
+            <button
+              type="button"
+              onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
+              title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+              aria-label="Toggle theme"
+              style={{
+                background: 'transparent', border: '1px solid var(--border)',
+                borderRadius: 6, padding: 6, cursor: 'pointer', color: 'var(--text2)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}
+            >
+              {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
+            </button>
           </div>
         </aside>
 
         <div className="main">
-          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} onRuleUpdated={replaceRule} onRuleAdded={addRule} onRuleDeleted={removeRule} primaryLanguage={orgProfile?.primary_query_language || orgProfile?.primary_siem} orgProfile={orgProfile} />}
+          {view === 'rules'     && <RulesView rules={rules} pendingFilter={pendingRulesFilter} clearPendingFilter={() => setPendingRulesFilter(null)} isMobile={isMobile} onRuleUpdated={replaceRule} onRuleAdded={addRule} onRuleDeleted={removeRule} primaryLanguage={orgProfile?.primary_query_language || orgProfile?.primary_siem} orgProfile={orgProfile} onFilteredCountChange={setFilteredRuleCount} searchFocusToken={searchFocusToken} />}
           {view === 'dashboard' && (
             <>
               <div className="topbar">

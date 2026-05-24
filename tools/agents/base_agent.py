@@ -136,10 +136,11 @@ EXAMPLE QUERIES (study these patterns)
             from anthropic import Anthropic
         except ImportError:
             raise RuntimeError("anthropic SDK not installed — `pip install anthropic`")
-        # 2 retries with exponential backoff. More than that burns input tokens
-        # in proportion to the retries for rules that ultimately fail anyway —
-        # the lost rules are cheap to pick up later via --resume.
-        return Anthropic(max_retries=2)
+        # SDK does exponential backoff with jitter and honors Retry-After on 429s.
+        # Default 2 retries (~1.5s worst case) keeps the user-facing /generate
+        # endpoint responsive. The audit pipeline opts into AGENT_MAX_RETRIES=6
+        # so long batch runs ride out a 429 storm instead of dropping calls.
+        return Anthropic(max_retries=int(os.environ.get("AGENT_MAX_RETRIES", "2")))
 
     def _system_blocks(self):
         # Cache the (large, static per-language) system prompt across calls.

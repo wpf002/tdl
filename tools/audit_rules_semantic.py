@@ -57,6 +57,10 @@ import os as _os
 CROSS_MODEL = _os.environ.get("AUDIT_CROSS_MODEL", "claude-haiku-4-5")
 CROSS_MAX_TOKENS = 1500
 
+# Batch runs ride out 429 storms instead of dropping calls — the runtime server
+# uses the lower default (2) in base_agent.py to keep /generate responsive.
+_os.environ.setdefault("AGENT_MAX_RETRIES", "6")
+
 # Haiku 4.5 pricing (USD per MTok)
 INPUT_PRICE = 1.00
 OUTPUT_PRICE = 5.00
@@ -278,8 +282,8 @@ def main() -> int:
     ap.add_argument("--rule-id")
     ap.add_argument("--resume", action="store_true",
                     help="Skip rules that already have semantic_issues recorded.")
-    ap.add_argument("--concurrency", type=int, default=3,
-                    help="How many rules to audit in parallel. Each rule fans out 10 specialists + 1 generalist, so effective in-flight requests = 11×concurrency.")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="How many rules to audit in parallel. Each rule fans out 10 specialists + 1 generalist, so effective in-flight requests = 11×concurrency. Default 1 keeps bursts under Haiku tier limits; raise only if you've checked headroom.")
     ap.add_argument("--max-cost", type=float, default=10.0,
                     help="HARD CEILING: abort the run cleanly when this dollar amount is spent. "
                          "Default $10. Pass a larger value to permit a bigger run. Set to 0 to disable.")

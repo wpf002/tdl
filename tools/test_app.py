@@ -21,6 +21,34 @@ ROOT = Path(__file__).resolve().parent.parent
 PORT = int(os.environ.get("TEST_PORT", 8788))  # different from default to avoid clash
 BASE = f"http://127.0.0.1:{PORT}"
 
+# Make `import tools.*` resolve when this file is run as a script, and load the
+# same .env the server reads so we can mint a session cookie with a matching
+# SESSION_SECRET.
+sys.path.insert(0, str(ROOT))
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env")
+except Exception:
+    pass
+# The dev .env may leave SESSION_SECRET blank; ensure a non-empty value so both
+# this process (minting the cookie) and the server subprocess (validating it)
+# share the same secret. The subprocess inherits this via os.environ.copy(), and
+# the server's load_dotenv(override=False) won't clobber an already-set var.
+if not os.environ.get("SESSION_SECRET"):
+    os.environ["SESSION_SECRET"] = "integration-test-secret-not-for-production"
+from tools import auth as authlib  # noqa: E402
+
+# The app gained a session-cookie auth gate; every /api/* route (except the
+# public auth/health paths) now requires a signed cookie. The gate only checks
+# the signature, so a minted cookie authenticates without a DB-backed user.
+_TEST_UID = "00000000-0000-0000-0000-000000000001"
+SESSION_COOKIE = f"{authlib.SESSION_COOKIE_NAME}={authlib.issue_session_cookie(_TEST_UID)}"
+
+# Source of truth for the expected rule count is the data file the server serves
+# in rules.json-fallback mode — derived, not hard-coded, so it never drifts.
+EXPECTED_TOTAL = len(json.loads((ROOT / "ui" / "src" / "data" / "rules.json").read_text()))
+
 GREEN = "\033[92m"
 RED = "\033[91m"
 DIM = "\033[2m"
@@ -39,7 +67,10 @@ def fail(msg: str) -> None:
 
 
 def fetch(path: str, timeout: float = 30.0):
-    req = urllib.request.Request(f"{BASE}{path}", headers={"Accept": "application/json"})
+    req = urllib.request.Request(
+        f"{BASE}{path}",
+        headers={"Accept": "application/json", "Cookie": SESSION_COOKIE},
+    )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
@@ -69,7 +100,7 @@ def main() -> int:
     env = os.environ.copy()
     env["PORT"] = str(PORT)
     proc = subprocess.Popen(
-        [sys.executable, str(ROOT / "tools" / "server.py")],
+        [sys.executable, "-m", "tools.server"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env,
@@ -95,24 +126,24 @@ def main() -> int:
 
         try:
             _, stats = fetch("/api/stats")
-            assert stats["total"] == 700, f"expected 700, got {stats['total']}"
+            assert stats["total"] == EXPECTED_TOTAL, f"expected {EXPECTED_TOTAL}, got {stats['total']}"
             assert len(stats["by_tactic"]) == 12
             assert set(stats["by_severity"]) >= {"Critical", "High", "Medium", "Low"}
-            ok(f"GET /api/stats — total=700, 12 tactics, 4 severities")
+            ok(f"GET /api/stats — total={EXPECTED_TOTAL}, 12 tactics, 4 severities")
         except Exception as e:
             fail(f"GET /api/stats: {e}")
 
         try:
             _, rules = fetch("/api/rules")
-            assert isinstance(rules, list) and len(rules) == 700
+            assert isinstance(rules, list) and len(rules) == EXPECTED_TOTAL
             ids = {r["rule_id"] for r in rules}
-            assert len(ids) == 700, "non-unique rule_ids"
+            assert len(ids) == EXPECTED_TOTAL, "non-unique rule_ids"
             assert not any(rid.startswith("TDE-") for rid in ids), "found TDE- legacy IDs"
             sample = rules[0]
             for k in ("rule_id", "name", "tactic", "technique_id", "severity", "lifecycle", "queries"):
                 assert k in sample, f"missing field: {k}"
             assert set(sample["queries"]) >= {"spl", "kql", "aql", "yara_l", "esql", "leql", "crowdstrike", "xql", "lucene"}
-            ok("GET /api/rules — 700 unique, all 9 query languages present")
+            ok(f"GET /api/rules — {EXPECTED_TOTAL} unique, all 9 query languages present")
         except Exception as e:
             fail(f"GET /api/rules: {e}")
 
@@ -152,8 +183,8 @@ def main() -> int:
         try:
             _, tactics = fetch("/api/tactics")
             assert isinstance(tactics, list) and len(tactics) == 12
-            assert sum(t["count"] for t in tactics) == 700
-            ok("GET /api/tactics — 12 tactics, counts sum to 700")
+            assert sum(t["count"] for t in tactics) == EXPECTED_TOTAL
+            ok(f"GET /api/tactics — 12 tactics, counts sum to {EXPECTED_TOTAL}")
         except Exception as e:
             fail(f"GET /api/tactics: {e}")
 
@@ -217,8 +248,8 @@ def main() -> int:
                 assert bundle_glob, "no JS bundle produced"
                 bundle_text = bundle_glob[0].read_text(encoding="utf-8", errors="replace")
                 bundle_rule_count = bundle_text.count('rule_id:"')
-                assert bundle_rule_count == 700, f"bundle has {bundle_rule_count} rule_ids, expected 700"
-                ok(f"ui build — dist/index.html present, bundle inlines 700 rules")
+                assert bundle_rule_count == EXPECTED_TOTAL, f"bundle has {bundle_rule_count} rule_ids, expected {EXPECTED_TOTAL}"
+                ok(f"ui build — dist/index.html present, bundle inlines {EXPECTED_TOTAL} rules")
         except subprocess.TimeoutExpired:
             fail("ui build timed out after 120s")
         except Exception as e:

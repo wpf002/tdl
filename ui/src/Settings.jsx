@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { QUERY_LANGUAGES } from './data/query-languages.js'
+import { QUERY_LANGUAGES, profileQueryLanguages } from './data/query-languages.js'
 
 const LOG_SOURCES = [
   { id: 'windows_security_events', name: 'Windows Security Event Log' },
@@ -23,8 +23,8 @@ const LOG_SOURCES = [
 
 export default function Settings({ profile, onSave, onRerunSetup }) {
   const [orgName, setOrgName] = useState(profile?.org_name || '')
-  const [primaryLanguage, setPrimaryLanguage] = useState(
-    profile?.primary_query_language || profile?.primary_siem || 'spl'
+  const [queryLanguages, setQueryLanguages] = useState(
+    () => new Set(profileQueryLanguages(profile))
   )
   const [logSources, setLogSources] = useState(new Set(profile?.log_sources_deployed || []))
   const [saving, setSaving] = useState(false)
@@ -36,9 +36,15 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
   // drift from what the matrix / other views render.
   useEffect(() => {
     setOrgName(profile?.org_name || '')
-    setPrimaryLanguage(profile?.primary_query_language || profile?.primary_siem || 'spl')
+    setQueryLanguages(new Set(profileQueryLanguages(profile)))
     setLogSources(new Set(profile?.log_sources_deployed || []))
   }, [profile])
+
+  const toggleLang = (key) => {
+    const next = new Set(queryLanguages)
+    next.has(key) ? next.delete(key) : next.add(key)
+    setQueryLanguages(next)
+  }
 
   const toggle = (id) => {
     const next = new Set(logSources)
@@ -48,17 +54,20 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
 
   const submit = async (e) => {
     e.preventDefault()
-    if (!orgName.trim()) return
+    if (!orgName.trim() || queryLanguages.size === 0) return
     setSaving(true)
     setError(null)
     try {
+      const orderedLangs = QUERY_LANGUAGES.filter((l) => queryLanguages.has(l.key)).map((l) => l.key)
+      const primary = orderedLangs[0] || null
       await onSave({
         ...(profile || {}),
         version: 1,
         org_name: orgName.trim(),
-        primary_query_language: primaryLanguage,
+        query_languages: orderedLangs,
+        primary_query_language: primary,
         // keep the legacy key populated for any old reader
-        primary_siem: primaryLanguage,
+        primary_siem: primary,
         log_sources_deployed: Array.from(logSources),
         // Preserve any event-level inventory captured during onboarding; the
         // per-event UI lives in the onboarding "Re-run setup" flow.
@@ -91,18 +100,29 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
           />
         </label>
 
-        <label style={S.label}>
-          Primary Query Language
-          <select
-            value={primaryLanguage}
-            onChange={(e) => setPrimaryLanguage(e.target.value)}
-            style={S.input}
-          >
-            {QUERY_LANGUAGES.map((l) => (
-              <option key={l.key} value={l.key}>{l.selectLabel}</option>
-            ))}
-          </select>
-        </label>
+        <div style={S.label}>
+          Query languages
+          <div style={S.sublabel}>
+            Detection Rules shows query logic for just these. The first selected is
+            your primary/default language.
+          </div>
+          <div style={S.grid}>
+            {QUERY_LANGUAGES.map((l) => {
+              const checked = queryLanguages.has(l.key)
+              return (
+                <label key={l.key} style={{ ...S.chip, ...(checked ? S.chipOn : {}) }}>
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggleLang(l.key)}
+                    style={S.checkbox}
+                  />
+                  {l.selectLabel}
+                </label>
+              )
+            })}
+          </div>
+        </div>
 
         <div style={S.label}>
           Log sources currently deployed
@@ -129,7 +149,8 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
 
         <div style={S.footer}>
           <span style={S.count}>
-            {logSources.size} of {LOG_SOURCES.length} log sources selected
+            {queryLanguages.size} {queryLanguages.size === 1 ? 'query language' : 'query languages'} · {logSources.size} of {LOG_SOURCES.length} log sources
+            {queryLanguages.size === 0 && <span style={{ color: '#F87171', marginLeft: 12 }}>Pick at least one query language.</span>}
             {savedAt && <span style={{ color: '#7C5CFF', marginLeft: 12 }}>Saved.</span>}
             {error && <span style={{ color: '#F87171', marginLeft: 12 }}>{error}</span>}
           </span>
@@ -140,7 +161,7 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
                 Re-run Setup
               </button>
             )}
-            <button type="submit" disabled={saving || !orgName.trim()} style={S.button}>
+            <button type="submit" disabled={saving || !orgName.trim() || queryLanguages.size === 0} style={S.button}>
               {saving ? 'Saving…' : 'Save Changes'}
             </button>
           </div>

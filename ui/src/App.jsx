@@ -10,7 +10,7 @@ import {
 import { LogOut } from 'lucide-react'
 import RULES_RAW from './data/rules.json'
 import { ATTACK_MATRIX, KILL_CHAIN, TACTIC_ORDER_MATRIX } from './data/attack-matrix.js'
-import { QUERY_LANGUAGES } from './data/query-languages.js'
+import { QUERY_LANGUAGES, profileQueryLanguages } from './data/query-languages.js'
 import { RULE_SCHEMA_FIELDS } from './data/rule-schema-fields.js'
 import {
   aggregateEventsBySource, rulePerSourceRequirements,
@@ -981,21 +981,32 @@ const linesToList = (s) => (s || '').split('\n').map(x => x.trim()).filter(Boole
 const listToLines = (xs) => (xs || []).join('\n')
 
 function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage, orgProfile, allRules, onSelectRule }) {
-  const platforms = Object.keys(rule.queries || {}).filter(k => rule.queries[k])
-  // Default the query tab to the org's primary query language when this rule
-  // actually has a query for it; otherwise fall back to spl (or whatever exists).
-  const defaultTab = (primaryLanguage && rule.queries?.[primaryLanguage])
+  // Languages the org selected during onboarding / Settings. The Detection Rules
+  // page only surfaces query logic for these. Empty selection ⇒ show everything
+  // (defensive fallback for profiles that never picked any).
+  const selectedLangs = profileQueryLanguages(orgProfile)
+  const selectedSet = new Set(selectedLangs)
+  const allPlatforms = Object.keys(rule.queries || {}).filter(k => rule.queries[k])
+  const platforms = selectedSet.size
+    ? allPlatforms.filter(k => selectedSet.has(k))
+    : allPlatforms
+  // Default the query tab to the org's primary query language when it's selected
+  // and this rule has it; otherwise the first visible language for this rule.
+  const defaultTab = (primaryLanguage && platforms.includes(primaryLanguage))
     ? primaryLanguage
-    : (rule.queries?.spl ? 'spl' : (platforms[0] || 'spl'))
+    : (platforms.includes('spl') ? 'spl' : (platforms[0] || 'spl'))
   const [tab, setTab] = useState(defaultTab)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
 
-  // When the user selects a different rule (or changes their primary language),
-  // reset the active tab to the preferred default for that rule.
-  useEffect(() => { setTab(defaultTab) }, [rule.rule_id, primaryLanguage])
+  // When the user selects a different rule, changes their primary language, or
+  // edits which query languages are selected, reset to the preferred default.
+  useEffect(() => { setTab(defaultTab) }, [rule.rule_id, primaryLanguage, selectedSet.size && selectedLangs.join(',')])
+  // Leaving edit mode: if the active tab is a language that isn't visible in the
+  // filtered view (author may have edited a non-selected language), snap back.
+  useEffect(() => { if (!editing && !platforms.includes(tab)) setTab(defaultTab) }, [editing])
   const rc = SEV_COLOR[rule.severity] || '#888'
 
   const startEdit = () => {

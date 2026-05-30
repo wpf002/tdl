@@ -92,3 +92,25 @@ export const QUERY_LANGUAGES = [
 export const QUERY_LANGUAGE_BY_KEY = Object.fromEntries(
   QUERY_LANGUAGES.map((l) => [l.key, l]),
 )
+
+const QUERY_LANGUAGE_ORDER = QUERY_LANGUAGES.map((l) => l.key)
+
+// Canonical list of the org's selected query languages, in catalog order.
+// Reads the new `query_languages` array, falling back to the legacy single
+// `primary_query_language` / `primary_siem` value so older profiles (DB rows or
+// localStorage) keep working. Returns [] when nothing is configured.
+export function profileQueryLanguages(profile) {
+  if (!profile) return []
+  const raw = Array.isArray(profile.query_languages)
+    ? profile.query_languages.filter((k) => k && QUERY_LANGUAGE_BY_KEY[k])
+    : []
+  const keys = raw.length
+    ? raw
+    : (() => {
+        const single = profile.primary_query_language || profile.primary_siem
+        return single && QUERY_LANGUAGE_BY_KEY[single] ? [single] : []
+      })()
+  // De-dupe and sort into catalog order for deterministic tab/primary ordering.
+  const set = new Set(keys)
+  return QUERY_LANGUAGE_ORDER.filter((k) => set.has(k))
+}

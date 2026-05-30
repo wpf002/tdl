@@ -1663,12 +1663,16 @@ def _org_to_dict(row):
     # primary_query_language is canonical; fall back to the legacy primary_siem
     # value (which already held query-language keys) for old rows.
     lang = row.primary_query_language or row.primary_siem
+    # query_languages is the multi-select going forward; fall back to wrapping the
+    # single legacy language so old rows still resolve to a non-empty list.
+    langs = row.query_languages if isinstance(row.query_languages, list) and row.query_languages else ([lang] if lang else [])
     return {
         "user_id": row.user_id,
         "org_name": row.org_name,
         # keep primary_siem in the payload for any old client code still reading it
         "primary_siem": row.primary_siem,
         "primary_query_language": lang,
+        "query_languages": langs,
         "log_sources_deployed": row.log_sources_deployed or [],
         "events_deployed": row.events_deployed or {},
         "created_at": row.created_at,
@@ -1699,8 +1703,26 @@ def put_org_profile():
     org_name = (body.get("org_name") or "").strip()
     if not org_name:
         abort(400, description="org_name required")
-    # Accept the new field name, falling back to the legacy one.
-    primary_language = body.get("primary_query_language") or body.get("primary_siem") or None
+    # Multi-select query languages (new). Validate and normalize to a clean list.
+    query_languages = body.get("query_languages")
+    if query_languages is not None and not isinstance(query_languages, list):
+        abort(400, description="query_languages must be a list")
+    if isinstance(query_languages, list):
+        seen = set()
+        query_languages = [
+            x for x in (str(k).strip() for k in query_languages if k)
+            if x and not (x in seen or seen.add(x))
+        ]
+    # Accept the new field name, falling back to the legacy one or the first
+    # selected language. primary_query_language is the default/primary tab.
+    primary_language = (
+        body.get("primary_query_language")
+        or body.get("primary_siem")
+        or (query_languages[0] if query_languages else None)
+    )
+    # If only the single legacy field was sent, derive the list from it.
+    if query_languages is None:
+        query_languages = [primary_language] if primary_language else []
     log_sources = body.get("log_sources_deployed") or []
     if not isinstance(log_sources, list):
         abort(400, description="log_sources_deployed must be a list")
@@ -1718,6 +1740,7 @@ def put_org_profile():
         row.primary_query_language = primary_language
         # mirror into legacy column so older reads stay consistent
         row.primary_siem = primary_language
+        row.query_languages = query_languages
         row.log_sources_deployed = log_sources
         if events_deployed is not None:
             row.events_deployed = events_deployed

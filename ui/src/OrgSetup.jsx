@@ -62,7 +62,7 @@ function matchLogSourceId(text) {
 export default function OrgSetup({ userId, onComplete }) {
   const [step, setStep] = useState('basics') // basics | events
   const [orgName, setOrgName] = useState('')
-  const [primaryLanguage, setPrimaryLanguage] = useState('spl')
+  const [queryLanguages, setQueryLanguages] = useState(new Set(['spl']))
   const [logSources, setLogSources] = useState(new Set())
   const [eventsDeployed, setEventsDeployed] = useState({}) // {canonical_id: Set<event_id>}
   const [submitting, setSubmitting] = useState(false)
@@ -88,6 +88,12 @@ export default function OrgSetup({ userId, onComplete }) {
     () => aggregateEventsBySource(rules, matchLogSourceId),
     [rules],
   )
+
+  const toggleLang = (key) => {
+    const next = new Set(queryLanguages)
+    next.has(key) ? next.delete(key) : next.add(key)
+    setQueryLanguages(next)
+  }
 
   const toggle = (id) => {
     const next = new Set(logSources)
@@ -157,11 +163,14 @@ export default function OrgSetup({ userId, onComplete }) {
       for (const [k, v] of Object.entries(eventsDeployed)) {
         eventsPayload[k] = [...v]
       }
+      const orderedLangs = QUERY_LANGUAGES.filter((l) => queryLanguages.has(l.key)).map((l) => l.key)
+      const primary = orderedLangs[0] || null
       await onComplete({
         version: 1,
         org_name: orgName.trim(),
-        primary_query_language: primaryLanguage,
-        primary_siem: primaryLanguage,
+        query_languages: orderedLangs,
+        primary_query_language: primary,
+        primary_siem: primary,
         log_sources_deployed: Array.from(logSources),
         events_deployed: eventsPayload,
         created_at: new Date().toISOString(),
@@ -189,7 +198,7 @@ export default function OrgSetup({ userId, onComplete }) {
 
   return (
     <div style={S.page}>
-      <form onSubmit={(e) => { e.preventDefault(); step === 'basics' ? setStep('events') : submit() }} style={S.card}>
+      <form onSubmit={(e) => { e.preventDefault(); if (step === 'basics') { if (orgName.trim() && queryLanguages.size > 0) setStep('events') } else { submit() } }} style={S.card}>
         {step === 'basics' && (
           <>
             <h1 style={S.h1}>Welcome to TDL Playbook</h1>
@@ -201,14 +210,29 @@ export default function OrgSetup({ userId, onComplete }) {
                      placeholder="Acme Security" required style={S.input} autoFocus />
             </label>
 
-            <label style={S.label}>
-              Primary Query Language
-              <select value={primaryLanguage} onChange={(e) => setPrimaryLanguage(e.target.value)} style={S.input}>
-                {QUERY_LANGUAGES.map((l) => (
-                  <option key={l.key} value={l.key}>{l.selectLabel}</option>
-                ))}
-              </select>
-            </label>
+            <div style={S.label}>
+              Query languages
+              <div style={S.sublabel}>
+                Pick every SIEM query language your team uses. Detection Rules will
+                show query logic for just these. The first is your primary/default.
+              </div>
+              <div style={S.grid}>
+                {QUERY_LANGUAGES.map((l) => {
+                  const checked = queryLanguages.has(l.key)
+                  return (
+                    <label key={l.key} style={{ ...S.chip, ...(checked ? S.chipOn : {}) }}>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleLang(l.key)}
+                        style={S.checkbox}
+                      />
+                      {l.selectLabel}
+                    </label>
+                  )
+                })}
+              </div>
+            </div>
 
             <div style={S.label}>
               Log sources currently deployed
@@ -229,8 +253,10 @@ export default function OrgSetup({ userId, onComplete }) {
             {error && <div style={S.error}>{error}</div>}
 
             <div style={S.footer}>
-              <span style={S.count}>{logSources.size} of {LOG_SOURCES.length} log sources selected</span>
-              <button type="submit" disabled={!orgName.trim()} style={S.button}>
+              <span style={S.count}>
+                {queryLanguages.size} {queryLanguages.size === 1 ? 'query language' : 'query languages'} · {logSources.size} of {LOG_SOURCES.length} log sources
+              </span>
+              <button type="submit" disabled={!orgName.trim() || queryLanguages.size === 0} style={S.button}>
                 {deployedCanonical.length ? 'Next: Pick Event IDs →' : 'Continue to Dashboard'}
               </button>
             </div>

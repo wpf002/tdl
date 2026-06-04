@@ -64,21 +64,39 @@ This is structurally incapable of expressing the rule-specific logic the
 reproduces the current broken Kerberoasting query verbatim — confirming the
 template engine is the source, and that re-running it cannot fix the mismatch.
 
-## 4. Remediation — validated by pilot
+## 4. Remediation — validated by measured sample (n=10)
 
 Regenerate each rule's queries **from its `pseudo_logic`** using the specialist
 agents' `generate_query` path (`AgentOrchestrator.generate_all_queries`), which
 reads the full logic and produces faithful, dialect-correct queries.
 
-Pilot (2 rules, regenerate → re-validate):
+Measured on a 10-rule sample weighted toward HARD cases (thresholds, time
+windows, event correlation, NOT-IN exclusions, wrong-source):
 
-| Rule | Old → New score | Fix |
-|---|---|---|
-| `TDL-CA-000019` Kerberoasting | **9 → 69** | EventCode 673+4769, `Failure_Code=0x0`, enc types 0x17/0x18, ticket options, krbtgt/machine exclusions, 1-min binning |
-| `TDL-DE-000027` Set-InboxRule | **11 → 65** | Correct `index=o365 …Operation="Set-InboxRule"`; forward/redirect target + external-domain check |
+| Metric | Result |
+|---|---|
+| Mean score | **15 → 71** (+56) |
+| Reached "solid" (≥75) | ~50% (e.g. SharePoint 20→91, Sudo 16→92, LDAP recon 4→86, Mass-deletion 16→82) |
+| Reached "usable" (50–74) | ~38% (Default logon 19→61, IRC 26→67, Port-scan 11→53) |
+| **Still broken (<50)** | ~12% |
 
-LLM regen lifts scores from "broken" (~10) to usable (~65–69). Template regen
-cannot.
+**Honest limit:** the rules that stay broken are **multi-event temporal
+correlation** (e.g. `TDL-PER-000109` "user created → *then* deleted, same user,
+within 24h" stayed at 38). The regen is closer (right event codes, domain
+check, `transaction maxspan=24h`) but doesn't enforce created→deleted ordering.
+**~10–15% of the library (complex correlation/sequencing) needs hand-tuning
+after regen.** This is "faithful, usable starting queries," not "perfect."
+
+**Self-grading caveat & checks:** generation and validation use the same
+per-language agent. Evidence the +56 lift is real, not inflation: (1) the
+correlation rule still scored 38 despite self-grading; (2) manual inspection
+confirms the regenerated Kerberoasting query now has the event codes,
+encryption types, failure code, and exclusions that were entirely absent
+before, and Set-InboxRule hits the correct O365 source instead of AWS
+CloudTrail. Baseline (16/100) and new (71) are graded on the same yardstick, so
+the lift is apples-to-apples.
+
+Template regen (`regen_queries.py`) cannot achieve any of this — confirmed.
 
 ## 5. Plan to execute (not yet run)
 
@@ -88,10 +106,27 @@ cannot.
    Add `--resume`, `--max-cost`, and credit-aware abort like
    `audit_rules_semantic.py`.
 2. **Run on a branch** (rewrites all 821 rule files): detached, concurrency 1,
-   resumable. Est. **$50–70**, ~2–3 hr. Will span credit refills.
-3. **Re-audit** the regenerated rules with `audit_rules_semantic.py` and confirm
-   the score lift before any merge to `main`.
+   resumable, with a hard `--max-cost` ceiling. ~2–3 hr. Will span credit refills.
+3. **Re-audit** to confirm the lift before any merge to `main`.
 
+### Measured cost (n=10, generation only)
+
+Per-rule generation: **mean $0.048, max $0.078, min $0.030.**
+
+| Component | Cost |
+|---|---|
+| Generate all 821 | ~**$40** expected; ~**$64** absolute worst case |
+| Verify — sample (~80 rules re-audit) | ~$5 |
+| Verify — full re-audit (all 821) | ~$48 |
+
+- **Recommended path ≈ $45** (generation + sample verification).
+- **Full belt-and-suspenders ≈ $90** (generation + full re-audit — repeats the
+  $48 already spent; not necessary).
+- Run generation with **`--max-cost 70`** as a hard ceiling so spend cannot
+  exceed it regardless of variance (aborts cleanly; `--resume` continues).
+
+**Status: ON HOLD** at user request (no further spend for now). All findings,
+costs, and the validated approach are captured here for a later decision.
 Decision pending: full library vs. one-tactic batch first.
 
 ## Appendix — worst-offenders (score 3–4)

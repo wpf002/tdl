@@ -1002,6 +1002,88 @@ function CopyBtn({ text, label = 'Copy' }) {
   )
 }
 
+// ── SIEM query syntax highlighting (#14) ─────────────────────────────────────
+// Lightweight tokenizer shared across all query languages — no external editor
+// dependency. Colors pipes, keywords/functions, strings, numbers, operators,
+// and comments. Used read-only in HighlightedQuery and behind QueryEditor.
+const QUERY_KEYWORDS = new Set([
+  // pipeline verbs / clauses common across SPL, KQL, ES|QL, XQL, CQL, AQL, LEQL…
+  'where','search','stats','count','by','index','sourcetype','source','union','summarize',
+  'project','extend','eval','rex','table','sort','order','dedup','distinct','join','let','from',
+  'fields','limit','head','tail','top','rare','timechart','chart','lookup','inputlookup','case',
+  'coalesce','if','isnotnull','isnull','mvexpand','spath','transaction','rename','fillnull','bin',
+  'eventstats','streamstats','tstats','datamodel','metadata','makeresults','group','groupby',
+  'select','asc','desc','as','on','with','parse','filter','and','or','not','in','like','matches',
+  'regex','contains','startswith','endswith','has','between','ago','earliest','latest','dc',
+  'values','avg','sum','min','max','count_distinct','render','mvcount','split','tostring','toint',
+])
+const SYNTAX = {
+  comment: '#6B7280', string: '#9ECE6A', number: '#E5C07B',
+  pipe: '#C678DD', keyword: '#61AFEF', op: '#56B6C2',
+}
+const QUERY_TOKEN_RE =
+  /(#[^\n]*|\/\/[^\n]*)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)|(\|)|(\b\d+(?:\.\d+)?\b)|([A-Za-z_][A-Za-z0-9_]*)|([=<>!~+\-*/%]+|[()[\]{},])/g
+
+function highlightQueryNodes(text) {
+  const src = text || ''
+  const out = []
+  let last = 0, m, i = 0
+  QUERY_TOKEN_RE.lastIndex = 0
+  while ((m = QUERY_TOKEN_RE.exec(src)) !== null) {
+    if (m.index > last) out.push(src.slice(last, m.index))
+    let color = null, val = m[0]
+    if (m[1]) color = SYNTAX.comment
+    else if (m[2]) color = SYNTAX.string
+    else if (m[3]) color = SYNTAX.pipe
+    else if (m[4]) color = SYNTAX.number
+    else if (m[5]) color = QUERY_KEYWORDS.has(m[5].toLowerCase()) ? SYNTAX.keyword : null
+    else if (m[6]) color = SYNTAX.op
+    out.push(color ? <span key={i++} style={{ color, ...(m[1] ? { fontStyle: 'italic' } : {}), ...(m[3] ? { fontWeight: 700 } : {}) }}>{val}</span> : val)
+    last = m.index + val.length
+  }
+  if (last < src.length) out.push(src.slice(last))
+  return out
+}
+
+function HighlightedQuery({ text }) {
+  return <div className="qcode">{highlightQueryNodes(text)}</div>
+}
+
+// Editor with live highlighting: a transparent textarea over a highlighted <pre>.
+// Both share identical mono metrics/wrapping so the caret aligns with the text.
+function QueryEditor({ value, onChange, placeholder, rows = 8 }) {
+  const taRef = useRef(null)
+  const preRef = useRef(null)
+  const shared = {
+    margin: 0, padding: '10px 12px', border: '1px solid transparent',
+    fontFamily: 'var(--mono)', fontSize: 12.5, lineHeight: 1.55,
+    whiteSpace: 'pre-wrap', wordBreak: 'break-word', overflowWrap: 'anywhere',
+    boxSizing: 'border-box', letterSpacing: 'normal', tabSize: 4,
+  }
+  const sync = () => {
+    if (preRef.current && taRef.current) {
+      preRef.current.scrollTop = taRef.current.scrollTop
+      preRef.current.scrollLeft = taRef.current.scrollLeft
+    }
+  }
+  return (
+    <div style={{ position: 'relative' }}>
+      <pre ref={preRef} aria-hidden="true" style={{
+        ...shared, position: 'absolute', inset: 0, pointerEvents: 'none',
+        overflow: 'hidden', color: 'var(--text)', background: 'transparent',
+      }}>{highlightQueryNodes(value)}{'\n'}</pre>
+      <textarea
+        ref={taRef} value={value} onChange={onChange} onScroll={sync} spellCheck={false}
+        rows={rows} placeholder={placeholder}
+        style={{
+          ...shared, position: 'relative', width: '100%', resize: 'vertical',
+          background: '#0B0B11', color: 'transparent', caretColor: 'var(--text)',
+          borderColor: '#262833', borderRadius: 6, outline: 'none',
+        }} />
+    </div>
+  )
+}
+
 // ─── RULE DETAIL ─────────────────────────────────────────────────────────────
 
 const SIEM_KEYS = ['spl','kql','aql','yara_l','esql','leql','crowdstrike','xql','lucene','sumo']
@@ -1270,12 +1352,11 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
               {!editing && <CopyBtn text={queryTab} />}
             </div>
             {editing ? (
-              <textarea className="edit-textarea edit-mono" rows={8}
-                        value={queryTab}
-                        onChange={e => updateQuery(tab, e.target.value)}
-                        placeholder={`${SIEM_LABELS[tab] || tab} query…`} />
+              <QueryEditor value={queryTab}
+                           onChange={e => updateQuery(tab, e.target.value)}
+                           placeholder={`${SIEM_LABELS[tab] || tab} query…`} />
             ) : (
-              <div className="qcode">{queryTab}</div>
+              <HighlightedQuery text={queryTab} />
             )}
           </div>
         </div>

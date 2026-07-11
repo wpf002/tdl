@@ -272,9 +272,10 @@ export default function OrgSetup({ userId, onComplete }) {
             </p>
 
             {deployedCanonical.length === 0 && (
-              <div style={S.error}>
-                None of your deployed log sources have event-ID metadata yet.
-                You can finish setup and refine this later from Settings.
+              <div style={S.note}>
+                No event-ID breakdown for your deployed log sources yet — that's fine.
+                All matching rules are enabled by default; you can fine-tune event IDs
+                later from Settings.
               </div>
             )}
 
@@ -381,6 +382,10 @@ const S = {
   error: {
     background: 'rgba(248,113,113,.08)', border: '1px solid rgba(248,113,113,.4)',
     color: '#F87171', borderRadius: 6, padding: '10px 12px', fontSize: 13,
+  },
+  note: {
+    background: 'rgba(148,152,168,.08)', border: '1px solid rgba(148,152,168,.28)',
+    color: '#9598A8', borderRadius: 6, padding: '10px 12px', fontSize: 13,
   },
   button: {
     background: '#7C5CFF', color: '#fff', border: 'none', borderRadius: 6,

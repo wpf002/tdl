@@ -697,7 +697,16 @@ def generate_rule_endpoint():
     except ValueError as e:
         return jsonify(error=str(e)), 400
     except Exception as e:
-        return jsonify(error=f"generation failed: {type(e).__name__}: {e}"), 502
+        # Surface actionable, non-leaky messages for the common server-side
+        # misconfigurations instead of dumping the raw Anthropic exception.
+        low = str(e).lower()
+        if "authentication_error" in low or "invalid x-api-key" in low or "401" in low:
+            return jsonify(error="AI generation is unavailable: the server's ANTHROPIC_API_KEY is missing or invalid. Contact an administrator."), 502
+        if "credit balance" in low or "billing" in low:
+            return jsonify(error="AI generation is temporarily unavailable: the server's AI account is out of credits."), 502
+        if "rate limit" in low or "429" in low:
+            return jsonify(error="AI generation is busy (rate limited). Try again in a moment."), 502
+        return jsonify(error=f"AI generation failed ({type(e).__name__}). Try again or contact an administrator."), 502
 
     rule = result["rule"]
     builder_usage = result["usage"]

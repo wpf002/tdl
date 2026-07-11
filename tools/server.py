@@ -70,7 +70,7 @@ RULE_COLUMNS = (
     "requirements",
     "test_method", "tuning_guidance",
     "author", "created", "last_modified",
-    "org_id", "is_custom",
+    "org_id", "owner_user_id", "is_custom",
 )
 
 app = Flask(__name__, static_folder=None)
@@ -371,7 +371,9 @@ def load_rules(force=False):
     global _rules_cache
     if db_enabled():
         with session_scope() as s:
-            rows = s.query(Rule).order_by(Rule.rule_id).all()
+            # Only shared library rules here; per-account owned rules (duplicates)
+            # are appended per-user by _overlay_user_edits.
+            rows = s.query(Rule).filter(Rule.owner_user_id.is_(None)).order_by(Rule.rule_id).all()
             return [_row_to_dict(r) for r in rows]
 
     if _rules_cache is not None and not force:
@@ -463,13 +465,20 @@ def list_rules():
 def get_rule(rule_id):
     full = request.args.get("full") == "1"
     if full:
-        doc = load_full_rule(rule_id)
-        if doc is None:
+        merged = _overlay_one(load_full_rule(rule_id))
+        if merged is None:
             abort(404)
-        return jsonify(_overlay_one(doc))
+        return jsonify(merged)
     for r in load_rules():
         if r.get("rule_id") == rule_id:
-            return jsonify(_overlay_one(r))
+            merged = _overlay_one(r)
+            if merged is None:
+                abort(404)
+            return jsonify(merged)
+    # Owned (duplicated) rules are excluded from load_rules(); check them directly.
+    for r in _owned_rules(g.get("user_id")):
+        if r.get("rule_id") == rule_id:
+            return jsonify(r)
     abort(404)
 
 
@@ -503,36 +512,61 @@ def _require_db(reason):
 # to others. All helpers degrade gracefully to the unedited rule on any error.
 
 def _user_edits(user_id):
-    """{rule_id: {field: value}} of the given user's rule overrides."""
+    """{rule_id: {"data": {...}, "deleted": bool}} of the user's rule overrides."""
     if not user_id or not db_enabled():
         return {}
     try:
         with session_scope() as s:
-            return {e.rule_id: (e.data or {})
+            return {e.rule_id: {"data": e.data or {}, "deleted": bool(e.deleted)}
                     for e in s.query(RuleEdit).filter(RuleEdit.user_id == user_id).all()}
     except Exception:
         return {}
 
 
+def _owned_rules(user_id):
+    """The user's own (duplicated) rules — visible only to them."""
+    if not user_id or not db_enabled():
+        return []
+    try:
+        with session_scope() as s:
+            rows = s.query(Rule).filter(Rule.owner_user_id == user_id).order_by(Rule.rule_id).all()
+            return [_row_to_dict(r) for r in rows]
+    except Exception:
+        return []
+
+
 def _overlay_user_edits(rules):
-    """Overlay the current user's per-account edits onto a list of rule dicts."""
-    edits = _user_edits(g.get("user_id"))
-    if not edits:
+    """Overlay the current user's per-account state onto a list of shared rules:
+    drop rules they soft-deleted, apply their edits, and append their own rules."""
+    user_id = g.get("user_id")
+    if not user_id or not db_enabled():
         return rules
+    edits = _user_edits(user_id)
     out = []
     for r in rules:
         e = edits.get(r.get("rule_id"))
-        out.append({**r, **e, "is_custom": True} if e else r)
+        if e:
+            if e["deleted"]:
+                continue
+            r = {**r, **e["data"], "is_custom": True}
+        out.append(r)
+    out.extend(_owned_rules(user_id))
     return out
 
 
 def _overlay_one(doc):
-    """Overlay the current user's edit onto a single rule dict."""
+    """Overlay the current user's edit onto a single rule dict. Returns None if
+    the rule is another user's private rule or the current user soft-deleted it."""
     if not doc:
         return doc
-    edits = _user_edits(g.get("user_id"))
-    e = edits.get(doc.get("rule_id"))
-    return {**doc, **e, "is_custom": True} if e else doc
+    user_id = g.get("user_id")
+    owner = doc.get("owner_user_id")
+    if owner and owner != user_id:
+        return None  # someone else's private rule — treat as not found
+    e = _user_edits(user_id).get(doc.get("rule_id"))
+    if e and e["deleted"]:
+        return None
+    return {**doc, **e["data"], "is_custom": True} if e else doc
 
 
 @app.put("/api/rules/<rule_id>")
@@ -551,24 +585,35 @@ def update_rule(rule_id):
             abort(400, description="queries must be an object")
         payload["queries"] = {k: v for k, v in payload["queries"].items() if k in QUERY_KEYS}
 
-    # Per-account edit (#7): store the changed fields against this user and
-    # overlay them on the shared rule for the response — never mutate the shared
+    # Per-account edit (#7): a user's own (duplicated) rule is edited in place;
+    # a shared rule is edited via a per-user overlay — never mutating the shared
     # Rule row, so edits don't leak across accounts.
     with session_scope() as s:
         base = s.query(Rule).filter(Rule.rule_id == rule_id).one_or_none()
         if base is None:
             abort(404)
-        edit = s.query(RuleEdit).filter(
-            RuleEdit.user_id == user_id, RuleEdit.rule_id == rule_id).one_or_none()
-        merged = dict(edit.data or {}) if edit else {}
-        merged.update(payload)
-        if edit is None:
-            s.add(RuleEdit(user_id=user_id, rule_id=rule_id, data=merged, updated_at=_now_iso()))
+        if base.owner_user_id and base.owner_user_id != user_id:
+            abort(404)  # someone else's private rule
+        if base.owner_user_id == user_id:
+            for k, v in payload.items():
+                setattr(base, k, v)
+            base.is_custom = True
+            base.last_modified = _today()
+            s.flush()
+            saved = _row_to_dict(base)
         else:
-            edit.data = merged
-            edit.updated_at = _now_iso()
-        s.flush()
-        saved = {**_row_to_dict(base), **merged, "is_custom": True, "last_modified": _today()}
+            edit = s.query(RuleEdit).filter(
+                RuleEdit.user_id == user_id, RuleEdit.rule_id == rule_id).one_or_none()
+            merged = dict(edit.data or {}) if edit else {}
+            merged.update(payload)
+            if edit is None:
+                s.add(RuleEdit(user_id=user_id, rule_id=rule_id, data=merged, updated_at=_now_iso()))
+            else:
+                edit.data = merged
+                edit.deleted = False  # editing un-deletes it for this user
+                edit.updated_at = _now_iso()
+            s.flush()
+            saved = {**_row_to_dict(base), **merged, "is_custom": True, "last_modified": _today()}
 
     # Optionally re-validate the saved rule's queries in the background.
     user_id = g.get("user_id")
@@ -586,21 +631,31 @@ def update_rule(rule_id):
 
 @app.delete("/api/rules/<rule_id>")
 def delete_rule(rule_id):
-    """Hard-delete a rule and tombstone the rule_id so re-seeds skip it."""
+    """Per-account delete (#7). A user's own (duplicated) rule is hard-deleted;
+    a shared rule is soft-deleted for that user only (hidden via the overlay),
+    leaving the shared library and other accounts untouched."""
     _require_db("rule deletes")
     user_id = g.get("user_id")
+    if not user_id:
+        abort(401)
     with session_scope() as s:
         row = s.query(Rule).filter(Rule.rule_id == rule_id).one_or_none()
         if row is None:
             abort(404)
-        s.delete(row)
-        existing = s.query(DeletedRule).filter(DeletedRule.rule_id == rule_id).one_or_none()
-        if existing is None:
-            s.add(DeletedRule(
-                rule_id=rule_id,
-                deleted_by_user_id=user_id,
-                deleted_at=_now_iso(),
-            ))
+        if row.owner_user_id and row.owner_user_id != user_id:
+            abort(404)  # someone else's private rule
+        if row.owner_user_id == user_id:
+            s.delete(row)  # your own rule — really delete it
+        else:
+            # Shared rule — record a per-account tombstone.
+            edit = s.query(RuleEdit).filter(
+                RuleEdit.user_id == user_id, RuleEdit.rule_id == rule_id).one_or_none()
+            if edit is None:
+                s.add(RuleEdit(user_id=user_id, rule_id=rule_id, data={},
+                               deleted=True, updated_at=_now_iso()))
+            else:
+                edit.deleted = True
+                edit.updated_at = _now_iso()
         s.flush()
         return jsonify(deleted=rule_id)
 
@@ -608,10 +663,15 @@ def delete_rule(rule_id):
 @app.post("/api/rules/<rule_id>/duplicate")
 def duplicate_rule(rule_id):
     _require_db("rule duplicate")
+    user_id = g.get("user_id")
+    if not user_id:
+        abort(401)
     with session_scope() as s:
         src = s.query(Rule).filter(Rule.rule_id == rule_id).one_or_none()
         if src is None:
             abort(404)
+        if src.owner_user_id and src.owner_user_id != user_id:
+            abort(404)  # can't duplicate someone else's private rule
         base = f"{rule_id}-COPY"
         n = 1
         while s.query(Rule.id).filter(Rule.rule_id == f"{base}-{n}").first():
@@ -633,6 +693,7 @@ def duplicate_rule(rule_id):
             author=src.author,
             created=_today(),
             last_modified=_today(),
+            owner_user_id=user_id,  # private to the creating account (#7)
             is_custom=True,
         )
         s.add(copy)
@@ -1297,7 +1358,7 @@ def rules_export():
     if not rules:
         abort(404, description="no rules match the supplied filters")
 
-    drop_keys = {"org_id", "is_custom"}
+    drop_keys = {"org_id", "owner_user_id", "is_custom"}
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for r in rules:
@@ -1455,7 +1516,7 @@ def export_rules():
         )
 
     import yaml
-    drop_keys = {"org_id", "is_custom"}
+    drop_keys = {"org_id", "owner_user_id", "is_custom"}
 
     if fmt == "yaml":
         buf = io.BytesIO()

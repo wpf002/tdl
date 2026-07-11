@@ -71,6 +71,9 @@ class Rule(Base):
     last_modified = Column(String(32))
 
     org_id = Column(String(64), index=True, nullable=True)
+    # NULL = shared library rule; set = per-account rule (a user's duplicate),
+    # visible only to its owner (#7 delete/duplicate scoping).
+    owner_user_id = Column(String(64), index=True, nullable=True)
     is_custom = Column(Boolean, nullable=False, default=False, server_default="false")
 
 
@@ -101,6 +104,7 @@ class RuleEdit(Base):
     user_id = Column(String(64), primary_key=True)
     rule_id = Column(String(64), primary_key=True)
     data = Column(JSONB)  # {field: value} overrides
+    deleted = Column(Boolean, nullable=False, default=False, server_default="false")  # per-account soft delete
     updated_at = Column(String(32))
 
 

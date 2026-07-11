@@ -250,6 +250,35 @@ function deployedEventsMap(orgProfile) {
   return out
 }
 
+// Short display labels for canonical log-source ids (used for rule tags).
+const LOG_SOURCE_LABEL = {
+  windows_security_events: 'Windows', sysmon: 'Sysmon', firewall: 'Firewall',
+  edr: 'EDR', dns: 'DNS', identity_provider: 'Identity', proxy: 'Proxy',
+  email_security: 'Email', cloud: 'Cloud', m365: 'M365', linux: 'Linux',
+  vpn: 'VPN', dlp: 'DLP', waf: 'WAF', saas: 'SaaS', kubernetes: 'Kubernetes', mfa: 'MFA',
+}
+
+// Canonical log-source ids a rule maps to (#12 — rule ↔ log source). Prefers the
+// structured requirements.log_sources[].source; falls back to keyword-matching
+// the rule's data_sources + platform against LOG_SOURCE_KEYWORDS.
+function ruleLogSourceIds(rule) {
+  const out = new Set()
+  const reqs = rule?.requirements?.log_sources
+  if (Array.isArray(reqs) && reqs.length) {
+    for (const ls of reqs) {
+      const id = matchLogSourceId(ls?.source || '')
+      if (id) out.add(id)
+    }
+  }
+  if (!out.size) {
+    const text = ((rule?.data_sources || []).join(' ') + ' ' + (rule?.platform || []).join(' ')).toLowerCase()
+    for (const id of Object.keys(LOG_SOURCE_KEYWORDS)) {
+      if ((LOG_SOURCE_KEYWORDS[id] || []).some(k => text.includes(k))) out.add(id)
+    }
+  }
+  return [...out]
+}
+
 // True if any of the rule's data_sources match a keyword for any deployed source.
 // If deployedSet is empty (no profile yet), treat all rules as covered.
 function ruleIsCovered(rule, deployedSet) {
@@ -1007,6 +1036,12 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
   // Leaving edit mode: if the active tab is a language that isn't visible in the
   // filtered view (author may have edited a non-selected language), snap back.
   useEffect(() => { if (!editing && !platforms.includes(tab)) setTab(defaultTab) }, [editing])
+  // Scroll the detail pane to the top whenever the selected rule changes (e.g.
+  // clicking a Related Rule near the bottom) so the user sees it switched.
+  const detailRef = useRef(null)
+  useEffect(() => {
+    detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [rule.rule_id])
   const rc = SEV_COLOR[rule.severity] || '#888'
 
   const startEdit = () => {
@@ -1113,11 +1148,12 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
   const queryTab = editing ? (draft.queries[tab] ?? '') : (rule.queries?.[tab] ?? '')
 
   return (
-    <div className="detail">
+    <div className="detail" ref={detailRef}>
       <div className="detail-rid">{rule.rule_id} · {rule.technique_id}</div>
 
       {editing ? (
         <input className="edit-input edit-input-lg" value={draft.name}
+               style={{ marginBottom: 12 }}
                onChange={e => updateDraft('name', e.target.value)} />
       ) : (
         <div className="detail-name">{rule.name}</div>
@@ -1126,7 +1162,13 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
       <div className="detail-badges">
         <SevBadge s={rule.severity} />
         <span className="pill pill-tactic">{tacticLabel(rule.tactic)}</span>
-        <span className="pill pill-lc">{(rule.platform||[]).join(' · ')}</span>
+        {(rule.platform || []).map(p => (
+          <span key={p} className="pill pill-lc">{p}</span>
+        ))}
+        {ruleLogSourceIds(rule).map(id => (
+          <span key={id} className="pill" style={{ background: 'rgba(96,165,250,.14)', color: '#93C5FD' }}
+                title="Log source">{LOG_SOURCE_LABEL[id]}</span>
+        ))}
         {rule.is_custom && <span className="pill" style={{background:'rgba(124,92,255,.18)', color:'#C4B5FD'}}>Custom</span>}
       </div>
 
@@ -1215,14 +1257,6 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
       {(platforms.length > 0 || editing) && (
         <div className="section">
           <div className="section-title"><Terminal size={11} />Detection Queries</div>
-          {primaryLanguage && rule.queries?.[primaryLanguage] && !editing && (
-            <div style={{ marginBottom: 8 }}>
-              <CopyBtn
-                text={rule.queries[primaryLanguage]}
-                label={`Copy for ${SIEM_LABELS[primaryLanguage] || primaryLanguage.toUpperCase()}`}
-              />
-            </div>
-          )}
           <div className="qtabs">
             {(editing ? SIEM_KEYS : platforms).map(p => (
               <button key={p} className={`qtab${tab===p?' active':''}`} onClick={()=>setTab(p)}>
@@ -2191,12 +2225,23 @@ function RulesView({ rules, pendingFilter, clearPendingFilter, isMobile, onRuleU
         <button
           type="button"
           className="topbar-link"
-          onClick={() => { setSelectionMode(m => !m); if (selectionMode) setSelectedIds(new Set()) }}
+          onClick={() => { const next = !selectionMode; setSelectionMode(next); if (!next) setSelectedIds(new Set()) }}
           title="Select rules to export"
           style={{ marginLeft: 6, color: selectionMode ? '#7C5CFF' : undefined }}
         >
           {selectionMode ? `Selecting · ${selectedIds.size}` : 'Select'}
         </button>
+        {selectionMode && (
+          <button
+            type="button"
+            className="topbar-link"
+            onClick={() => { setSelectionMode(false); setSelectedIds(new Set()) }}
+            title="Cancel selection"
+            style={{ marginLeft: 6 }}
+          >
+            <X size={11} style={{ marginRight: 3, verticalAlign: 'middle' }} />Cancel
+          </button>
+        )}
       </div>
       <div className="filterbar">
         <div className="filter-row">
@@ -2377,8 +2422,33 @@ function ExportModal({ open, onClose, allRules, filteredRules = null, selectedId
   const [customSevs, setCustomSevs] = useState(new Set())
   const [customLifecycles, setCustomLifecycles] = useState(new Set())
   const [customTag, setCustomTag] = useState('')
+  const [customSearch, setCustomSearch] = useState('')
+  const [customLogSources, setCustomLogSources] = useState(new Set())
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
+
+  // Client-side predicate for the Custom scope. Covers the backend filter fields
+  // plus name/rule_id search (#8) and log-source filtering (#11) which the
+  // backend export API doesn't support — for those we resolve to rule_ids here.
+  const customMatch = (r) => {
+    if (customTactics.size && !customTactics.has(r.tactic)) return false
+    if (customSevs.size && !customSevs.has(r.severity)) return false
+    if (customLifecycles.size && !customLifecycles.has(r.lifecycle)) return false
+    if (customTag.trim()) {
+      const tag = customTag.trim().toLowerCase()
+      if (!(r.tags || []).some(t => (t || '').toLowerCase().includes(tag))) return false
+    }
+    if (customSearch.trim()) {
+      const q = customSearch.trim().toLowerCase()
+      if (!((r.name || '').toLowerCase().includes(q) || (r.rule_id || '').toLowerCase().includes(q))) return false
+    }
+    if (customLogSources.size) {
+      const ls = ruleLogSourceIds(r)
+      if (!ls.some(id => customLogSources.has(id))) return false
+    }
+    return true
+  }
+  const customMatches = () => allRules.filter(customMatch)
 
   useEffect(() => {
     if (!open) return
@@ -2399,18 +2469,7 @@ function ExportModal({ open, onClose, allRules, filteredRules = null, selectedId
   if (scope === 'all') previewCount = allRules.length
   else if (scope === 'selected') previewCount = selectedIds.length
   else if (scope === 'filtered') previewCount = (filteredRules || allRules).length
-  else if (scope === 'custom') {
-    previewCount = allRules.filter(r => {
-      if (customTactics.size && !customTactics.has(r.tactic)) return false
-      if (customSevs.size && !customSevs.has(r.severity)) return false
-      if (customLifecycles.size && !customLifecycles.has(r.lifecycle)) return false
-      if (customTag.trim()) {
-        const tag = customTag.trim().toLowerCase()
-        if (!(r.tags || []).some(t => (t || '').toLowerCase().includes(tag))) return false
-      }
-      return true
-    }).length
-  }
+  else if (scope === 'custom') previewCount = customMatches().length
 
   const langApplies = fmt === 'json' || fmt === 'yaml'
 
@@ -2421,18 +2480,13 @@ function ExportModal({ open, onClose, allRules, filteredRules = null, selectedId
       if (scope === 'selected') body.rule_ids = selectedIds
       if (scope === 'filtered' && filteredRules) body.rule_ids = filteredRules.map(r => r.rule_id)
       if (scope === 'filtered' && !filteredRules) body.scope = 'all'
-      if (scope === 'custom') {
-        body.filters = {
-          tactics: [...customTactics],
-          severities: [...customSevs],
-          lifecycles: [...customLifecycles],
-          tag: customTag.trim() || undefined,
-        }
-      }
+      // Custom is resolved client-side (search + log-source filters aren't
+      // supported server-side) and sent as an explicit rule_id list.
+      if (scope === 'custom') body.rule_ids = customMatches().map(r => r.rule_id)
       if (langApplies) body.include_languages = [...langs]
 
-      // When scope=filtered we converted to selected via rule_ids — re-tag.
-      if (scope === 'filtered' && body.rule_ids) body.scope = 'selected'
+      // Anything resolved to a rule_ids list exports as scope=selected.
+      if (body.rule_ids) body.scope = 'selected'
 
       const r = await fetch('/api/export', {
         method: 'POST', credentials: 'include',
@@ -2501,7 +2555,19 @@ function ExportModal({ open, onClose, allRules, filteredRules = null, selectedId
 
         {scope === 'custom' && (
           <div style={{ marginTop: 8, padding: 12, border: '1px solid #262833', borderRadius: 6 }}>
-            <div style={{ fontSize: 11, color: 'var(--text3)', marginBottom: 4 }}>Tactics</div>
+            <div style={{ fontSize: 11, color: 'var(--text3)', marginBottom: 4 }}>Search name or rule ID</div>
+            <input type="text" value={customSearch} onChange={e => setCustomSearch(e.target.value)}
+                   placeholder="e.g. kerberoast or TDL-CA-000019"
+                   style={{ background: '#0B0B11', border: '1px solid #262833', borderRadius: 6,
+                            padding: '6px 10px', color: '#E6E7EE', fontSize: 12, width: '100%', marginBottom: 10 }} />
+            <div style={{ fontSize: 11, color: 'var(--text3)', marginBottom: 4 }}>Log source</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 4 }}>
+              {Object.keys(LOG_SOURCE_LABEL).map(id => (
+                <span key={id} style={checkChip(customLogSources.has(id))}
+                      onClick={() => setCustomLogSources(toggle(customLogSources, id))}>{LOG_SOURCE_LABEL[id]}</span>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text3)', margin: '10px 0 4px' }}>Tactics</div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
               {TACTICS_ALL.map(t => (
                 <span key={t} style={checkChip(customTactics.has(t))}

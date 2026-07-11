@@ -50,7 +50,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 from tools.db import db_enabled, session_scope
-from tools.models import AIUsage, AuthToken, DeletedRule, ImportJob, OrgProfile, Rule, User
+from tools.models import AIUsage, AuthToken, DeletedRule, ImportJob, OrgProfile, Rule, RuleEdit, User
 from tools import auth as authlib
 from tools.agents.base_agent import AGENT_MODEL
 
@@ -434,7 +434,7 @@ def stats():
 
 @app.get("/api/rules")
 def list_rules():
-    rules = load_rules()
+    rules = _overlay_user_edits(load_rules())
     tactic = request.args.get("tactic")
     severity = request.args.get("severity")
     lifecycle = request.args.get("lifecycle")
@@ -466,10 +466,10 @@ def get_rule(rule_id):
         doc = load_full_rule(rule_id)
         if doc is None:
             abort(404)
-        return jsonify(doc)
+        return jsonify(_overlay_one(doc))
     for r in load_rules():
         if r.get("rule_id") == rule_id:
-            return jsonify(r)
+            return jsonify(_overlay_one(r))
     abort(404)
 
 
@@ -497,9 +497,50 @@ def _require_db(reason):
         abort(503, description=f"{reason} requires Postgres (DATABASE_URL)")
 
 
+# ── Per-account rule edits (#7) ─────────────────────────────────────────────
+# Edits are stored per user in `rule_edits` and overlaid on the shared rule at
+# read time, so one account's changes never mutate the shared library or leak
+# to others. All helpers degrade gracefully to the unedited rule on any error.
+
+def _user_edits(user_id):
+    """{rule_id: {field: value}} of the given user's rule overrides."""
+    if not user_id or not db_enabled():
+        return {}
+    try:
+        with session_scope() as s:
+            return {e.rule_id: (e.data or {})
+                    for e in s.query(RuleEdit).filter(RuleEdit.user_id == user_id).all()}
+    except Exception:
+        return {}
+
+
+def _overlay_user_edits(rules):
+    """Overlay the current user's per-account edits onto a list of rule dicts."""
+    edits = _user_edits(g.get("user_id"))
+    if not edits:
+        return rules
+    out = []
+    for r in rules:
+        e = edits.get(r.get("rule_id"))
+        out.append({**r, **e, "is_custom": True} if e else r)
+    return out
+
+
+def _overlay_one(doc):
+    """Overlay the current user's edit onto a single rule dict."""
+    if not doc:
+        return doc
+    edits = _user_edits(g.get("user_id"))
+    e = edits.get(doc.get("rule_id"))
+    return {**doc, **e, "is_custom": True} if e else doc
+
+
 @app.put("/api/rules/<rule_id>")
 def update_rule(rule_id):
     _require_db("rule edits")
+    user_id = g.get("user_id")
+    if not user_id:
+        abort(401)
     body = request.get_json(silent=True) or {}
     payload = {k: v for k, v in body.items() if k in EDITABLE_RULE_FIELDS}
     if not payload:
@@ -510,16 +551,24 @@ def update_rule(rule_id):
             abort(400, description="queries must be an object")
         payload["queries"] = {k: v for k, v in payload["queries"].items() if k in QUERY_KEYS}
 
+    # Per-account edit (#7): store the changed fields against this user and
+    # overlay them on the shared rule for the response — never mutate the shared
+    # Rule row, so edits don't leak across accounts.
     with session_scope() as s:
-        row = s.query(Rule).filter(Rule.rule_id == rule_id).one_or_none()
-        if row is None:
+        base = s.query(Rule).filter(Rule.rule_id == rule_id).one_or_none()
+        if base is None:
             abort(404)
-        for k, v in payload.items():
-            setattr(row, k, v)
-        row.is_custom = True
-        row.last_modified = _today()
+        edit = s.query(RuleEdit).filter(
+            RuleEdit.user_id == user_id, RuleEdit.rule_id == rule_id).one_or_none()
+        merged = dict(edit.data or {}) if edit else {}
+        merged.update(payload)
+        if edit is None:
+            s.add(RuleEdit(user_id=user_id, rule_id=rule_id, data=merged, updated_at=_now_iso()))
+        else:
+            edit.data = merged
+            edit.updated_at = _now_iso()
         s.flush()
-        saved = _row_to_dict(row)
+        saved = {**_row_to_dict(base), **merged, "is_custom": True, "last_modified": _today()}
 
     # Optionally re-validate the saved rule's queries in the background.
     user_id = g.get("user_id")

@@ -91,6 +91,18 @@ class OrgProfile(Base):
     updated_at = Column(String(32))
 
 
+class RuleEdit(Base):
+    """Per-account overrides on shared rules (#7). Rule edits are scoped to the
+    editing user: `data` holds the changed fields, overlaid on the shared Rule
+    at read time. The shared library is never mutated by an edit."""
+    __tablename__ = "rule_edits"
+
+    user_id = Column(String(64), primary_key=True)
+    rule_id = Column(String(64), primary_key=True)
+    data = Column(JSONB)  # {field: value} overrides
+    updated_at = Column(String(32))
+
+
 class AIUsage(Base):
     __tablename__ = "ai_usage"
 

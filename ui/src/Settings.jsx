@@ -1,5 +1,17 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useMemo } from 'react'
 import { QUERY_LANGUAGES, profileQueryLanguages } from './data/query-languages.js'
+
+// Build the per-SIEM log-source map from a profile: prefer stored siem_log_sources,
+// else fall back to the flat log_sources_deployed under the primary (first) SIEM.
+function initSiemLogSources(profile) {
+  const langs = profileQueryLanguages(profile)
+  const src = (profile && typeof profile.siem_log_sources === 'object' && profile.siem_log_sources) || null
+  const out = {}
+  langs.forEach((k, i) => {
+    out[k] = new Set(src && Array.isArray(src[k]) ? src[k] : (i === 0 ? (profile?.log_sources_deployed || []) : []))
+  })
+  return out
+}
 
 const LOG_SOURCES = [
   { id: 'windows_security_events', name: 'Windows Security Event Log' },
@@ -26,10 +38,17 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
   const [queryLanguages, setQueryLanguages] = useState(
     () => new Set(profileQueryLanguages(profile))
   )
-  const [logSources, setLogSources] = useState(new Set(profile?.log_sources_deployed || []))
+  // Per-SIEM log sources (#15): { queryLanguageKey: Set<logSourceId> }.
+  const [siemLogSources, setSiemLogSources] = useState(() => initSiemLogSources(profile))
   const [saving, setSaving] = useState(false)
   const [savedAt, setSavedAt] = useState(null)
   const [error, setError] = useState(null)
+
+  const logSources = useMemo(() => {
+    const u = new Set()
+    for (const s of Object.values(siemLogSources)) for (const id of s) u.add(id)
+    return u
+  }, [siemLogSources])
 
   // Keep local form state in sync if the live org profile changes underneath us
   // (single source of truth lives at the App root). Without this, the form could
@@ -37,19 +56,25 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
   useEffect(() => {
     setOrgName(profile?.org_name || '')
     setQueryLanguages(new Set(profileQueryLanguages(profile)))
-    setLogSources(new Set(profile?.log_sources_deployed || []))
+    setSiemLogSources(initSiemLogSources(profile))
   }, [profile])
 
   const toggleLang = (key) => {
-    const next = new Set(queryLanguages)
-    next.has(key) ? next.delete(key) : next.add(key)
-    setQueryLanguages(next)
+    const selecting = !queryLanguages.has(key)
+    setQueryLanguages(prev => { const n = new Set(prev); selecting ? n.add(key) : n.delete(key); return n })
+    setSiemLogSources(prev => {
+      const out = { ...prev }
+      if (selecting) { if (!out[key]) out[key] = new Set() } else { delete out[key] }
+      return out
+    })
   }
 
-  const toggle = (id) => {
-    const next = new Set(logSources)
-    next.has(id) ? next.delete(id) : next.add(id)
-    setLogSources(next)
+  const toggleSiemSource = (lang, id) => {
+    setSiemLogSources(prev => {
+      const set = new Set(prev[lang] || [])
+      set.has(id) ? set.delete(id) : set.add(id)
+      return { ...prev, [lang]: set }
+    })
   }
 
   const submit = async (e) => {
@@ -60,6 +85,8 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
     try {
       const orderedLangs = QUERY_LANGUAGES.filter((l) => queryLanguages.has(l.key)).map((l) => l.key)
       const primary = orderedLangs[0] || null
+      const siemPayload = {}
+      for (const k of orderedLangs) siemPayload[k] = [...(siemLogSources[k] || [])]
       await onSave({
         ...(profile || {}),
         version: 1,
@@ -68,6 +95,7 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
         primary_query_language: primary,
         // keep the legacy key populated for any old reader
         primary_siem: primary,
+        siem_log_sources: siemPayload,
         log_sources_deployed: Array.from(logSources),
         // Preserve any event-level inventory captured during onboarding; the
         // per-event UI lives in the onboarding "Re-run setup" flow.
@@ -125,26 +153,32 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
         </div>
 
         <div style={S.label}>
-          Log sources currently deployed
+          Log sources per SIEM
           <div style={S.sublabel}>
-            What you actually have running — not aspirational.
+            For each SIEM, the log sources you actually send to it — not aspirational.
           </div>
-          <div style={S.grid}>
-            {LOG_SOURCES.map((src) => {
-              const checked = logSources.has(src.id)
-              return (
-                <label key={src.id} style={{ ...S.chip, ...(checked ? S.chipOn : {}) }}>
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    onChange={() => toggle(src.id)}
-                    style={S.checkbox}
-                  />
-                  {src.name}
-                </label>
-              )
-            })}
-          </div>
+          {QUERY_LANGUAGES.filter((l) => queryLanguages.has(l.key)).map((l) => {
+            const set = siemLogSources[l.key] || new Set()
+            return (
+              <div key={l.key} style={{ marginTop: 12 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: '#A78BFA', marginBottom: 6 }}>
+                  {l.selectLabel} <span style={{ color: '#6E6E7C', fontWeight: 400 }}>· {set.size} selected</span>
+                </div>
+                <div style={S.grid}>
+                  {LOG_SOURCES.map((src) => {
+                    const checked = set.has(src.id)
+                    return (
+                      <label key={src.id} style={{ ...S.chip, ...(checked ? S.chipOn : {}) }}>
+                        <input type="checkbox" checked={checked}
+                               onChange={() => toggleSiemSource(l.key, src.id)} style={S.checkbox} />
+                        {src.name}
+                      </label>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          })}
         </div>
 
         <div style={S.footer}>

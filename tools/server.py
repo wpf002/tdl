@@ -1732,6 +1732,11 @@ def _org_to_dict(row):
         "primary_query_language": lang,
         "query_languages": langs,
         "log_sources_deployed": row.log_sources_deployed or [],
+        # Per-SIEM log sources (#15); fall back to mapping the flat list under the
+        # primary language so older single-SIEM rows still resolve.
+        "siem_log_sources": (row.siem_log_sources
+                             if isinstance(row.siem_log_sources, dict) and row.siem_log_sources
+                             else ({lang: (row.log_sources_deployed or [])} if lang else {})),
         "events_deployed": row.events_deployed or {},
         "created_at": row.created_at,
         "updated_at": row.updated_at,
@@ -1781,9 +1786,28 @@ def put_org_profile():
     # If only the single legacy field was sent, derive the list from it.
     if query_languages is None:
         query_languages = [primary_language] if primary_language else []
+    # Per-SIEM log sources (#15): {query_language_key: [log_source_id, ...]}.
+    siem_log_sources = body.get("siem_log_sources")
+    if siem_log_sources is not None:
+        if not isinstance(siem_log_sources, dict):
+            abort(400, description="siem_log_sources must be an object")
+        siem_log_sources = {
+            str(k): [str(x) for x in (v or []) if x]
+            for k, v in siem_log_sources.items() if isinstance(v, list)
+        }
     log_sources = body.get("log_sources_deployed") or []
     if not isinstance(log_sources, list):
         abort(400, description="log_sources_deployed must be a list")
+    # When per-SIEM sources are provided, the flat list is their union (keeps
+    # coverage/matrix/recommend, which read log_sources_deployed, working).
+    if siem_log_sources:
+        union = []
+        seen_ls = set()
+        for ids in siem_log_sources.values():
+            for x in ids:
+                if x not in seen_ls:
+                    seen_ls.add(x); union.append(x)
+        log_sources = union
     events_deployed = body.get("events_deployed")
     if events_deployed is not None and not isinstance(events_deployed, dict):
         abort(400, description="events_deployed must be an object")
@@ -1800,6 +1824,8 @@ def put_org_profile():
         row.primary_siem = primary_language
         row.query_languages = query_languages
         row.log_sources_deployed = log_sources
+        if siem_log_sources is not None:
+            row.siem_log_sources = siem_log_sources
         if events_deployed is not None:
             row.events_deployed = events_deployed
         row.updated_at = now

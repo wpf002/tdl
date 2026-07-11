@@ -63,8 +63,15 @@ export default function OrgSetup({ userId, onComplete }) {
   const [step, setStep] = useState('basics') // basics | events
   const [orgName, setOrgName] = useState('')
   const [queryLanguages, setQueryLanguages] = useState(new Set(['spl']))
-  const [logSources, setLogSources] = useState(new Set())
+  // Per-SIEM log sources (#15): { queryLanguageKey: Set<logSourceId> }.
+  const [siemLogSources, setSiemLogSources] = useState({ spl: new Set() })
   const [eventsDeployed, setEventsDeployed] = useState({}) // {canonical_id: Set<event_id>}
+  // The flat union of all per-SIEM sources — drives the events step + coverage.
+  const logSources = useMemo(() => {
+    const u = new Set()
+    for (const s of Object.values(siemLogSources)) for (const id of s) u.add(id)
+    return u
+  }, [siemLogSources])
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState(null)
 
@@ -90,23 +97,31 @@ export default function OrgSetup({ userId, onComplete }) {
   )
 
   const toggleLang = (key) => {
-    const next = new Set(queryLanguages)
-    next.has(key) ? next.delete(key) : next.add(key)
-    setQueryLanguages(next)
+    const selecting = !queryLanguages.has(key)
+    setQueryLanguages(prev => { const n = new Set(prev); selecting ? n.add(key) : n.delete(key); return n })
+    // Keep the per-SIEM map in sync: selecting a SIEM adds an (empty) entry,
+    // deselecting drops it (and, via the union, its now-orphaned sources).
+    setSiemLogSources(prev => {
+      const out = { ...prev }
+      if (selecting) { if (!out[key]) out[key] = new Set() } else { delete out[key] }
+      return out
+    })
   }
 
-  const toggle = (id) => {
-    const next = new Set(logSources)
-    next.has(id) ? next.delete(id) : next.add(id)
-    setLogSources(next)
-    // Default-on every event for any newly added source; clear out events for
-    // sources the user just removed.
+  // Toggle a log source for one SIEM, then default-on events for any source now
+  // in the union (and clear events for sources no longer in any SIEM).
+  const toggleSiemSource = (lang, id) => {
+    const set = new Set(siemLogSources[lang] || [])
+    set.has(id) ? set.delete(id) : set.add(id)
+    const nextSls = { ...siemLogSources, [lang]: set }
+    setSiemLogSources(nextSls)
+    const union = new Set()
+    for (const s of Object.values(nextSls)) for (const x of s) union.add(x)
+    const canonical = toCanonical(id)
     setEventsDeployed(prev => {
       const out = { ...prev }
-      const canonical = toCanonical(id)
-      if (next.has(id)) {
-        const events = eventsBySource[canonical] || {}
-        out[canonical] = new Set(Object.keys(events))
+      if (union.has(id)) {
+        if (!out[canonical]) out[canonical] = new Set(Object.keys(eventsBySource[canonical] || {}))
       } else {
         delete out[canonical]
       }
@@ -165,12 +180,15 @@ export default function OrgSetup({ userId, onComplete }) {
       }
       const orderedLangs = QUERY_LANGUAGES.filter((l) => queryLanguages.has(l.key)).map((l) => l.key)
       const primary = orderedLangs[0] || null
+      const siemPayload = {}
+      for (const k of orderedLangs) siemPayload[k] = [...(siemLogSources[k] || [])]
       await onComplete({
         version: 1,
         org_name: orgName.trim(),
         query_languages: orderedLangs,
         primary_query_language: primary,
         primary_siem: primary,
+        siem_log_sources: siemPayload,
         log_sources_deployed: Array.from(logSources),
         events_deployed: eventsPayload,
         created_at: new Date().toISOString(),
@@ -235,19 +253,33 @@ export default function OrgSetup({ userId, onComplete }) {
             </div>
 
             <div style={S.label}>
-              Log sources currently deployed
-              <div style={S.sublabel}>What you actually have running — not aspirational.</div>
-              <div style={S.grid}>
-                {LOG_SOURCES.map((src) => {
-                  const checked = logSources.has(src.id)
-                  return (
-                    <label key={src.id} style={{ ...S.chip, ...(checked ? S.chipOn : {}) }}>
-                      <input type="checkbox" checked={checked} onChange={() => toggle(src.id)} style={S.checkbox} />
-                      {src.name}
-                    </label>
-                  )
-                })}
+              Log sources per SIEM
+              <div style={S.sublabel}>
+                For each SIEM you selected, pick the log sources you actually send to it.
+                What you have running — not aspirational.
               </div>
+              {QUERY_LANGUAGES.filter((l) => queryLanguages.has(l.key)).map((l) => {
+                const set = siemLogSources[l.key] || new Set()
+                return (
+                  <div key={l.key} style={{ marginTop: 12 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: '#A78BFA', marginBottom: 6 }}>
+                      {l.selectLabel} <span style={{ color: '#6E6E7C', fontWeight: 400 }}>· {set.size} selected</span>
+                    </div>
+                    <div style={S.grid}>
+                      {LOG_SOURCES.map((src) => {
+                        const checked = set.has(src.id)
+                        return (
+                          <label key={src.id} style={{ ...S.chip, ...(checked ? S.chipOn : {}) }}>
+                            <input type="checkbox" checked={checked}
+                                   onChange={() => toggleSiemSource(l.key, src.id)} style={S.checkbox} />
+                            {src.name}
+                          </label>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )
+              })}
             </div>
 
             {error && <div style={S.error}>{error}</div>}

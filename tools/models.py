@@ -85,7 +85,8 @@ class OrgProfile(Base):
     primary_siem = Column(String(32))  # legacy; kept for backward-compat reads
     primary_query_language = Column(String(32))  # primary/default lang (first selected)
     query_languages = Column(JSONB)  # list[str] — all selected query languages
-    log_sources_deployed = Column(JSONB)  # list[str]
+    log_sources_deployed = Column(JSONB)  # list[str] — union across SIEMs (compat)
+    siem_log_sources = Column(JSONB)  # {query_language_key: [log_source_id, ...]} (#15)
     events_deployed = Column(JSONB)  # {log_source_id: [event_id, ...]}
     created_at = Column(String(32))
     updated_at = Column(String(32))

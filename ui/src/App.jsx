@@ -1247,10 +1247,17 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
         {(rule.platform || []).map(p => (
           <span key={p} className="pill pill-lc">{p}</span>
         ))}
-        {ruleLogSourceIds(rule).map(id => (
-          <span key={id} className="pill" style={{ background: 'rgba(96,165,250,.14)', color: '#93C5FD' }}
-                title="Log source">{LOG_SOURCE_LABEL[id]}</span>
-        ))}
+        {(() => {
+          // Log-source tags, minus any whose label duplicates a platform tag
+          // (e.g. windows_security_events → "Windows" next to platform "Windows").
+          const plats = new Set((rule.platform || []).map(p => String(p).toLowerCase()))
+          return ruleLogSourceIds(rule)
+            .filter(id => !plats.has((LOG_SOURCE_LABEL[id] || '').toLowerCase()))
+            .map(id => (
+              <span key={id} className="pill" style={{ background: 'rgba(96,165,250,.14)', color: '#93C5FD' }}
+                    title="Log source">{LOG_SOURCE_LABEL[id]}</span>
+            ))
+        })()}
         {rule.is_custom && <span className="pill" style={{background:'rgba(124,92,255,.18)', color:'#C4B5FD'}}>Custom</span>}
       </div>
 

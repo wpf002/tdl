@@ -75,29 +75,15 @@ def _ids_in_text(text: str) -> set[str]:
 
 
 def heuristic_requirements(rule: dict) -> dict | None:
-    """Build a requirements object from the rule's own fields. None if nothing found."""
-    queries_text = " ".join((rule.get("queries") or {}).values()) if rule.get("queries") else ""
-    logic_text = " ".join(filter(None, [rule.get("pseudo_logic") or "", queries_text]))
-    triage_text = " ".join(rule.get("triage_steps") or [])
+    """Build per-source requirements using each log source's real event catalog.
 
-    required_ids = _ids_in_text(logic_text)         # in detection logic → required
-    optional_ids = _ids_in_text(triage_text) - required_ids  # only in triage → optional
-    all_ids = required_ids | optional_ids
-    if not all_ids:
-        return None
-
-    # Group every found event under the rule's first/primary data source name.
-    sources = rule.get("data_sources") or []
-    primary = sources[0] if sources else "Unknown log source"
-
-    events = []
-    for eid in sorted(all_ids, key=lambda x: int(x)):
-        events.append({
-            "id": eid,
-            "name": WINDOWS_EVENT_NAMES.get(eid, f"Event {eid}"),
-            "required": eid in required_ids,
-        })
-    return {"log_sources": [{"source": primary, "events": events}]}
+    Delegates to tools/log_source_event_catalog.py, which maps a rule to the
+    correct log source(s) and attaches that source's own events (Windows/Sysmon
+    numeric IDs, M365 operations, IdP/EDR/DNS/cloud event types, …) — instead of
+    dumping Windows/Sysmon IDs under whatever the first data_source happened to be.
+    """
+    from tools.log_source_event_catalog import build_requirements
+    return build_requirements(rule)
 
 
 # ── Claude fallback ──────────────────────────────────────────────────────────
@@ -185,6 +171,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="Count + cost estimate; no writes, no API")
     ap.add_argument("--apply", action="store_true", help="Write requirements to the DB")
     ap.add_argument("--use-claude", action="store_true", help="Claude fallback for rules with no parsable event IDs (REAL SPEND)")
+    ap.add_argument("--force", action="store_true", help="Recompute + overwrite requirements on ALL rules (not just NULL). Free heuristic is deterministic, so this is safe to re-run.")
     ap.add_argument("--limit", type=int, default=None)
     args = ap.parse_args()
 
@@ -196,7 +183,10 @@ def main():
         return 1
 
     with session_scope() as s:
-        rows = s.query(Rule).filter(Rule.requirements.is_(None)).order_by(Rule.rule_id).all()
+        q = s.query(Rule).order_by(Rule.rule_id)
+        if not args.force:
+            q = q.filter(Rule.requirements.is_(None))
+        rows = q.all()
         rules = [{
             "rule_id": r.rule_id, "name": r.name, "description": r.description,
             "technique_id": r.technique_id, "technique_name": r.technique_name,
@@ -268,7 +258,7 @@ def main():
     with session_scope() as s:
         for rule_id, req in all_hits.items():
             row = s.query(Rule).filter(Rule.rule_id == rule_id).one_or_none()
-            if row is not None and row.requirements is None:
+            if row is not None and (args.force or row.requirements is None):
                 row.requirements = req
     print(f"\n✓ Wrote requirements to {len(all_hits)} rules "
           f"({len(heuristic_hits)} heuristic, {len(claude_hits)} Claude).")

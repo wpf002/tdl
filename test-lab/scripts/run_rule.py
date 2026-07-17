@@ -19,6 +19,7 @@ import argparse
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -82,6 +83,8 @@ def main() -> int:
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--tactic")
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--workers", type=int, default=6, help="Parallel searches (default 6)")
+    ap.add_argument("--quiet", action="store_true", help="Only print fired/errored + summary")
     args = ap.parse_args()
 
     rules = load_rules(tactic=args.tactic, rule_id=args.rule_id)
@@ -90,20 +93,29 @@ def main() -> int:
     if not rules:
         sys.exit("No matching rules with an SPL query.")
 
+    print(f"Running {len(rules)} rule(s) against {URL} with {args.workers} workers …\n")
     fired = errored = 0
-    print(f"Running {len(rules)} rule(s) against {URL} …\n")
-    for rid, name, spl in rules:
+    done = 0
+
+    def work(rule):
+        rid, name, spl = rule
         n, err = run_spl(spl)
-        if err:
-            errored += 1
-            print(f"  ⚠ {rid:<20} ERROR  {err}")
-        elif n > 0:
-            fired += 1
-            print(f"  ✓ {rid:<20} {n:>5} hits  {name[:48]}")
-        else:
-            print(f"  · {rid:<20} {'0':>5} hits  {name[:48]}")
-    print(f"\n{fired} fired · {len(rules)-fired-errored} no-hit · {errored} errored "
-          f"(of {len(rules)})")
+        return rid, name, n, err
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        for rid, name, n, err in (f.result() for f in as_completed(
+                pool.submit(work, r) for r in rules)):
+            done += 1
+            if err:
+                errored += 1
+                print(f"  ⚠ {rid:<20} ERROR  {err[:70]}")
+            elif n > 0:
+                fired += 1
+                print(f"  ✓ {rid:<20} {n:>5} hits  {name[:48]}")
+            elif not args.quiet:
+                print(f"  · {rid:<20} {'0':>5} hits  {name[:48]}")
+    print(f"\n{fired} FIRED · {len(rules)-fired-errored} no-hit · {errored} errored "
+          f"(of {len(rules)} rules)")
     return 0
 
 

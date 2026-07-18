@@ -16,6 +16,7 @@ Env (defaults target this repo's docker-compose):
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -85,9 +86,14 @@ def main() -> int:
     ap.add_argument("--limit", type=int)
     ap.add_argument("--workers", type=int, default=6, help="Parallel searches (default 6)")
     ap.add_argument("--quiet", action="store_true", help="Only print fired/errored + summary")
+    ap.add_argument("--spl-from", help="JSON {rule_id: {spl}} to test instead of the YAML SPL (e.g. exports/regen_spl.json)")
     args = ap.parse_args()
 
     rules = load_rules(tactic=args.tactic, rule_id=args.rule_id)
+    if args.spl_from:
+        override = json.loads(Path(args.spl_from).read_text())
+        rules = [(rid, name, (override.get(rid) or {}).get("spl") or spl)
+                 for (rid, name, spl) in rules]
     if args.limit:
         rules = rules[: args.limit]
     if not rules:

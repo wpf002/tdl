@@ -49,6 +49,28 @@ python scripts/ingest_evtx.py "samples/EVTX-ATTACK-SAMPLES/**/*.evtx"
 `fetch_samples.sh "Credential Access"` grabs a single tactic folder if you don't
 want the whole set.
 
+## 3b. Load the other log sources (cloud / network / endpoint / IdP)
+
+EVTX samples are Windows-only. To make the *whole* library testable, load
+representative events for the other sourcetypes TDL rules query
+(aws:cloudtrail, azure:auditlogs, gcp:audit, Sysmon, firewall, ids, Okta, …):
+
+```bash
+python scripts/load_sources.py
+```
+
+## 3c. Field normalization
+
+Real EVTX carries raw field names (Image, CommandLine, SubjectUserName…) while
+TDL's SPL uses process_name/command_line/user. `splunk-config/props.conf` adds
+the search-time aliases a real Splunk gets from the Windows TA. It's applied when
+the container is created; to (re)apply to a running container:
+
+```bash
+docker cp splunk-config/props.conf tdl-splunk:/opt/splunk/etc/system/local/props.conf
+curl -sk -u admin:$SPLUNK_PASSWORD -X POST https://localhost:8089/services/admin/conf-props/_reload
+```
+
 ## 4. Run TDL rules against the data
 
 ```bash
@@ -89,8 +111,19 @@ The lab receives that host's logs via a Splunk **Universal Forwarder**:
 | `scripts/fetch_samples.sh` | Download EVTX-ATTACK-SAMPLES |
 | `scripts/ingest_evtx.py` | EVTX → JSON → Splunk HEC |
 | `scripts/run_rule.py` | Run TDL SPL rules via REST, report hits |
+| `scripts/load_sources.py` | Load cloud/network/endpoint/IdP sample events |
+| `scripts/run_rule.py` | `--workers` parallel, `--all/--tactic/--limit`, index-normalized |
+| `splunk-config/props.conf` | Windows-TA-style field aliases (raw EVTX → TDL field names) |
 | `scripts/enable-remote-login.sh` | Re-enable REST login after the trial → Free reversion |
 | `atomic-red-team/splunk-uf/` | Universal Forwarder configs for a Windows ART host |
+
+## Open a rule's logs from the app
+
+The Detection Rules page has an **"Open in Splunk"** link on each rule's SPL tab.
+It opens this Splunk instance in a new tab, searching the rule's **base events**
+(the raw logs it matches, before aggregation) with the index normalized to the
+lab data. Defaults to `http://localhost:8000`; override in the browser console:
+`localStorage.setItem('tdl_splunk_url', 'http://your-splunk:8000')`.
 
 ## Stop / reset
 

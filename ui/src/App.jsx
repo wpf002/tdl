@@ -1002,6 +1002,26 @@ function CopyBtn({ text, label = 'Copy' }) {
   )
 }
 
+// ── Open a rule's matching logs in the local Splunk lab (test-lab/) ──────────
+// Base URL of the lab Splunk; override with localStorage 'tdl_splunk_url'.
+function splunkBaseUrl() {
+  try { return localStorage.getItem('tdl_splunk_url') || 'http://localhost:8000' }
+  catch { return 'http://localhost:8000' }
+}
+// Transforming commands — everything after the first of these is dropped so the
+// link shows the RAW events the rule matches, not its aggregated output.
+const SPL_TRANSFORM_RE = /\|\s*(stats|eventstats|streamstats|tstats|timechart|chart|eval|where|table|fields|sort|dedup|top|rare|rename|bin|transaction|head|tail|convert|fillnull|mvexpand|spath)\b/i
+function splunkEventsUrl(spl) {
+  if (!spl) return null
+  let q = spl.trim()
+  const m = q.match(SPL_TRANSFORM_RE)
+  if (m) q = q.slice(0, m.index).trim()                       // keep only the filtering part
+  q = q.replace(/\bindex\s*=\s*"?[\w*-]+"?/gi, 'index=*')      // normalize to the lab data
+  if (!/^(search|\|)\b/i.test(q)) q = 'search ' + q
+  const params = new URLSearchParams({ q, earliest: '0', latest: 'now' })
+  return `${splunkBaseUrl()}/en-US/app/search/search?${params.toString()}`
+}
+
 // ── SIEM query syntax highlighting (#14) ─────────────────────────────────────
 // Lightweight tokenizer shared across all query languages — no external editor
 // dependency. Colors pipes, keywords/functions, strings, numbers, operators,
@@ -1356,6 +1376,13 @@ function RuleDetail({ rule, onUpdated, onDuplicated, onDeleted, primaryLanguage,
           <div className="qblock">
             <div className="qblock-head">
               <span className="qblock-lang">{SIEM_LABELS[tab] || tab.toUpperCase()}</span>
+              {!editing && tab === 'spl' && rule.queries?.spl && (
+                <a className="copy-btn" href={splunkEventsUrl(rule.queries.spl)}
+                   target="_blank" rel="noreferrer" style={{ textDecoration: 'none' }}
+                   title="Open the matching logs in your local Splunk lab (test-lab/)">
+                  <ExternalLink size={10} /> Open in Splunk
+                </a>
+              )}
               {!editing && <CopyBtn text={queryTab} />}
             </div>
             {editing ? (

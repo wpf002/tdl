@@ -154,7 +154,11 @@ add("azure", "azure:aad:signin", [
 def main():
     total = 0
     for index, sourcetype, events in BATCHES:
-        body = "".join(json.dumps({"index": index, "sourcetype": sourcetype,
+        # Everything goes to `main` (the only index that exists by default; HEC
+        # drops events for non-existent indexes). The rule runner normalizes
+        # index=… to index=*, so the source's real index name doesn't matter —
+        # only its sourcetype + fields do.
+        body = "".join(json.dumps({"index": "main", "sourcetype": sourcetype,
                                    "source": "tdl-lab:sources", "time": now,
                                    "event": e}) + "\n" for e in events)
         r = requests.post(HEC_URL, headers={"Authorization": f"Splunk {HEC_TOKEN}"},

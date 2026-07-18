@@ -1,9 +1,8 @@
 rule_id: TDL-EXE-000704
 v4_id: '000704'
 name: Suspicious Lambda/Function Created with Admin Role
-description: New serverless function created with privileged role (IAM admin / contributor) by a non-CI/CD identity. Adversaries
-  weaponize serverless to persist with cloud creds. Generated from gap analysis against canonical ATT&CK Enterprise matrix
-  (T1648 under Execution).
+description: New serverless function created with privileged role (IAM admin / contributor) by a non-CI/CD identity. Adversaries weaponize serverless
+  to persist with cloud creds. Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1648 under Execution).
 tactic: Execution
 tactic_id: TA0002
 technique_id: T1648
@@ -19,74 +18,86 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: "index=cloud_audit (eventName=\"CreateFunction\" OR eventName=\"CreateFunction20150331\" OR eventName=\"functions.create\" OR eventName=\"\
+    Microsoft.Web/sites/functions/write\") \n| eval is_lambda=if(eventName=\"CreateFunction\" OR eventName=\"CreateFunction20150331\", 1, 0),\n\
+    \       is_gcf=if(eventName=\"functions.create\", 1, 0),\n       is_azure=if(eventName=\"Microsoft.Web/sites/functions/write\", 1, 0)\n| eval\
+    \ role_arn=coalesce('requestParameters.role', 'requestParameters.functionConfiguration.role', 'properties.functionAppConfig.deployment.storage.authentication.type')\n\
+    | eval service_account=coalesce('request.serviceAccountEmail', 'authorization.resource.attributes.service_account')\n| eval azure_identity=coalesce('identity.claims.appid',\
+    \ userIdentity)\n| eval function_name=coalesce('requestParameters.functionName', 'request.function', 'resourceId')\n| eval caller_identity=coalesce(userIdentity.principalId,\
+    \ userIdentity.arn, user, azure_identity, service_account)\n| eval is_cicd=if(match(caller_identity, \"(?i)(jenkins|gitlab|github|circleci|azure-pipelines|codebuild|cloudbuild|deploy|automation|service)\"\
+    ), 1, 0)\n| eval is_privileged=if(match(role_arn, \"(?i)(admin|contributor|owner|poweruser|fullaccess|\\*)\") OR match(service_account, \"\
+    (?i)(admin|owner|editor)\"), 1, 0)\n| where is_cicd=0 AND is_privileged=1\n| stats count earliest(_time) as first_seen latest(_time) as last_seen\
+    \ values(role_arn) as roles values(function_name) as functions by caller_identity, eventName, src_ip\n| table first_seen last_seen caller_identity\
+    \ eventName src_ip roles functions count\n"
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_exe_000704 {
-      meta:
-        author = "TDL"
-        description = "Suspicious Lambda/Function Created with Admin Role"
-        severity = "MEDIUM"
-        tactic = "TA0002"
-        technique = "T1648"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_exe_000704 {\n  meta:\n    author = \"TDL\"\n    description = \"Suspicious Lambda/Function Created with Admin Role\"\n\
+    \    severity = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1648\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
+    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
-pseudo_logic: New serverless function created with privileged role (IAM admin / contributor) by a non-CI/CD identity. Adversaries
-  weaponize serverless to persist with cloud creds.
+
+    '
+pseudo_logic: New serverless function created with privileged role (IAM admin / contributor) by a non-CI/CD identity. Adversaries weaponize serverless
+  to persist with cloud creds.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
-  group, and refine thresholds using ≥7 days of telemetry before promoting.
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset group, and refine
+  thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - serverless
@@ -98,15 +109,14 @@ references:
 - https://attack.mitre.org/techniques/T1648/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'
-- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — pay attention to short-lived
-  processes, encoded arguments, and unusual parents (Office, browser, services).
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — pay attention to short-lived processes, encoded
+  arguments, and unusual parents (Office, browser, services).
 - Pull EDR process tree for the alert PID; check the parent / grandparent and any child processes spawned within 5 minutes.
 - 'Compare against the host''s baseline: is the binary / interpreter normally invoked here, by this user, at this time?'
-- 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software
-  install, or scheduled job.'
-- 'If TP: contain the host, kill the offending process, snapshot memory if possible, and escalate to IR with the process tree
-  attached.'
+- 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software install, or scheduled
+  job.'
+- 'If TP: contain the host, kill the offending process, snapshot memory if possible, and escalate to IR with the process tree attached.'

@@ -1,8 +1,8 @@
 rule_id: TDL-IMP-000132
 v4_id: '000132'
 name: AWS Production Instance Terminations
-description: Detects when multiple AWS production instances are terminated in a short amount of time. An attacker may terminate
-  instances to destory data with the goal of negatively impacting the company’s operations.
+description: Detects when multiple AWS production instances are terminated in a short amount of time. An attacker may terminate instances to destory
+  data with the goal of negatively impacting the company’s operations.
 tactic: Impact
 tactic_id: TA0040
 technique_id: T1489
@@ -17,66 +17,74 @@ lifecycle: Deployed
 risk_score: 75
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    index=cloudtrail sourcetype=aws:cloudtrail (eventName=TerminateInstances OR eventName=DeleteInstance)
+    | lookup aws_production_instances.csv instanceId OUTPUT instanceId as prod_instance
+    | where isnotnull(prod_instance)
+    | bin _time span=5m
+    | stats dc(requestParameters.instancesSet.items{}.instanceId) as instance_count values(requestParameters.instancesSet.items{}.instanceId) as instances values(eventName) as event_names by _time, userIdentity.userName
+    | where instance_count >= 3
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_imp_000132 {
-      meta:
-        author = "TDL"
-        description = "AWS Production Instance Terminations"
-        severity = "HIGH"
-        tactic = "TA0040"
-        technique = "T1489"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_imp_000132 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Production Instance Terminations\"\n    severity\
+    \ = \"HIGH\"\n    tactic = \"TA0040\"\n    technique = \"T1489\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
+    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Security software
 - Authorized admin tools
@@ -86,7 +94,7 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
 pseudo_logic: '3 AWS CloudTrail Events
 
@@ -102,11 +110,10 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'
-- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — characterize the destructive
-  action (encrypt, delete, lockout, disable, reboot).
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — characterize the destructive action (encrypt,
+  delete, lockout, disable, reboot).
 - 'Determine spread: is this a single host or a coordinated multi-host event? Pull file / service telemetry across the fleet.'
 - Trigger your major-incident bridge if scope is multi-host or business-critical — early activation buys time.
-- 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this
-  severity.'
-- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence
-  to prevent recurrence.'
+- 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this severity.'
+- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence to prevent
+  recurrence.'

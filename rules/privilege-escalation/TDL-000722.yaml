@@ -1,8 +1,8 @@
 rule_id: TDL-PE-000722
 v4_id: '000722'
 name: Trusted Binary Loading DLL from Application Directory
-description: Microsoft-signed binary loads an unsigned DLL from its application directory or %APPDATA%. Side-load / search-order
-  hijack pattern. Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1574 under Privilege Escalation).
+description: Microsoft-signed binary loads an unsigned DLL from its application directory or %APPDATA%. Side-load / search-order hijack pattern.
+  Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1574 under Privilege Escalation).
 tactic: Privilege Escalation
 tactic_id: TA0004
 technique_id: T1574
@@ -20,75 +20,84 @@ lifecycle: Proposed
 risk_score: 75
 queries:
   spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1
-    | search process_name="*.+*"
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
-    | where count >= 1
-    | sort - count
-  kql: |
-    DeviceProcessEvents
+    index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=7
+    | eval ImageLower=lower(Image), ImageLoadedLower=lower(ImageLoaded)
+    | search ImageLower IN ("*\\system32\\*", "*\\syswow64\\*", "*\\program files*") ImageLoadedLower IN ("*\\appdata\\*", "*\\programdata\\*", "*\\users\\*", "*\\temp\\*")
+    | where Signed="true" AND (SignedStatus="Valid" OR SignedStatus="Trusted") AND (ImageSignedStatus!="Valid" OR ImageSignedStatus="false" OR ImageSignedStatus="Unsigned" OR isnull(ImageSignedStatus))
+    | stats count values(ImageLoaded) as loaded_dlls values(Signature) as signer by ComputerName, Image, User
+    | where count > 0
+    | table _time, ComputerName, User, Image, signer, loaded_dlls, count
+  kql: 'DeviceProcessEvents
+
     | where TimeGenerated > ago(1d)
+
     | where process_name matches regex ".+"
+
     | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" = '1'
-      AND "process_name" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_pe_000722 {
-      meta:
-        author = "TDL"
-        description = "Trusted Binary Loading DLL from Application Directory"
-        severity = "HIGH"
-        tactic = "TA0004"
-        technique = "T1574"
-      events:
-        $e.metadata.event_type = "PROCESS_LAUNCH"
-        $e.process_name = /.+/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*,logs-windows*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_pe_000722 {\n  meta:\n    author = \"TDL\"\n    description = \"Trusted Binary Loading DLL from Application Directory\"\
+    \n    severity = \"HIGH\"\n    tactic = \"TA0004\"\n    technique = \"T1574\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
+    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*,logs-windows*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "process" AND process_name LIKE "%.+%"
+
     | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND process_name=/.+/)
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
+
     groupby(asset, process_name, parent_process_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=ProcessRollup2 AND process_name=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
+
     | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+
     | sort -occurrences
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
+
     | sort desc occurrences
-  lucene: |
-    event.category:"process" AND process_name:*.+*
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"process" AND process_name:*.+*
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id="1" AND process_name matches "*.+*"
+
     | count by host, user, parent_process_name, command_line
+
     | sort by _count desc
-pseudo_logic: Microsoft-signed binary loads an unsigned DLL from its application directory or %APPDATA%. Side-load / search-order
-  hijack pattern.
+
+    '
+pseudo_logic: Microsoft-signed binary loads an unsigned DLL from its application directory or %APPDATA%. Side-load / search-order hijack pattern.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
-  group, and refine thresholds using ≥7 days of telemetry before promoting.
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset group, and refine
+  thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - dll-hijack
@@ -100,16 +109,14 @@ references:
 - https://attack.mitre.org/techniques/T1574/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, source user, and (if visible) the resulting privileged context.'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the privilege gain was
-  not part of an approved elevation flow (UAC consent, sudo, PAM ticket).
+- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the privilege gain was not part of an approved
+  elevation flow (UAC consent, sudo, PAM ticket).
 - 'Pull preceding 1h of activity for the source user: was there earlier credential-access / discovery / exploit telemetry?'
-- 'Validate token / session changes: new SeImpersonate-style privileges, new IAM role assumption, or a SYSTEM-level child
-  process from a user-level parent.'
-- 'Decide TP / FP: TP if there''s no change-management correlation and no parent admin process; FP if it''s a documented elevation
-  by IT.'
-- 'If TP: contain the host, revoke the elevated session, sweep for other escalations using the same primitive, and notify
-  identity / IR teams.'
+- 'Validate token / session changes: new SeImpersonate-style privileges, new IAM role assumption, or a SYSTEM-level child process from a user-level
+  parent.'
+- 'Decide TP / FP: TP if there''s no change-management correlation and no parent admin process; FP if it''s a documented elevation by IT.'
+- 'If TP: contain the host, revoke the elevated session, sweep for other escalations using the same primitive, and notify identity / IR teams.'

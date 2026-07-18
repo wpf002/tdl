@@ -1,9 +1,9 @@
 rule_id: TDL-C2-000241
 v4_id: '000241'
 name: C2 Callback - Multiple Internal Hosts
-description: Detects outbound traffic flagged by the IDS as malware communications back to a command and control server from
-  multiple hosts. Infected hosts need to maintain contact with a C2 server in order to receive updates and commands  to further
-  their objective. Multiple internal hosts demonstrating this activity could indicate a widespread botnet infection.
+description: Detects outbound traffic flagged by the IDS as malware communications back to a command and control server from multiple hosts. Infected
+  hosts need to maintain contact with a C2 server in order to receive updates and commands  to further their objective. Multiple internal hosts
+  demonstrating this activity could indicate a widespread botnet infection.
 tactic: Command and Control
 tactic_id: TA0011
 technique_id: T1071
@@ -20,66 +20,83 @@ lifecycle: Deployed
 risk_score: 75
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    (index=ids OR index=ips OR index=guardduty)
+    | eval detection_type=case(
+        (sourcetype IN ("suricata","snort","ids","ips") AND match(signature, "(?i)\b(C2|c&c|command and control)") AND direction="outbound"), "ids_c2",
+        (sourcetype="aws:guardduty" AND 'detail.type' IN ("Backdoor:EC2/C&CActivity.B","Backdoor:EC2/C&CActivity.B!DNS","Backdoor:Lambda/C&CActivity.B","Backdoor:Runtime/C&CActivity.B","Backdoor:Runtime/C&CActivity.B!DNS") AND direction="outbound"), "guardduty_c2",
+        1=1, null()
+    )
+    | where isnotnull(detection_type)
+    | eval src_ip=coalesce(src, src_ip, 'detail.resource.instanceDetails.networkInterfaces{}.privateIpAddress', sourceIPAddress)
+    | eval dest_ip=coalesce(dest, dest_ip, dst, 'detail.service.action.networkConnectionAction.remoteIpDetails.ipAddressV4', destinationIPAddress)
+    | bin _time span=10m
+    | eventstats dc(src_ip) as unique_src_count, dc(dest_ip) as unique_dest_count, dc(dest_ip) as dest_count_per_src by _time, detection_type, src_ip
+    | eventstats dc(src_ip) as src_count_per_dest by _time, detection_type, dest_ip
+    | where (detection_type="ids_c2" AND src_count_per_dest >= 5 AND unique_src_count >= 5) OR (detection_type="guardduty_c2" AND dest_count_per_src >= 5 AND unique_dest_count >= 5)
+    | stats values(src_ip) as source_ips, values(dest_ip) as destination_ips, dc(src_ip) as unique_sources, dc(dest_ip) as unique_destinations, values(signature) as signatures, values(detail.type) as guardduty_types, count by _time, detection_type
+    | table _time, detection_type, source_ips, destination_ips, unique_sources, unique_destinations, signatures, guardduty_types, count
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_c2_000241 {
-      meta:
-        author = "TDL"
-        description = "C2 Callback - Multiple Internal Hosts"
-        severity = "HIGH"
-        tactic = "TA0011"
-        technique = "T1071"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_c2_000241 {\n  meta:\n    author = \"TDL\"\n    description = \"C2 Callback - Multiple Internal Hosts\"\n    severity\
+    \ = \"HIGH\"\n    tactic = \"TA0011\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
+    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -89,12 +106,11 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
-pseudo_logic: "5 IDS/IPS Exploit Event\nFrom multiple internal sources to a single external destinations (Outbound)\nWhere\
-  \ the IDS/IPS Signature matches the following regex \"(?i)\\b(C2|c&c|command and control)\"\nWith unique Source IPs\nWithin\
-  \ 10 minutes\n\n\n--------------------------------------------------------------------------------------\n\n5 Guard Duty\
-  \ Events \nFrom one internal source to many external destinations (Outbound)\nWhere the Event Type is in [\"Backdoor:EC2/C&CActivity.B\"\
+pseudo_logic: "5 IDS/IPS Exploit Event\nFrom multiple internal sources to a single external destinations (Outbound)\nWhere the IDS/IPS Signature\
+  \ matches the following regex \"(?i)\\b(C2|c&c|command and control)\"\nWith unique Source IPs\nWithin 10 minutes\n\n\n--------------------------------------------------------------------------------------\n\
+  \n5 Guard Duty Events \nFrom one internal source to many external destinations (Outbound)\nWhere the Event Type is in [\"Backdoor:EC2/C&CActivity.B\"\
   ,  \"Backdoor:EC2/C&CActivity.B!DNS\", \"Backdoor:Lambda/C&CActivity.B\", \"Backdoor:Runtime/C&CActivity.B\", \"Backdoor:Runtime/C&CActivity.B!DNS\"\
   ]\nWith unique Destination IPs\nWithin 10 minutes"
 suppression:
@@ -102,10 +118,9 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'
-- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — verify beaconing characteristics (interval,
-  jitter, request size, server response code).
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — verify beaconing characteristics (interval, jitter, request size,
+  server response code).
 - Pull WHOIS / TLS / passive-DNS context on the destination — newly registered or low-reputation infrastructure raises confidence.
 - Identify the originating process and trace it back to its install / launch event (initial access / persistence stage).
 - 'Decide TP / FP: FP for sanctioned OOB management agents (allowlist them); TP for unattended periodic egress to new infrastructure.'
-- 'If TP: block the destination at egress, isolate the host, capture network PCAP / memory while session is live, and escalate
-  to IR.'
+- 'If TP: block the destination at egress, isolate the host, capture network PCAP / memory while session is live, and escalate to IR.'

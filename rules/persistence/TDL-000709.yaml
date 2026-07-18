@@ -1,9 +1,8 @@
 rule_id: TDL-PER-000709
 v4_id: 000709
 name: Container Image Pushed to Production Registry by Unusual Identity
-description: Push to internal/prod container registry from an identity outside the CI/CD service-account allowlist. Adversaries
-  plant backdoored images for later pulls. Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1525 under
-  Persistence).
+description: Push to internal/prod container registry from an identity outside the CI/CD service-account allowlist. Adversaries plant backdoored
+  images for later pulls. Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1525 under Persistence).
 tactic: Persistence
 tactic_id: TA0003
 technique_id: T1525
@@ -22,73 +21,83 @@ lifecycle: Proposed
 risk_score: 75
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    index=cloud_audit (source="*container*registry*" OR source="*artifact*registry*" OR sourcetype="gcp:cloudaudit:activity" OR sourcetype="aws:cloudtrail" OR sourcetype="azure:monitor:activity") (action="*push*" OR action="*upload*" OR action="*PutImage*" OR action="*UploadBlob*" OR eventName="PutImage" OR operationName="*uploadBlob*" OR operationName="*push*")
+    | eval registry_path=coalesce(requestParameters.repositoryName, resource.name, repository_name, repositoryName)
+    | where (match(registry_path, "(?i)(prod|production|internal)") OR match(dest, "(?i)(prod|production|internal)"))
+    | eval identity=coalesce(userIdentity.principalId, userIdentity.arn, user, caller, userPrincipalName, actor.user.email, principalEmail)
+    | where NOT (match(identity, "(?i)(ci-cd-sa|gitlab-runner|jenkins-sa|github-actions|circleci|buildkite|tekton|argo-cd|flux-cd|deploy-bot|automation-sa)"))
+    | stats count earliest(_time) as first_time latest(_time) as last_time values(action) as actions values(registry_path) as repositories by identity, src_ip, user_agent
+    | eval first_time=strftime(first_time, "%Y-%m-%d %H:%M:%S"), last_time=strftime(last_time, "%Y-%m-%d %H:%M:%S")
+    | table identity, src_ip, user_agent, count, first_time, last_time, repositories, actions
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_per_000709 {
-      meta:
-        author = "TDL"
-        description = "Container Image Pushed to Production Registry by Unusual Identity"
-        severity = "HIGH"
-        tactic = "TA0003"
-        technique = "T1525"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_per_000709 {\n  meta:\n    author = \"TDL\"\n    description = \"Container Image Pushed to Production Registry by Unusual\
+    \ Identity\"\n    severity = \"HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1525\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
+    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
-pseudo_logic: Push to internal/prod container registry from an identity outside the CI/CD service-account allowlist. Adversaries
-  plant backdoored images for later pulls.
+
+    '
+pseudo_logic: Push to internal/prod container registry from an identity outside the CI/CD service-account allowlist. Adversaries plant backdoored
+  images for later pulls.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
-  group, and refine thresholds using ≥7 days of telemetry before promoting.
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset group, and refine
+  thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - container
@@ -100,17 +109,14 @@ references:
 - https://attack.mitre.org/techniques/T1525/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 triage_steps:
-- 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service
-  / config).'
-- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — verify the persistence
-  target points to an unusual location or unsigned binary.
-- Determine when the artifact was created and which process/account performed the write — pivot on that process for the original
-  attack chain.
+- 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — verify the persistence target points to an
+  unusual location or unsigned binary.
+- Determine when the artifact was created and which process/account performed the write — pivot on that process for the original attack chain.
 - 'Look for prior child-process activity from the persistence target: did anything actually launch from it?'
-- 'Decide TP / FP: FP for sanctioned management software (RMM, vendor agents, custom installers) — verify against the asset
-  register.'
-- 'If TP: remove the persistence artifact, isolate the host, hunt for the same artifact across the fleet, and rotate any credentials
-  touched by the persistent process.'
+- 'Decide TP / FP: FP for sanctioned management software (RMM, vendor agents, custom installers) — verify against the asset register.'
+- 'If TP: remove the persistence artifact, isolate the host, hunt for the same artifact across the fleet, and rotate any credentials touched by
+  the persistent process.'

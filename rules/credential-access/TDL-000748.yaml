@@ -1,9 +1,8 @@
 rule_id: TDL-CA-000748
 v4_id: 000748
 name: SAML Token Issued With Impossible Lifetime
-description: ADFS / Azure AD token with NotOnOrAfter > 24h, or SignatureCertificate fingerprint not in the published cert
-  set. Golden-SAML forging signal. Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1606 under Credential
-  Access).
+description: ADFS / Azure AD token with NotOnOrAfter > 24h, or SignatureCertificate fingerprint not in the published cert set. Golden-SAML forging
+  signal. Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1606 under Credential Access).
 tactic: Credential Access
 tactic_id: TA0006
 technique_id: T1606
@@ -21,73 +20,90 @@ lifecycle: Proposed
 risk_score: 95
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    (index=azure OR index=aws OR index=cloud OR index=adfs) (sourcetype=azure:aad:audit OR sourcetype=aws:cloudtrail OR sourcetype=ADFS:Admin OR sourcetype=ADFS:Security OR sourcetype=WinEventLog:AD* OR source="*adfs*")
+    ("NotOnOrAfter" OR "saml" OR "token" OR "SignatureCertificate" OR "assertion")
+    | rex field=_raw "NotOnOrAfter[\"\':\s=]+(?<NotOnOrAfter_raw>[^\",\s\}]+)"
+    | rex field=_raw "(?i)SignatureCertificate[\"\':\s=]+(?<cert_fingerprint>[0-9A-Fa-f:]+)"
+    | rex field=_raw "(?i)thumbprint[\"\':\s=]+(?<thumbprint>[0-9A-Fa-f:]+)"
+    | eval cert_id=coalesce(cert_fingerprint, thumbprint)
+    | eval NotOnOrAfter_epoch=strptime(NotOnOrAfter_raw, "%Y-%m-%dT%H:%M:%S")
+    | eval token_lifetime_hours=round((NotOnOrAfter_epoch - _time)/3600, 2)
+    | eval suspicious_lifetime=if(token_lifetime_hours > 24, 1, 0)
+    | lookup adfs_known_certs.csv fingerprint AS cert_id OUTPUT is_known
+    | eval suspicious_cert=if(isnull(is_known) AND isnotnull(cert_id), 1, 0)
+    | where suspicious_lifetime=1 OR suspicious_cert=1
+    | eval alert_reason=case(suspicious_lifetime=1 AND suspicious_cert=1, "Token lifetime exceeds 24h AND unknown certificate", suspicious_lifetime=1, "Token lifetime exceeds 24h", suspicious_cert=1, "Unknown SignatureCertificate fingerprint", 1=1, "Unknown")
+    | stats values(alert_reason) as reasons values(token_lifetime_hours) as token_lifetime_hours values(cert_id) as certificate_fingerprint values(NotOnOrAfter_raw) as NotOnOrAfter by _time, host, user, source, sourcetype
+    | table _time, host, user, reasons, token_lifetime_hours, certificate_fingerprint, NotOnOrAfter, source, sourcetype
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_ca_000748 {
-      meta:
-        author = "TDL"
-        description = "SAML Token Issued With Impossible Lifetime"
-        severity = "CRITICAL"
-        tactic = "TA0006"
-        technique = "T1606"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_ca_000748 {\n  meta:\n    author = \"TDL\"\n    description = \"SAML Token Issued With Impossible Lifetime\"\n    severity\
+    \ = \"CRITICAL\"\n    tactic = \"TA0006\"\n    technique = \"T1606\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n \
+    \   $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
-pseudo_logic: ADFS / Azure AD token with NotOnOrAfter > 24h, or SignatureCertificate fingerprint not in the published cert
-  set. Golden-SAML forging signal.
+
+    '
+pseudo_logic: ADFS / Azure AD token with NotOnOrAfter > 24h, or SignatureCertificate fingerprint not in the published cert set. Golden-SAML forging
+  signal.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
-  group, and refine thresholds using ≥7 days of telemetry before promoting.
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset group, and refine
+  thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - golden-saml
@@ -99,15 +115,14 @@ references:
 - https://attack.mitre.org/techniques/T1606/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — verify the read / dump
-  / brute-force pattern is consistent with this technique.
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — verify the read / dump / brute-force pattern
+  is consistent with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
-- 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
-  kerberos tickets).'
+- 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens, kerberos tickets).'
 - 'Decide TP / FP: FP for sanctioned IR / pen-test / DSC tooling; TP for unattended dumping or anomalous Kerberos behavior.'
-- 'If TP: rotate all potentially exposed credentials and tickets, invalidate sessions, isolate the host, and consider golden-ticket
-  / krbtgt rotation if scope warrants.'
+- 'If TP: rotate all potentially exposed credentials and tickets, invalidate sessions, isolate the host, and consider golden-ticket / krbtgt rotation
+  if scope warrants.'

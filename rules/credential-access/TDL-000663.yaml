@@ -1,9 +1,9 @@
 rule_id: TDL-CA-000663
 v4_id: '000663'
 name: Windows Replay Attack Detected
-description: This rule identifies potential replay attacks on Windows systems. Replay attacks involve capturing and reusing
-  valid authentication tokens or network traffic to gain unauthorized access. This detection focuses on anomalies such as
-  repeated Kerberos authentication errors (e.g., KRB_AP_ERR_REPEAT ) or unusual patterns in authentication attempts.
+description: This rule identifies potential replay attacks on Windows systems. Replay attacks involve capturing and reusing valid authentication
+  tokens or network traffic to gain unauthorized access. This detection focuses on anomalies such as repeated Kerberos authentication errors (e.g.,
+  KRB_AP_ERR_REPEAT ) or unusual patterns in authentication attempts.
 tactic: Credential Access
 tactic_id: TA0006
 technique_id: T1558
@@ -19,68 +19,73 @@ lifecycle: Proposed
 risk_score: 75
 queries:
   spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1
-    | search event_id IN ("4649")
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
-    | where count >= 1
-    | sort - count
-  kql: |
-    DeviceProcessEvents
+    index=windows sourcetype=WinEventLog:Security EventCode=4649
+    | table _time, ComputerName, Account_Name, Ticket_Options, Ticket_Encryption_Type, Service_Name, Client_Address
+  kql: 'DeviceProcessEvents
+
     | where TimeGenerated > ago(1d)
+
     | where event_id in ("4649")
+
     | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" = '1'
-      AND "event_id" IN ('4649')
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_ca_000663 {
-      meta:
-        author = "TDL"
-        description = "Windows Replay Attack Detected"
-        severity = "HIGH"
-        tactic = "TA0006"
-        technique = "T1558"
-      events:
-        $e.metadata.event_type = "PROCESS_LAUNCH"
-        $e.event_id = /(4649)/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*,logs-windows*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4649')\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_ca_000663 {\n  meta:\n    author = \"TDL\"\n    description = \"Windows Replay Attack Detected\"\n    severity = \"HIGH\"\
+    \n    tactic = \"TA0006\"\n    technique = \"T1558\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4649)/\n\
+    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*,logs-windows*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "process" AND event_id IN ("4649")
+
     | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND event_id IN [4649])
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4649])
+
     groupby(asset, process_name, parent_process_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=ProcessRollup2 AND event_id IN (4649)
+
+    '
+  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4649)
+
     | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+
     | sort -occurrences
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.PROCESS AND event_id in ("4649")
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
+
     | sort desc occurrences
-  lucene: |
-    event.category:"process" AND event_id:(4649)
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"process" AND event_id:(4649)
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id="1" AND event_id IN ("4649")
+
     | count by host, user, parent_process_name, command_line
+
     | sort by _count desc
+
+    '
 false_positives:
 - Miss-configuration may casuse false positives. Base line for atleast a week.
 tuning_guidance: Tune per environment baseline.
@@ -89,18 +94,17 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 pseudo_logic: '1 Windows Security Event
 
   Where Event ID 4649'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force
-  pattern is consistent with this technique.
+- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force pattern is consistent
+  with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
-- 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
-  kerberos tickets).'
+- 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens, kerberos tickets).'
 - 'Decide TP / FP: FP for sanctioned IR / pen-test / DSC tooling; TP for unattended dumping or anomalous Kerberos behavior.'
-- 'If TP: rotate all potentially exposed credentials and tickets, invalidate sessions, isolate the host, and consider golden-ticket
-  / krbtgt rotation if scope warrants.'
+- 'If TP: rotate all potentially exposed credentials and tickets, invalidate sessions, isolate the host, and consider golden-ticket / krbtgt rotation
+  if scope warrants.'

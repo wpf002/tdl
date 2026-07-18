@@ -16,33 +16,24 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: 'index=network sourcetype=firewall OR sourcetype=ids
-
-    | search network.protocol="*tcp*"
-
-    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip,
-    dest_ip, dest_port
-
+  spl: |
+    index=network (sourcetype=firewall OR sourcetype=ids) network.protocol="tcp" NOT (src_ip IN ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
+    | stats count dc(dest_ip) as unique_dests sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
     | where count >= 1
-
     | sort - bytes_out
-
-    '
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP),
-    DestinationIP=tostring(DestinationIP))
+    | dedup src_ip
+  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
 
     | where TimeGenerated > ago(1d)
 
     | where network.protocol matches regex "tcp"
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP,
-    DestinationPort
+    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
 
     | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections,
-    SUM(bytessrc) as bytes_out
+  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
 
     FROM flows
 
@@ -53,19 +44,16 @@ queries:
     LAST 1 HOURS
 
     '
-  yara_l: "rule tdl_tdl_auth_000556 {\n  meta:\n    author = \"TDL\"\n    description\
-    \ = \"Excessive Login Attempts from Bot IP\"\n    severity = \"MEDIUM\"\n    tactic\
-    \ = \"TA0001\"\n    technique = \"T1133\"\n  events:\n    $e.metadata.event_type\
-    \ = \"NETWORK_CONNECTION\"\n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n\
-    \  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
+  yara_l: "rule tdl_tdl_auth_000556 {\n  meta:\n    author = \"TDL\"\n    description = \"Excessive Login Attempts from Bot IP\"\n    severity\
+    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1133\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
+    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
   esql: 'FROM logs-network*,logs-endpoint*
 
     | WHERE @timestamp > NOW() - 1 hour
 
     | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
 
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip,
-    destination.port
+    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
 
     | SORT bytes_out DESC
 
@@ -77,11 +65,9 @@ queries:
     calculate(count, sum(bytes_out))
 
     '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest)
-    AND network.protocol=*tcp*
+  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
 
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4,
-    RemotePort
+    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
 
     | sort -bytes_out
 
@@ -90,8 +76,7 @@ queries:
 
     | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
 
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname,
-    action_remote_ip, action_remote_port
+    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
 
     | sort desc bytes_out
 
@@ -117,23 +102,17 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 triage_steps:
-- 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender,
-  URL), and the matched IOC.'
-- Examine the destination domain/IP, ASN, port, and TLS / HTTP fingerprints to assess
-  whether the entry vector is consistent with this technique.
-- Cross-reference with email gateway, web proxy, and EDR telemetry in the 30 minutes
-  around the alert for related delivery activity.
-- 'Pivot on the user / host: look for follow-on execution, persistence, or credential-access
-  events in the next 24h.'
-- 'Decide TP / FP / dual-use: confirm the user did not request the activity (sanctioned
-  vendor onboarding, marketing campaign, pen test).'
-- 'If TP: isolate the host, reset the user''s credentials and tokens, capture forensic
-  artifacts, and open an incident ticket referencing this rule_id.'
-pseudo_logic: '1 or more instances over the observed session window of login attempt
-  events sourced from a known Botnet IP address.
+- 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'
+- Examine the destination domain/IP, ASN, port, and TLS / HTTP fingerprints to assess whether the entry vector is consistent with this technique.
+- Cross-reference with email gateway, web proxy, and EDR telemetry in the 30 minutes around the alert for related delivery activity.
+- 'Pivot on the user / host: look for follow-on execution, persistence, or credential-access events in the next 24h.'
+- 'Decide TP / FP / dual-use: confirm the user did not request the activity (sanctioned vendor onboarding, marketing campaign, pen test).'
+- 'If TP: isolate the host, reset the user''s credentials and tokens, capture forensic artifacts, and open an incident ticket referencing this
+  rule_id.'
+pseudo_logic: '1 or more instances over the observed session window of login attempt events sourced from a known Botnet IP address.
 
 
   From index=network where sourcetype is firewall or sourcetype is ids
@@ -142,13 +121,10 @@ pseudo_logic: '1 or more instances over the observed session window of login att
 
   With count of events per grouping >= 1
 
-  With distinct count of dest_ip (unique_dests) and total sum of bytes_out calculated
-  per src_ip, dest_ip, and dest_port combination
+  With distinct count of dest_ip (unique_dests) and total sum of bytes_out calculated per src_ip, dest_ip, and dest_port combination
 
   With results sorted descending by bytes_out
 
-  Excluding traffic originating from authorized scanners or monitoring agents appearing
-  on the admin allow-list
+  Excluding traffic originating from authorized scanners or monitoring agents appearing on the admin allow-list
 
-  With the same src_ip, dest_ip, and dest_port as the correlation key, deduplicating
-  on unique src_ip per evaluation window'
+  With the same src_ip, dest_ip, and dest_port as the correlation key, deduplicating on unique src_ip per evaluation window'

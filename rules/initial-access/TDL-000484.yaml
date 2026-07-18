@@ -15,67 +15,83 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=network sourcetype=firewall OR sourcetype=ids
-    | search application="*rpc*"
-    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-    | where count >= 1
-    | sort - bytes_out
-  kql: |
-    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  spl: "index=firewall \n    (action=allowed OR (dest_port IN (\"135\", \"593\") OR app=\"rpc\"))\n    src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)\n\
+    \    dest_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)\n    earliest=-90d latest=now\n| eval is_baseline=if(_time < relative_time(now(),\
+    \ \"-30d\"), 1, 0)\n| eventstats dc(dest_ip) as baseline_dest_count by src_ip, is_baseline\n| where is_baseline=0\n| stats earliest(_time)\
+    \ as first_seen, latest(_time) as last_seen, count by src_ip, dest_ip, dest_port, app, action\n| eventstats values(dest_ip) as baseline_dest_ips\
+    \ by src_ip\n| where NOT (dest_ip IN (baseline_dest_ips) AND first_seen < relative_time(now(), \"-30d\"))\n| where first_seen >= relative_time(now(),\
+    \ \"-30d\")\n| table first_seen, last_seen, src_ip, dest_ip, dest_port, app, action, count\n"
+  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+
     | where TimeGenerated > ago(1d)
+
     | where application matches regex "rpc"
+
     | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+
     | order by Bytes desc
-  aql: |
-    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+
+    '
+  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+
     FROM flows
-    WHERE "application" LIKE '%rpc%'
+
+    WHERE "application" LIKE ''%rpc%''
+
     GROUP BY sourceip, destinationip, destinationport
+
     LAST 1 HOURS
-  yara_l: |
-    rule tdl_tdl_auth_000484 {
-      meta:
-        author = "TDL"
-        description = "First Seen Allowed Internal RPC Traffic"
-        severity = "LOW"
-        tactic = "TA0001"
-        technique = "T1021"
-      events:
-        $e.metadata.event_type = "NETWORK_CONNECTION"
-        $e.application = /rpc/
-        $src = $e.principal.ip
-      match:
-        $src over 10m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-network*,logs-endpoint*
+
+    '
+  yara_l: "rule tdl_tdl_auth_000484 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Allowed Internal RPC Traffic\"\n    severity\
+    \ = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1021\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.application\
+    \ = /rpc/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-network*,logs-endpoint*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "network" AND application LIKE "%rpc%"
+
     | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+
     | SORT bytes_out DESC
-  leql: |
-    where(logset = "Network Activity" AND application=/rpc/)
+
+    '
+  leql: 'where(logset = "Network Activity" AND application=/rpc/)
+
     groupby(source_ip, destination_ip, destination_port)
+
     calculate(count, sum(bytes_out))
-  crowdstrike: |
-    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*rpc*
+
+    '
+  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*rpc*
+
     | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
+
     | sort -bytes_out
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.NETWORK AND application ~= "rpc"
+
     | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
+
     | sort desc bytes_out
-  lucene: |
-    event.category:"network" AND application:*rpc*
-  sumo: |
-    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+
+    '
+  lucene: 'event.category:"network" AND application:*rpc*
+
+    '
+  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+
     | where application matches "*rpc*"
+
     | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+
     | sort by bytes_out desc
+
+    '
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -85,19 +101,16 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
-pseudo_logic: "1 Firewall Event \nFrom one internal source to one internal destination (Internal)\nWhere the Action is Allowed\n\
-  OR\n    Where the Destination Port IN (\"135\", \"593\")\n\n    Where the Application is \"rpc\"\n\nBaseline Learning: 30\
-  \ Days\nRetention: 90 Days\n\nNew Value: Destination IP"
+pseudo_logic: "1 Firewall Event \nFrom one internal source to one internal destination (Internal)\nWhere the Action is Allowed\nOR\n    Where\
+  \ the Destination Port IN (\"135\", \"593\")\n\n    Where the Application is \"rpc\"\n\nBaseline Learning: 30 Days\nRetention: 90 Days\n\nNew\
+  \ Value: Destination IP"
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'
-- Examine the destination domain/IP, ASN, port, and TLS / HTTP fingerprints to assess whether the entry vector is consistent
-  with this technique.
-- Cross-reference with email gateway, web proxy, and EDR telemetry in the 30 minutes around the alert for related delivery
-  activity.
+- Examine the destination domain/IP, ASN, port, and TLS / HTTP fingerprints to assess whether the entry vector is consistent with this technique.
+- Cross-reference with email gateway, web proxy, and EDR telemetry in the 30 minutes around the alert for related delivery activity.
 - 'Pivot on the user / host: look for follow-on execution, persistence, or credential-access events in the next 24h.'
-- 'Decide TP / FP / dual-use: confirm the user did not request the activity (sanctioned vendor onboarding, marketing campaign,
-  pen test).'
-- 'If TP: isolate the host, reset the user''s credentials and tokens, capture forensic artifacts, and open an incident ticket
-  referencing this rule_id.'
+- 'Decide TP / FP / dual-use: confirm the user did not request the activity (sanctioned vendor onboarding, marketing campaign, pen test).'
+- 'If TP: isolate the host, reset the user''s credentials and tokens, capture forensic artifacts, and open an incident ticket referencing this
+  rule_id.'

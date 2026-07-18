@@ -1,8 +1,8 @@
 rule_id: TDL-DIS-000325
 v4_id: '000325'
 name: Excessive Failures by User - GCP
-description: Detects when a Non-Service account fails more 10 actions within five minutes. This activity could be indicative
-  of a threat actor testing what permissions an account has.
+description: Detects when a Non-Service account fails more 10 actions within five minutes. This activity could be indicative of a threat actor
+  testing what permissions an account has.
 tactic: Discovery
 tactic_id: TA0007
 technique_id: T1078
@@ -17,66 +17,72 @@ lifecycle: Deployed
 risk_score: 30
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    index=gcp sourcetype="google:gcp:pubsub:message" code=7 NOT src_user="*gserviceaccount*"
+    | bin _time span=5m
+    | stats count by _time, src_user
+    | where count >= 10
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_dis_000325 {
-      meta:
-        author = "TDL"
-        description = "Excessive Failures by User - GCP"
-        severity = "LOW"
-        tactic = "TA0007"
-        technique = "T1078"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_dis_000325 {\n  meta:\n    author = \"TDL\"\n    description = \"Excessive Failures by User - GCP\"\n    severity = \"\
+    LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
+    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -86,7 +92,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
 pseudo_logic: '10 Cloud Audit event within 5 minutes
 
@@ -96,12 +102,12 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'
-- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — determine whether the
-  enumeration is targeted (specific user / share / OU) or scattered (broad, scripted).
-- 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from
-  a finance or HR identity is high-signal.'
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — determine whether the enumeration is targeted
+  (specific user / share / OU) or scattered (broad, scripted).
+- 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from a finance or HR identity
+  is high-signal.'
 - Pull adjacent execution / lateral-movement / cred-access telemetry — discovery often precedes the next stage by minutes.
-- 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and
-  adjacent telemetry is suspicious.'
-- 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity
-  that the recon was likely setting up.'
+- 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and adjacent telemetry
+  is suspicious.'
+- 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity that the recon
+  was likely setting up.'

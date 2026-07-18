@@ -1,9 +1,8 @@
 rule_id: TDL-DE-000729
 v4_id: 000729
 name: Process Reads Domain Membership / Geo Before Execution
-description: Short-lived process queries GetComputerNameEx, NetWkstaGetInfo, GetUserGeoID and exits with no further activity.
-  Likely environment-keyed payload bailing on a non-target host. Generated from gap analysis against canonical ATT&CK Enterprise
-  matrix (T1480 under Defense Evasion).
+description: Short-lived process queries GetComputerNameEx, NetWkstaGetInfo, GetUserGeoID and exits with no further activity. Likely environment-keyed
+  payload bailing on a non-target host. Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1480 under Defense Evasion).
 tactic: Defense Evasion
 tactic_id: TA0005
 technique_id: T1480
@@ -21,75 +20,86 @@ lifecycle: Proposed
 risk_score: 50
 queries:
   spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1
-    | search process_name="*.+*"
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
-    | where count >= 1
-    | sort - count
-  kql: |
-    DeviceProcessEvents
+    index=* sourcetype IN ("WinEventLog:Microsoft-Windows-Sysmon/Operational", "edr", "carbon_black", "crowdstrike") (EventCode=1 OR event_simpleName=ProcessRollup* OR event_type=proc_create)
+    | bin _time span=10s
+    | stats min(_time) as first_seen, max(_time) as last_seen, values(Image) as process_image, values(CommandLine) as cmdline, dc(EventCode) as event_variety, values(loaded_modules) as modules, values(network_connections) as net_conns by ComputerName, process_guid
+    | eval process_lifetime=last_seen - first_seen
+    | where process_lifetime <= 5
+    | search (modules="*GetComputerNameEx*" OR modules="*NetWkstaGetInfo*" OR modules="*GetUserGeoID*" OR cmdline="*GetComputerNameEx*" OR cmdline="*NetWkstaGetInfo*" OR cmdline="*GetUserGeoID*")
+    | where event_variety <= 2 AND (isnull(net_conns) OR net_conns="")
+    | table _time, ComputerName, process_image, cmdline, process_lifetime, event_variety
+  kql: 'DeviceProcessEvents
+
     | where TimeGenerated > ago(1d)
+
     | where process_name matches regex ".+"
+
     | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" = '1'
-      AND "process_name" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_de_000729 {
-      meta:
-        author = "TDL"
-        description = "Process Reads Domain Membership / Geo Before Execution"
-        severity = "MEDIUM"
-        tactic = "TA0005"
-        technique = "T1480"
-      events:
-        $e.metadata.event_type = "PROCESS_LAUNCH"
-        $e.process_name = /.+/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*,logs-windows*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_de_000729 {\n  meta:\n    author = \"TDL\"\n    description = \"Process Reads Domain Membership / Geo Before Execution\"\
+    \n    severity = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1480\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
+    \n    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*,logs-windows*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "process" AND process_name LIKE "%.+%"
+
     | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND process_name=/.+/)
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
+
     groupby(asset, process_name, parent_process_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=ProcessRollup2 AND process_name=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
+
     | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+
     | sort -occurrences
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
+
     | sort desc occurrences
-  lucene: |
-    event.category:"process" AND process_name:*.+*
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"process" AND process_name:*.+*
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id="1" AND process_name matches "*.+*"
+
     | count by host, user, parent_process_name, command_line
+
     | sort by _count desc
-pseudo_logic: Short-lived process queries GetComputerNameEx, NetWkstaGetInfo, GetUserGeoID and exits with no further activity.
-  Likely environment-keyed payload bailing on a non-target host.
+
+    '
+pseudo_logic: Short-lived process queries GetComputerNameEx, NetWkstaGetInfo, GetUserGeoID and exits with no further activity. Likely environment-keyed
+  payload bailing on a non-target host.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
-  group, and refine thresholds using ≥7 days of telemetry before promoting.
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset group, and refine
+  thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - guardrail
@@ -100,16 +110,14 @@ references:
 - https://attack.mitre.org/techniques/T1480/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — distinguish administrative tooling
-  from adversary tradecraft (LOLBins, signed binary proxies, masquerading paths).
+- Inspect the parent → child process tree, command line arguments, and code-signing status — distinguish administrative tooling from adversary
+  tradecraft (LOLBins, signed binary proxies, masquerading paths).
 - 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log channel state to see what was suppressed.'
-- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same
-  minute.'
-- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts for it; TP if it''s unattended and
-  pairs with other malicious telemetry.'
-- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out of retention, isolate the host, and escalate
-  to IR.'
+- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same minute.'
+- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts for it; TP if it''s unattended and pairs with other malicious
+  telemetry.'
+- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out of retention, isolate the host, and escalate to IR.'

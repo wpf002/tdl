@@ -1,8 +1,8 @@
 rule_id: TDL-EXE-000563
 v4_id: '000563'
 name: Command Execution on Pod
-description: Detects a user executing a bash shell within a pod. This will only show the execution and not have visibility
-  into what happens after the shell is started
+description: Detects a user executing a bash shell within a pod. This will only show the execution and not have visibility into what happens after
+  the shell is started
 tactic: Execution
 tactic_id: TA0002
 technique_id: T1204
@@ -17,66 +17,85 @@ lifecycle: Proposed
 risk_score: 75
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    index=* sourcetype=kube:*
+    (
+      (objectRef.resource="pods" verb="create" objectRef.subresource="exec")
+      OR
+      (requestURI="*%2Fbin%2Fbash*")
+      OR
+      (requestURI="*%2Fbin%2Fsh*")
+      OR
+      (requestURI="*/bin/bash*")
+      OR
+      (requestURI="*%/bin/sh%*")
+      OR
+      (requestURI="bash *")
+      OR
+      (requestURI="sh *")
+    )
+    | table _time, user.username, sourceIPs{}, objectRef.namespace, objectRef.name, verb, requestURI, responseStatus.code
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_exe_000563 {
-      meta:
-        author = "TDL"
-        description = "Command Execution on Pod"
-        severity = "HIGH"
-        tactic = "TA0002"
-        technique = "T1204"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_exe_000563 {\n  meta:\n    author = \"TDL\"\n    description = \"Command Execution on Pod\"\n    severity = \"HIGH\"\n\
+    \    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
+    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Security software
 - Authorized admin tools
@@ -86,19 +105,18 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
-pseudo_logic: "1 Kubernetes Event \nWhere the Resource is \"pods\"\nWhere Subresource is \"exec\"\nWhere Verb is \"create\"\
-  \nOR\n    Where the RequestURI contains \"%2Fbin%2Fbash\"\n    Where the RequestURI contains \"%2Fbin%2Fsh\"\n    Where\
-  \ the RequestURI contains \"/bin/bash\"\n    Where the RequestURI contains \"%/bin/sh%\"\n    Where the RequestURI starts\
-  \ with \"bash \"\n    Where the RequestURI starts with \"sh \""
+pseudo_logic: "1 Kubernetes Event \nWhere the Resource is \"pods\"\nWhere Subresource is \"exec\"\nWhere Verb is \"create\"\nOR\n    Where the\
+  \ RequestURI contains \"%2Fbin%2Fbash\"\n    Where the RequestURI contains \"%2Fbin%2Fsh\"\n    Where the RequestURI contains \"/bin/bash\"\n\
+  \    Where the RequestURI contains \"%/bin/sh%\"\n    Where the RequestURI starts with \"bash \"\n    Where the RequestURI starts with \"sh\
+  \ \""
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — pay attention to short-lived
-  processes, encoded arguments, and unusual parents (Office, browser, services).
+- Inspect the parent → child process tree, command line arguments, and code-signing status — pay attention to short-lived processes, encoded arguments,
+  and unusual parents (Office, browser, services).
 - Pull EDR process tree for the alert PID; check the parent / grandparent and any child processes spawned within 5 minutes.
 - 'Compare against the host''s baseline: is the binary / interpreter normally invoked here, by this user, at this time?'
-- 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software
-  install, or scheduled job.'
-- 'If TP: contain the host, kill the offending process, snapshot memory if possible, and escalate to IR with the process tree
-  attached.'
+- 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software install, or scheduled
+  job.'
+- 'If TP: contain the host, kill the offending process, snapshot memory if possible, and escalate to IR with the process tree attached.'

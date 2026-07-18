@@ -1,8 +1,7 @@
 rule_id: TDL-AUTH-000023
 v4_id: '000023'
 name: Impossible Travel Login Detected
-description: Detects when a user successfully logs in from 2 locations where the user would have to be Superman to travel
-  that fast.
+description: Detects when a user successfully logs in from 2 locations where the user would have to be Superman to travel that fast.
 tactic: Initial Access
 tactic_id: TA0001
 technique_id: T1078
@@ -20,66 +19,89 @@ lifecycle: Deployed
 risk_score: 75
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    (index=o365 sourcetype="o365:management:activity" Operation=UserLoggedIn Result=Success) OR (index=vpn sourcetype=vpn (action=success OR action=login)) OR (index=aws sourcetype="aws:cloudtrail" eventName=ConsoleLogin errorCode=success) OR (index=o365 sourcetype="o365:atp:alert" alert_name="Impossible travel activity") OR (index=aws sourcetype="aws:guardduty" type="UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B")
+    | eval user=coalesce(UserId, user, userName, userIdentity.userName, dest_user)
+    | eval src_ip=coalesce(ClientIP, src_ip, src, sourceIPAddress)
+    | eval event_type=case(
+        sourcetype="o365:atp:alert" AND alert_name="Impossible travel activity", "o365_atp_alert",
+        sourcetype="aws:guardduty" AND type="UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B", "guardduty_event",
+        (sourcetype="o365:management:activity" OR sourcetype="vpn" OR sourcetype="aws:cloudtrail"), "login_event",
+        1=1, "other"
+    )
+    | iplocation src_ip
+    | eval lat=coalesce(lat, 0), lon=coalesce(lon, 0)
+    | sort 0 user _time
+    | streamstats current=f last(lat) as prev_lat last(lon) as prev_lon last(_time) as prev_time by user
+    | eval time_diff_hours=(_time - prev_time)/3600
+    | eval distance_km=6371*acos(cos(radians(lat))*cos(radians(prev_lat))*cos(radians(prev_lon)-radians(lon))+sin(radians(lat))*sin(radians(prev_lat)))
+    | eval speed_kph=distance_km/time_diff_hours
+    | eval impossible_travel=if(speed_kph > 925 AND isnotnull(prev_lat), 1, 0)
+    | where (event_type="login_event" AND impossible_travel=1) OR event_type="o365_atp_alert" OR event_type="guardduty_event"
+    | stats count(eval(event_type="login_event" AND impossible_travel=1)) as login_events, count(eval(event_type="o365_atp_alert")) as o365_alerts, count(eval(event_type="guardduty_event")) as guardduty_events, values(_time) as event_times, values(src_ip) as src_ips, values(Country) as countries, max(speed_kph) as max_speed_kph by user
+    | where (login_events >= 2) OR (o365_alerts >= 1) OR (guardduty_events >= 1)
+    | table user, login_events, o365_alerts, guardduty_events, max_speed_kph, event_times, src_ips, countries
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_auth_000023 {
-      meta:
-        author = "TDL"
-        description = "Impossible Travel Login Detected"
-        severity = "HIGH"
-        tactic = "TA0001"
-        technique = "T1078"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_auth_000023 {\n  meta:\n    author = \"TDL\"\n    description = \"Impossible Travel Login Detected\"\n    severity = \"\
+    HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
+    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,10 +111,10 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
-pseudo_logic: "2 Successful Login Events\nFrom multiple sources\nWith the same Destination Username\nWhere the Distance Traveled\
-  \ speed required is greater than 925 kph\n\n---------------------------------------------------------------------------------------------------------------\n\
+pseudo_logic: "2 Successful Login Events\nFrom multiple sources\nWith the same Destination Username\nWhere the Distance Traveled speed required\
+  \ is greater than 925 kph\n\n---------------------------------------------------------------------------------------------------------------\n\
   \n1 O365 ATP Alert\nWhere the alert name is \"Impossible travel activity\"\n\n\n---------------------------------------------------------------------------------------------------------------\n\
   \n1 Guard Duty Event \nWhere the Event Type is in [\"UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B\"]"
 suppression:
@@ -102,12 +124,10 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'
-- Examine the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on to assess whether the entry
-  vector is consistent with this technique.
-- Cross-reference with email gateway, web proxy, and EDR telemetry in the 30 minutes around the alert for related delivery
-  activity.
+- Examine the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on to assess whether the entry vector is consistent
+  with this technique.
+- Cross-reference with email gateway, web proxy, and EDR telemetry in the 30 minutes around the alert for related delivery activity.
 - 'Pivot on the user / host: look for follow-on execution, persistence, or credential-access events in the next 24h.'
-- 'Decide TP / FP / dual-use: confirm the user did not request the activity (sanctioned vendor onboarding, marketing campaign,
-  pen test).'
-- 'If TP: isolate the host, reset the user''s credentials and tokens, capture forensic artifacts, and open an incident ticket
-  referencing this rule_id.'
+- 'Decide TP / FP / dual-use: confirm the user did not request the activity (sanctioned vendor onboarding, marketing campaign, pen test).'
+- 'If TP: isolate the host, reset the user''s credentials and tokens, capture forensic artifacts, and open an incident ticket referencing this
+  rule_id.'

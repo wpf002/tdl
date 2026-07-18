@@ -1,8 +1,8 @@
 rule_id: TDL-IMP-000580
 v4_id: 000580
 name: Deployment Deleted From Kubernetes Cluster
-description: 'Detects the removal of a deployment from a Kubernetes cluster. This could indicate disruptive activity aiming
-  to impact business operations. Sigma rule by "Leo Tsaousis (@laripping)"
+description: 'Detects the removal of a deployment from a Kubernetes cluster. This could indicate disruptive activity aiming to impact business
+  operations. Sigma rule by "Leo Tsaousis (@laripping)"
 
 
   ref: https://microsoft.github.io/Threat-Matrix-for-Kubernetes/techniques/Data%20destruction/'
@@ -20,66 +20,70 @@ lifecycle: Proposed
 risk_score: 30
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    index=kubernetes sourcetype=kube:events object.kind="Deployment" verb="delete"
+    | table _time, user.username, object.metadata.name, object.metadata.namespace, verb, sourceIPs{}
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_imp_000580 {
-      meta:
-        author = "TDL"
-        description = "Deployment Deleted From Kubernetes Cluster"
-        severity = "LOW"
-        tactic = "TA0040"
-        technique = "T1498"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_imp_000580 {\n  meta:\n    author = \"TDL\"\n    description = \"Deployment Deleted From Kubernetes Cluster\"\n    severity\
+    \ = \"LOW\"\n    tactic = \"TA0040\"\n    technique = \"T1498\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
+    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Security software
 - Authorized admin tools
@@ -89,16 +93,15 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere Resource is \"deployments\"\nWhere Verb is \"delete\""
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — characterize the destructive
-  action (encrypt, delete, lockout, disable, reboot).
+- Inspect the parent → child process tree, command line arguments, and code-signing status — characterize the destructive action (encrypt, delete,
+  lockout, disable, reboot).
 - 'Determine spread: is this a single host or a coordinated multi-host event? Pull file / service telemetry across the fleet.'
 - Trigger your major-incident bridge if scope is multi-host or business-critical — early activation buys time.
-- 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this
-  severity.'
-- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence
-  to prevent recurrence.'
+- 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this severity.'
+- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence to prevent
+  recurrence.'

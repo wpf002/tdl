@@ -1,9 +1,8 @@
 rule_id: TDL-AUTH-000242
 v4_id: '000242'
 name: Successful SQL Injection
-description: Detects when a SQL injection is successful in exfiltrating data from a web server’s database. After an injection
-  attempt, the firewall session will log a large amount of bytes being sent back to the external source, indicating a successful
-  injection.
+description: Detects when a SQL injection is successful in exfiltrating data from a web server’s database. After an injection attempt, the firewall
+  session will log a large amount of bytes being sent back to the external source, indicating a successful injection.
 tactic: Initial Access
 tactic_id: TA0001
 technique_id: T1190
@@ -19,66 +18,105 @@ lifecycle: Deployed
 risk_score: 55
 queries:
   spl: |
-    index=network sourcetype=firewall OR sourcetype=ids
-    | search network.protocol="*tcp*"
-    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-    | where count >= 1
-    | sort - bytes_out
-  kql: |
-    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+    (index=network (sourcetype=snort OR sourcetype=suricata OR sourcetype=ids OR sourcetype=ips) signature IN ("*SQL Injection*", "*sql injection*") src_ip!=10.* src_ip!=172.16.* src_ip!=192.168.* dest_ip IN (10.*, 172.16.*, 192.168.*))
+    OR
+    (index=network (sourcetype=firewall OR sourcetype=paloalto OR sourcetype=checkpoint OR sourcetype=fortinet) action IN (allow, allowed, accept) src_ip!=10.* src_ip!=172.16.* src_ip!=192.168.* dest_ip IN (10.*, 172.16.*, 192.168.*) bytes_in>10485760)
+    OR
+    (index=network (sourcetype=waf OR sourcetype=imperva OR sourcetype=akamai OR sourcetype=cloudflare_waf) signature IN ("*SQL Injection*", "*sql injection*") action IN (allow, allowed, permit))
+    | eval event_type=case(
+        match(sourcetype, "(?i)(snort|suricata|ids|ips)"), "ids",
+        match(sourcetype, "(?i)(firewall|paloalto|checkpoint|fortinet)"), "firewall",
+        match(sourcetype, "(?i)(waf|imperva|akamai|cloudflare)"), "waf",
+        1=1, "unknown"
+    )
+    | eval src_ip=coalesce(src_ip, src, source_ip)
+    | eval dest_ip=coalesce(dest_ip, dest, destination_ip, dst_ip)
+    | eval src_port=coalesce(src_port, source_port)
+    | eval bytes_in=coalesce(bytes_in, bytes_received, recv_bytes)
+    | eval signature=lower(coalesce(signature, sig_name, rule_name, message))
+    | eval action=lower(coalesce(action, act))
+    | eval combo_key=src_ip."|".dest_ip."|".src_port
+    | transaction combo_key maxspan=15m startswith=(event_type="ids") endswith=(event_type="firewall")
+    | search event_type="ids" AND event_type="firewall"
+    | where match(signature, "(?i)sql injection") AND bytes_in>10485760
+    | append [
+        search index=network (sourcetype=waf OR sourcetype=imperva OR sourcetype=akamai OR sourcetype=cloudflare_waf)
+        | eval signature=lower(coalesce(signature, sig_name, rule_name, message))
+        | eval action=lower(coalesce(action, act))
+        | where match(signature, "(?i)sql injection") AND match(action, "(?i)(allow|permit)")
+    ]
+    | table _time, src_ip, dest_ip, src_port, event_type, signature, action, bytes_in
+  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+
     | where TimeGenerated > ago(1d)
+
     | where network.protocol matches regex "tcp"
+
     | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+
     | order by Bytes desc
-  aql: |
-    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+
+    '
+  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+
     FROM flows
-    WHERE "network.protocol" LIKE '%tcp%'
+
+    WHERE "network.protocol" LIKE ''%tcp%''
+
     GROUP BY sourceip, destinationip, destinationport
+
     LAST 1 HOURS
-  yara_l: |
-    rule tdl_tdl_auth_000242 {
-      meta:
-        author = "TDL"
-        description = "Successful SQL Injection"
-        severity = "MEDIUM"
-        tactic = "TA0001"
-        technique = "T1190"
-      events:
-        $e.metadata.event_type = "NETWORK_CONNECTION"
-        $e.network.protocol = /tcp/
-        $src = $e.principal.ip
-      match:
-        $src over 10m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-network*,logs-endpoint*
+
+    '
+  yara_l: "rule tdl_tdl_auth_000242 {\n  meta:\n    author = \"TDL\"\n    description = \"Successful SQL Injection\"\n    severity = \"MEDIUM\"\
+    \n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
+    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-network*,logs-endpoint*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+
     | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+
     | SORT bytes_out DESC
-  leql: |
-    where(logset = "Network Activity" AND network.protocol=/tcp/)
+
+    '
+  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
+
     groupby(source_ip, destination_ip, destination_port)
+
     calculate(count, sum(bytes_out))
-  crowdstrike: |
-    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
+
+    '
+  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
+
     | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
+
     | sort -bytes_out
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
+
     | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
+
     | sort desc bytes_out
-  lucene: |
-    event.category:"network" AND network.protocol:*tcp*
-  sumo: |
-    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+
+    '
+  lucene: 'event.category:"network" AND network.protocol:*tcp*
+
+    '
+  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+
     | where network.protocol matches "*tcp*"
+
     | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+
     | sort by bytes_out desc
+
+    '
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -88,7 +126,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
 pseudo_logic: '1 IDS/IPS Exploit Event
 
@@ -124,12 +162,9 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'
-- Examine the destination domain/IP, ASN, port, and TLS / HTTP fingerprints to assess whether the entry vector is consistent
-  with this technique.
-- Cross-reference with email gateway, web proxy, and EDR telemetry in the 30 minutes around the alert for related delivery
-  activity.
+- Examine the destination domain/IP, ASN, port, and TLS / HTTP fingerprints to assess whether the entry vector is consistent with this technique.
+- Cross-reference with email gateway, web proxy, and EDR telemetry in the 30 minutes around the alert for related delivery activity.
 - 'Pivot on the user / host: look for follow-on execution, persistence, or credential-access events in the next 24h.'
-- 'Decide TP / FP / dual-use: confirm the user did not request the activity (sanctioned vendor onboarding, marketing campaign,
-  pen test).'
-- 'If TP: isolate the host, reset the user''s credentials and tokens, capture forensic artifacts, and open an incident ticket
-  referencing this rule_id.'
+- 'Decide TP / FP / dual-use: confirm the user did not request the activity (sanctioned vendor onboarding, marketing campaign, pen test).'
+- 'If TP: isolate the host, reset the user''s credentials and tokens, capture forensic artifacts, and open an incident ticket referencing this
+  rule_id.'

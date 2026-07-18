@@ -17,67 +17,75 @@ lifecycle: Deployed
 risk_score: 55
 queries:
   spl: |
-    index=windows sourcetype="WinEventLog:Security"
-    | search event_id IN ("5140", "5145")
-    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
-    | where count >= 1
-    | sort - count
-  kql: |
-    SecurityEvent
+    index=windows sourcetype=WinEventLog:Security (EventCode=5140 OR EventCode=5145)
+    | bin _time span=2m
+    | stats dc(Share_Name) as unique_shares values(Share_Name) as share_names by _time, Source_Network_Address
+    | where unique_shares >= 3
+    | table _time, Source_Network_Address, unique_shares, share_names
+  kql: 'SecurityEvent
+
     | where TimeGenerated > ago(1d)
+
     | where event_id in ("5140", "5145")
+
     | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
-      AND "event_id" IN ('5140', '5145')
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_dis_000141 {
-      meta:
-        author = "TDL"
-        description = "File Share Enumeration"
-        severity = "MEDIUM"
-        tactic = "TA0007"
-        technique = "T1135"
-      events:
-        $e.metadata.event_type = "USER_LOGIN"
-        $e.event_id = /(5140|5145)/
-        $user = $e.target.user.userid
-      match:
-        $user over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-windows.security*,logs-system.security*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('5140', '5145')\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_dis_000141 {\n  meta:\n    author = \"TDL\"\n    description = \"File Share Enumeration\"\n    severity = \"MEDIUM\"\n\
+    \    tactic = \"TA0007\"\n    technique = \"T1135\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(5140|5145)/\n\
+    \    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-windows.security*,logs-system.security*
+
     | WHERE @timestamp > NOW() - 1 day
+
     | WHERE event.category == "authentication" AND event_id IN ("5140", "5145")
+
     | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [5140, 5145])
+
+    '
+  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [5140, 5145])
+
     groupby(destination_account, source_ip, asset)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (5140, 5145)
+
+    '
+  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (5140, 5145)
+
     | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+
     | sort -auth_events
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.LOGIN AND event_id in ("5140", "5145")
+
     | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+
     | sort desc logins
-  lucene: |
-    event.category:"authentication" AND event_id:(5140 OR 5145)
-  sumo: |
-    _sourceCategory=*windows*security* OR _sourceCategory=*ad*
+
+    '
+  lucene: 'event.category:"authentication" AND event_id:(5140 OR 5145)
+
+    '
+  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
+
     | parse "EventID=*\"" as event_id nodrop
+
     | where event_id IN ("5140", "5145")
+
     | count by host, user, src_ip, logon_type, event_id
+
     | sort by _count desc
+
+    '
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -87,7 +95,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
 pseudo_logic: '3 Windows Network Share Object Accessed Events
 
@@ -106,12 +114,12 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'
-- Inspect the file path, file hash, parent process, and any prior network/email delivery — determine whether the enumeration
-  is targeted (specific user / share / OU) or scattered (broad, scripted).
-- 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from
-  a finance or HR identity is high-signal.'
+- Inspect the file path, file hash, parent process, and any prior network/email delivery — determine whether the enumeration is targeted (specific
+  user / share / OU) or scattered (broad, scripted).
+- 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from a finance or HR identity
+  is high-signal.'
 - Pull adjacent execution / lateral-movement / cred-access telemetry — discovery often precedes the next stage by minutes.
-- 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and
-  adjacent telemetry is suspicious.'
-- 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity
-  that the recon was likely setting up.'
+- 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and adjacent telemetry
+  is suspicious.'
+- 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity that the recon
+  was likely setting up.'

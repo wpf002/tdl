@@ -1,9 +1,8 @@
 rule_id: TDL-DE-000730
 v4_id: '000730'
 name: Suspicious Crash in Security Product Process
-description: AV/EDR process crash (MsMpEng.exe, sentinel*.exe, Csagent.exe) followed within 5m by new process creation that
-  the dead product would normally block. Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1211 under
-  Defense Evasion).
+description: AV/EDR process crash (MsMpEng.exe, sentinel*.exe, Csagent.exe) followed within 5m by new process creation that the dead product would
+  normally block. Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1211 under Defense Evasion).
 tactic: Defense Evasion
 tactic_id: TA0005
 technique_id: T1211
@@ -19,76 +18,89 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1
-    | search process_name IN ("MsMpEng.exe", "Csagent.exe")
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
-    | where count >= 1
-    | sort - count
-  kql: |
-    DeviceProcessEvents
+  spl: "index=* (sourcetype=WinEventLog:Application OR sourcetype=linux_secure OR sourcetype=XmlWinEventLog:Application OR sourcetype=sysmon)\
+    \ \n(\n    (EventCode=1000 OR EventCode=1001 OR \"application error\" OR \"segmentation fault\" OR \"core dumped\")\n    (Image=\"*\\\\MsMpEng.exe\"\
+    \ OR Image=\"*\\\\sentinel*.exe\" OR Image=\"*\\\\Csagent.exe\" OR process_name=\"MsMpEng.exe\" OR process_name=\"sentinel*\" OR process_name=\"\
+    Csagent.exe\" OR AppName=\"*MsMpEng.exe*\" OR AppName=\"*sentinel*.exe*\" OR AppName=\"*Csagent.exe*\")\n)\nOR\n(\n    (EventCode=1 OR EventCode=4688)\n\
+    )\n| eval crash_event=if(match(EventCode, \"1000|1001\") OR match(_raw, \"(?i)(application error|segmentation fault|core dumped)\"), 1, 0)\n\
+    | eval proc_event=if(match(EventCode, \"^(1|4688)$\"), 1, 0)\n| eval av_product=coalesce(Image, process_name, AppName)\n| where crash_event=1\
+    \ OR proc_event=1\n| bin _time span=5m\n| stats earliest(_time) as crash_time, latest(_time) as proc_time, values(eval(if(crash_event=1, av_product,\
+    \ null()))) as crashed_av, values(eval(if(proc_event=1, Image, null()))) as new_process, values(eval(if(proc_event=1, CommandLine, null())))\
+    \ as new_cmdline, dc(eval(if(crash_event=1, _time, null()))) as crash_count, dc(eval(if(proc_event=1, _time, null()))) as proc_count by _time,\
+    \ ComputerName, host\n| where crash_count > 0 AND proc_count > 0\n| eval time_diff=proc_time - crash_time\n| where time_diff >= 0 AND time_diff\
+    \ <= 300\n| table _time, ComputerName, host, crashed_av, new_process, new_cmdline, crash_time, proc_time, time_diff\n"
+  kql: 'DeviceProcessEvents
+
     | where TimeGenerated > ago(1d)
+
     | where process_name in ("MsMpEng.exe", "Csagent.exe")
+
     | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" = '1'
-      AND "process_name" IN ('MsMpEng.exe', 'Csagent.exe')
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_de_000730 {
-      meta:
-        author = "TDL"
-        description = "Suspicious Crash in Security Product Process"
-        severity = "HIGH"
-        tactic = "TA0005"
-        technique = "T1211"
-      events:
-        $e.metadata.event_type = "PROCESS_LAUNCH"
-        $e.process_name = /(MsMpEng.exe|Csagent.exe)/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*,logs-windows*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('MsMpEng.exe', 'Csagent.exe')\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_de_000730 {\n  meta:\n    author = \"TDL\"\n    description = \"Suspicious Crash in Security Product Process\"\n    severity\
+    \ = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1211\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
+    \ = /(MsMpEng.exe|Csagent.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*,logs-windows*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "process" AND process_name IN ("MsMpEng.exe", "Csagent.exe")
+
     | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND process_name IN [MsMpEng.exe, Csagent.exe])
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND process_name IN [MsMpEng.exe, Csagent.exe])
+
     groupby(asset, process_name, parent_process_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=ProcessRollup2 AND process_name IN (MsMpEng.exe, Csagent.exe)
+
+    '
+  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (MsMpEng.exe, Csagent.exe)
+
     | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+
     | sort -occurrences
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.PROCESS AND process_name in ("MsMpEng.exe", "Csagent.exe")
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
+
     | sort desc occurrences
-  lucene: |
-    event.category:"process" AND process_name:(MsMpEng.exe OR Csagent.exe)
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"process" AND process_name:(MsMpEng.exe OR Csagent.exe)
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id="1" AND process_name IN ("MsMpEng.exe", "Csagent.exe")
+
     | count by host, user, parent_process_name, command_line
+
     | sort by _count desc
-pseudo_logic: AV/EDR process crash (MsMpEng.exe, sentinel*.exe, Csagent.exe) followed within 5m by new process creation that
-  the dead product would normally block.
+
+    '
+pseudo_logic: AV/EDR process crash (MsMpEng.exe, sentinel*.exe, Csagent.exe) followed within 5m by new process creation that the dead product
+  would normally block.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
-  group, and refine thresholds using ≥7 days of telemetry before promoting.
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset group, and refine
+  thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - exploit
@@ -100,16 +112,14 @@ references:
 - https://attack.mitre.org/techniques/T1211/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — distinguish administrative tooling
-  from adversary tradecraft (LOLBins, signed binary proxies, masquerading paths).
+- Inspect the parent → child process tree, command line arguments, and code-signing status — distinguish administrative tooling from adversary
+  tradecraft (LOLBins, signed binary proxies, masquerading paths).
 - 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log channel state to see what was suppressed.'
-- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same
-  minute.'
-- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts for it; TP if it''s unattended and
-  pairs with other malicious telemetry.'
-- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out of retention, isolate the host, and escalate
-  to IR.'
+- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same minute.'
+- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts for it; TP if it''s unattended and pairs with other malicious
+  telemetry.'
+- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out of retention, isolate the host, and escalate to IR.'

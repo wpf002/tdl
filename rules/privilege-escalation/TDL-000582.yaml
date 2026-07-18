@@ -1,9 +1,9 @@
 rule_id: TDL-PE-000582
 v4_id: 000582
 name: Kubernetes Pod Created with a hostPath Mount
-description: 'Detects creation of a container with a hostPath mount. A hostPath volume mounts a directory or a file from the
-  node to the container. Attackers who have permissions to create a new pod in the cluster may create one with a writable
-  hostPath volume and chroot to escape to the underlying node. A sigma rule by Leo Tsaousis (@laripping)
+description: 'Detects creation of a container with a hostPath mount. A hostPath volume mounts a directory or a file from the node to the container.
+  Attackers who have permissions to create a new pod in the cluster may create one with a writable hostPath volume and chroot to escape to the
+  underlying node. A sigma rule by Leo Tsaousis (@laripping)
 
 
   ref: https://microsoft.github.io/Threat-Matrix-for-Kubernetes/techniques/Writable%20hostPath%20mount/
@@ -22,67 +22,70 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: "index=kubernetes sourcetype=kube:* resource=pods verb=create \n| spath path=requestObject.spec.hostPath \n| search requestObject.spec.hostPath=*\n\
+    | table _time, user, namespace, resource, verb, requestObject.spec.hostPath\n"
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_pe_000582 {
-      meta:
-        author = "TDL"
-        description = "Kubernetes Pod Created with a hostPath Mount"
-        severity = "LOW"
-        tactic = "TA0004"
-        technique = "T1611"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_pe_000582 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubernetes Pod Created with a hostPath Mount\"\n    severity\
+    \ = \"LOW\"\n    tactic = \"TA0004\"\n    technique = \"T1611\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
+    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Security software
 - Authorized admin tools
@@ -92,18 +95,15 @@ tags:
 - privilege-escalation
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
-pseudo_logic: "1 Kubernetes Event \nWhere the Resource is \"pods\"\nWhere Verb is \"create\"\nWhere \"requestObject.spec.hostPath\"\
-  \ is NOT Null"
+pseudo_logic: "1 Kubernetes Event \nWhere the Resource is \"pods\"\nWhere Verb is \"create\"\nWhere \"requestObject.spec.hostPath\" is NOT Null"
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, source user, and (if visible) the resulting privileged context.'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the privilege gain was
-  not part of an approved elevation flow (UAC consent, sudo, PAM ticket).
+- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the privilege gain was not part of an approved
+  elevation flow (UAC consent, sudo, PAM ticket).
 - 'Pull preceding 1h of activity for the source user: was there earlier credential-access / discovery / exploit telemetry?'
-- 'Validate token / session changes: new SeImpersonate-style privileges, new IAM role assumption, or a SYSTEM-level child
-  process from a user-level parent.'
-- 'Decide TP / FP: TP if there''s no change-management correlation and no parent admin process; FP if it''s a documented elevation
-  by IT.'
-- 'If TP: contain the host, revoke the elevated session, sweep for other escalations using the same primitive, and notify
-  identity / IR teams.'
+- 'Validate token / session changes: new SeImpersonate-style privileges, new IAM role assumption, or a SYSTEM-level child process from a user-level
+  parent.'
+- 'Decide TP / FP: TP if there''s no change-management correlation and no parent admin process; FP if it''s a documented elevation by IT.'
+- 'If TP: contain the host, revoke the elevated session, sweep for other escalations using the same primitive, and notify identity / IR teams.'

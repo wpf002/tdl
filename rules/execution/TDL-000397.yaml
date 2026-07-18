@@ -1,8 +1,8 @@
 rule_id: TDL-EXE-000397
 v4_id: 000397
 name: AWS Reverse Shell Activity - GuardDuty
-description: Detects a reverse shell within an AWS enviroment. Threat actors create a reverse shell to execute commands on
-  the target after gaining initial access to the target.
+description: Detects a reverse shell within an AWS enviroment. Threat actors create a reverse shell to execute commands on the target after gaining
+  initial access to the target.
 tactic: Execution
 tactic_id: TA0002
 technique_id: T1059
@@ -17,66 +17,70 @@ lifecycle: Deployed
 risk_score: 55
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*GuardDuty*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    index=guardduty sourcetype=aws:cloudwatch:guardduty:findings type IN ("Execution:Runtime/ReverseShell")
+    | table _time, account, region, type, severity, resource.instanceDetails.instanceId, resource.instanceDetails.imageId, service.action.networkConnectionAction.remoteIpDetails.ipAddressV4, service.action.networkConnectionAction.remotePortDetails.port, title, description
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex "GuardDuty"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%GuardDuty%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_exe_000397 {
-      meta:
-        author = "TDL"
-        description = "AWS Reverse Shell Activity - GuardDuty"
-        severity = "MEDIUM"
-        tactic = "TA0002"
-        technique = "T1059"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /GuardDuty/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_exe_000397 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Reverse Shell Activity - GuardDuty\"\n    severity\
+    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1059\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
+    \ $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%GuardDuty%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= "GuardDuty"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*GuardDuty*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Security software
 - Authorized admin tools
@@ -86,17 +90,16 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Execution:Runtime/ReverseShell\"]"
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'
-- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — pay attention to short-lived
-  processes, encoded arguments, and unusual parents (Office, browser, services).
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — pay attention to short-lived processes, encoded
+  arguments, and unusual parents (Office, browser, services).
 - Pull EDR process tree for the alert PID; check the parent / grandparent and any child processes spawned within 5 minutes.
 - 'Compare against the host''s baseline: is the binary / interpreter normally invoked here, by this user, at this time?'
-- 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software
-  install, or scheduled job.'
-- 'If TP: contain the host, kill the offending process, snapshot memory if possible, and escalate to IR with the process tree
-  attached.'
+- 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software install, or scheduled
+  job.'
+- 'If TP: contain the host, kill the offending process, snapshot memory if possible, and escalate to IR with the process tree attached.'

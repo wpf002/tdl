@@ -14,17 +14,12 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 80
 queries:
-  spl: 'index=windows sourcetype="WinEventLog:Security"
-
-    | search event_id IN ("4688")
-
-    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
-
+  spl: |
+    index=windows sourcetype="WinEventLog:Security" EventCode=4688 (New_Process_Name="*\\wscript.exe" OR New_Process_Name="*\\cscript.exe") (Process_Command_Line="*\\\\*" OR Process_Command_Line="*http://*" OR Process_Command_Line="*https://*") NOT (Process_Command_Line="*\\\\approvedshare\\logonscripts\\*" OR Process_Command_Line="*\\\\trusteddc\\netlogon\\*")
+    | stats count values(Process_Command_Line) as command_line values(New_Process_Name) as process values(LogonType) as logon_type by Account_Name, IpAddress, EventCode
     | where count >= 1
-
     | sort - count
-
-    '
+    | table Account_Name, IpAddress, EventCode, count, process, command_line, logon_type
   kql: 'SecurityEvent
 
     | where TimeGenerated > ago(1d)
@@ -36,36 +31,30 @@ queries:
     | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type,\
-    \ eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'\n\
-    \  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_002 {\n  meta:\n    author = \"TDL\"\n    description\
-    \ = \"Windows Script Host Executing Remote Payload\"\n    severity = \"HIGH\"\n\
-    \    tactic = \"TA0002\"\n    technique = \"T1059.005\"\n  events:\n    $e.metadata.event_type\
-    \ = \"USER_LOGIN\"\n    $e.event_id = /(4688)/\n    $user = $e.target.user.userid\n\
-    \  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
+  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_exe_002 {\n  meta:\n    author = \"TDL\"\n    description = \"Windows Script Host Executing Remote Payload\"\n    severity\
+    \ = \"HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1059.005\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id\
+    \ = /(4688)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
   esql: 'FROM logs-windows.security*,logs-system.security*
 
     | WHERE @timestamp > NOW() - 1 day
 
     | WHERE event.category == "authentication" AND event_id IN ("4688")
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType,
-    event.code
+    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
 
     | SORT count DESC
 
     '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id
-    IN [4688])
+  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4688])
 
     groupby(destination_account, source_ip, asset)
 
     calculate(count)
 
     '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp)
-    AND event_id IN (4688)
+  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4688)
 
     | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
 
@@ -76,8 +65,7 @@ queries:
 
     | filter event_type = ENUM.LOGIN AND event_id in ("4688")
 
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip,
-    action_logon_type
+    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
 
     | sort desc logins
 
@@ -105,37 +93,30 @@ tags:
 author: TDL
 created: '2024-01-15'
 test_method: synthetic
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'
-- Inspect the parent → child process tree, command line arguments, and code-signing
-  status — pay attention to short-lived processes, encoded arguments, and unusual
-  parents (Office, browser, services).
-- Pull EDR process tree for the alert PID; check the parent / grandparent and any
-  child processes spawned within 5 minutes.
-- 'Compare against the host''s baseline: is the binary / interpreter normally invoked
-  here, by this user, at this time?'
-- 'Decide TP / FP: TP if the execution chain has no business justification; FP if
-  it traces to a packaging script, software install, or scheduled job.'
-- 'If TP: contain the host, kill the offending process, snapshot memory if possible,
-  and escalate to IR with the process tree attached.'
-pseudo_logic: '1 Instance within any observation window of a Windows Security Event
-  ID 4688 (Process Creation) event.
+- Inspect the parent → child process tree, command line arguments, and code-signing status — pay attention to short-lived processes, encoded arguments,
+  and unusual parents (Office, browser, services).
+- Pull EDR process tree for the alert PID; check the parent / grandparent and any child processes spawned within 5 minutes.
+- 'Compare against the host''s baseline: is the binary / interpreter normally invoked here, by this user, at this time?'
+- 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software install, or scheduled
+  job.'
+- 'If TP: contain the host, kill the offending process, snapshot memory if possible, and escalate to IR with the process tree attached.'
+pseudo_logic: '1 Instance within any observation window of a Windows Security Event ID 4688 (Process Creation) event.
 
 
   From index=windows sourcetype="WinEventLog:Security"
 
   Where event_id is "4688"
 
-  With process name or command line indicating Windows Script Host (wscript.exe or
-  cscript.exe) executing a remote payload (UNC path, HTTP/HTTPS URI, or network share
-  reference)
+  With process name or command line indicating Windows Script Host (wscript.exe or cscript.exe) executing a remote payload (UNC path, HTTP/HTTPS
+  URI, or network share reference)
 
   With fields user, IpAddress, LogonType, and EventCode captured per occurrence
 
-  Excluding known-good logon script paths sourced from approved network shares per
-  administrator allow-list
+  Excluding known-good logon script paths sourced from approved network shares per administrator allow-list
 
 
-  With the same user and IpAddress, deduplicated so that a minimum of 1 matching instance
-  triggers the detection with results sorted descending by count.'
+  With the same user and IpAddress, deduplicated so that a minimum of 1 matching instance triggers the detection with results sorted descending
+  by count.'

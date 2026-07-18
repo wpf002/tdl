@@ -16,66 +16,70 @@ lifecycle: Deployed
 risk_score: 30
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    index=azure sourcetype=azure:monitor:aad EventCategory=SignInLogs OperationName="Sign-in activity" AppId="1b730954-1685-4b74-9bfd-dac224a7b894" TokenIssuerType="AzureAD" ResultType=0
+    | table _time, UserPrincipalName, AppDisplayName, IPAddress, Location, DeviceDetail.operatingSystem, ResultDescription
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_per_000369 {
-      meta:
-        author = "TDL"
-        description = "Azure Successful Powershell Login"
-        severity = "LOW"
-        tactic = "TA0003"
-        technique = "T1098"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_per_000369 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Successful Powershell Login\"\n    severity = \"\
+    LOW\"\n    tactic = \"TA0003\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
+    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -85,7 +89,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
 pseudo_logic: '1 Azure SigninLogs Event
 
@@ -102,14 +106,11 @@ suppression:
   - src_user
 tuning_period: 14 days
 triage_steps:
-- 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service
-  / config).'
-- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — verify the persistence
-  target points to an unusual location or unsigned binary.
-- Determine when the artifact was created and which process/account performed the write — pivot on that process for the original
-  attack chain.
+- 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — verify the persistence target points to an
+  unusual location or unsigned binary.
+- Determine when the artifact was created and which process/account performed the write — pivot on that process for the original attack chain.
 - 'Look for prior child-process activity from the persistence target: did anything actually launch from it?'
-- 'Decide TP / FP: FP for sanctioned management software (RMM, vendor agents, custom installers) — verify against the asset
-  register.'
-- 'If TP: remove the persistence artifact, isolate the host, hunt for the same artifact across the fleet, and rotate any credentials
-  touched by the persistent process.'
+- 'Decide TP / FP: FP for sanctioned management software (RMM, vendor agents, custom installers) — verify against the asset register.'
+- 'If TP: remove the persistence artifact, isolate the host, hunt for the same artifact across the fleet, and rotate any credentials touched by
+  the persistent process.'

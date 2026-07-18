@@ -15,33 +15,32 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: 'index=network sourcetype=firewall OR sourcetype=ids
-
-    | search network.protocol="*tcp*"
-
-    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip,
-    dest_ip, dest_port
-
+  spl: |
+    index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp
+    | stats count sum(bytes_out) as total_bytes_out dc(dest_ip) as unique_destinations values(dest_port) as dest_ports by src_ip, dest_ip
     | where count >= 1
-
-    | sort - bytes_out
-
-    '
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP),
-    DestinationIP=tostring(DestinationIP))
+    | sort - total_bytes_out
+    | lookup domain_age_lookup dest_ip OUTPUT domain, domain_age
+    | where domain_age < 30 OR isnull(domain_age)
+    | lookup cdn_allowlist_lookup dest_ip OUTPUT is_allowed
+    | where isnull(is_allowed) OR is_allowed != "true"
+    | lookup cdn_allowlist_lookup domain OUTPUT is_allowed as domain_allowed
+    | where isnull(domain_allowed) OR domain_allowed != "true"
+    | mvexpand dest_ports
+    | dedup src_ip, dest_ip, dest_ports
+    | table src_ip, dest_ip, dest_ports, total_bytes_out, unique_destinations, count, domain, domain_age
+  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
 
     | where TimeGenerated > ago(1d)
 
     | where network.protocol matches regex "tcp"
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP,
-    DestinationPort
+    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
 
     | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections,
-    SUM(bytessrc) as bytes_out
+  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
 
     FROM flows
 
@@ -52,19 +51,16 @@ queries:
     LAST 1 HOURS
 
     '
-  yara_l: "rule tdl_tdl_exf_002 {\n  meta:\n    author = \"TDL\"\n    description\
-    \ = \"Exfiltration to Newly Registered Domain\"\n    severity = \"HIGH\"\n   \
-    \ tactic = \"TA0010\"\n    technique = \"T1048.002\"\n  events:\n    $e.metadata.event_type\
-    \ = \"NETWORK_CONNECTION\"\n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n\
-    \  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
+  yara_l: "rule tdl_tdl_exf_002 {\n  meta:\n    author = \"TDL\"\n    description = \"Exfiltration to Newly Registered Domain\"\n    severity\
+    \ = \"HIGH\"\n    tactic = \"TA0010\"\n    technique = \"T1048.002\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n   \
+    \ $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
   esql: 'FROM logs-network*,logs-endpoint*
 
     | WHERE @timestamp > NOW() - 1 hour
 
     | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
 
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip,
-    destination.port
+    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
 
     | SORT bytes_out DESC
 
@@ -76,11 +72,9 @@ queries:
     calculate(count, sum(bytes_out))
 
     '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest)
-    AND network.protocol=*tcp*
+  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
 
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4,
-    RemotePort
+    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
 
     | sort -bytes_out
 
@@ -89,8 +83,7 @@ queries:
 
     | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
 
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname,
-    action_remote_ip, action_remote_port
+    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
 
     | sort desc bytes_out
 
@@ -117,23 +110,16 @@ tags:
 author: TDL
 created: '2024-03-16'
 test_method: synthetic
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 triage_steps:
-- 'Confirm the alert metadata: timestamp, source host, destination, total bytes transferred,
-  and the protocol used.'
-- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — quantify
-  the data volume vs the host's baseline outbound profile.
-- 'Pivot to preceding collection / staging activity: archives, mailbox dumps, database
-  extracts in the prior 24h on the same host.'
-- Identify what was likely exfiltrated (path patterns, file types, classification
-  labels) and the user/process that produced it.
-- 'Decide TP / FP: FP for sanctioned cloud backup / vendor data sharing on a known
-  channel; TP for unattended bulk transfers to new endpoints.'
-- 'If TP: block the destination, isolate the host, preserve network and DLP evidence,
-  and trigger your data-incident process (legal / privacy / customer notification
-  as applicable).'
-pseudo_logic: '1 or more instances within the observed time window of network traffic
-  events where outbound bytes are ranked by volume descending.
+- 'Confirm the alert metadata: timestamp, source host, destination, total bytes transferred, and the protocol used.'
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — quantify the data volume vs the host's baseline outbound profile.
+- 'Pivot to preceding collection / staging activity: archives, mailbox dumps, database extracts in the prior 24h on the same host.'
+- Identify what was likely exfiltrated (path patterns, file types, classification labels) and the user/process that produced it.
+- 'Decide TP / FP: FP for sanctioned cloud backup / vendor data sharing on a known channel; TP for unattended bulk transfers to new endpoints.'
+- 'If TP: block the destination, isolate the host, preserve network and DLP evidence, and trigger your data-incident process (legal / privacy
+  / customer notification as applicable).'
+pseudo_logic: '1 or more instances within the observed time window of network traffic events where outbound bytes are ranked by volume descending.
 
 
   From index=network with sourcetype firewall or sourcetype ids
@@ -148,11 +134,9 @@ pseudo_logic: '1 or more instances within the observed time window of network tr
 
   With dc(dest_ip) tracked as unique destination count per source
 
-  Where dest_ip or associated domain resolves to a newly registered domain (domain
-  age below threshold per threat intelligence or domain registration feed)
+  Where dest_ip or associated domain resolves to a newly registered domain (domain age below threshold per threat intelligence or domain registration
+  feed)
 
-  Excluding dest_ip or dest domain values present in the legitimate vendor and CDN
-  edge node allow-list
+  Excluding dest_ip or dest domain values present in the legitimate vendor and CDN edge node allow-list
 
-  With the same src_ip and dest_ip as the correlation key, deduplicated per unique
-  dest_port pairing'
+  With the same src_ip and dest_ip as the correlation key, deduplicated per unique dest_port pairing'

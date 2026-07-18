@@ -1,11 +1,10 @@
 rule_id: TDL-CA-000283
 v4_id: 000283
 name: Stealth Account Guessing - Domain Controller - 4776
-description: Detects a potential account guessing attack against Windows accounts. Attackers may attempt to determine if a
-  username exists by authenticating with a username and observing error messages received. The guessed usernames may be default
-  accounts for applications or permutations the organization's naming convention. Once the attacker has determined if a username
-  exists, they can target the existing accounts with password spraying attacks. The attacker, in this instance, is preforming
-  the account guessing at a slow rate to avoid detection.
+description: Detects a potential account guessing attack against Windows accounts. Attackers may attempt to determine if a username exists by
+  authenticating with a username and observing error messages received. The guessed usernames may be default accounts for applications or permutations
+  the organization's naming convention. Once the attacker has determined if a username exists, they can target the existing accounts with password
+  spraying attacks. The attacker, in this instance, is preforming the account guessing at a slow rate to avoid detection.
 tactic: Credential Access
 tactic_id: TA0006
 technique_id: T1110
@@ -21,67 +20,87 @@ lifecycle: Proposed
 risk_score: 30
 queries:
   spl: |
-    index=windows sourcetype="WinEventLog:Security"
-    | search event_id IN ("4776")
-    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
-    | where count >= 1
-    | sort - count
-  kql: |
-    SecurityEvent
+    index=wineventlog sourcetype=WinEventLog:Security (EventCode=680 OR EventCode=681 OR EventCode=4776) Status="0xC0000064"
+    | eval src_host=upper(coalesce(Workstation_Name, Source_Workstation))
+    | eval dest_host=upper(coalesce(ComputerName, Computer))
+    | eval dest_user=upper(coalesce(TargetUserName, Target_User_Name))
+    | where NOT match(dest_user, "\$$")
+    | lookup domain_controllers.csv hostname AS dest_host OUTPUT is_dc
+    | where is_dc="true"
+    | lookup mail_servers.csv hostname AS src_host OUTPUT is_mail
+    | lookup central_auth_servers.csv hostname AS src_host OUTPUT is_auth
+    | where (is_mail!="true" OR isnull(is_mail)) AND (is_auth!="true" OR isnull(is_auth))
+    | bin _time span=3m
+    | stats dc(dest_user) as unique_users, values(dest_user) as users, count as failures, values(EventCode) as event_codes by _time, src_host, dest_host, EventCode
+    | where failures >= 2 AND unique_users >= 1
+    | bin _time span=1h as hour_window
+    | stats count as instances, sum(failures) as total_failures, dc(dest_user) as total_unique_users by hour_window, src_host, dest_host, EventCode
+    | where instances >= 4
+    | table hour_window, src_host, dest_host, EventCode, instances, total_failures, total_unique_users
+  kql: 'SecurityEvent
+
     | where TimeGenerated > ago(1d)
+
     | where event_id in ("4776")
+
     | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
-      AND "event_id" IN ('4776')
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_ca_000283 {
-      meta:
-        author = "TDL"
-        description = "Stealth Account Guessing - Domain Controller - 4776"
-        severity = "LOW"
-        tactic = "TA0006"
-        technique = "T1110"
-      events:
-        $e.metadata.event_type = "USER_LOGIN"
-        $e.event_id = /(4776)/
-        $user = $e.target.user.userid
-      match:
-        $user over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-windows.security*,logs-system.security*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4776')\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_ca_000283 {\n  meta:\n    author = \"TDL\"\n    description = \"Stealth Account Guessing - Domain Controller - 4776\"\n\
+    \    severity = \"LOW\"\n    tactic = \"TA0006\"\n    technique = \"T1110\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id\
+    \ = /(4776)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-windows.security*,logs-system.security*
+
     | WHERE @timestamp > NOW() - 1 day
+
     | WHERE event.category == "authentication" AND event_id IN ("4776")
+
     | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4776])
+
+    '
+  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4776])
+
     groupby(destination_account, source_ip, asset)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4776)
+
+    '
+  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4776)
+
     | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+
     | sort -auth_events
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.LOGIN AND event_id in ("4776")
+
     | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+
     | sort desc logins
-  lucene: |
-    event.category:"authentication" AND event_id:(4776)
-  sumo: |
-    _sourceCategory=*windows*security* OR _sourceCategory=*ad*
+
+    '
+  lucene: 'event.category:"authentication" AND event_id:(4776)
+
+    '
+  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
+
     | parse "EventID=*\"" as event_id nodrop
+
     | where event_id IN ("4776")
+
     | count by host, user, src_ip, logon_type, event_id
+
     | sort by _count desc
+
+    '
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,23 +110,22 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
-pseudo_logic: "4 Instances over 1 hour of at least 2 Windows Authentication Failure Events \nFrom the same internal Source\
-  \ Hostname to the same Destination\nWhere the Event ID in [680, 681, 4776]\nWhere the Failure Code is \"0xC0000064\"\nWhere\
-  \ the Destination Hostname is on the Domain Controller List \nWhere the Destination Username does NOT end with \"$\" \n\
-  Where the Source Hostname is NOT on a Mail Server List \nWhere the Source Hostname is NOT on a Central Authentication Server\
-  \ List \nWith unique Destination Usernames \nWith the same Event ID \nWithin 3 minutes"
+pseudo_logic: "4 Instances over 1 hour of at least 2 Windows Authentication Failure Events \nFrom the same internal Source Hostname to the same\
+  \ Destination\nWhere the Event ID in [680, 681, 4776]\nWhere the Failure Code is \"0xC0000064\"\nWhere the Destination Hostname is on the Domain\
+  \ Controller List \nWhere the Destination Username does NOT end with \"$\" \nWhere the Source Hostname is NOT on a Mail Server List \nWhere\
+  \ the Source Hostname is NOT on a Central Authentication Server List \nWith unique Destination Usernames \nWith the same Event ID \nWithin 3\
+  \ minutes"
 suppression:
   window: 24 hours
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force
-  pattern is consistent with this technique.
+- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force pattern is consistent
+  with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
-- 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
-  kerberos tickets).'
+- 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens, kerberos tickets).'
 - 'Decide TP / FP: FP for sanctioned IR / pen-test / DSC tooling; TP for unattended dumping or anomalous Kerberos behavior.'
-- 'If TP: rotate all potentially exposed credentials and tickets, invalidate sessions, isolate the host, and consider golden-ticket
-  / krbtgt rotation if scope warrants.'
+- 'If TP: rotate all potentially exposed credentials and tickets, invalidate sessions, isolate the host, and consider golden-ticket / krbtgt rotation
+  if scope warrants.'

@@ -1,10 +1,9 @@
 rule_id: TDL-CA-000695
 v4_id: 000695
 name: DSRM Persistence Usage
-description: Detects the usages of a DSRM account for persistence on a host. The DSRM account, being a local administrator
-  account on the DC, is not subject to domain password policies. However, by default, its use is limited to specific conditions,
-  such as when the DC is booted into DSRM. These limitations can be bypassed by altering the registry key responsible for
-  the account’s logon behavior.
+description: Detects the usages of a DSRM account for persistence on a host. The DSRM account, being a local administrator account on the DC,
+  is not subject to domain password policies. However, by default, its use is limited to specific conditions, such as when the DC is booted into
+  DSRM. These limitations can be bypassed by altering the registry key responsible for the account’s logon behavior.
 tactic: Credential Access
 tactic_id: TA0006
 technique_id: T1078
@@ -20,68 +19,73 @@ lifecycle: Proposed
 risk_score: 75
 queries:
   spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1
-    | search event_id IN ("4657")
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
-    | where count >= 1
-    | sort - count
-  kql: |
-    DeviceProcessEvents
+    index=windows sourcetype=WinEventLog:Security EventCode=4657 Object_Name="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\DsrmAdminLogonBehavior" (New_Value=1 OR New_Value=2 OR Old_Value=1 OR Old_Value=2)
+    | table _time, ComputerName, SubjectUserName, Object_Name, Old_Value, New_Value, Process_Name
+  kql: 'DeviceProcessEvents
+
     | where TimeGenerated > ago(1d)
+
     | where event_id in ("4657")
+
     | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" = '1'
-      AND "event_id" IN ('4657')
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_ca_000695 {
-      meta:
-        author = "TDL"
-        description = "DSRM Persistence Usage"
-        severity = "HIGH"
-        tactic = "TA0006"
-        technique = "T1078"
-      events:
-        $e.metadata.event_type = "PROCESS_LAUNCH"
-        $e.event_id = /(4657)/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*,logs-windows*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4657')\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_ca_000695 {\n  meta:\n    author = \"TDL\"\n    description = \"DSRM Persistence Usage\"\n    severity = \"HIGH\"\n  \
+    \  tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4657)/\n\
+    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*,logs-windows*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "process" AND event_id IN ("4657")
+
     | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND event_id IN [4657])
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4657])
+
     groupby(asset, process_name, parent_process_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=ProcessRollup2 AND event_id IN (4657)
+
+    '
+  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4657)
+
     | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+
     | sort -occurrences
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.PROCESS AND event_id in ("4657")
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
+
     | sort desc occurrences
-  lucene: |
-    event.category:"process" AND event_id:(4657)
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"process" AND event_id:(4657)
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id="1" AND event_id IN ("4657")
+
     | count by host, user, parent_process_name, command_line
+
     | sort by _count desc
+
+    '
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +95,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 pseudo_logic: '1 Windows Security Event
 
@@ -102,11 +106,10 @@ pseudo_logic: '1 Windows Security Event
   Where the New Value/Old Value is 1 OR 2'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force
-  pattern is consistent with this technique.
+- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force pattern is consistent
+  with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
-- 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
-  kerberos tickets).'
+- 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens, kerberos tickets).'
 - 'Decide TP / FP: FP for sanctioned IR / pen-test / DSC tooling; TP for unattended dumping or anomalous Kerberos behavior.'
-- 'If TP: rotate all potentially exposed credentials and tickets, invalidate sessions, isolate the host, and consider golden-ticket
-  / krbtgt rotation if scope warrants.'
+- 'If TP: rotate all potentially exposed credentials and tickets, invalidate sessions, isolate the host, and consider golden-ticket / krbtgt rotation
+  if scope warrants.'

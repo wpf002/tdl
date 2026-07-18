@@ -1,8 +1,8 @@
 rule_id: TDL-IMP-000116
 v4_id: '000116'
 name: Unauthorized User Deletion
-description: Detects when an unauthorized user deletes an account. This could be indicative of a user performing destructive
-  behavior since this is commonly performed by domain admins.
+description: Detects when an unauthorized user deletes an account. This could be indicative of a user performing destructive behavior since this
+  is commonly performed by domain admins.
 tactic: Impact
 tactic_id: TA0040
 technique_id: T1531
@@ -18,68 +18,75 @@ lifecycle: Deployed
 risk_score: 30
 queries:
   spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1
-    | search event_id IN ("4726")
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
-    | where count >= 1
-    | sort - count
-  kql: |
-    DeviceProcessEvents
+    index=wineventlog sourcetype=WinEventLog:Security EventCode=4726
+    | lookup authorized_user_modifiers.csv SubjectUserName OUTPUT authorized
+    | where isnull(authorized) OR authorized!=1
+    | table _time, ComputerName, SubjectUserName, TargetUserName
+  kql: 'DeviceProcessEvents
+
     | where TimeGenerated > ago(1d)
+
     | where event_id in ("4726")
+
     | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" = '1'
-      AND "event_id" IN ('4726')
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_imp_000116 {
-      meta:
-        author = "TDL"
-        description = "Unauthorized User Deletion"
-        severity = "LOW"
-        tactic = "TA0040"
-        technique = "T1531"
-      events:
-        $e.metadata.event_type = "PROCESS_LAUNCH"
-        $e.event_id = /(4726)/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*,logs-windows*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4726')\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_imp_000116 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized User Deletion\"\n    severity = \"LOW\"\n\
+    \    tactic = \"TA0040\"\n    technique = \"T1531\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4726)/\n\
+    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*,logs-windows*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "process" AND event_id IN ("4726")
+
     | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND event_id IN [4726])
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4726])
+
     groupby(asset, process_name, parent_process_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=ProcessRollup2 AND event_id IN (4726)
+
+    '
+  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4726)
+
     | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+
     | sort -occurrences
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.PROCESS AND event_id in ("4726")
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
+
     | sort desc occurrences
-  lucene: |
-    event.category:"process" AND event_id:(4726)
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"process" AND event_id:(4726)
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id="1" AND event_id IN ("4726")
+
     | count by host, user, parent_process_name, command_line
+
     | sort by _count desc
+
+    '
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,10 +96,10 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
-pseudo_logic: "1 Windows User Deletion Event \nWhere the Event ID is 4726\nWhere the Source Username is NOT on the Users Authorized\
-  \ to Modify Users List"
+pseudo_logic: "1 Windows User Deletion Event \nWhere the Event ID is 4726\nWhere the Source Username is NOT on the Users Authorized to Modify\
+  \ Users List"
 suppression:
   window: 24 hours
   fields:
@@ -100,11 +107,10 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'
-- Inspect the source IP, geo / ASN, authentication method, and prior sign-in pattern for the user — characterize the destructive
-  action (encrypt, delete, lockout, disable, reboot).
+- Inspect the source IP, geo / ASN, authentication method, and prior sign-in pattern for the user — characterize the destructive action (encrypt,
+  delete, lockout, disable, reboot).
 - 'Determine spread: is this a single host or a coordinated multi-host event? Pull file / service telemetry across the fleet.'
 - Trigger your major-incident bridge if scope is multi-host or business-critical — early activation buys time.
-- 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this
-  severity.'
-- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence
-  to prevent recurrence.'
+- 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this severity.'
+- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence to prevent
+  recurrence.'

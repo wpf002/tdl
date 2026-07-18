@@ -15,67 +15,86 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=network sourcetype=firewall OR sourcetype=ids
-    | search application="*ftp*"
-    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-    | where count >= 1
-    | sort - bytes_out
-  kql: |
-    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  spl: "index=firewall action=allowed \n| eval is_internal_src=if(match(src_ip, \"^(10\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.|192\\.168\\.)\"), 1,\
+    \ 0)\n| eval is_external_dest=if(match(dest_ip, \"^(10\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.|192\\.168\\.)\"), 0, 1)\n| where is_internal_src=1\
+    \ AND is_external_dest=1 AND (dest_port IN (\"20\", \"21\", \"69\") OR like(app, \"%ftp%\"))\n| eval baseline_start=relative_time(now(), \"\
+    -90d\")\n| eval baseline_end=relative_time(now(), \"-30d\")\n| eval detection_start=relative_time(now(), \"-30d\")\n| eval is_baseline=if(_time\
+    \ >= baseline_start AND _time < baseline_end, 1, 0)\n| eval is_detection=if(_time >= detection_start, 1, 0)\n| eventstats dc(dest_ip) as baseline_dest_count\
+    \ values(dest_ip) as baseline_dest_ips by src_ip, is_baseline\n| where is_detection=1\n| eval is_new_dest=if(is_baseline=0 OR (is_baseline=1\
+    \ AND NOT match(dest_ip, baseline_dest_ips)), 1, 0)\n| where is_new_dest=1\n| stats count earliest(_time) as first_seen latest(_time) as last_seen\
+    \ values(dest_port) as dest_ports values(app) as applications by src_ip, dest_ip\n| convert ctime(first_seen) ctime(last_seen)\n| table first_seen\
+    \ last_seen src_ip dest_ip dest_ports applications count\n"
+  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+
     | where TimeGenerated > ago(1d)
+
     | where application matches regex "ftp"
+
     | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+
     | order by Bytes desc
-  aql: |
-    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+
+    '
+  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+
     FROM flows
-    WHERE "application" LIKE '%ftp%'
+
+    WHERE "application" LIKE ''%ftp%''
+
     GROUP BY sourceip, destinationip, destinationport
+
     LAST 1 HOURS
-  yara_l: |
-    rule tdl_tdl_exf_000486 {
-      meta:
-        author = "TDL"
-        description = "First Seen Allowed Outbound FTP Traffic"
-        severity = "LOW"
-        tactic = "TA0010"
-        technique = "T1071"
-      events:
-        $e.metadata.event_type = "NETWORK_CONNECTION"
-        $e.application = /ftp/
-        $src = $e.principal.ip
-      match:
-        $src over 10m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-network*,logs-endpoint*
+
+    '
+  yara_l: "rule tdl_tdl_exf_000486 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Allowed Outbound FTP Traffic\"\n    severity\
+    \ = \"LOW\"\n    tactic = \"TA0010\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.application\
+    \ = /ftp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-network*,logs-endpoint*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "network" AND application LIKE "%ftp%"
+
     | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+
     | SORT bytes_out DESC
-  leql: |
-    where(logset = "Network Activity" AND application=/ftp/)
+
+    '
+  leql: 'where(logset = "Network Activity" AND application=/ftp/)
+
     groupby(source_ip, destination_ip, destination_port)
+
     calculate(count, sum(bytes_out))
-  crowdstrike: |
-    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*ftp*
+
+    '
+  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*ftp*
+
     | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
+
     | sort -bytes_out
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.NETWORK AND application ~= "ftp"
+
     | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
+
     | sort desc bytes_out
-  lucene: |
-    event.category:"network" AND application:*ftp*
-  sumo: |
-    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+
+    '
+  lucene: 'event.category:"network" AND application:*ftp*
+
+    '
+  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+
     | where application matches "*ftp*"
+
     | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+
     | sort by bytes_out desc
+
+    '
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -85,20 +104,16 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
-pseudo_logic: "1 Firewall Event \nFrom one internal source to one external destination (Outbound)\nWhere the Action is Allowed\n\
-  OR\n    Where the Destination Port IN (\"20\", \"21\", \"69\")\n\n    Where the Application contains \"ftp\"\n\nBaseline\
-  \ Learning: 30 Days\nRetention: 90 Days\n\nNew Value: Destination IP"
+pseudo_logic: "1 Firewall Event \nFrom one internal source to one external destination (Outbound)\nWhere the Action is Allowed\nOR\n    Where\
+  \ the Destination Port IN (\"20\", \"21\", \"69\")\n\n    Where the Application contains \"ftp\"\n\nBaseline Learning: 30 Days\nRetention: 90\
+  \ Days\n\nNew Value: Destination IP"
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination, total bytes transferred, and the protocol used.'
-- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — quantify the data volume vs the host's baseline
-  outbound profile.
-- 'Pivot to preceding collection / staging activity: archives, mailbox dumps, database extracts in the prior 24h on the same
-  host.'
-- Identify what was likely exfiltrated (path patterns, file types, classification labels) and the user/process that produced
-  it.
-- 'Decide TP / FP: FP for sanctioned cloud backup / vendor data sharing on a known channel; TP for unattended bulk transfers
-  to new endpoints.'
-- 'If TP: block the destination, isolate the host, preserve network and DLP evidence, and trigger your data-incident process
-  (legal / privacy / customer notification as applicable).'
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — quantify the data volume vs the host's baseline outbound profile.
+- 'Pivot to preceding collection / staging activity: archives, mailbox dumps, database extracts in the prior 24h on the same host.'
+- Identify what was likely exfiltrated (path patterns, file types, classification labels) and the user/process that produced it.
+- 'Decide TP / FP: FP for sanctioned cloud backup / vendor data sharing on a known channel; TP for unattended bulk transfers to new endpoints.'
+- 'If TP: block the destination, isolate the host, preserve network and DLP evidence, and trigger your data-incident process (legal / privacy
+  / customer notification as applicable).'

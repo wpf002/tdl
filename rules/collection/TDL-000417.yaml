@@ -1,9 +1,8 @@
 rule_id: TDL-COL-000417
 v4_id: '000417'
 name: Unauthorized WaveDownload Event - Salesforce
-description: Wave Download events represent downloads made from lens explorations and dashboard widgets in the Tableau CRM
-  user interface. A Wave Download event type is captured when a user downloads images ( .png ), Microsoft Excel data ( .xls
-  ), or comma-separated values ( .csv ) files.
+description: Wave Download events represent downloads made from lens explorations and dashboard widgets in the Tableau CRM user interface. A Wave
+  Download event type is captured when a user downloads images ( .png ), Microsoft Excel data ( .xls ), or comma-separated values ( .csv ) files.
 tactic: Collection
 tactic_id: TA0009
 technique_id: T1213
@@ -18,66 +17,71 @@ lifecycle: Deployed
 risk_score: 30
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*WaveDownload*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    index=salesforce EventType=WaveDownload
+    | search NOT [| inputlookup salesforce_admins.csv | fields SourceUsername]
+    | table _time, SourceUsername, EventType, Resource, FileName, RecordId, SessionKey, LoginKey
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex "WaveDownload"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%WaveDownload%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_col_000417 {
-      meta:
-        author = "TDL"
-        description = "Unauthorized WaveDownload Event - Salesforce"
-        severity = "LOW"
-        tactic = "TA0009"
-        technique = "T1213"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /WaveDownload/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%WaveDownload%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_col_000417 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized WaveDownload Event - Salesforce\"\n    severity\
+    \ = \"LOW\"\n    tactic = \"TA0009\"\n    technique = \"T1213\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
+    \ = /WaveDownload/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%WaveDownload%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/WaveDownload/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/WaveDownload/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*WaveDownload*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*WaveDownload*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= "WaveDownload"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*WaveDownload*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*WaveDownload*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*WaveDownload*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -87,19 +91,17 @@ tags:
 - collection
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
-pseudo_logic: "1 Salseforce Event  \nWhere the Event Type is 'WaveDownload'\nWhere the Source Username is NOT on the Salesforce\
-  \ Admins List"
+pseudo_logic: "1 Salseforce Event  \nWhere the Event Type is 'WaveDownload'\nWhere the Source Username is NOT on the Salesforce Admins List"
 suppression:
   window: 24 Hours
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'
-- Inspect the source IP, geo / ASN, authentication method, and prior sign-in pattern for the user — determine the collection
-  scope (single file, recursive walk, mailbox export).
+- Inspect the source IP, geo / ASN, authentication method, and prior sign-in pattern for the user — determine the collection scope (single file,
+  recursive walk, mailbox export).
 - 'Compare against business need: does this user have a legitimate reason to read this data set in this way?'
 - 'Pull staging telemetry: archive creation, large temp folders, encrypted blobs in unusual locations within the next 30 minutes.'
 - 'Decide TP / FP: FP for sanctioned migration / backup / DLP testing; TP if collection volume is anomalous and lacks a ticket.'
-- 'If TP: determine sensitivity of accessed data, preserve audit logs, prepare for possible DLP / privacy notification, and
-  escalate accordingly.'
+- 'If TP: determine sensitivity of accessed data, preserve audit logs, prepare for possible DLP / privacy notification, and escalate accordingly.'

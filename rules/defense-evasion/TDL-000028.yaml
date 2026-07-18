@@ -15,67 +15,75 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*New-InboxRule*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: "index=o365 sourcetype=o365:management:activity Operation=\"New-InboxRule\" \n| rex field=Parameters \"ForwardTo=(?<ForwardTo>[^,\\s]+)\"\
+    \ \n| rex field=Parameters \"RedirectTo=(?<RedirectTo>[^,\\s]+)\" \n| eval forward_target=coalesce(ForwardTo, RedirectTo) \n| rex field=forward_target\
+    \ \"@(?<target_domain>[^>\\\"]+)\" \n| search NOT target_domain IN (\"your-org-domain.com\", \"subsidiary-domain.com\") \n| table _time, UserId,\
+    \ ClientIP, target_domain, forward_target, Parameters\n```\n\nOR\n\n```\nindex=o365 sourcetype=o365:management:activity Operation=\"AlertTriggered\"\
+    \ Name=\"Suspicious inbox forwarding\" \n| table _time, UserId, ClientIP, Name, AlertEntityId, Data\n```\n\nOR\n\n```\nindex=mcas sourcetype=mcas:activity\
+    \ activity_type=\"ADMIN_EVENT\" activity_name=\"Create inbox rule\" \n| search NOT target_domain IN (\"your-org-domain.com\") \n| table _time,\
+    \ user, ip_address, activity_name, target_domain\n"
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex "New-InboxRule"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%New-InboxRule%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_de_000028 {
-      meta:
-        author = "TDL"
-        description = "Suspicious Inbox Forwarding"
-        severity = "HIGH"
-        tactic = "TA0005"
-        technique = "T1020"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /New-InboxRule/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%New-InboxRule%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_de_000028 {\n  meta:\n    author = \"TDL\"\n    description = \"Suspicious Inbox Forwarding\"\n    severity = \"HIGH\"\
+    \n    tactic = \"TA0005\"\n    technique = \"T1020\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
+    \ /New-InboxRule/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%New-InboxRule%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/New-InboxRule/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/New-InboxRule/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*New-InboxRule*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*New-InboxRule*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= "New-InboxRule"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*New-InboxRule*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*New-InboxRule*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*New-InboxRule*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -85,13 +93,12 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
-pseudo_logic: "1 O365 Exchange event \nWhere the operation is \"New-InboxRule\"\nWhere the Forward/Redirect Target Domain\
-  \ is not owned by the organization\n\n---------------------------------------------------------------------------------------------------------------\n\
-  \n1 O365 ATP Alert Event\nWhere the Operation is \"AlertTriggered\"\nWhere the Alert Name is \"Suspicious inbox forwarding\"\
-  \n\n---------------------------------------------------------------------------------------------------------------\n\n\
-  1 MCAS Event"
+pseudo_logic: "1 O365 Exchange event \nWhere the operation is \"New-InboxRule\"\nWhere the Forward/Redirect Target Domain is not owned by the\
+  \ organization\n\n---------------------------------------------------------------------------------------------------------------\n\n1 O365\
+  \ ATP Alert Event\nWhere the Operation is \"AlertTriggered\"\nWhere the Alert Name is \"Suspicious inbox forwarding\"\n\n---------------------------------------------------------------------------------------------------------------\n\
+  \n1 MCAS Event"
 suppression:
   window: 8 hours
   fields:
@@ -100,12 +107,10 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
-- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — distinguish administrative
-  tooling from adversary tradecraft (LOLBins, signed binary proxies, masquerading paths).
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — distinguish administrative tooling from adversary
+  tradecraft (LOLBins, signed binary proxies, masquerading paths).
 - 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log channel state to see what was suppressed.'
-- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same
-  minute.'
-- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts for it; TP if it''s unattended and
-  pairs with other malicious telemetry.'
-- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out of retention, isolate the host, and escalate
-  to IR.'
+- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same minute.'
+- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts for it; TP if it''s unattended and pairs with other malicious
+  telemetry.'
+- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out of retention, isolate the host, and escalate to IR.'

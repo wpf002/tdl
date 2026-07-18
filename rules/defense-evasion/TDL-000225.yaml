@@ -1,8 +1,7 @@
 rule_id: TDL-DE-000225
 v4_id: '000225'
 name: Credentials Stored in Plaintext
-description: The attacker would modify key systems to store plaintext credentials in memory. This can be modified in the Wdigest
-  registry key.
+description: The attacker would modify key systems to store plaintext credentials in memory. This can be modified in the Wdigest registry key.
 tactic: Defense Evasion
 tactic_id: TA0005
 technique_id: T1112
@@ -18,67 +17,73 @@ lifecycle: Proposed
 risk_score: 55
 queries:
   spl: |
-    index=endpoint sourcetype=Sysmon (EventCode=12 OR EventCode=13 OR EventCode=14)
-    | search registry_key="*.+*"
-    | stats count, values(host) as hosts by user, target_object, details, image
-    | sort - count
-  kql: |
-    DeviceRegistryEvents
+    index=windows EventCode IN (567, 4657) Object_Name IN ("HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Control\\SecurityProviders\\WDigest", "HKLM\\System\\CurrentControlSet\\Control\\SecurityProviders\\WDigest") Object_Value_Name="WDigest" New_Value=1
+    | table _time, ComputerName, EventCode, Object_Name, Object_Value_Name, New_Value, SubjectUserName, ProcessName
+  kql: 'DeviceRegistryEvents
+
     | where TimeGenerated > ago(1d)
+
     | where registry_key matches regex ".+"
+
     | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Registry Key", "Registry Value Name", "Registry Value Data", "Process Name"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" IN ('12','13','14')
-      AND "registry_key" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_de_000225 {
-      meta:
-        author = "TDL"
-        description = "Credentials Stored in Plaintext"
-        severity = "MEDIUM"
-        tactic = "TA0005"
-        technique = "T1112"
-      events:
-        $e.metadata.event_type = "REGISTRY_MODIFICATION"
-        $e.registry_key = /.+/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Registry Key\", \"Registry Value Name\", \"Registry Value Data\", \"Process Name\"\nFROM events\nWHERE\
+    \ LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n  AND \"EventID\" IN ('12','13','14')\n  AND \"registry_key\" LIKE '%.+%'\n\
+    LAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_de_000225 {\n  meta:\n    author = \"TDL\"\n    description = \"Credentials Stored in Plaintext\"\n    severity = \"MEDIUM\"\
+    \n    tactic = \"TA0005\"\n    technique = \"T1112\"\n  events:\n    $e.metadata.event_type = \"REGISTRY_MODIFICATION\"\n    $e.registry_key\
+    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "registry" AND registry_key LIKE "%.+%"
+
     | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/.+/)
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/.+/)
+
     groupby(asset, registry_key, registry_value)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*.+*
+
+    '
+  crowdstrike: 'event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*.+*
+
     | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
+
     | sort -changes
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.REGISTRY AND registry_key ~= ".+"
+
     | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
+
     | sort desc changes
-  lucene: |
-    event.category:"registry" AND registry_key:*.+*
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"registry" AND registry_key:*.+*
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id IN ("12","13","14") AND registry_key matches "*.+*"
+
     | count by host, user, registry_key, registry_value, image
+
     | sort by _count desc
+
+    '
 false_positives:
 - Security software
 - Authorized admin tools
@@ -88,7 +93,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 pseudo_logic: '1 Windows Registry Modification Event
 
@@ -104,12 +109,10 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — distinguish administrative tooling
-  from adversary tradecraft (LOLBins, signed binary proxies, masquerading paths).
+- Inspect the parent → child process tree, command line arguments, and code-signing status — distinguish administrative tooling from adversary
+  tradecraft (LOLBins, signed binary proxies, masquerading paths).
 - 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log channel state to see what was suppressed.'
-- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same
-  minute.'
-- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts for it; TP if it''s unattended and
-  pairs with other malicious telemetry.'
-- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out of retention, isolate the host, and escalate
-  to IR.'
+- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same minute.'
+- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts for it; TP if it''s unattended and pairs with other malicious
+  telemetry.'
+- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out of retention, isolate the host, and escalate to IR.'

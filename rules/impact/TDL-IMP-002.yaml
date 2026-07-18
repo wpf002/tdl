@@ -14,17 +14,12 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 100
 queries:
-  spl: 'index=windows sourcetype="WinEventLog:Security"
-
-    | search event_id IN ("4688")
-
-    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
-
+  spl: |
+    index=windows sourcetype="WinEventLog:Security" EventCode=4688 (NewProcessName="*\\vssadmin.exe" OR NewProcessName="*\\wmic.exe") (CommandLine="*delete shadows*" OR CommandLine="*resize shadowstorage*" OR CommandLine="*shadowcopy delete*" OR CommandLine="*delete shadowcopy*" OR CommandLine="*shadowstorage /for=*" OR CommandLine="*Win32_ShadowCopy*")
+    | search NOT [| inputlookup authorized_backup_accounts.csv | fields SubjectUserName] NOT [| inputlookup admin_allowlist_hosts.csv | fields ComputerName]
+    | stats count values(SubjectUserName) as user values(IpAddress) as IpAddress values(SubjectLogonId) as LogonType values(EventCode) as EventCode by ComputerName, SubjectUserName, IpAddress
     | where count >= 1
-
-    | sort - count
-
-    '
+    | table _time, ComputerName, user, IpAddress, LogonType, EventCode, count
   kql: 'SecurityEvent
 
     | where TimeGenerated > ago(1d)
@@ -36,36 +31,30 @@ queries:
     | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type,\
-    \ eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'\n\
-    \  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_002 {\n  meta:\n    author = \"TDL\"\n    description\
-    \ = \"Shadow Copy Deletion via vssadmin or wmic\"\n    severity = \"CRITICAL\"\
-    \n    tactic = \"TA0040\"\n    technique = \"T1490\"\n  events:\n    $e.metadata.event_type\
-    \ = \"USER_LOGIN\"\n    $e.event_id = /(4688)/\n    $user = $e.target.user.userid\n\
-    \  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
+  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_imp_002 {\n  meta:\n    author = \"TDL\"\n    description = \"Shadow Copy Deletion via vssadmin or wmic\"\n    severity\
+    \ = \"CRITICAL\"\n    tactic = \"TA0040\"\n    technique = \"T1490\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id\
+    \ = /(4688)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
   esql: 'FROM logs-windows.security*,logs-system.security*
 
     | WHERE @timestamp > NOW() - 1 day
 
     | WHERE event.category == "authentication" AND event_id IN ("4688")
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType,
-    event.code
+    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
 
     | SORT count DESC
 
     '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id
-    IN [4688])
+  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4688])
 
     groupby(destination_account, source_ip, asset)
 
     calculate(count)
 
     '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp)
-    AND event_id IN (4688)
+  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4688)
 
     | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
 
@@ -76,8 +65,7 @@ queries:
 
     | filter event_type = ENUM.LOGIN AND event_id in ("4688")
 
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip,
-    action_logon_type
+    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
 
     | sort desc logins
 
@@ -106,22 +94,17 @@ tags:
 author: TDL
 created: '2024-03-01'
 test_method: purple_team
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 triage_steps:
-- 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count
-  of files / accounts / services).'
-- Inspect the file path, file hash, parent process, and any prior network/email delivery
-  — characterize the destructive action (encrypt, delete, lockout, disable, reboot).
-- 'Determine spread: is this a single host or a coordinated multi-host event? Pull
-  file / service telemetry across the fleet.'
-- Trigger your major-incident bridge if scope is multi-host or business-critical —
-  early activation buys time.
-- 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission)
-  is documented; default to TP at this severity.'
-- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup
-  if appropriate, hunt for adversary persistence to prevent recurrence.'
-pseudo_logic: '1 Instance within any observation window of a Windows Security Event
-  Log process creation event.
+- 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'
+- Inspect the file path, file hash, parent process, and any prior network/email delivery — characterize the destructive action (encrypt, delete,
+  lockout, disable, reboot).
+- 'Determine spread: is this a single host or a coordinated multi-host event? Pull file / service telemetry across the fleet.'
+- Trigger your major-incident bridge if scope is multi-host or business-critical — early activation buys time.
+- 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this severity.'
+- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence to prevent
+  recurrence.'
+pseudo_logic: '1 Instance within any observation window of a Windows Security Event Log process creation event.
 
 
   From index=windows sourcetype="WinEventLog:Security"
@@ -130,17 +113,13 @@ pseudo_logic: '1 Instance within any observation window of a Windows Security Ev
 
   Where NewProcessName matches vssadmin.exe or wmic.exe
 
-  Where CommandLine contains shadow copy deletion terms such as "delete shadows",
-  "resize shadowstorage", "shadowcopy delete", or equivalent volume shadow copy destruction
-  arguments
+  Where CommandLine contains shadow copy deletion terms such as "delete shadows", "resize shadowstorage", "shadowcopy delete", or equivalent volume
+  shadow copy destruction arguments
 
-  With fields user, IpAddress, LogonType, EventCode, host collected via stats count
-  and values
+  With fields user, IpAddress, LogonType, EventCode, host collected via stats count and values
 
-  With a minimum threshold of count >= 1, meaning any single occurrence triggers the
-  detection
+  With a minimum threshold of count >= 1, meaning any single occurrence triggers the detection
 
   With the same user and IpAddress as the correlation key
 
-  Excluding process executions attributed to known authorized backup solution service
-  accounts or hosts present in an admin allow-list'
+  Excluding process executions attributed to known authorized backup solution service accounts or hosts present in an admin allow-list'

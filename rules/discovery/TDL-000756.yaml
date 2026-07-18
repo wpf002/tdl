@@ -1,9 +1,8 @@
 rule_id: TDL-DIS-000756
 v4_id: '000756'
 name: Wide-Scope ListServices / GetServices Without Prior Use
-description: Identity invokes service-enumeration APIs (resourcegroups.ListResources, billing.GetCostAndUsage) for the first
-  time. New tenants of a compromised role. Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1526 under
-  Discovery).
+description: Identity invokes service-enumeration APIs (resourcegroups.ListResources, billing.GetCostAndUsage) for the first time. New tenants
+  of a compromised role. Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1526 under Discovery).
 tactic: Discovery
 tactic_id: TA0007
 technique_id: T1526
@@ -21,73 +20,81 @@ lifecycle: Proposed
 risk_score: 35
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*ListServices*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    index=cloud_audit (action="resourcegroups.ListResources" OR action="billing.GetCostAndUsage" OR action="resources.cloudresourcemanager.projects.list" OR action="compute.projects.get" OR action="Microsoft.Resources/subscriptions/resourceGroups/read" OR action="Microsoft.CostManagement/query/action")
+    | eval identity=coalesce(user, user_name, userIdentity.principalId, actor.user.email, userIdentity.arn)
+    | eval service_action=coalesce(action, eventName, operation.name, operationName)
+    | streamstats earliest(_time) as first_seen by identity, service_action
+    | where _time = first_seen
+    | table _time, identity, service_action, src, cloud_provider, account_id
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex "ListServices"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%ListServices%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_dis_000756 {
-      meta:
-        author = "TDL"
-        description = "Wide-Scope ListServices / GetServices Without Prior Use"
-        severity = "LOW"
-        tactic = "TA0007"
-        technique = "T1526"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /ListServices/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%ListServices%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_dis_000756 {\n  meta:\n    author = \"TDL\"\n    description = \"Wide-Scope ListServices / GetServices Without Prior Use\"\
+    \n    severity = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1526\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
+    \n    $e.eventName = /ListServices/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%ListServices%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/ListServices/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/ListServices/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*ListServices*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*ListServices*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= "ListServices"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*ListServices*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*ListServices*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*ListServices*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
-pseudo_logic: Identity invokes service-enumeration APIs (resourcegroups.ListResources, billing.GetCostAndUsage) for the first
-  time. New tenants of a compromised role.
+
+    '
+pseudo_logic: Identity invokes service-enumeration APIs (resourcegroups.ListResources, billing.GetCostAndUsage) for the first time. New tenants
+  of a compromised role.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
-  group, and refine thresholds using ≥7 days of telemetry before promoting.
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset group, and refine
+  thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - cloud-service
@@ -98,16 +105,16 @@ references:
 - https://attack.mitre.org/techniques/T1526/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'
-- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — determine whether the
-  enumeration is targeted (specific user / share / OU) or scattered (broad, scripted).
-- 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from
-  a finance or HR identity is high-signal.'
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — determine whether the enumeration is targeted
+  (specific user / share / OU) or scattered (broad, scripted).
+- 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from a finance or HR identity
+  is high-signal.'
 - Pull adjacent execution / lateral-movement / cred-access telemetry — discovery often precedes the next stage by minutes.
-- 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and
-  adjacent telemetry is suspicious.'
-- 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity
-  that the recon was likely setting up.'
+- 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and adjacent telemetry
+  is suspicious.'
+- 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity that the recon
+  was likely setting up.'

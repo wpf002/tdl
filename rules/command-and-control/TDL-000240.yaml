@@ -1,8 +1,8 @@
 rule_id: TDL-C2-000240
 v4_id: '000240'
 name: C2 Callback
-description: Detects outbound traffic flagged by the IDS as malware communications back to a command and control server. Infected
-  hosts need to maintain contact with a C2 server in order to receive updates and commands to further their objective.
+description: Detects outbound traffic flagged by the IDS as malware communications back to a command and control server. Infected hosts need to
+  maintain contact with a C2 server in order to receive updates and commands to further their objective.
 tactic: Command and Control
 tactic_id: TA0011
 technique_id: T1071
@@ -19,66 +19,75 @@ lifecycle: Deployed
 risk_score: 55
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*.+*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    (index=network sourcetype=suricata* OR sourcetype=snort* OR index=ids OR index=ips) (alert.signature=*C2* OR alert.signature=*c&c* OR alert.signature=*command*and*control* OR signature=*C2* OR signature=*c&c* OR signature=*command*and*control*) (src_ip=10.* OR src_ip=172.16.* OR src_ip=172.17.* OR src_ip=172.18.* OR src_ip=172.19.* OR src_ip=172.20.* OR src_ip=172.21.* OR src_ip=172.22.* OR src_ip=172.23.* OR src_ip=172.24.* OR src_ip=172.25.* OR src_ip=172.26.* OR src_ip=172.27.* OR src_ip=172.28.* OR src_ip=172.29.* OR src_ip=172.30.* OR src_ip=172.31.* OR src_ip=192.168.*) NOT (dest_ip=10.* OR dest_ip=172.16.* OR dest_ip=172.17.* OR dest_ip=172.18.* OR dest_ip=172.19.* OR dest_ip=172.20.* OR dest_ip=172.21.* OR dest_ip=172.22.* OR dest_ip=172.23.* OR dest_ip=172.24.* OR dest_ip=172.25.* OR dest_ip=172.26.* OR dest_ip=172.27.* OR dest_ip=172.28.* OR dest_ip=172.29.* OR dest_ip=172.30.* OR dest_ip=172.31.* OR dest_ip=192.168.*)
+    | eval detection_type="IDS_C2_Signature"
+    | table _time, src_ip, dest_ip, signature, alert.signature, detection_type
+    | append [search index=aws sourcetype=aws:cloudwatch:guardduty (finding.type="Backdoor:EC2/C&CActivity.B" OR finding.type="Backdoor:EC2/C&CActivity.B!DNS" OR finding.type="Backdoor:Lambda/C&CActivity.B" OR finding.type="Backdoor:Runtime/C&CActivity.B" OR finding.type="Backdoor:Runtime/C&CActivity.B!DNS" OR type="Backdoor:EC2/C&CActivity.B" OR type="Backdoor:EC2/C&CActivity.B!DNS" OR type="Backdoor:Lambda/C&CActivity.B" OR type="Backdoor:Runtime/C&CActivity.B" OR type="Backdoor:Runtime/C&CActivity.B!DNS")
+    | eval detection_type="GuardDuty_C2"
+    | eval signature=coalesce(finding.type, type)
+    | table _time, resource.instanceDetails.networkInterfaces{}.privateIpAddress, resource.instanceDetails.networkInterfaces{}.publicIp, signature, detection_type]
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex ".+"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_c2_000240 {
-      meta:
-        author = "TDL"
-        description = "C2 Callback"
-        severity = "MEDIUM"
-        tactic = "TA0011"
-        technique = "T1071"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /.+/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_c2_000240 {\n  meta:\n    author = \"TDL\"\n    description = \"C2 Callback\"\n    severity = \"MEDIUM\"\n    tactic =\
+    \ \"TA0011\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n    $actor\
+    \ = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%.+%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= ".+"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*.+*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -88,21 +97,20 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
-pseudo_logic: "1 IDS/IPS Exploit Event\nFrom one internal source to one external destination (Outbound)\nWhere the IDS/IPS\
-  \ Signature matches the following regex \"(?i)\\b(C2|c&c|command and control)\"\n\n--------------------------------------------------------------\n\
-  \n1 Guard Duty Event \nWhere the Event Type is in [\"Backdoor:EC2/C&CActivity.B\",  \"Backdoor:EC2/C&CActivity.B!DNS\",\
-  \ \"Backdoor:Lambda/C&CActivity.B\", \"Backdoor:Runtime/C&CActivity.B\", \"Backdoor:Runtime/C&CActivity.B!DNS\"]"
+pseudo_logic: "1 IDS/IPS Exploit Event\nFrom one internal source to one external destination (Outbound)\nWhere the IDS/IPS Signature matches the\
+  \ following regex \"(?i)\\b(C2|c&c|command and control)\"\n\n--------------------------------------------------------------\n\n1 Guard Duty\
+  \ Event \nWhere the Event Type is in [\"Backdoor:EC2/C&CActivity.B\",  \"Backdoor:EC2/C&CActivity.B!DNS\", \"Backdoor:Lambda/C&CActivity.B\"\
+  , \"Backdoor:Runtime/C&CActivity.B\", \"Backdoor:Runtime/C&CActivity.B!DNS\"]"
 suppression:
   window: 12 hours
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'
-- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — verify beaconing characteristics (interval,
-  jitter, request size, server response code).
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — verify beaconing characteristics (interval, jitter, request size,
+  server response code).
 - Pull WHOIS / TLS / passive-DNS context on the destination — newly registered or low-reputation infrastructure raises confidence.
 - Identify the originating process and trace it back to its install / launch event (initial access / persistence stage).
 - 'Decide TP / FP: FP for sanctioned OOB management agents (allowlist them); TP for unattended periodic egress to new infrastructure.'
-- 'If TP: block the destination at egress, isolate the host, capture network PCAP / memory while session is live, and escalate
-  to IR.'
+- 'If TP: block the destination at egress, isolate the host, capture network PCAP / memory while session is live, and escalate to IR.'

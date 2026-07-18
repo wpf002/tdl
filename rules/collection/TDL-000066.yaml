@@ -19,66 +19,73 @@ lifecycle: Deployed
 risk_score: 55
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*FileDownload*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    index=sharepoint OR index=o365 OR index=cloud sourcetype IN (mscs:sharepoint, o365:management:activity, netskope:events, box:events, dropbox:events) Operation=FileDownload
+    | search NOT [| inputlookup authorized_countries.csv | fields Country | rename Country as src_country]
+    | eval src_country=coalesce(ClientIP_Country, src_country, SourceCountry, client_location_country)
+    | where isnotnull(src_country)
+    | table _time, user, src_country, Operation, ObjectId, SourceFileName, Workload, ClientIP
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex "FileDownload"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%FileDownload%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_col_000066 {
-      meta:
-        author = "TDL"
-        description = "File Download From Unauthorized Country"
-        severity = "MEDIUM"
-        tactic = "TA0009"
-        technique = "T1213"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /FileDownload/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%FileDownload%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_col_000066 {\n  meta:\n    author = \"TDL\"\n    description = \"File Download From Unauthorized Country\"\n    severity\
+    \ = \"MEDIUM\"\n    tactic = \"TA0009\"\n    technique = \"T1213\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
+    \ $e.eventName = /FileDownload/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%FileDownload%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/FileDownload/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/FileDownload/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*FileDownload*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*FileDownload*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= "FileDownload"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*FileDownload*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*FileDownload*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*FileDownload*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -88,7 +95,7 @@ tags:
 - collection
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
 pseudo_logic: '1 Sharepoint Event
 
@@ -100,10 +107,9 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'
-- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — determine the collection
-  scope (single file, recursive walk, mailbox export).
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — determine the collection scope (single file,
+  recursive walk, mailbox export).
 - 'Compare against business need: does this user have a legitimate reason to read this data set in this way?'
 - 'Pull staging telemetry: archive creation, large temp folders, encrypted blobs in unusual locations within the next 30 minutes.'
 - 'Decide TP / FP: FP for sanctioned migration / backup / DLP testing; TP if collection volume is anomalous and lacks a ticket.'
-- 'If TP: determine sensitivity of accessed data, preserve audit logs, prepare for possible DLP / privacy notification, and
-  escalate accordingly.'
+- 'If TP: determine sensitivity of accessed data, preserve audit logs, prepare for possible DLP / privacy notification, and escalate accordingly.'

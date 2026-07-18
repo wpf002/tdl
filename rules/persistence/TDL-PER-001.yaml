@@ -13,47 +13,34 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 70
 queries:
-  spl: 'index=endpoint sourcetype=Sysmon EventCode=1
-
-    | search process_name="*.+*"
-
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name,
-    command_line
-
-    | where count >= 1
-
-    | sort - count
-
-    '
+  spl: |
+    index=endpoint sourcetype=Sysmon EventCode=13 (TargetObject="*\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\*" OR TargetObject="*\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\*") NOT (Image="*\\msiexec.exe" OR Image="*\\setup.exe" OR Image="*\\installer.exe" OR Image="*\\TrustedInstaller.exe")
+    | eval process_name=mvindex(split(Image,"\\"),-1), parent_process_name=mvindex(split(ParentImage,"\\"),-1), command_line=CommandLine, host=ComputerName, user=User
+    | dedup host, TargetObject, user
+    | table _time, host, user, process_name, parent_process_name, command_line, TargetObject, Details
   kql: 'DeviceProcessEvents
 
     | where TimeGenerated > ago(1d)
 
     | where process_name matches regex ".+"
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName,
-    ProcessCommandLine
+    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
 
     | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"\
-    Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft\
-    \ Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\n\
-    LAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_001 {\n  meta:\n    author = \"TDL\"\n    description\
-    \ = \"Registry Run Key Persistence Added\"\n    severity = \"HIGH\"\n    tactic\
-    \ = \"TA0003\"\n    technique = \"T1547.001\"\n  events:\n    $e.metadata.event_type\
-    \ = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n    $host = $e.principal.hostname\n\
-    \  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_per_001 {\n  meta:\n    author = \"TDL\"\n    description = \"Registry Run Key Persistence Added\"\n    severity = \"\
+    HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1547.001\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
+    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
   esql: 'FROM logs-endpoint*,logs-windows*
 
     | WHERE @timestamp > NOW() - 1 hour
 
     | WHERE event.category == "process" AND process_name LIKE "%.+%"
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name,
-    process.command_line
+    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
 
     | SORT count DESC
 
@@ -67,8 +54,7 @@ queries:
     '
   crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
 
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName,
-    CommandLine
+    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
 
     | sort -occurrences
 
@@ -77,8 +63,8 @@ queries:
 
     | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
 
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name,
-    causality_actor_process_image_name, action_process_image_command_line
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
 
     | sort desc occurrences
 
@@ -106,20 +92,16 @@ tags:
 author: TDL
 created: '2024-01-20'
 test_method: synthetic
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 triage_steps:
-- 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact
-  (registry path / scheduled task / service / config).'
-- Inspect the registry hive, key path, value name, and writing process — verify the
-  persistence target points to an unusual location or unsigned binary.
-- Determine when the artifact was created and which process/account performed the
-  write — pivot on that process for the original attack chain.
-- 'Look for prior child-process activity from the persistence target: did anything
-  actually launch from it?'
-- 'Decide TP / FP: FP for sanctioned management software (RMM, vendor agents, custom
-  installers) — verify against the asset register.'
-- 'If TP: remove the persistence artifact, isolate the host, hunt for the same artifact
-  across the fleet, and rotate any credentials touched by the persistent process.'
+- 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'
+- Inspect the registry hive, key path, value name, and writing process — verify the persistence target points to an unusual location or unsigned
+  binary.
+- Determine when the artifact was created and which process/account performed the write — pivot on that process for the original attack chain.
+- 'Look for prior child-process activity from the persistence target: did anything actually launch from it?'
+- 'Decide TP / FP: FP for sanctioned management software (RMM, vendor agents, custom installers) — verify against the asset register.'
+- 'If TP: remove the persistence artifact, isolate the host, hunt for the same artifact across the fleet, and rotate any credentials touched by
+  the persistent process.'
 pseudo_logic: '1 Instance within any time window of a Sysmon Registry Value Set event.
 
 
@@ -127,14 +109,12 @@ pseudo_logic: '1 Instance within any time window of a Sysmon Registry Value Set 
 
   Where EventCode=13
 
-  Where TargetObject matches a known Run or RunOnce registry path (e.g., HKLM\Software\Microsoft\Windows\CurrentVersion\Run,
-  HKCU\Software\Microsoft\Windows\CurrentVersion\Run, and equivalent RunOnce variants)
+  Where TargetObject matches a known Run or RunOnce registry path (e.g., HKLM\Software\Microsoft\Windows\CurrentVersion\Run, HKCU\Software\Microsoft\Windows\CurrentVersion\Run,
+  and equivalent RunOnce variants)
 
-  With process_name, parent_process_name, command_line, host, and user captured at
-  time of write
+  With process_name, parent_process_name, command_line, host, and user captured at time of write
 
   Where process_name is not in the approved software installer allow-list
 
 
-  With the same TargetObject registry path and user, deduplicated per host on first
-  observed instance.'
+  With the same TargetObject registry path and user, deduplicated per host on first observed instance.'

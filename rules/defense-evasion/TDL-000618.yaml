@@ -1,8 +1,7 @@
 rule_id: TDL-DE-000618
 v4_id: 000618
 name: AWS GuardDuty Low Alert
-description: A catch all detection used to alert on any low severity GuardDuty alert
-  that is not mapped to an exisiting TDL Detection
+description: A catch all detection used to alert on any low severity GuardDuty alert that is not mapped to an exisiting TDL Detection
 tactic: Defense Evasion
 tactic_id: TA0005
 technique_id: T1078
@@ -16,38 +15,34 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: 'index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-
-    | search eventName="*GuardDuty*"
-
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName,
-    resources{}.ARN
-
+  spl: |
+    index=cloud sourcetype=aws:cloudtrail eventName="*GuardDuty*"
+    | eval severity=coalesce('detail.severity', severity, "UNKNOWN")
+    | search severity="Low" OR severity="low" OR severity="1" OR severity="2" OR severity="3"
+    | eval arn=coalesce('userIdentity.arn', userIdentity_arn, user)
+    | eval src_ip=coalesce(sourceIPAddress, src_ip, src)
+    | eval resource_arn=mvindex('resources{}.ARN', 0)
+    | where isnotnull(arn) AND isnotnull(eventName)
+    | stats count values(src_ip) as src_ips values(resource_arn) as resource_arns by arn, eventName
     | where count >= 1
-
     | sort - count
-
-    '
+    | table arn, eventName, count, src_ips, resource_arns
   kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
 
     | where TimeGenerated > ago(1d)
 
     | where eventName matches regex "GuardDuty"
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName),
-    Resource=tostring(coalesce(ResourceId, ResourceProvider))
+    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
 
     | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\
-    \nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure\
-    \ Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000618 {\n  meta:\n    author = \"TDL\"\n    description\
-    \ = \"AWS GuardDuty Low Alert\"\n    severity = \"LOW\"\n    tactic = \"TA0005\"\
-    \n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n\
-    \    $actor over 30m\n  condition:\n    $e\n}\n"
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_de_000618 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS GuardDuty Low Alert\"\n    severity = \"LOW\"\n  \
+    \  tactic = \"TA0005\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /GuardDuty/\n\
+    \    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
   esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
 
     | WHERE @timestamp > NOW() - 1 hour
@@ -77,8 +72,7 @@ queries:
 
     | filter eventName ~= "GuardDuty"
 
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name,
-    action_remote_ip
+    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
 
     | sort desc calls
 
@@ -104,24 +98,18 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 triage_steps:
-- 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process
-  / DLL / log clear / service stop).'
-- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource
-  being acted on — distinguish administrative tooling from adversary tradecraft (LOLBins,
-  signed binary proxies, masquerading paths).
-- 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log
-  channel state to see what was suppressed.'
-- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence
-  / cred-access action in the same minute.'
-- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts
-  for it; TP if it''s unattended and pairs with other malicious telemetry.'
-- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out
-  of retention, isolate the host, and escalate to IR.'
-pseudo_logic: '1 Instance within any time window of an AWS GuardDuty low severity
-  alert event not covered by an existing TDL detection rule.
+- 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — distinguish administrative tooling from adversary
+  tradecraft (LOLBins, signed binary proxies, masquerading paths).
+- 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log channel state to see what was suppressed.'
+- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same minute.'
+- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts for it; TP if it''s unattended and pairs with other malicious
+  telemetry.'
+- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out of retention, isolate the host, and escalate to IR.'
+pseudo_logic: '1 Instance within any time window of an AWS GuardDuty low severity alert event not covered by an existing TDL detection rule.
 
 
   From index=cloud
@@ -136,8 +124,6 @@ pseudo_logic: '1 Instance within any time window of an AWS GuardDuty low severit
 
   With associated sourceIPAddress values collected as src_ips
 
-  Excluding alerts attributable to known security software or authorized admin tools
-  per vendor allow-list
+  Excluding alerts attributable to known security software or authorized admin tools per vendor allow-list
 
-  With the same userIdentity.arn and eventName as the correlation key, sorted descending
-  by event count'
+  With the same userIdentity.arn and eventName as the correlation key, sorted descending by event count'

@@ -1,10 +1,10 @@
 rule_id: TDL-DE-000589
 v4_id: 000589
 name: Pass the Ticket Attack Activity
-description: Detects when a source generates ticket granting service (TGS) events without ticket granting ticket (TGT) events,
-  which means a Pass the Ticket attack may be occurring. Adversaries may "pass the ticket" using stolen Kerberos tickets to
-  move laterally within an environment, bypassing normal system access controls. Pass the ticket (PtT) is a method of authenticating
-  to a system using Kerberos tickets without having access to an account's password.
+description: Detects when a source generates ticket granting service (TGS) events without ticket granting ticket (TGT) events, which means a Pass
+  the Ticket attack may be occurring. Adversaries may "pass the ticket" using stolen Kerberos tickets to move laterally within an environment,
+  bypassing normal system access controls. Pass the ticket (PtT) is a method of authenticating to a system using Kerberos tickets without having
+  access to an account's password.
 tactic: Defense Evasion
 tactic_id: TA0005
 technique_id: T1550
@@ -20,67 +20,83 @@ lifecycle: Proposed
 risk_score: 75
 queries:
   spl: |
-    index=windows sourcetype="WinEventLog:Security"
-    | search event_id IN ("4768", "4769")
-    | stats count, values(host) as hosts by user, IpAddress, LogonType, EventCode
-    | where count >= 1
-    | sort - count
-  kql: |
-    SecurityEvent
+    index=wineventlog sourcetype=WinEventLog:Security (EventCode=4769 OR EventCode=4768)
+    | eval timewindow=relative_time(_time, "-5h")
+    | eventstats min(_time) as first_event, max(_time) as last_event, values(EventCode) as all_event_codes, dc(eval(if(EventCode=4769, Service_Name, null()))) as unique_services, count(eval(if(EventCode=4769, 1, null()))) as ticket_count by Source_Network_Address, Account_Name
+    | where EventCode=4769
+    | where NOT match(Account_Name, "\$$")
+    | where NOT match(Service_Name, "\$$")
+    | where Service_Name!="krbtgt"
+    | where (last_event - first_event) <= 18000
+    | where ticket_count >= 5
+    | where unique_services >= 5
+    | where NOT match(all_event_codes, "4768")
+    | stats count, values(Service_Name) as service_names, min(_time) as first_seen, max(_time) as last_seen by Source_Network_Address, Account_Name
+    | table first_seen, last_seen, Source_Network_Address, Account_Name, count, service_names
+  kql: 'SecurityEvent
+
     | where TimeGenerated > ago(1d)
+
     | where event_id in ("4768", "4769")
+
     | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, username, hostname, "Logon Type" as logon_type, eventid
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Windows%'
-      AND "event_id" IN ('4768', '4769')
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_de_000589 {
-      meta:
-        author = "TDL"
-        description = "Pass the Ticket Attack Activity"
-        severity = "HIGH"
-        tactic = "TA0005"
-        technique = "T1550"
-      events:
-        $e.metadata.event_type = "USER_LOGIN"
-        $e.event_id = /(4768|4769)/
-        $user = $e.target.user.userid
-      match:
-        $user over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-windows.security*,logs-system.security*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4768', '4769')\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_de_000589 {\n  meta:\n    author = \"TDL\"\n    description = \"Pass the Ticket Attack Activity\"\n    severity = \"HIGH\"\
+    \n    tactic = \"TA0005\"\n    technique = \"T1550\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(4768|4769)/\n\
+    \    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-windows.security*,logs-system.security*
+
     | WHERE @timestamp > NOW() - 1 day
+
     | WHERE event.category == "authentication" AND event_id IN ("4768", "4769")
+
     | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4768, 4769])
+
+    '
+  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4768, 4769])
+
     groupby(destination_account, source_ip, asset)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4768, 4769)
+
+    '
+  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4768, 4769)
+
     | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
+
     | sort -auth_events
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.LOGIN AND event_id in ("4768", "4769")
+
     | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
+
     | sort desc logins
-  lucene: |
-    event.category:"authentication" AND event_id:(4768 OR 4769)
-  sumo: |
-    _sourceCategory=*windows*security* OR _sourceCategory=*ad*
+
+    '
+  lucene: 'event.category:"authentication" AND event_id:(4768 OR 4769)
+
+    '
+  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
+
     | parse "EventID=*\"" as event_id nodrop
+
     | where event_id IN ("4768", "4769")
+
     | count by host, user, src_ip, logon_type, event_id
+
     | sort by _count desc
+
+    '
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +106,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 pseudo_logic: '5 Windows Events
 
@@ -112,12 +128,10 @@ pseudo_logic: '5 Windows Events
   AND where there are no 4768 Events within the timeframe from the same source IP and user'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — distinguish administrative tooling
-  from adversary tradecraft (LOLBins, signed binary proxies, masquerading paths).
+- Inspect the parent → child process tree, command line arguments, and code-signing status — distinguish administrative tooling from adversary
+  tradecraft (LOLBins, signed binary proxies, masquerading paths).
 - 'Pull surrounding security-tool telemetry: EDR sensor health, AV scan history, log channel state to see what was suppressed.'
-- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same
-  minute.'
-- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts for it; TP if it''s unattended and
-  pairs with other malicious telemetry.'
-- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out of retention, isolate the host, and escalate
-  to IR.'
+- 'Look for adjacent stages: a successful evasion typically wraps an execution / persistence / cred-access action in the same minute.'
+- 'Decide TP / FP: FP if patch / debugging / IT-troubleshooting context fully accounts for it; TP if it''s unattended and pairs with other malicious
+  telemetry.'
+- 'If TP: restore the disabled defenses, capture artifacts before evidence rolls out of retention, isolate the host, and escalate to IR.'

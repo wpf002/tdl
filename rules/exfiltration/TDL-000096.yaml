@@ -15,69 +15,74 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1
-    | search process_name="*.+*"
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
-    | where count >= 1
-    | sort - count
-  kql: |
-    DeviceProcessEvents
+  spl: "index=dlp sourcetype=dlp* \n| search policy IN (\"Sensitive Data Transfer\", \"PII Protection\", \"Confidential Documents\", \"Financial\
+    \ Data\", \"Intellectual Property\", \"Customer Data\", \"HIPAA\", \"PCI-DSS\", \"Export Control\", \"Trade Secrets\")\n| table _time, user,\
+    \ src, dest, policy, action, file_name, file_size, severity, dlp_rule\n"
+  kql: 'DeviceProcessEvents
+
     | where TimeGenerated > ago(1d)
+
     | where process_name matches regex ".+"
+
     | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" = '1'
-      AND "process_name" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_exf_000096 {
-      meta:
-        author = "TDL"
-        description = "DLP Detection for Sensitive Data"
-        severity = "MEDIUM"
-        tactic = "TA0010"
-        technique = "T1048"
-      events:
-        $e.metadata.event_type = "PROCESS_LAUNCH"
-        $e.process_name = /.+/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*,logs-windows*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_exf_000096 {\n  meta:\n    author = \"TDL\"\n    description = \"DLP Detection for Sensitive Data\"\n    severity = \"\
+    MEDIUM\"\n    tactic = \"TA0010\"\n    technique = \"T1048\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
+    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*,logs-windows*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "process" AND process_name LIKE "%.+%"
+
     | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND process_name=/.+/)
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
+
     groupby(asset, process_name, parent_process_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=ProcessRollup2 AND process_name=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
+
     | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+
     | sort -occurrences
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
+
     | sort desc occurrences
-  lucene: |
-    event.category:"process" AND process_name:*.+*
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"process" AND process_name:*.+*
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id="1" AND process_name matches "*.+*"
+
     | count by host, user, parent_process_name, command_line
+
     | sort by _count desc
+
+    '
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -87,7 +92,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
 pseudo_logic: '1 DLP Detection Event
 
@@ -97,13 +102,10 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination, total bytes transferred, and the protocol used.'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — quantify the data volume vs the
-  host's baseline outbound profile.
-- 'Pivot to preceding collection / staging activity: archives, mailbox dumps, database extracts in the prior 24h on the same
-  host.'
-- Identify what was likely exfiltrated (path patterns, file types, classification labels) and the user/process that produced
-  it.
-- 'Decide TP / FP: FP for sanctioned cloud backup / vendor data sharing on a known channel; TP for unattended bulk transfers
-  to new endpoints.'
-- 'If TP: block the destination, isolate the host, preserve network and DLP evidence, and trigger your data-incident process
-  (legal / privacy / customer notification as applicable).'
+- Inspect the parent → child process tree, command line arguments, and code-signing status — quantify the data volume vs the host's baseline outbound
+  profile.
+- 'Pivot to preceding collection / staging activity: archives, mailbox dumps, database extracts in the prior 24h on the same host.'
+- Identify what was likely exfiltrated (path patterns, file types, classification labels) and the user/process that produced it.
+- 'Decide TP / FP: FP for sanctioned cloud backup / vendor data sharing on a known channel; TP for unattended bulk transfers to new endpoints.'
+- 'If TP: block the destination, isolate the host, preserve network and DLP evidence, and trigger your data-incident process (legal / privacy
+  / customer notification as applicable).'

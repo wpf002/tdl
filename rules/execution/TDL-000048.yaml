@@ -1,10 +1,9 @@
 rule_id: TDL-EXE-000048
 v4_id: 000048
 name: Persistent Malware
-description: Detects a specific piece of malware that is repeatedly detected and cleaned by the AV on a system. This could
-  indicate that the AV is leaving remnants of the malware when deleting it that cause it to be installed again after it has
-  been cleaned. This could also be an indication that a user has bad network practice and is repeatedly infected with the
-  same malware.
+description: Detects a specific piece of malware that is repeatedly detected and cleaned by the AV on a system. This could indicate that the AV
+  is leaving remnants of the malware when deleting it that cause it to be installed again after it has been cleaned. This could also be an indication
+  that a user has bad network practice and is repeatedly infected with the same malware.
 tactic: Execution
 tactic_id: TA0002
 technique_id: T1204
@@ -19,68 +18,76 @@ lifecycle: Deployed
 risk_score: 55
 queries:
   spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1
-    | search process_name="*.+*"
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
-    | where count >= 1
-    | sort - count
-  kql: |
-    DeviceProcessEvents
+    index=* sourcetype=*av* OR sourcetype=*antivirus* OR sourcetype=*symantec* OR sourcetype=*mcafee* OR sourcetype=*defender* OR tag=malware
+    | bin _time span=20m
+    | stats count dc(host) as host_count values(host) as hosts by _time, file_hash, signature
+    | where count >= 4 AND host_count = 1
+    | table _time, hosts, file_hash, signature, count
+  kql: 'DeviceProcessEvents
+
     | where TimeGenerated > ago(1d)
+
     | where process_name matches regex ".+"
+
     | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" = '1'
-      AND "process_name" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_exe_000048 {
-      meta:
-        author = "TDL"
-        description = "Persistent Malware"
-        severity = "MEDIUM"
-        tactic = "TA0002"
-        technique = "T1204"
-      events:
-        $e.metadata.event_type = "PROCESS_LAUNCH"
-        $e.process_name = /.+/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*,logs-windows*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_exe_000048 {\n  meta:\n    author = \"TDL\"\n    description = \"Persistent Malware\"\n    severity = \"MEDIUM\"\n   \
+    \ tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
+    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*,logs-windows*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "process" AND process_name LIKE "%.+%"
+
     | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND process_name=/.+/)
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
+
     groupby(asset, process_name, parent_process_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=ProcessRollup2 AND process_name=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
+
     | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+
     | sort -occurrences
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
+
     | sort desc occurrences
-  lucene: |
-    event.category:"process" AND process_name:*.+*
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"process" AND process_name:*.+*
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id="1" AND process_name matches "*.+*"
+
     | count by host, user, parent_process_name, command_line
+
     | sort by _count desc
+
+    '
 false_positives:
 - Security software
 - Authorized admin tools
@@ -90,7 +97,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
 pseudo_logic: '4 Malware Detection Events
 
@@ -105,11 +112,10 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — pay attention to short-lived
-  processes, encoded arguments, and unusual parents (Office, browser, services).
+- Inspect the parent → child process tree, command line arguments, and code-signing status — pay attention to short-lived processes, encoded arguments,
+  and unusual parents (Office, browser, services).
 - Pull EDR process tree for the alert PID; check the parent / grandparent and any child processes spawned within 5 minutes.
 - 'Compare against the host''s baseline: is the binary / interpreter normally invoked here, by this user, at this time?'
-- 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software
-  install, or scheduled job.'
-- 'If TP: contain the host, kill the offending process, snapshot memory if possible, and escalate to IR with the process tree
-  attached.'
+- 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software install, or scheduled
+  job.'
+- 'If TP: contain the host, kill the offending process, snapshot memory if possible, and escalate to IR with the process tree attached.'

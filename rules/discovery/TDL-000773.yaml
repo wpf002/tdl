@@ -1,8 +1,8 @@
 rule_id: TDL-DIS-000773
 v4_id: '000773'
 name: sc query / Get-Service Burst
-description: sc.exe query, Get-Service, systemctl list-units invoked from non-admin context with no preceding service interaction.
-  Generated from gap analysis against canonical ATT&CK Enterprise matrix (T1007 under Discovery).
+description: sc.exe query, Get-Service, systemctl list-units invoked from non-admin context with no preceding service interaction. Generated from
+  gap analysis against canonical ATT&CK Enterprise matrix (T1007 under Discovery).
 tactic: Discovery
 tactic_id: TA0007
 technique_id: T1007
@@ -17,75 +17,85 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1
-    | search process_name IN ("sc.exe")
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
-    | where count >= 1
-    | sort - count
-  kql: |
-    DeviceProcessEvents
+  spl: "index=* sourcetype IN (\"WinEventLog:Microsoft-Windows-Sysmon/Operational\",\"linux_sysmon\") EventCode=1\n(Image IN (\"*\\\\sc.exe\"\
+    ,\"*\\\\powershell.exe\",\"*\\\\pwsh.exe\",\"/bin/systemctl\",\"/usr/bin/systemctl\") \n AND (CommandLine IN (\"*sc.exe*query*\",\"*sc*query*\"\
+    ,\"*Get-Service*\",\"*systemctl*list-units*\")))\n| eval is_admin=if(match(User,\"(?i)(administrator|admin|root|SYSTEM)\"),1,0)\n| where is_admin=0\n\
+    | eval proc_guid=coalesce(ProcessGuid,process_guid)\n| join type=left proc_guid \n    [search index=* sourcetype IN (\"WinEventLog:Microsoft-Windows-Sysmon/Operational\"\
+    ,\"linux_sysmon\") EventCode IN (1,11,13)\n     (Image IN (\"*\\\\services.exe\",\"*\\\\sc.exe\",\"*systemd*\") OR CommandLine IN (\"*Start-Service*\"\
+    ,\"*Stop-Service*\",\"*New-Service*\",\"*systemctl*start*\",\"*systemctl*stop*\",\"*systemctl*enable*\"))\n     | eval proc_guid=coalesce(ProcessGuid,process_guid)\n\
+    \     | stats earliest(_time) as prior_service_time by proc_guid]\n| where isnull(prior_service_time)\n| table _time, ComputerName, User,\
+    \ Image, CommandLine, ParentImage\n"
+  kql: 'DeviceProcessEvents
+
     | where TimeGenerated > ago(1d)
+
     | where process_name in ("sc.exe")
+
     | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" = '1'
-      AND "process_name" IN ('sc.exe')
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_dis_000773 {
-      meta:
-        author = "TDL"
-        description = "sc query / Get-Service Burst"
-        severity = "LOW"
-        tactic = "TA0007"
-        technique = "T1007"
-      events:
-        $e.metadata.event_type = "PROCESS_LAUNCH"
-        $e.process_name = /(sc.exe)/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*,logs-windows*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('sc.exe')\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_dis_000773 {\n  meta:\n    author = \"TDL\"\n    description = \"sc query / Get-Service Burst\"\n    severity = \"LOW\"\
+    \n    tactic = \"TA0007\"\n    technique = \"T1007\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(sc.exe)/\n\
+    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*,logs-windows*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "process" AND process_name IN ("sc.exe")
+
     | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND process_name IN [sc.exe])
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND process_name IN [sc.exe])
+
     groupby(asset, process_name, parent_process_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=ProcessRollup2 AND process_name IN (sc.exe)
+
+    '
+  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (sc.exe)
+
     | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+
     | sort -occurrences
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.PROCESS AND process_name in ("sc.exe")
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
+
     | sort desc occurrences
-  lucene: |
-    event.category:"process" AND process_name:(sc.exe)
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"process" AND process_name:(sc.exe)
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id="1" AND process_name IN ("sc.exe")
+
     | count by host, user, parent_process_name, command_line
+
     | sort by _count desc
+
+    '
 pseudo_logic: sc.exe query, Get-Service, systemctl list-units invoked from non-admin context with no preceding service interaction.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
-  group, and refine thresholds using ≥7 days of telemetry before promoting.
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset group, and refine
+  thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - services
@@ -96,16 +106,16 @@ references:
 - https://attack.mitre.org/techniques/T1007/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — determine whether the enumeration
-  is targeted (specific user / share / OU) or scattered (broad, scripted).
-- 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from
-  a finance or HR identity is high-signal.'
+- Inspect the parent → child process tree, command line arguments, and code-signing status — determine whether the enumeration is targeted (specific
+  user / share / OU) or scattered (broad, scripted).
+- 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from a finance or HR identity
+  is high-signal.'
 - Pull adjacent execution / lateral-movement / cred-access telemetry — discovery often precedes the next stage by minutes.
-- 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and
-  adjacent telemetry is suspicious.'
-- 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity
-  that the recon was likely setting up.'
+- 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and adjacent telemetry
+  is suspicious.'
+- 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity that the recon
+  was likely setting up.'

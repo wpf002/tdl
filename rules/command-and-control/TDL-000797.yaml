@@ -1,8 +1,8 @@
 rule_id: TDL-C2-000797
 v4_id: 000797
 name: High-Entropy Base64 Body in Outbound HTTP
-description: HTTP body with Shannon entropy > 5.0 and length > 256 sent to non-cdn destinations. Encoded C2 traffic. Generated
-  from gap analysis against canonical ATT&CK Enterprise matrix (T1132 under Command and Control).
+description: HTTP body with Shannon entropy > 5.0 and length > 256 sent to non-cdn destinations. Encoded C2 traffic. Generated from gap analysis
+  against canonical ATT&CK Enterprise matrix (T1132 under Command and Control).
 tactic: Command and Control
 tactic_id: TA0011
 technique_id: T1132
@@ -16,73 +16,91 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 50
 queries:
-  spl: |
-    index=network sourcetype=firewall OR sourcetype=ids
-    | search network.protocol="*http*"
-    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-    | where count >= 1
-    | sort - bytes_out
-  kql: |
-    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  spl: "index=network (sourcetype=suricata OR sourcetype=zeek OR sourcetype=bro OR sourcetype=snort OR sourcetype=ids) \n(http.method=POST OR\
+    \ http_method=POST OR method=POST)\n| eval http_body=coalesce(http.request_body, http_data, post_data, http_body)\n| eval http_body_len=len(http_body)\n\
+    | where http_body_len > 256\n| eval dest_host=coalesce(http.hostname, host.name, dest_host, url_hostname, http_hostname)\n| search NOT (dest_host=\"\
+    *cloudfront.net\" OR dest_host=\"*akamai.net\" OR dest_host=\"*fastly.net\" OR dest_host=\"*cloudflare.com\" OR dest_host=\"*cdn*\")\n| eval\
+    \ chars=split(http_body, \"\")\n| mvexpand chars\n| stats count by _time, src, dest, dest_host, http_body, http_body_len, chars\n| eventstats\
+    \ sum(count) as total by _time, src, dest, dest_host, http_body, http_body_len\n| eval freq=count/total\n| eval entropy_contrib=if(freq >\
+    \ 0, -1 * freq * log(freq, 2), 0)\n| stats sum(entropy_contrib) as shannon_entropy, values(http_body_len) as body_length by _time, src, dest,\
+    \ dest_host\n| where shannon_entropy > 5.0\n| table _time, src, dest, dest_host, shannon_entropy, body_length\n"
+  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+
     | where TimeGenerated > ago(1d)
+
     | where network.protocol matches regex "http"
+
     | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+
     | order by Bytes desc
-  aql: |
-    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+
+    '
+  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+
     FROM flows
-    WHERE "network.protocol" LIKE '%http%'
+
+    WHERE "network.protocol" LIKE ''%http%''
+
     GROUP BY sourceip, destinationip, destinationport
+
     LAST 1 HOURS
-  yara_l: |
-    rule tdl_tdl_c2_000797 {
-      meta:
-        author = "TDL"
-        description = "High-Entropy Base64 Body in Outbound HTTP"
-        severity = "MEDIUM"
-        tactic = "TA0011"
-        technique = "T1132"
-      events:
-        $e.metadata.event_type = "NETWORK_CONNECTION"
-        $e.network.protocol = /http/
-        $src = $e.principal.ip
-      match:
-        $src over 10m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-network*,logs-endpoint*
+
+    '
+  yara_l: "rule tdl_tdl_c2_000797 {\n  meta:\n    author = \"TDL\"\n    description = \"High-Entropy Base64 Body in Outbound HTTP\"\n    severity\
+    \ = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1132\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
+    \ = /http/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-network*,logs-endpoint*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "network" AND network.protocol LIKE "%http%"
+
     | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+
     | SORT bytes_out DESC
-  leql: |
-    where(logset = "Network Activity" AND network.protocol=/http/)
+
+    '
+  leql: 'where(logset = "Network Activity" AND network.protocol=/http/)
+
     groupby(source_ip, destination_ip, destination_port)
+
     calculate(count, sum(bytes_out))
-  crowdstrike: |
-    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*http*
+
+    '
+  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*http*
+
     | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
+
     | sort -bytes_out
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.NETWORK AND network.protocol ~= "http"
+
     | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
+
     | sort desc bytes_out
-  lucene: |
-    event.category:"network" AND network.protocol:*http*
-  sumo: |
-    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+
+    '
+  lucene: 'event.category:"network" AND network.protocol:*http*
+
+    '
+  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+
     | where network.protocol matches "*http*"
+
     | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+
     | sort by bytes_out desc
+
+    '
 pseudo_logic: HTTP body with Shannon entropy > 5.0 and length > 256 sent to non-cdn destinations. Encoded C2 traffic.
 false_positives:
 - Sanctioned admin or engineering activity
 - Approved automation / CI workflows
-tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset
-  group, and refine thresholds using ≥7 days of telemetry before promoting.
+tuning_guidance: Proposed rule generated from ATT&CK gap analysis — review the pseudo_logic, scope filters to the right asset group, and refine
+  thresholds using ≥7 days of telemetry before promoting.
 tuning_period: 14 days
 tags:
 - base64
@@ -93,14 +111,13 @@ references:
 - https://attack.mitre.org/techniques/T1132/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'
-- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — verify beaconing characteristics (interval,
-  jitter, request size, server response code).
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — verify beaconing characteristics (interval, jitter, request size,
+  server response code).
 - Pull WHOIS / TLS / passive-DNS context on the destination — newly registered or low-reputation infrastructure raises confidence.
 - Identify the originating process and trace it back to its install / launch event (initial access / persistence stage).
 - 'Decide TP / FP: FP for sanctioned OOB management agents (allowlist them); TP for unattended periodic egress to new infrastructure.'
-- 'If TP: block the destination at egress, isolate the host, capture network PCAP / memory while session is live, and escalate
-  to IR.'
+- 'If TP: block the destination at egress, isolate the host, capture network PCAP / memory while session is live, and escalate to IR.'

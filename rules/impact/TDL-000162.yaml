@@ -1,8 +1,8 @@
 rule_id: TDL-IMP-000162
 v4_id: '000162'
 name: DHCP Starvation
-description: An attacker can broadcast DHCPDISCOVER messages with spoofed MAC addresses to force the DHCP server to lease
-  all of the IPs in the address pool this can cause a denial-of-service.
+description: An attacker can broadcast DHCPDISCOVER messages with spoofed MAC addresses to force the DHCP server to lease all of the IPs in the
+  address pool this can cause a denial-of-service.
 tactic: Impact
 tactic_id: TA0040
 technique_id: T1489
@@ -17,68 +17,76 @@ lifecycle: Proposed
 risk_score: 55
 queries:
   spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1
-    | search process_name="*.+*"
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
-    | where count >= 1
-    | sort - count
-  kql: |
-    DeviceProcessEvents
+    index=* sourcetype=dhcp* event_type=DHCPACK OR action=DHCPACK OR EventType=DHCPACK OR Message="*DHCPACK*"
+    | bin _time span=1m
+    | stats dc(src_mac) as unique_macs by _time, dhcp_server
+    | where unique_macs >= 200
+    | table _time, dhcp_server, unique_macs
+  kql: 'DeviceProcessEvents
+
     | where TimeGenerated > ago(1d)
+
     | where process_name matches regex ".+"
+
     | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" = '1'
-      AND "process_name" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_imp_000162 {
-      meta:
-        author = "TDL"
-        description = "DHCP Starvation"
-        severity = "MEDIUM"
-        tactic = "TA0040"
-        technique = "T1489"
-      events:
-        $e.metadata.event_type = "PROCESS_LAUNCH"
-        $e.process_name = /.+/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*,logs-windows*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_imp_000162 {\n  meta:\n    author = \"TDL\"\n    description = \"DHCP Starvation\"\n    severity = \"MEDIUM\"\n    tactic\
+    \ = \"TA0040\"\n    technique = \"T1489\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n    $host\
+    \ = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*,logs-windows*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "process" AND process_name LIKE "%.+%"
+
     | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND process_name=/.+/)
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
+
     groupby(asset, process_name, parent_process_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=ProcessRollup2 AND process_name=*.+*
+
+    '
+  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
+
     | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+
     | sort -occurrences
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
+
     | sort desc occurrences
-  lucene: |
-    event.category:"process" AND process_name:*.+*
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"process" AND process_name:*.+*
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id="1" AND process_name matches "*.+*"
+
     | count by host, user, parent_process_name, command_line
+
     | sort by _count desc
+
+    '
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -88,7 +96,7 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 pseudo_logic: '200 DHCP Events
 
@@ -104,11 +112,10 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — characterize the destructive
-  action (encrypt, delete, lockout, disable, reboot).
+- Inspect the parent → child process tree, command line arguments, and code-signing status — characterize the destructive action (encrypt, delete,
+  lockout, disable, reboot).
 - 'Determine spread: is this a single host or a coordinated multi-host event? Pull file / service telemetry across the fleet.'
 - Trigger your major-incident bridge if scope is multi-host or business-critical — early activation buys time.
-- 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this
-  severity.'
-- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence
-  to prevent recurrence.'
+- 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this severity.'
+- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence to prevent
+  recurrence.'

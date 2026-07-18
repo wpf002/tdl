@@ -1,8 +1,8 @@
 rule_id: TDL-COL-000125
 v4_id: '000125'
 name: Mass File Download from Malicious IP
-description: Detects when a known malicious IP downloads multiple files from a file transfer/storage appliance. This could
-  indicate a data exfiltration attempt by insider threat or a compromised user.
+description: Detects when a known malicious IP downloads multiple files from a file transfer/storage appliance. This could indicate a data exfiltration
+  attempt by insider threat or a compromised user.
 tactic: Collection
 tactic_id: TA0009
 technique_id: T1213
@@ -17,66 +17,75 @@ lifecycle: Deployed
 risk_score: 55
 queries:
   spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
-    | search eventName="*FileDownloaded*"
-    | stats count, values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN
-    | where count >= 1
-    | sort - count
-  kql: |
-    union AWSCloudTrail, AzureActivity, AuditLogs
+    index=* sourcetype=o365:management:activity Workload=SharePoint Operation=FileDownloaded
+    | bin _time span=5m
+    | lookup threat_intel_list SourceIP OUTPUT is_malicious
+    | where is_malicious=1 OR is_malicious="true"
+    | stats dc(FileName) as distinct_files values(FileName) as files values(SourceIP) as source_ips by _time, UserId
+    | where distinct_files >= 10
+    | table _time, UserId, source_ips, distinct_files, files
+  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+
     | where TimeGenerated > ago(1d)
+
     | where eventName matches regex "FileDownloaded"
+
     | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, "User Identity", "Event Name", "Source IP Address"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) IN ('AWS CloudTrail','Azure Audit','GCP Cloud Audit')
-      AND "eventName" LIKE '%FileDownloaded%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_col_000125 {
-      meta:
-        author = "TDL"
-        description = "Mass File Download from Malicious IP"
-        severity = "MEDIUM"
-        tactic = "TA0009"
-        technique = "T1213"
-      events:
-        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
-        $e.eventName = /FileDownloaded/
-        $actor = $e.principal.user.userid
-      match:
-        $actor over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-aws*,logs-azure*,logs-gcp*
+
+    '
+  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
+    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%FileDownloaded%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_col_000125 {\n  meta:\n    author = \"TDL\"\n    description = \"Mass File Download from Malicious IP\"\n    severity\
+    \ = \"MEDIUM\"\n    tactic = \"TA0009\"\n    technique = \"T1213\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
+    \ $e.eventName = /FileDownloaded/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE eventName LIKE "%FileDownloaded%"
+
     | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+
     | SORT count DESC
-  leql: |
-    where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/FileDownloaded/)
+
+    '
+  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/FileDownloaded/)
+
     groupby(actor, event_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=CloudOcsfApiActivity AND eventName=*FileDownloaded*
+
+    '
+  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*FileDownloaded*
+
     | stats count as calls by Actor, ApiName, SourceIPAddress
+
     | sort -calls
-  xql: |
-    dataset = cloud_audit_logs
+
+    '
+  xql: 'dataset = cloud_audit_logs
+
     | filter eventName ~= "FileDownloaded"
+
     | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+
     | sort desc calls
-  lucene: |
-    event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*FileDownloaded*
-  sumo: |
-    _sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
+    '
+  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*FileDownloaded*
+
+    '
+  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+
     | where eventName matches "*FileDownloaded*"
+
     | count by userIdentity_arn, eventName, sourceIPAddress
+
     | sort by _count desc
+
+    '
 false_positives:
 - Authorized pen testing
 - Security research
@@ -86,19 +95,18 @@ tags:
 - collection
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
-pseudo_logic: "10 Sharepoint Events\nWhere the Operation is \"FileDownloaded\"\nWhere the workload is \"Sharepoint\"\nWhere\
-  \ the Source IP is on a Threat Intelligence List\nWith distinct File Names\nWith the same Source Username \nWithin 5 minutes"
+pseudo_logic: "10 Sharepoint Events\nWhere the Operation is \"FileDownloaded\"\nWhere the workload is \"Sharepoint\"\nWhere the Source IP is on\
+  \ a Threat Intelligence List\nWith distinct File Names\nWith the same Source Username \nWithin 5 minutes"
 suppression:
   window: 12 hours
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'
-- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — determine the collection
-  scope (single file, recursive walk, mailbox export).
+- Inspect the calling identity (ARN / UPN), source IP, user agent, and the resource being acted on — determine the collection scope (single file,
+  recursive walk, mailbox export).
 - 'Compare against business need: does this user have a legitimate reason to read this data set in this way?'
 - 'Pull staging telemetry: archive creation, large temp folders, encrypted blobs in unusual locations within the next 30 minutes.'
 - 'Decide TP / FP: FP for sanctioned migration / backup / DLP testing; TP if collection volume is anomalous and lacks a ticket.'
-- 'If TP: determine sensitivity of accessed data, preserve audit logs, prepare for possible DLP / privacy notification, and
-  escalate accordingly.'
+- 'If TP: determine sensitivity of accessed data, preserve audit logs, prepare for possible DLP / privacy notification, and escalate accordingly.'

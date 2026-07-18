@@ -1,13 +1,12 @@
 rule_id: TDL-CA-000202
 v4_id: '000202'
 name: Credential Dumping
-description: Detects the dumping of memory or registry hives to gain credentials. The tool Procdump or Task Manager can be
-  used to dump the memory of the lsass.exe. The lsass process is responsible for the authentication of users on a Windows
-  host. Procdump is a tool that can dump a process’ memory to a file. The Task Manager can also be used to dump any process’
-  memory in the GUI. By dumping the memory of lsass.exe, an attacker can search the memory for plaintext passwords that were
-  inputted during authentication and compromise the accounts. Alternatively, an attacker can use reg.exe to download the Security
-  Account Manager (SAM) registry hive, which contains user password hashes. These hashes can then be cracked or used in pass-the-hash
-  attacks at a later time.
+description: Detects the dumping of memory or registry hives to gain credentials. The tool Procdump or Task Manager can be used to dump the memory
+  of the lsass.exe. The lsass process is responsible for the authentication of users on a Windows host. Procdump is a tool that can dump a process’
+  memory to a file. The Task Manager can also be used to dump any process’ memory in the GUI. By dumping the memory of lsass.exe, an attacker
+  can search the memory for plaintext passwords that were inputted during authentication and compromise the accounts. Alternatively, an attacker
+  can use reg.exe to download the Security Account Manager (SAM) registry hive, which contains user password hashes. These hashes can then be
+  cracked or used in pass-the-hash attacks at a later time.
 tactic: Credential Access
 tactic_id: TA0006
 technique_id: T1003
@@ -22,68 +21,91 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=endpoint sourcetype=Sysmon (EventCode=12 OR EventCode=13 OR EventCode=14)
-    | search registry_key="*save hklm\system*"
-    | stats count, values(host) as hosts by user, target_object, details, image
-    | sort - count
-  kql: |
-    DeviceRegistryEvents
+  spl: "index=wineventlog sourcetype=WinEventLog:Security (EventCode=592 OR EventCode=4688 OR EventCode=4657)\n| eval CommandLine=lower(coalesce(CommandLine,\
+    \ Command_Line, Process_Command_Line))\n| eval ProcessName=lower(coalesce(Process_Name, New_Process_Name, Image))\n| eval RegistryKey=lower(coalesce(Registry_Key,\
+    \ Object_Name))\n| where \n    (EventCode=592 OR EventCode=4688) AND\n    (\n        (ProcessName=\"reg.exe\" AND \n            (\n      \
+    \          match(CommandLine, \"save.*hklm\\\\system\") OR\n                match(CommandLine, \"save.*hklm\\\\sam\") OR\n               \
+    \ match(CommandLine, \"save.*hklm\\\\security\") OR\n                match(CommandLine, \"save.*hkey_local_machine\\\\system\") OR\n     \
+    \           match(CommandLine, \"save.*hkey_local_machine\\\\sam\") OR\n                match(CommandLine, \"save.*hkey_local_machine\\\\\
+    security\") OR\n                match(CommandLine, \"save.*registry\\\\machine\\\\system\") OR\n                match(CommandLine, \"save.*registry\\\
+    \\machine\\\\sam\") OR\n                match(CommandLine, \"save.*registry\\\\machine\\\\security\") OR\n                match(CommandLine,\
+    \ \"export.*hklm\\\\system\") OR\n                match(CommandLine, \"export.*hklm\\\\sam\") OR\n                match(CommandLine, \"export.*hklm\\\
+    \\security\") OR\n                match(CommandLine, \"export.*hkey_local_machine\\\\system\") OR\n                match(CommandLine, \"export.*hkey_local_machine\\\
+    \\sam\") OR\n                match(CommandLine, \"export.*hkey_local_machine\\\\security\") OR\n                match(CommandLine, \"export.*registry\\\
+    \\machine\\\\system\") OR\n                match(CommandLine, \"export.*registry\\\\machine\\\\sam\") OR\n                match(CommandLine,\
+    \ \"export.*registry\\\\machine\\\\security\")\n            )\n        )\n        OR\n        (ProcessName=\"powershell.exe\" AND match(CommandLine,\
+    \ \"invoke-mimikatz\"))\n        OR\n        (ProcessName=\"procdump.exe\" AND match(CommandLine, \"lsass\"))\n        OR\n        (ProcessName=\"\
+    taskmgr.exe\" AND match(CommandLine, \"lsass\"))\n    )\nOR\n    (EventCode=4657 AND\n        (\n            match(RegistryKey, \"hklm\\\\\
+    system\") OR\n            match(RegistryKey, \"hklm\\\\sam\") OR\n            match(RegistryKey, \"hklm\\\\security\") OR\n            match(RegistryKey,\
+    \ \"hkey_local_machine\\\\system\") OR\n            match(RegistryKey, \"hkey_local_machine\\\\sam\") OR\n            match(RegistryKey, \"\
+    hkey_local_machine\\\\security\") OR\n            match(RegistryKey, \"registry\\\\machine\\\\system\") OR\n            match(RegistryKey,\
+    \ \"registry\\\\machine\\\\sam\") OR\n            match(RegistryKey, \"registry\\\\machine\\\\security\")\n        )\n    )\n| table _time,\
+    \ ComputerName, EventCode, ProcessName, CommandLine, RegistryKey, User\n"
+  kql: 'DeviceRegistryEvents
+
     | where TimeGenerated > ago(1d)
+
     | where registry_key matches regex "save hklm\system"
+
     | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Registry Key", "Registry Value Name", "Registry Value Data", "Process Name"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" IN ('12','13','14')
-      AND "registry_key" LIKE '%save hklm\system%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_ca_000202 {
-      meta:
-        author = "TDL"
-        description = "Credential Dumping"
-        severity = "HIGH"
-        tactic = "TA0006"
-        technique = "T1003"
-      events:
-        $e.metadata.event_type = "REGISTRY_MODIFICATION"
-        $e.registry_key = /save hklm\system/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Registry Key\", \"Registry Value Name\", \"Registry Value Data\", \"Process Name\"\nFROM events\nWHERE\
+    \ LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n  AND \"EventID\" IN ('12','13','14')\n  AND \"registry_key\" LIKE '%save hklm\\\
+    system%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_ca_000202 {\n  meta:\n    author = \"TDL\"\n    description = \"Credential Dumping\"\n    severity = \"HIGH\"\n    tactic\
+    \ = \"TA0006\"\n    technique = \"T1003\"\n  events:\n    $e.metadata.event_type = \"REGISTRY_MODIFICATION\"\n    $e.registry_key = /save\
+    \ hklm\\system/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "registry" AND registry_key LIKE "%save hklm\system%"
+
     | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/save hklm\system/)
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/save hklm\system/)
+
     groupby(asset, registry_key, registry_value)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*save hklm\system*
+
+    '
+  crowdstrike: 'event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*save hklm\system*
+
     | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
+
     | sort -changes
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.REGISTRY AND registry_key ~= "save hklm\system"
+
     | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
+
     | sort desc changes
-  lucene: |
-    event.category:"registry" AND registry_key:*save hklm\system*
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"registry" AND registry_key:*save hklm\system*
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id IN ("12","13","14") AND registry_key matches "*save hklm\system*"
+
     | count by host, user, registry_key, registry_value, image
+
     | sort by _count desc
+
+    '
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,25 +115,23 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
-pseudo_logic: "1 Windows Process Creation Event\nWhere the Event ID is in [592, 4688]\nWhere Destination Host is a Domain\
-  \ Controller\nOR\n    Where Process Name equals \"reg.exe\"\n\tOR\n\t\tWhere Command Line contains \"save hklm\\system\"\
-  \n\t\tWhere Command Line contains \"save hklm\\sam\"\n\t\tWhere Command Line contains \"save hklm\\security\"\n\t\tWhere\
-  \ Command Line contains \"save hkey_local_machine\\system\"\n\t\tWhere Command Line contains \"save hkey_local_machine\\\
-  sam\"\n\t\tWhere Command Line contains \"save hkey_local_machine\\security\"\n\t\tWhere Command Line contains \"save registry\\\
-  machine\\system\"\n\t\tWhere Command Line contains \"save registry\\machine\\sam\"\n\t\tWhere Command Line contains \"save\
-  \ registry\\machine\\security\"\n\t\tWhere Command Line contains \"export hklm\\system\"\n\t\tWhere Command Line contains\
-  \ \"export hklm\\sam\"\n\t\tWhere Command Line contains \"export hklm\\security\"\n\t\tWhere Command Line contains \"export\
-  \ hkey_local_machine\\system\"\n\t\tWhere Command Line contains \"export hkey_local_machine\\sam\"\n\t\tWhere Command Line\
-  \ contains \"export hkey_local_machine\\security\"\n\t\tWhere Command Line contains \"export registry\\machine\\system\"\
-  \n\t\tWhere Command Line contains \"export registry\\machine\\sam\"\n\t\tWhere Command Line contains \"export registry\\\
-  machine\\security\"\n   \n    Where Process Name equals \"powershell.exe\"\n    Where Command Line contains \"Invoke-Mimikatz\"\
-  \n\t\n\tWhere Process Name equals \"procdump.exe\"\n\tWhere Command contains \"lsass.exe\"\n\t\n\tWhere Process Name equals\
-  \ \"taskmgr.exe\"\n\tWhere Command contains \"lsass\"\n\n\n-----------------------------------------------------------------------------------\n\
-  \n1 Windows Process Creation Event\nWhere the Event ID is in [4657]\nWhere Destination Host is a Domain Controller\nRegistry\
-  \ Key contains [hklm\\system, hklm\\sam, hkey_local_machine\\system, hklm\\security, hkey_local_machine\\sam, hkey_local_machine\\\
-  security, registry\\machine\\system, registry\\machine\\sam, registry\\machine\\security]"
+pseudo_logic: "1 Windows Process Creation Event\nWhere the Event ID is in [592, 4688]\nWhere Destination Host is a Domain Controller\nOR\n   \
+  \ Where Process Name equals \"reg.exe\"\n\tOR\n\t\tWhere Command Line contains \"save hklm\\system\"\n\t\tWhere Command Line contains \"save\
+  \ hklm\\sam\"\n\t\tWhere Command Line contains \"save hklm\\security\"\n\t\tWhere Command Line contains \"save hkey_local_machine\\system\"\n\
+  \t\tWhere Command Line contains \"save hkey_local_machine\\sam\"\n\t\tWhere Command Line contains \"save hkey_local_machine\\security\"\n\t\t\
+  Where Command Line contains \"save registry\\machine\\system\"\n\t\tWhere Command Line contains \"save registry\\machine\\sam\"\n\t\tWhere Command\
+  \ Line contains \"save registry\\machine\\security\"\n\t\tWhere Command Line contains \"export hklm\\system\"\n\t\tWhere Command Line contains\
+  \ \"export hklm\\sam\"\n\t\tWhere Command Line contains \"export hklm\\security\"\n\t\tWhere Command Line contains \"export hkey_local_machine\\\
+  system\"\n\t\tWhere Command Line contains \"export hkey_local_machine\\sam\"\n\t\tWhere Command Line contains \"export hkey_local_machine\\\
+  security\"\n\t\tWhere Command Line contains \"export registry\\machine\\system\"\n\t\tWhere Command Line contains \"export registry\\machine\\\
+  sam\"\n\t\tWhere Command Line contains \"export registry\\machine\\security\"\n   \n    Where Process Name equals \"powershell.exe\"\n    Where\
+  \ Command Line contains \"Invoke-Mimikatz\"\n\t\n\tWhere Process Name equals \"procdump.exe\"\n\tWhere Command contains \"lsass.exe\"\n\t\n\t\
+  Where Process Name equals \"taskmgr.exe\"\n\tWhere Command contains \"lsass\"\n\n\n-----------------------------------------------------------------------------------\n\
+  \n1 Windows Process Creation Event\nWhere the Event ID is in [4657]\nWhere Destination Host is a Domain Controller\nRegistry Key contains [hklm\\\
+  system, hklm\\sam, hkey_local_machine\\system, hklm\\security, hkey_local_machine\\sam, hkey_local_machine\\security, registry\\machine\\system,\
+  \ registry\\machine\\sam, registry\\machine\\security]"
 suppression:
   window: 8 hours
   fields:
@@ -119,11 +139,10 @@ suppression:
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force
-  pattern is consistent with this technique.
+- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force pattern is consistent
+  with this technique.
 - 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
-- 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens,
-  kerberos tickets).'
+- 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens, kerberos tickets).'
 - 'Decide TP / FP: FP for sanctioned IR / pen-test / DSC tooling; TP for unattended dumping or anomalous Kerberos behavior.'
-- 'If TP: rotate all potentially exposed credentials and tickets, invalidate sessions, isolate the host, and consider golden-ticket
-  / krbtgt rotation if scope warrants.'
+- 'If TP: rotate all potentially exposed credentials and tickets, invalidate sessions, isolate the host, and consider golden-ticket / krbtgt rotation
+  if scope warrants.'

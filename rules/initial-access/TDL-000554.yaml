@@ -16,33 +16,23 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: 'index=network sourcetype=firewall OR sourcetype=ids
-
-    | search network.protocol="*tcp*"
-
-    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip,
-    dest_ip, dest_port
-
+  spl: |
+    index=network (sourcetype=firewall OR sourcetype=ids) action=blocked (signature="*SQL*injection*" OR attack_type="*SQL*injection*") protocol=tcp NOT (src_ip IN ("10.0.1.100", "10.0.1.101", "192.168.100.50"))
+    | stats count sum(bytes_out) as total_bytes_out dc(dest_ip) as unique_dests by src_ip, dest_ip, dest_port
     | where count >= 1
-
-    | sort - bytes_out
-
-    '
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP),
-    DestinationIP=tostring(DestinationIP))
+    | sort - total_bytes_out
+  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
 
     | where TimeGenerated > ago(1d)
 
     | where network.protocol matches regex "tcp"
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP,
-    DestinationPort
+    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
 
     | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections,
-    SUM(bytessrc) as bytes_out
+  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
 
     FROM flows
 
@@ -53,19 +43,16 @@ queries:
     LAST 1 HOURS
 
     '
-  yara_l: "rule tdl_tdl_auth_000554 {\n  meta:\n    author = \"TDL\"\n    description\
-    \ = \"Blocked SQL Injection Attempt\"\n    severity = \"MEDIUM\"\n    tactic =\
-    \ \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type\
-    \ = \"NETWORK_CONNECTION\"\n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n\
-    \  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
+  yara_l: "rule tdl_tdl_auth_000554 {\n  meta:\n    author = \"TDL\"\n    description = \"Blocked SQL Injection Attempt\"\n    severity = \"MEDIUM\"\
+    \n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
+    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
   esql: 'FROM logs-network*,logs-endpoint*
 
     | WHERE @timestamp > NOW() - 1 hour
 
     | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
 
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip,
-    destination.port
+    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
 
     | SORT bytes_out DESC
 
@@ -77,11 +64,9 @@ queries:
     calculate(count, sum(bytes_out))
 
     '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest)
-    AND network.protocol=*tcp*
+  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
 
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4,
-    RemotePort
+    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
 
     | sort -bytes_out
 
@@ -90,8 +75,7 @@ queries:
 
     | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
 
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname,
-    action_remote_ip, action_remote_port
+    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
 
     | sort desc bytes_out
 
@@ -117,31 +101,24 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: none
 triage_steps:
-- 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender,
-  URL), and the matched IOC.'
-- Examine the destination domain/IP, ASN, port, and TLS / HTTP fingerprints to assess
-  whether the entry vector is consistent with this technique.
-- Cross-reference with email gateway, web proxy, and EDR telemetry in the 30 minutes
-  around the alert for related delivery activity.
-- 'Pivot on the user / host: look for follow-on execution, persistence, or credential-access
-  events in the next 24h.'
-- 'Decide TP / FP / dual-use: confirm the user did not request the activity (sanctioned
-  vendor onboarding, marketing campaign, pen test).'
-- 'If TP: isolate the host, reset the user''s credentials and tokens, capture forensic
-  artifacts, and open an incident ticket referencing this rule_id.'
-pseudo_logic: '1 Instance within any observed window of a Blocked SQL Injection Attempt
-  event.
+- 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'
+- Examine the destination domain/IP, ASN, port, and TLS / HTTP fingerprints to assess whether the entry vector is consistent with this technique.
+- Cross-reference with email gateway, web proxy, and EDR telemetry in the 30 minutes around the alert for related delivery activity.
+- 'Pivot on the user / host: look for follow-on execution, persistence, or credential-access events in the next 24h.'
+- 'Decide TP / FP / dual-use: confirm the user did not request the activity (sanctioned vendor onboarding, marketing campaign, pen test).'
+- 'If TP: isolate the host, reset the user''s credentials and tokens, capture forensic artifacts, and open an incident ticket referencing this
+  rule_id.'
+pseudo_logic: '1 Instance within any observed window of a Blocked SQL Injection Attempt event.
 
 
   From index=network with sourcetype=firewall or sourcetype=ids
 
   Where network.protocol contains "tcp"
 
-  With count of events greater than or equal to 1 per src_ip and dest_ip and dest_port
-  combination
+  With count of events greater than or equal to 1 per src_ip and dest_ip and dest_port combination
 
   With distinct count of dest_ip as unique_dests tracked per src_ip
 
@@ -149,7 +126,6 @@ pseudo_logic: '1 Instance within any observed window of a Blocked SQL Injection 
 
   With results sorted descending by bytes_out to surface highest-volume sources first
 
-  Excluding events originating from known authorized scanner IPs and monitoring agent
-  source addresses
+  Excluding events originating from known authorized scanner IPs and monitoring agent source addresses
 
   With the same src_ip, dest_ip, and dest_port as the correlation key'

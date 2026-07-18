@@ -1,8 +1,8 @@
 rule_id: TDL-EXE-000359
 v4_id: 000359
 name: Cobalt Strike Process Patterns
-description: Detects process patterns found in Cobalt Strike beacon activity. This includes the use of named pipes to communicate
-  the result of post-exploitation tools to the Cobalt Strike beacon.
+description: Detects process patterns found in Cobalt Strike beacon activity. This includes the use of named pipes to communicate the result of
+  post-exploitation tools to the Cobalt Strike beacon.
 tactic: Execution
 tactic_id: TA0002
 technique_id: T1059
@@ -18,68 +18,81 @@ lifecycle: Deployed
 risk_score: 55
 queries:
   spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1
-    | search process_name IN ("cmd.exe", "dllhost.exe", "whoami.exe", "runonce.exe")
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name, command_line
-    | where count >= 1
-    | sort - count
-  kql: |
-    DeviceProcessEvents
+    index=windows sourcetype=WinEventLog:Security (EventCode=592 OR EventCode=4688)
+    | eval Parent_Process_Name=coalesce(Parent_Process_Name, ParentImage, Creator_Process_Name)
+    | eval Process_Name=coalesce(Process_Name, Image, New_Process_Name)
+    | eval Command_Line=coalesce(CommandLine, Process_Command_Line)
+    | eval match1=if(like(lower(Parent_Process_Name), "c:\\temp\\%") AND like(lower(Command_Line), "%cmd.exe /c whoami%"), 1, 0)
+    | eval match2=if(like(lower(Process_Name), "%dllhost.exe") AND (like(lower(Command_Line), "%cmd.exe /c echo%") OR like(lower(Command_Line), "%> \\\\.\\pipe%") OR like(lower(Command_Line), "%whoami.exe%")), 1, 0)
+    | eval match3=if((like(lower(Parent_Process_Name), "%dllhost.exe") OR like(lower(Parent_Process_Name), "%runonce.exe")) AND like(lower(Command_Line), "%cmd.exe /c echo%") AND like(lower(Command_Line), "%> \\\\.\\pipe%"), 1, 0)
+    | where match1=1 OR match2=1 OR match3=1
+    | table _time, ComputerName, EventCode, Parent_Process_Name, Process_Name, Command_Line, User
+  kql: 'DeviceProcessEvents
+
     | where TimeGenerated > ago(1d)
+
     | where process_name in ("cmd.exe", "dllhost.exe", "whoami.exe", "runonce.exe")
+
     | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "Process Name", "Parent Process Name", "Process CommandLine"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" = '1'
-      AND "process_name" IN ('cmd.exe', 'dllhost.exe', 'whoami.exe', 'runonce.exe')
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_exe_000359 {
-      meta:
-        author = "TDL"
-        description = "Cobalt Strike Process Patterns"
-        severity = "MEDIUM"
-        tactic = "TA0002"
-        technique = "T1059"
-      events:
-        $e.metadata.event_type = "PROCESS_LAUNCH"
-        $e.process_name = /(cmd.exe|dllhost.exe|whoami.exe|runonce.exe)/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*,logs-windows*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('cmd.exe', 'dllhost.exe', 'whoami.exe', 'runonce.exe')\n\
+    LAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_exe_000359 {\n  meta:\n    author = \"TDL\"\n    description = \"Cobalt Strike Process Patterns\"\n    severity = \"MEDIUM\"\
+    \n    tactic = \"TA0002\"\n    technique = \"T1059\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(cmd.exe|dllhost.exe|whoami.exe|runonce.exe)/\n\
+    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*,logs-windows*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "process" AND process_name IN ("cmd.exe", "dllhost.exe", "whoami.exe", "runonce.exe")
+
     | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND process_name IN [cmd.exe, dllhost.exe, whoami.exe, runonce.exe])
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND process_name IN [cmd.exe, dllhost.exe, whoami.exe, runonce.exe])
+
     groupby(asset, process_name, parent_process_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName=ProcessRollup2 AND process_name IN (cmd.exe, dllhost.exe, whoami.exe, runonce.exe)
+
+    '
+  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (cmd.exe, dllhost.exe, whoami.exe, runonce.exe)
+
     | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
+
     | sort -occurrences
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.PROCESS AND process_name in ("cmd.exe", "dllhost.exe", "whoami.exe", "runonce.exe")
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name, action_process_image_command_line
+
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
+
     | sort desc occurrences
-  lucene: |
-    event.category:"process" AND process_name:(cmd.exe OR dllhost.exe OR whoami.exe OR runonce.exe)
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"process" AND process_name:(cmd.exe OR dllhost.exe OR whoami.exe OR runonce.exe)
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id="1" AND process_name IN ("cmd.exe", "dllhost.exe", "whoami.exe", "runonce.exe")
+
     | count by host, user, parent_process_name, command_line
+
     | sort by _count desc
+
+    '
 false_positives:
 - Security software
 - Authorized admin tools
@@ -89,20 +102,19 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
-pseudo_logic: "1 Windows Process Creation Event\nWhere the Event ID is in [592, 4688]\nWhere\n\tParent Process Name starts\
-  \ with \"C:\\Temp\"\n\tAND Command Line contains \"cmd.exe /c whoami\"\nOR\n\tProcess Name is dllhost.exe\n\tAND Command\
-  \ Line contains any of [\"cmd.exe /c echo\", \"> \\\\.\\pipe\", \"whoami.exe\"]\nOR\n\tParent Process Name is in [\"dllhost.exe\"\
-  , \"runonce.exe\"]\n\tAND Command Line contains all of [\"cmd.exe /c echo\", \"> \\\\.\\pipe\"]"
+pseudo_logic: "1 Windows Process Creation Event\nWhere the Event ID is in [592, 4688]\nWhere\n\tParent Process Name starts with \"C:\\Temp\"\n\
+  \tAND Command Line contains \"cmd.exe /c whoami\"\nOR\n\tProcess Name is dllhost.exe\n\tAND Command Line contains any of [\"cmd.exe /c echo\"\
+  , \"> \\\\.\\pipe\", \"whoami.exe\"]\nOR\n\tParent Process Name is in [\"dllhost.exe\", \"runonce.exe\"]\n\tAND Command Line contains all of\
+  \ [\"cmd.exe /c echo\", \"> \\\\.\\pipe\"]"
 tuning_period: 14 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — pay attention to short-lived
-  processes, encoded arguments, and unusual parents (Office, browser, services).
+- Inspect the parent → child process tree, command line arguments, and code-signing status — pay attention to short-lived processes, encoded arguments,
+  and unusual parents (Office, browser, services).
 - Pull EDR process tree for the alert PID; check the parent / grandparent and any child processes spawned within 5 minutes.
 - 'Compare against the host''s baseline: is the binary / interpreter normally invoked here, by this user, at this time?'
-- 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software
-  install, or scheduled job.'
-- 'If TP: contain the host, kill the offending process, snapshot memory if possible, and escalate to IR with the process tree
-  attached.'
+- 'Decide TP / FP: TP if the execution chain has no business justification; FP if it traces to a packaging script, software install, or scheduled
+  job.'
+- 'If TP: contain the host, kill the offending process, snapshot memory if possible, and escalate to IR with the process tree attached.'

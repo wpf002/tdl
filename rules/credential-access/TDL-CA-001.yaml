@@ -13,47 +13,31 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 95
 queries:
-  spl: 'index=endpoint sourcetype=Sysmon EventCode=1
-
-    | search process_name="*.+*"
-
-    | stats count, values(host) as hosts, values(user) as users by process_name, parent_process_name,
-    command_line
-
-    | where count >= 1
-
-    | sort - count
-
-    '
+  spl: |
+    index=endpoint sourcetype=Sysmon EventCode=10 TargetImage="*\\lsass.exe" NOT (SourceImage="*\\MsMpEng.exe" OR SourceImage="*\\SenseIR.exe" OR SourceImage="*\\SenseCncProxy.exe" OR SourceImage="*\\NisSrv.exe" OR SourceImage="*\\CcSvcHst.exe" OR SourceImage="*\\CSFalconService.exe" OR SourceImage="*\\tanium*.exe" OR SourceImage="*\\CB.exe" OR SourceImage="*\\RepMgr*.exe" OR SourceImage="*\\AvastSvc.exe" OR SourceImage="*\\MBAMService.exe" OR SourceImage="*\\SentinelAgent.exe" OR SourceImage="*\\SentinelStaticEngine.exe" OR SourceImage="*\\SentinelServiceHost.exe" OR SourceImage="*\\SentinelHelperService.exe" OR SourceImage="*\\WerFault.exe" OR SourceImage="*\\WerFaultSecure.exe") | eval process_name=SourceImage, parent_process_name=ParentImage, command_line=CommandLine, host=ComputerName, user=SourceUser | stats count values(parent_process_name) as parent_process_name values(command_line) as command_line values(user) as user earliest(_time) as first_time latest(_time) as last_time by process_name, host | where count >= 1 | table first_time, last_time, host, process_name, parent_process_name, command_line, user, count
   kql: 'DeviceProcessEvents
 
     | where TimeGenerated > ago(1d)
 
     | where process_name matches regex ".+"
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName,
-    ProcessCommandLine
+    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
 
     | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"\
-    Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft\
-    \ Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\n\
-    LAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_001 {\n  meta:\n    author = \"TDL\"\n    description =\
-    \ \"LSASS Memory Access by Non-System Process\"\n    severity = \"CRITICAL\"\n\
-    \    tactic = \"TA0006\"\n    technique = \"T1003.001\"\n  events:\n    $e.metadata.event_type\
-    \ = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n    $host = $e.principal.hostname\n\
-    \  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_ca_001 {\n  meta:\n    author = \"TDL\"\n    description = \"LSASS Memory Access by Non-System Process\"\n    severity\
+    \ = \"CRITICAL\"\n    tactic = \"TA0006\"\n    technique = \"T1003.001\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n   \
+    \ $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
   esql: 'FROM logs-endpoint*,logs-windows*
 
     | WHERE @timestamp > NOW() - 1 hour
 
     | WHERE event.category == "process" AND process_name LIKE "%.+%"
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name,
-    process.command_line
+    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
 
     | SORT count DESC
 
@@ -67,8 +51,7 @@ queries:
     '
   crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
 
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName,
-    CommandLine
+    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
 
     | sort -occurrences
 
@@ -77,8 +60,8 @@ queries:
 
     | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
 
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name,
-    causality_actor_process_image_name, action_process_image_command_line
+    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
+    action_process_image_command_line
 
     | sort desc occurrences
 
@@ -109,22 +92,17 @@ author: TDL
 created: '2024-02-01'
 test_method: purple_team
 simulation_id: SIM-010
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 triage_steps:
-- 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity
-  provider, and the source process / actor.'
-- Inspect the parent → child process tree, command line arguments, and code-signing
-  status — verify the read / dump / brute-force pattern is consistent with this technique.
-- 'Pull preceding execution / discovery telemetry: many credential-access actions
-  follow process-injection or LSASS tooling.'
-- 'Compute the blast radius: which accounts could have been exposed (enumerate cached
-  credentials, recent session tokens, kerberos tickets).'
-- 'Decide TP / FP: FP for sanctioned IR / pen-test / DSC tooling; TP for unattended
-  dumping or anomalous Kerberos behavior.'
-- 'If TP: rotate all potentially exposed credentials and tickets, invalidate sessions,
-  isolate the host, and consider golden-ticket / krbtgt rotation if scope warrants.'
-pseudo_logic: '1 Instance within any time window of a Sysmon ProcessAccess event targeting
-  LSASS memory by a non-system process.
+- 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
+- Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force pattern is consistent
+  with this technique.
+- 'Pull preceding execution / discovery telemetry: many credential-access actions follow process-injection or LSASS tooling.'
+- 'Compute the blast radius: which accounts could have been exposed (enumerate cached credentials, recent session tokens, kerberos tickets).'
+- 'Decide TP / FP: FP for sanctioned IR / pen-test / DSC tooling; TP for unattended dumping or anomalous Kerberos behavior.'
+- 'If TP: rotate all potentially exposed credentials and tickets, invalidate sessions, isolate the host, and consider golden-ticket / krbtgt rotation
+  if scope warrants.'
+pseudo_logic: '1 Instance within any time window of a Sysmon ProcessAccess event targeting LSASS memory by a non-system process.
 
 
   From index=endpoint sourcetype=Sysmon
@@ -133,12 +111,10 @@ pseudo_logic: '1 Instance within any time window of a Sysmon ProcessAccess event
 
   Where TargetImage matches lsass.exe
 
-  Where SourceImage does not originate from a known AV/EDR product or Windows Error
-  Reporting process
+  Where SourceImage does not originate from a known AV/EDR product or Windows Error Reporting process
 
   With fields process_name, parent_process_name, command_line, host, user
 
   With the same process_name and host as the correlation key
 
-  With a minimum count of 1 instance to trigger — no minimum spacing or deduplication
-  window required given Critical severity and High fidelity'
+  With a minimum count of 1 instance to trigger — no minimum spacing or deduplication window required given Critical severity and High fidelity'

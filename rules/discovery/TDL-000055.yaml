@@ -1,8 +1,8 @@
 rule_id: TDL-DIS-000055
 v4_id: '000055'
 name: Port Scan Detected - Inbound
-description: Detects a port scan from an external host to an internal host. Attackers will use port scans to perform reconnaissance
-  to determine open services on a target.
+description: Detects a port scan from an external host to an internal host. Attackers will use port scans to perform reconnaissance to determine
+  open services on a target.
 tactic: Discovery
 tactic_id: TA0007
 technique_id: T1046
@@ -16,67 +16,82 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=network sourcetype=firewall OR sourcetype=ids
-    | search network.protocol="*tcp*"
-    | stats count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
-    | where count >= 1
-    | sort - bytes_out
-  kql: |
-    union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  spl: "index=firewall \n| eval is_inbound=if(match(src, \"^(?:10\\.|172\\.(?:1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)\") OR match(src, \"^(?:127\\\
+    .|169\\.254\\.|fe80:)\"), 0, if(match(dest, \"^(?:10\\.|172\\.(?:1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)\"), 1, 0))\n| where is_inbound=1\n\
+    | where (dest_port >= 1 AND dest_port <= 1024) OR (sourcetype=\"fortigate\" AND NOT action IN(\"server-rst\", \"client-rst\", \"timeout\"\
+    )) OR (NOT action IN(\"reset\", \"timeout\"))\n| bin _time span=15m\n| stats dc(dest_port) as unique_ports by _time, src, dest\n| where unique_ports\
+    \ >= 30\n| table _time, src, dest, unique_ports\n"
+  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+
     | where TimeGenerated > ago(1d)
+
     | where network.protocol matches regex "tcp"
+
     | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+
     | order by Bytes desc
-  aql: |
-    SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+
+    '
+  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+
     FROM flows
-    WHERE "network.protocol" LIKE '%tcp%'
+
+    WHERE "network.protocol" LIKE ''%tcp%''
+
     GROUP BY sourceip, destinationip, destinationport
+
     LAST 1 HOURS
-  yara_l: |
-    rule tdl_tdl_dis_000055 {
-      meta:
-        author = "TDL"
-        description = "Port Scan Detected - Inbound"
-        severity = "MEDIUM"
-        tactic = "TA0007"
-        technique = "T1046"
-      events:
-        $e.metadata.event_type = "NETWORK_CONNECTION"
-        $e.network.protocol = /tcp/
-        $src = $e.principal.ip
-      match:
-        $src over 10m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-network*,logs-endpoint*
+
+    '
+  yara_l: "rule tdl_tdl_dis_000055 {\n  meta:\n    author = \"TDL\"\n    description = \"Port Scan Detected - Inbound\"\n    severity = \"MEDIUM\"\
+    \n    tactic = \"TA0007\"\n    technique = \"T1046\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
+    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-network*,logs-endpoint*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+
     | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+
     | SORT bytes_out DESC
-  leql: |
-    where(logset = "Network Activity" AND network.protocol=/tcp/)
+
+    '
+  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
+
     groupby(source_ip, destination_ip, destination_port)
+
     calculate(count, sum(bytes_out))
-  crowdstrike: |
-    event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
+
+    '
+  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
+
     | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
+
     | sort -bytes_out
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
+
     | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
+
     | sort desc bytes_out
-  lucene: |
-    event.category:"network" AND network.protocol:*tcp*
-  sumo: |
-    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+
+    '
+  lucene: 'event.category:"network" AND network.protocol:*tcp*
+
+    '
+  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
+
     | where network.protocol matches "*tcp*"
+
     | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
+
     | sort by bytes_out desc
+
+    '
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -86,23 +101,23 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
-pseudo_logic: "30 Firewall Events\nFrom one external source to one internal destination (Inbound)\nWhere the Destination Port\
-  \ is 1-1024\nOR\n\tWhere the Log Source is Fortinet FortiGate\n\tWhere the action is NOT in [server-rst, client-rst, timeout]\n\
-  \n\tWhere the action/result is NOT in [reset, timeout]\n\t\nWith unique Destination Ports\nWithin 15 minutes"
+pseudo_logic: "30 Firewall Events\nFrom one external source to one internal destination (Inbound)\nWhere the Destination Port is 1-1024\nOR\n\t\
+  Where the Log Source is Fortinet FortiGate\n\tWhere the action is NOT in [server-rst, client-rst, timeout]\n\n\tWhere the action/result is NOT\
+  \ in [reset, timeout]\n\t\nWith unique Destination Ports\nWithin 15 minutes"
 suppression:
   fields:
   - Source IP
 tuning_period: 7 days
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'
-- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — determine whether the enumeration is targeted
-  (specific user / share / OU) or scattered (broad, scripted).
-- 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from
-  a finance or HR identity is high-signal.'
+- Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — determine whether the enumeration is targeted (specific user / share
+  / OU) or scattered (broad, scripted).
+- 'Compare against the user''s role: is this discovery activity normal for an admin, engineer, or pen-tester? Discovery from a finance or HR identity
+  is high-signal.'
 - Pull adjacent execution / lateral-movement / cred-access telemetry — discovery often precedes the next stage by minutes.
-- 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and
-  adjacent telemetry is suspicious.'
-- 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity
-  that the recon was likely setting up.'
+- 'Decide TP / FP: FP for sanctioned pen-test, asset inventory, or admin troubleshooting; TP if the user is unexpected and adjacent telemetry
+  is suspicious.'
+- 'If TP: review what was learned (groups, hosts, paths), constrain the user''s privileges, and watch for the next-stage activity that the recon
+  was likely setting up.'

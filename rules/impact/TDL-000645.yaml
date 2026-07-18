@@ -1,8 +1,8 @@
 rule_id: TDL-IMP-000645
 v4_id: '000645'
 name: Possible Ransomware Detected - Varonis
-description: Detects when multiple files have been encrypted within a short period. This could be related to the modification
-  of file extensions or the creation of files with known ransomware related extensions.
+description: Detects when multiple files have been encrypted within a short period. This could be related to the modification of file extensions
+  or the creation of files with known ransomware related extensions.
 tactic: Impact
 tactic_id: TA0040
 technique_id: T1486
@@ -17,68 +17,72 @@ lifecycle: Deployed
 risk_score: 75
 queries:
   spl: |
-    index=endpoint sourcetype=Sysmon (EventCode=11 OR EventCode=23 OR EventCode=26)
-    | search file_name="*.+*"
-    | stats count, values(host) as hosts by user, image, target_filename
-    | where count >= 1
-    | sort - count
-  kql: |
-    DeviceFileEvents
+    index=varonis sourcetype=varonis:datalert Alert_Name IN ("File encrypted by ransomware", "Immediate pattern detected: user actions resemble ransomware", "Suspected ransomware intrusion activity", "Potential encryption of multiple files")
+    | table _time, Alert_Name, User, host, src, Object_Name, Object_Type
+  kql: 'DeviceFileEvents
+
     | where TimeGenerated > ago(1d)
+
     | where file_name matches regex ".+"
+
     | summarize Count=count() by DeviceName, InitiatingProcessFileName, FolderPath, FileName
+
     | order by Count desc
-  aql: |
-    SELECT DEVICETIME, sourceip, "File Path", "Process Name"
-    FROM events
-    WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'
-      AND "EventID" IN ('11','23','26')
-      AND "file_name" LIKE '%.+%'
-    LAST 24 HOURS
-  yara_l: |
-    rule tdl_tdl_imp_000645 {
-      meta:
-        author = "TDL"
-        description = "Possible Ransomware Detected - Varonis"
-        severity = "HIGH"
-        tactic = "TA0040"
-        technique = "T1486"
-      events:
-        $e.metadata.event_type = "FILE_CREATION"
-        $e.file_name = /.+/
-        $host = $e.principal.hostname
-      match:
-        $host over 30m
-      condition:
-        $e
-    }
-  esql: |
-    FROM logs-endpoint*
+
+    '
+  aql: "SELECT DEVICETIME, sourceip, \"File Path\", \"Process Name\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n\
+    \  AND \"EventID\" IN ('11','23','26')\n  AND \"file_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
+  yara_l: "rule tdl_tdl_imp_000645 {\n  meta:\n    author = \"TDL\"\n    description = \"Possible Ransomware Detected - Varonis\"\n    severity\
+    \ = \"HIGH\"\n    tactic = \"TA0040\"\n    technique = \"T1486\"\n  events:\n    $e.metadata.event_type = \"FILE_CREATION\"\n    $e.file_name\
+    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
+  esql: 'FROM logs-endpoint*
+
     | WHERE @timestamp > NOW() - 1 hour
+
     | WHERE event.category == "file" AND file_name LIKE "%.+%"
+
     | STATS count = COUNT(*) BY host.name, user.name, file.path, process.name
+
     | SORT count DESC
-  leql: |
-    where(logset = "Endpoint Activity" AND log_type = "file" AND file_name=/.+/)
+
+    '
+  leql: 'where(logset = "Endpoint Activity" AND log_type = "file" AND file_name=/.+/)
+
     groupby(asset, file_path, process_name)
+
     calculate(count)
-  crowdstrike: |
-    event_simpleName IN (FileWritten, NewExecutableWritten) AND file_name=*.+*
+
+    '
+  crowdstrike: 'event_simpleName IN (FileWritten, NewExecutableWritten) AND file_name=*.+*
+
     | stats count as writes by ComputerName, UserName, FileName, ImageFileName
+
     | sort -writes
-  xql: |
-    dataset = xdr_data
+
+    '
+  xql: 'dataset = xdr_data
+
     | filter event_type = ENUM.FILE AND file_name ~= ".+"
+
     | comp count() as writes by agent_hostname, actor_effective_username, action_file_name, action_file_path
+
     | sort desc writes
-  lucene: |
-    event.category:"file" AND file_name:*.+*
-  sumo: |
-    _sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
+    '
+  lucene: 'event.category:"file" AND file_name:*.+*
+
+    '
+  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
+
     | parse "EventID=*\"" as event_id
+
     | where event_id IN ("11","23","26") AND file_name matches "*.+*"
+
     | count by host, user, target_filename, image
+
     | sort by _count desc
+
+    '
 false_positives:
 - Security software
 - Authorized admin tools
@@ -88,19 +92,18 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-04-28'
+last_modified: '2026-07-18'
 test_method: historical
 pseudo_logic: '1 VaronisDatAdvantage Alert
 
-  Where the Alert Name is in ["File encrypted by ransomware","Immediate pattern detected: user actions resemble ransomware","Suspected
-  ransomware intrusion activity","Potential encryption of multiple files"]'
+  Where the Alert Name is in ["File encrypted by ransomware","Immediate pattern detected: user actions resemble ransomware","Suspected ransomware
+  intrusion activity","Potential encryption of multiple files"]'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'
-- Inspect the parent → child process tree, command line arguments, and code-signing status — characterize the destructive
-  action (encrypt, delete, lockout, disable, reboot).
+- Inspect the parent → child process tree, command line arguments, and code-signing status — characterize the destructive action (encrypt, delete,
+  lockout, disable, reboot).
 - 'Determine spread: is this a single host or a coordinated multi-host event? Pull file / service telemetry across the fleet.'
 - Trigger your major-incident bridge if scope is multi-host or business-critical — early activation buys time.
-- 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this
-  severity.'
-- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence
-  to prevent recurrence.'
+- 'Decide TP / FP: FP only if a sanctioned destructive action (DR test, decommission) is documented; default to TP at this severity.'
+- 'If TP: execute your IR runbook — isolate, preserve evidence, restore from backup if appropriate, hunt for adversary persistence to prevent
+  recurrence.'

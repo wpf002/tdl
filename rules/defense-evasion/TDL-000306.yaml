@@ -15,73 +15,79 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudwatch:guardduty findingType IN ("Stealth:IAMUser/PasswordPolicyChange")
-    | eval src_user=coalesce('userIdentity.userName', 'userIdentity.principalId', "unknown")
+  spl: 'index=aws sourcetype=aws:cloudwatch:guardduty findingType IN ("Stealth:IAMUser/PasswordPolicyChange")
+
+    | eval src_user=coalesce(''userIdentity.userName'', ''userIdentity.principalId'', "unknown")
+
     | search NOT [| inputlookup aws_admin_list | fields username | rename username as src_user]
+
     | table _time, awsAccountId, src_user, findingType, severity, region, service.action.actionType, resource.resourceType
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000306 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Password Policy Change - GuardDuty\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1562\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(24h)
+    | where Title == "Stealth:IAMUser/PasswordPolicyChange"
+    | extend SourceUsername = tostring(parse_json(tostring(Service)).Action.AwsApiCallAction.RemoteAccountDetails.AccountId)
+    | extend ActorUsername = tostring(parse_json(tostring(Service)).Action.AwsApiCallAction.AffectedResources)
+    | extend UserIdentity = tostring(parse_json(tostring(Resource)).AccessKeyDetails.UserName)
+    | where UserIdentity !in ("aws-admin-user1", "aws-admin-user2", "terraform-service-account")
+    | project TimeGenerated, Title, Severity, UserIdentity, AccountId, Region, Description
+  aql: |
+    SELECT sourceip, username, "Event Type" AS event_type, LOGSOURCENAME(logsourceid) AS source, eventtime
+    FROM events
+    WHERE "Event Type" IN ('Stealth:IAMUser/PasswordPolicyChange')
+      AND username NOT IN ('aws-admin-user1', 'aws-admin-user2', 'aws-service-account')
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_password_policy_weakening {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects GuardDuty alerts for IAM password policy changes indicating defense evasion"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1562"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_event_type = "Stealth:IAMUser/PasswordPolicyChange"
+        $e.principal.user.userid = $user
+        not $user in %aws_admin_list
 
-    | WHERE eventName LIKE "%GuardDuty%"
+      match:
+        $user over 1h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM .ds-logs-aws.guardduty-*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND event.action IN ("Stealth:IAMUser/PasswordPolicyChange")
+      AND NOT user.name IN ("admin", "terraform", "cloudformation", "root")
+    | KEEP @timestamp, event.action, user.name, cloud.account.id, aws.guardduty.severity, source.ip
+  leql: |
+    where(source_json.service.serviceName="guardduty" AND source_json.type="Stealth:IAMUser/PasswordPolicyChange" AND NOT(source_user IN [AWS_ADMIN_LIST]))
+  crowdstrike: |
+    #repo=aws_guardduty event.type="Stealth:IAMUser/PasswordPolicyChange"
+    | not (userIdentity.userName in ["admin", "terraform", "cloudformation"])
+    | table([@timestamp, userIdentity.userName, userIdentity.accountId, event.type, awsRegion, sourceIPAddress])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and vendor = "Amazon" and product = "GuardDuty"
+    | filter action_finding_type in ("Stealth:IAMUser/PasswordPolicyChange")
+    | filter actor_user not in ("admin", "root", "Administrator", "terraform", "cloudformation")
+    | fields _time, cloud_provider, actor_user, action_finding_type, action_finding_description, cloud_account, cloud_region
+  lucene: |
+    eventName:"Stealth:IAMUser/PasswordPolicyChange" AND NOT userIdentity.userName:(admin1 OR admin2 OR admin3)
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty*
+    | json field=_raw "type" as event_type
+    | json field=_raw "service.action.awsApiCallAction.callerType" as caller_type
+    | json field=_raw "resource.accessKeyDetails.userName" as source_user
+    | json field=_raw "accountId" as account_id
+    | where event_type = "Stealth:IAMUser/PasswordPolicyChange"
+    | where !(source_user in ("admin", "root", "Administrator", "sysadmin"))
+    | fields _messageTime, account_id, source_user, event_type, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +97,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Guard Duty Event
 

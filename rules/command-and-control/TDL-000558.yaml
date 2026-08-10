@@ -15,81 +15,125 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=windows sourcetype="WinEventLog:Security" (EventCode=4624 OR EventCode=4625 OR EventCode=4768 OR EventCode=4769 OR EventCode=4776)
+  spl: 'index=windows sourcetype="WinEventLog:Security" (EventCode=4624 OR EventCode=4625 OR EventCode=4768 OR EventCode=4769 OR EventCode=4776)
+
     | lookup ja3_malicious_list ja3 OUTPUT is_malicious
+
     | where is_malicious="true"
+
     | lookup network_traffic_action src_ip as IpAddress OUTPUT action
+
     | where action="allowed" OR action="permit" OR action="accept"
+
     | lookup admin_allowlist src_ip as IpAddress OUTPUT is_authorized
+
     | where isnull(is_authorized) OR is_authorized!="true"
+
     | stats dc(ComputerName) as host_count values(ComputerName) as affected_hosts by Account_Name, IpAddress, Logon_Type, EventCode
+
     | where host_count >= 1
+
     | table Account_Name, IpAddress, Logon_Type, EventCode, host_count, affected_hosts
-  kql: 'SecurityEvent
 
-    | where TimeGenerated > ago(1d)
-
+    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (4624, 4625, 4768, 4769, 4776)
+    | join kind=inner (
+        CommonSecurityLog
+        | where TimeGenerated > ago(24h)
+        | where DeviceAction in ("allowed", "permit", "accept")
+        | where isnotempty(DeviceCustomString1) and DeviceCustomString1 has_any (
+            "e7d705a3286e19ea42f587b344ee6865",
+            "6734f37431670b3ab4292b8f60f29984",
+            "c7d9e4e4e4e4e4e4e4e4e4e4e4e4e4e4",
+            "a0e9f5d64349fb13191bc781f81f42e1",
+            "de350869b8c85de67a350c8d186f11e6"
+        )
+        | where SourceIP !has_any ("scanner01", "monitor01", "nessus", "qualys")
+        | project TimeGenerated, SourceIP, JA3=DeviceCustomString1
+    ) on $left.IpAddress == $right.SourceIP
+    | summarize DistinctHosts = dcount(Computer) by Account, IpAddress, LogonType, EventID
+    | where DistinctHosts >= 1
+    | project Account, IpAddress, LogonType, EventID, DistinctHosts
+  aql: |
+    SELECT username, sourceip AS IpAddress, "Logon Type" AS LogonType, "EventID" AS EventCode, LOGSOURCENAME(logsourceid) AS host, COUNT(*) AS event_count
+    FROM events
+    WHERE "EventID" IN ('4624', '4625', '4768', '4769', '4776')
+      AND logsourceid NOT IN (SELECT logsourceid FROM assets WHERE description ILIKE '%scanner%' OR description ILIKE '%monitoring%' OR tags ILIKE '%admin-allow-list%')
+    GROUP BY username, sourceip, "Logon Type", "EventID", LOGSOURCENAME(logsourceid)
+    HAVING event_count >= 1
+    LAST 24 HOURS
+  yara_l: "rule windows_auth_malicious_ja3 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects Windows authentication events with malicious\
+    \ JA3 fingerprints on allowed network traffic\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique = \"T1078\"\
+    \n    severity = \"HIGH\"\n    \n  events:\n    $auth.metadata.event_type = \"USER_LOGIN\"\n    (\n      $auth.metadata.product_event_type\
+    \ = \"4624\" or\n      $auth.metadata.product_event_type = \"4625\" or\n      $auth.metadata.product_event_type = \"4768\" or\n      $auth.metadata.product_event_type\
+    \ = \"4769\" or\n      $auth.metadata.product_event_type = \"4776\"\n    )\n    $auth.target.user.userid = $user\n    $auth.principal.ip =\
+    \ $ip\n    $auth.target.resource.attribute.labels.key = \"LogonType\"\n    $auth.target.resource.attribute.labels.value = $logon_type\n  \
+    \  $auth.metadata.product_event_type = $event_code\n    $auth.principal.hostname = $host\n    \n    $net.metadata.event_type = \"NETWORK_CONNECTION\"\
+    \n    $net.network.tls.client.ja3 = $ja3\n    (\n      $ja3 = \"e7d705a3286e19ea42f587b344ee6865\" or\n      $ja3 = \"6734f37431670b3ab4292b8f60f29984\"\
+    \ or\n      $ja3 = \"a0e9f5d64349fb13191bc781f81f42e1\" or\n      $ja3 = \"72a589da586844d7f0818ce684948eea\" or\n      $ja3 = \"239059b0b33bfce3821e6158e5dc487d\"\
+    \n    )\n    $net.security_result.action = \"ALLOW\"\n    $net.principal.ip = $ip\n    \n    not (\n      $auth.principal.asset.hostname =\
+    \ /(?i)(scanner|monitor|nagios|zabbix|solarwinds|prtg)/\n    )\n    not (\n      $auth.principal.user.userid = /(?i)(svc_monitor|admin_scanner|scan_agent)/\n\
+    \    )\n    \n  match:\n    $user, $ip, $logon_type, $event_code over 1h\n    \n  outcome:\n    $risk_score = 85\n    $distinct_hosts = count_distinct($host)\n\
+    \    \n  condition:\n    $auth and $net and $distinct_hosts >= 1\n}\n"
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.code IN ("4624", "4625", "4768", "4769", "4776")
+      AND tls.client.ja3 IS NOT NULL
+      AND event.action == "allowed"
+      AND NOT (source.ip IN ("10.0.0.100", "10.0.0.101") OR host.name LIKE "*scanner*" OR process.name IN ("monitoring_agent.exe", "nessus.exe"))
+    | STATS host_count = COUNT_DISTINCT(host.name) BY user.name, source.ip, winlog.event_data.LogonType, event.code
+    | WHERE host_count >= 1
+    | KEEP user.name, source.ip, winlog.event_data.LogonType, event.code, host_count
+  leql: |
+    where(source_json.EventID IN [4624, 4625, 4768, 4769, 4776] AND source_json.ja3_hash!=null AND traffic_action="allowed" AND source_address NOT IN [scanner_ip_1, scanner_ip_2, monitoring_agent_ip]) groupby(user, source_json.IpAddress, source_json.LogonType, source_json.EventCode) calculate(unique:asset)
+  crowdstrike: |
+    EventCode in [4624, 4625, 4768, 4769, 4776]
+    | join({#type=network ja3_hash=* action=allow | ja3_hash!=/^(authorized_scanner_ja3_1|authorized_scanner_ja3_2|monitoring_agent_ja3)$/ | table([ComputerName, ja3_hash, src_ip, dst_ip, @timestamp], limit=max)}, field=ComputerName, include=[ja3_hash, src_ip], mode=left)
+    | ja3_hash=*
+    | !match(file="admin_allowlist.csv", field=ComputerName, strict=false)
+    | groupBy([TargetUserName, IpAddress, LogonType, EventCode], function=count(ComputerName, distinct=true, as=host_count))
+    | host_count >= 1
+    | table([TargetUserName, IpAddress, LogonType, EventCode, host_count])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (4624, 4625, 4768, 4769, 4776)
+    | alter user = coalesce(action_evtlog_event_data_TargetUserName, action_evtlog_event_data_TargetUserName),
+            ip_address = coalesce(action_evtlog_event_data_IpAddress, action_remote_ip),
+            logon_type = action_evtlog_event_data_LogonType,
+            event_code = action_evtlog_event_id
+    | join type=inner (
+        dataset = panw_ngfw_traffic_raw
+        | filter action in ("allow", "allowed")
+        | filter ja3 in ("malicious_ja3_hash_1", "malicious_ja3_hash_2", "malicious_ja3_hash_3")
+        | alter ip_address = dest_ip
+        | fields ip_address, ja3
+      ) as ngfw_data ngfw_data.ip_address = ip_address
+    | filter agent_hostname not in ("authorized_scanner_1", "monitoring_agent_1", "admin_allowed_host_1")
+    | comp count_distinct(agent_hostname) as host_count by user, ip_address, logon_type, event_code
+    | filter host_count >= 1
+    | fields _time, user, ip_address, logon_type, event_code, host_count, agent_hostname
+  lucene: |
+    (event.code:(4624 OR 4625 OR 4768 OR 4769 OR 4776) OR EventID:(4624 OR 4625 OR 4768 OR 4769 OR 4776)) AND (ja3_hash:* OR ja3:* OR tls.ja3:*) AND (action:allowed OR action:permit OR traffic_action:allowed OR firewall_action:allow) AND NOT (host.name:(authorized_scanner* OR monitoring_agent*) OR source.ip:(10.1.1.100 OR 10.1.1.101) OR scanner:true)
+  sumo: |
+    _sourceCategory=*Windows*Security*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "IpAddress" as ip_address
+    | json field=_raw "TargetUserName" as user
+    | json field=_raw "LogonType" as logon_type
+    | json field=_raw "Computer" as computer
     | where event_id in ("4624", "4625", "4768", "4769", "4776")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4624', '4625', '4768', '4769', '4776')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000558 {\n  meta:\n    author = \"TDL\"\n    description = \"Allowed Traffic with Malicious JA3 Hash\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id\
-    \ = /(4624|4625|4768|4769|4776)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("4624", "4625", "4768", "4769", "4776")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4624, 4625, 4768, 4769, 4776])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4624, 4625, 4768, 4769, 4776)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4624", "4625", "4768", "4769", "4776")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4624 OR 4625 OR 4768 OR 4769 OR 4776)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4624", "4625", "4768", "4769", "4776")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+    | lookup ja3_hash from ja3_malicious_fingerprints on ip=ip_address
+    | where !isNull(ja3_hash)
+    | lookup action from network_traffic on src_ip=ip_address
+    | where action matches "*allow*" or action matches "*permit*"
+    | lookup scanner from admin_allowlist on host=computer or ip=ip_address
+    | where isNull(scanner)
+    | count_distinct(computer) as host_count by user, ip_address, logon_type, event_id
+    | where host_count >= 1
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -99,7 +143,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

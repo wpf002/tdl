@@ -16,77 +16,96 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=antivirus OR index=av OR index=edr
+  spl: 'index=antivirus OR index=av OR index=edr
+
     | bin _time span=30m
-    | stats dc(ComputerName) as unique_hosts values(ComputerName) as affected_hosts values(file_name) as files values(signature_name) as signatures by _time, file_hash
+
+    | stats dc(ComputerName) as unique_hosts values(ComputerName) as affected_hosts values(file_name) as files values(signature_name) as signatures
+    by _time, file_hash
+
     | where unique_hosts >= 6
+
     | table _time, file_hash, unique_hosts, affected_hosts, files, signatures
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000049 {\n  meta:\n    author = \"TDL\"\n    description = \"Malware Outbreak\"\n    severity = \"HIGH\"\n    tactic\
-    \ = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n    $host\
-    \ = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    let timeWindow = 30m;
+    let threshold = 6;
+    CommonSecurityLog
+    | where TimeGenerated > ago(timeWindow)
+    | where DeviceVendor has "antivirus" or DeviceProduct has "antivirus" or DeviceEventClassID has "malware"
+    | extend FileHash = coalesce(FileHash, SourceUserName, DeviceCustomString1, DeviceCustomString2)
+    | where isnotempty(FileHash)
+    | summarize UniqueHosts = dcount(SourceHostName), Hosts = make_set(SourceHostName), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by FileHash, DeviceProduct
+    | where UniqueHosts >= threshold
+    | project FileHash, DeviceProduct, UniqueHosts, Hosts, FirstSeen, LastSeen
+  aql: |
+    SELECT "File Hash" AS file_hash, COUNT(*) AS total_events, UNIQUECOUNT(LOGSOURCENAME(logsourceid)) AS unique_hosts
+    FROM events
+    WHERE category IN (1800, 1801, 1802, 1803, 1804, 1805, 1806, 1807, 1808, 1809, 1810, 1811, 1812, 1813, 1814, 1815, 1816, 1817, 1818, 1819, 1820)
+      AND "File Hash" IS NOT NULL
+    GROUP BY "File Hash"
+    HAVING total_events >= 6 AND unique_hosts >= 1
+    LAST 30 MINUTES
+  yara_l: |
+    rule malware_multi_host_spread {
+      meta:
+        author = "TDL"
+        description = "Detects malware detected on 6+ unique hosts within 30 minutes - T1204 Execution"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "SCAN_UNCATEGORIZED"
+        $e.security_result.summary = "malware_detected" or
+        $e.security_result.summary = "virus_detected" or
+        $e.security_result.action = "BLOCK" or
+        $e.security_result.action = "QUARANTINE"
+        $e.target.file.sha256 = $hash
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $hash over 30m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 85
+        $unique_hosts = count_distinct($host)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        #host >= 6
+    }
+  esql: "FROM .alerts-security.alerts-*\n| WHERE @timestamp > NOW() - 30 minutes \n  AND event.kind == \"alert\" \n  AND event.category == \"\
+    malware\"\n| STATS host_count = COUNT_DISTINCT(host.name) BY file.hash.sha256, threat.indicator.file.hash.sha256, event.action\n| WHERE host_count\
+    \ >= 6\n| KEEP file.hash.sha256, threat.indicator.file.hash.sha256, event.action, host_count\n"
+  leql: |
+    where(log_source_type="antivirus") groupby(source_json.file_hash) calculate(unique:asset) calculate(count)
+  crowdstrike: |
+    event_simpleName=DetectionSummaryEvent
+    | groupBy([SHA256HashData], function=[count(as=detections), count(ComputerName, distinct=true, as=unique_hosts)])
+    | unique_hosts >= 6
+    | detections >= 6
+    | table([SHA256HashData, detections, unique_hosts])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_MALWARE and event_behavior != ENUM.MALWARE_BEHAVIOR_BENIGN
+    | bin _time span=30m
+    | comp count_distinct(agent_hostname) as unique_hosts, count() as malware_events by _time, action_file_sha256
+    | filter malware_events >= 6 and unique_hosts >= 1
+    | fields _time, action_file_sha256, unique_hosts, malware_events
+  lucene: |
+    event_type:"malware_detection" OR event_type:"antivirus_alert" OR (action:"detected" AND threat_name:*) OR event.category:"malware"
+  sumo: |
+    _sourceCategory=*antivirus* OR _sourceCategory=*malware* OR _sourceCategory=*av*
+    | parse regex "(?i)(?<file_hash>[a-f0-9]{32,64})" nodrop
+    | parse regex "(?i)signature[:\s]+(?<signature>[^\s,]+)" nodrop
+    | parse regex "(?i)(?:host|computer|hostname)[:\s]+(?<hostname>[^\s,]+)" nodrop
+    | where !isNull(file_hash) OR !isNull(signature)
+    | if(isNull(file_hash), signature, file_hash) as indicator
+    | timeslice 30m
+    | count_distinct(hostname) as unique_hosts by _timeslice, indicator
+    | where unique_hosts >= 6
+    | fields _timeslice, indicator, unique_hosts
 false_positives:
 - Security software
 - Authorized admin tools
@@ -96,7 +115,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '6 Malware Detection Events
 

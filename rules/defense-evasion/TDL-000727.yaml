@@ -20,77 +20,204 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=k8s_audit OR index=cloud_audit sourcetype IN (kubernetes:audit, gcp:kubernetes:audit, azure:kubernetes:audit, aws:eks:audit) objectRef.resource=pods verb IN (create, update)
+  spl: 'index=k8s_audit OR index=cloud_audit sourcetype IN (kubernetes:audit, gcp:kubernetes:audit, azure:kubernetes:audit, aws:eks:audit) objectRef.resource=pods
+    verb IN (create, update)
+
     | spath input=requestObject.spec
+
     | eval is_privileged=if(like(requestObject.spec, "%\"privileged\":true%"), 1, 0)
+
     | eval has_hostPID=if(like(requestObject.spec, "%\"hostPID\":true%"), 1, 0)
+
     | eval has_hostNetwork=if(like(requestObject.spec, "%\"hostNetwork\":true%"), 1, 0)
-    | eval has_hostPath_root=if(like(requestObject.spec, "%\"hostPath\":{\"path\":\"/\"%") OR like(requestObject.spec, "%\"hostPath\":{\"path\":\"/etc%"), 1, 0)
+
+    | eval has_hostPath_root=if(like(requestObject.spec, "%\"hostPath\":{\"path\":\"/\"%") OR like(requestObject.spec, "%\"hostPath\":{\"path\":\"/etc%"),
+    1, 0)
+
     | where is_privileged=1 OR has_hostPID=1 OR has_hostNetwork=1 OR has_hostPath_root=1
+
     | table _time, user.username, objectRef.namespace, objectRef.name, verb, is_privileged, has_hostPID, has_hostNetwork, has_hostPath_root, sourceIPs{}
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000727 {\n  meta:\n    author = \"TDL\"\n    description = \"Privileged Pod Created With Host Mounts\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1610\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    union isfuzzy=true
+    (AzureDiagnostics
+    | where Category == "kube-audit"
+    | where TimeGenerated > ago(1h)
+    | where tolower(OperationName) has "pods/create" or tolower(OperationName) has "pods/update"
+    | extend podSpec = parse_json(properties_s)
+    | extend containers = parse_json(podSpec.spec.containers)
+    | mv-expand containers
+    | extend securityContext = parse_json(containers.securityContext)
+    | extend privileged = tobool(securityContext.privileged)
+    | extend hostPID = tobool(podSpec.spec.hostPID)
+    | extend hostNetwork = tobool(podSpec.spec.hostNetwork)
+    | extend volumes = parse_json(podSpec.spec.volumes)
+    | mv-expand volumes
+    | extend hostPath = parse_json(volumes.hostPath)
+    | extend hostPathMount = tostring(hostPath.path)
+    | where privileged == true or hostPID == true or hostNetwork == true or hostPathMount in ("/", "/etc")
+    | project TimeGenerated, OperationName, podName = tostring(podSpec.metadata.name), namespace = tostring(podSpec.metadata.namespace), user = identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_name_s, privileged, hostPID, hostNetwork, hostPathMount),
+    (AzureActivity
+    | where TimeGenerated > ago(1h)
+    | where OperationNameValue has "Microsoft.ContainerService/managedClusters"
+    | where ActivityStatusValue == "Success"
+    | extend podSpec = parse_json(Properties)
+    | extend containers = parse_json(podSpec.spec.containers)
+    | mv-expand containers
+    | extend securityContext = parse_json(containers.securityContext)
+    | extend privileged = tobool(securityContext.privileged)
+    | extend hostPID = tobool(podSpec.spec.hostPID)
+    | extend hostNetwork = tobool(podSpec.spec.hostNetwork)
+    | extend volumes = parse_json(podSpec.spec.volumes)
+    | mv-expand volumes
+    | extend hostPath = parse_json(volumes.hostPath)
+    | extend hostPathMount = tostring(hostPath.path)
+    | where privileged == true or hostPID == true or hostNetwork == true or hostPathMount in ("/", "/etc")
+    | project TimeGenerated, OperationNameValue, podName = tostring(podSpec.metadata.name), namespace = tostring(podSpec.metadata.namespace), Caller, privileged, hostPID, hostNetwork, hostPathMount),
+    (AWSCloudTrail
+    | where TimeGenerated > ago(1h)
+    | where EventName has_any ("CreatePod", "UpdatePod")
+    | extend requestParams = parse_json(RequestParameters)
+    | extend podSpec = parse_json(requestParams.spec)
+    | extend containers = parse_json(podSpec.containers)
+    | mv-expand containers
+    | extend securityContext = parse_json(containers.securityContext)
+    | extend privileged = tobool(securityContext.privileged)
+    | extend hostPID = tobool(podSpec.hostPID)
+    | extend hostNetwork = tobool(podSpec.hostNetwork)
+    | extend volumes = parse_json(podSpec.volumes)
+    | mv-expand volumes
+    | extend hostPath = parse_json(volumes.hostPath)
+    | extend hostPathMount = tostring(hostPath.path)
+    | where privileged == true or hostPID == true or hostNetwork == true or hostPathMount in ("/", "/etc")
+    | project TimeGenerated, EventName, podName = tostring(requestParams.metadata.name), namespace = tostring(requestParams.metadata.namespace), UserIdentityUserName, privileged, hostPID, hostNetwork, hostPathMount),
+    (GCPAuditLogs
+    | where TimeGenerated > ago(1h)
+    | where ServiceName == "k8s.io"
+    | where MethodName has_any ("io.k8s.core.v1.pods.create", "io.k8s.core.v1.pods.update")
+    | extend requestObj = parse_json(RequestJson)
+    | extend podSpec = parse_json(requestObj.spec)
+    | extend containers = parse_json(podSpec.containers)
+    | mv-expand containers
+    | extend securityContext = parse_json(containers.securityContext)
+    | extend privileged = tobool(securityContext.privileged)
+    | extend hostPID = tobool(podSpec.hostPID)
+    | extend hostNetwork = tobool(podSpec.hostNetwork)
+    | extend volumes = parse_json(podSpec.volumes)
+    | mv-expand volumes
+    | extend hostPath = parse_json(volumes.hostPath)
+    | extend hostPathMount = tostring(hostPath.path)
+    | where privileged == true or hostPID == true or hostNetwork == true or hostPathMount in ("/", "/etc")
+    | project TimeGenerated, MethodName, podName = tostring(requestObj.metadata.name), namespace = tostring(requestObj.metadata.namespace), CallerIdentity, privileged, hostPID, hostNetwork, hostPathMount)
+  aql: |
+    SELECT username, sourceip, destinationip, "pod_name", "container_name", "namespace", "request_uri", "response_code", COUNT(*) AS event_count
+    FROM events
+    WHERE (
+      ("request_uri" ILIKE '%/api/v1/namespaces/%/pods%' OR "request_uri" ILIKE '%/apis/apps/v1/namespaces/%/deployments%' OR "request_uri" ILIKE '%/apis/apps/v1/namespaces/%/daemonsets%' OR "request_uri" ILIKE '%/apis/apps/v1/namespaces/%/statefulsets%' OR "request_uri" ILIKE '%/apis/batch/v1/namespaces/%/jobs%')
+      AND ("verb" = 'create' OR "verb" = 'update' OR "verb" = 'patch')
+      AND (
+        "request_body" ILIKE '%"privileged":true%'
+        OR "request_body" ILIKE '%"hostPID":true%'
+        OR "request_body" ILIKE '%"hostNetwork":true%'
+        OR ("request_body" ILIKE '%"hostPath"%' AND ("request_body" ILIKE '%"path":"/",%' OR "request_body" ILIKE '%"path":"/"%' OR "request_body" ILIKE '%"path":"/etc"%'))
+      )
+    )
+    GROUP BY username, sourceip, destinationip, "pod_name", "container_name", "namespace", "request_uri", "response_code"
+    LAST 1 HOURS
+  yara_l: |
+    rule privileged_pod_creation {
+      meta:
+        author = "TDL"
+        description = "Detects creation of Kubernetes pods with privileged escalation or host access primitives (T1610 - Deploy Container)"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1610"
+        severity = "HIGH"
 
+      events:
+        $e.metadata.event_type = "RESOURCE_CREATION"
+        (
+          re.regex($e.metadata.product_log_id, `(?i)k8s|kubernetes`) or
+          re.regex($e.metadata.product_name, `(?i)k8s|kubernetes|gke|eks|aks`)
+        )
+        re.regex($e.target.resource.name, `(?i)pod`)
+        $e.principal.user.userid = $user
+        $e.target.resource.attribute.labels.key = "privileged"
+        $e.target.resource.attribute.labels.value = "true"
+        or (
+          $e.target.resource.attribute.labels.key = "hostPID"
+          $e.target.resource.attribute.labels.value = "true"
+        )
+        or (
+          $e.target.resource.attribute.labels.key = "hostNetwork"
+          $e.target.resource.attribute.labels.value = "true"
+        )
+        or (
+          $e.target.resource.attribute.labels.key = "hostPath"
+          (
+            re.regex($e.target.resource.attribute.labels.value, `^/$`) or
+            re.regex($e.target.resource.attribute.labels.value, `^/etc`)
+          )
+        )
+
+      match:
+        $user over 5m
+
+      outcome:
+        $risk_score = 75
+
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-kubernetes.audit*,logs-cloud.audit*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      AND event.action IN ("create", "CREATE")
+      AND (
+        (kubernetes.audit.objectRef.resource == "pods" AND (
+          kubernetes.audit.requestObject.spec.containers.securityContext.privileged == true
+          OR kubernetes.audit.requestObject.spec.securityContext.hostPID == true
+          OR kubernetes.audit.requestObject.spec.securityContext.hostNetwork == true
+          OR (kubernetes.audit.requestObject.spec.volumes.hostPath.path == "/" OR kubernetes.audit.requestObject.spec.volumes.hostPath.path == "/etc")
+        ))
+        OR (cloud.provider IN ("aws", "azure", "gcp") AND (
+          TO_LOWER(cloud.service.name) LIKE "*container*" OR TO_LOWER(cloud.service.name) LIKE "*kubernetes*"
+        ) AND (
+          TO_LOWER(event.original) LIKE "*privileged*true*"
+          OR TO_LOWER(event.original) LIKE "*hostpid*true*"
+          OR TO_LOWER(event.original) LIKE "*hostnetwork*true*"
+          OR TO_LOWER(event.original) LIKE "*hostpath*/*"
+          OR TO_LOWER(event.original) LIKE "*hostpath*/etc*"
+        ))
+      )
+    | KEEP @timestamp, event.action, user.name, kubernetes.audit.objectRef.namespace, kubernetes.audit.objectRef.name, kubernetes.audit.requestObject.spec.containers.name, kubernetes.audit.requestObject.spec.containers.securityContext.privileged, kubernetes.audit.requestObject.spec.securityContext.hostPID, kubernetes.audit.requestObject.spec.securityContext.hostNetwork, kubernetes.audit.requestObject.spec.volumes.hostPath.path, cloud.provider, cloud.service.name, cloud.account.id
+  leql: |
+    where(source_json.objectRef.resource="pods" AND source_json.verb IN ["create", "update"] AND (source_json.requestObject.spec.containers[*].securityContext.privileged=true OR source_json.requestObject.spec.hostPID=true OR source_json.requestObject.spec.hostNetwork=true OR (source_json.requestObject.spec.volumes[*].hostPath.path="/" OR source_json.requestObject.spec.volumes[*].hostPath.path="/etc"))) groupby(source_json.user.username, source_json.objectRef.namespace, source_json.objectRef.name) calculate(count)
+  crowdstrike: "(#type=kubernetes-audit OR #type=cloud-audit) \n(verb=create OR verb=patch) \nobjectRef.resource=pods \n(requestObject.spec.containers[*].securityContext.privileged=true\
+    \ OR requestObject.spec.hostPID=true OR requestObject.spec.hostNetwork=true OR requestObject.spec.volumes[*].hostPath.path=\"/\" OR requestObject.spec.volumes[*].hostPath.path=\"\
+    /etc\")\n| table([@timestamp, user.username, objectRef.namespace, objectRef.name, verb, sourceIPs, requestObject.spec.containers[*].securityContext.privileged,\
+    \ requestObject.spec.hostPID, requestObject.spec.hostNetwork, requestObject.spec.volumes[*].hostPath.path])\n"
+  xql: "dataset = cloud_audit_logs\n| filter action in (\"io.k8s.core.v1.pods.create\", \"pods.create\", \"CREATE\") \n  and (json_extract_scalar(action_resource_json_base64,\
+    \ \"$.spec.containers[*].securityContext.privileged\") = \"true\"\n       or json_extract_scalar(action_resource_json_base64, \"$.spec.hostPID\"\
+    ) = \"true\"\n       or json_extract_scalar(action_resource_json_base64, \"$.spec.hostNetwork\") = \"true\"\n       or (json_extract_scalar(action_resource_json_base64,\
+    \ \"$.spec.volumes[*].hostPath.path\") = \"/\"\n           or json_extract_scalar(action_resource_json_base64, \"$.spec.volumes[*].hostPath.path\"\
+    ) = \"/etc\"))\n| fields _time, action_country, actor_effective_username, action_resource_name, action_resource_json_base64\n"
+  lucene: |
+    (objectRef.resource:pods OR objectRef.resource:pod) AND verb:create AND (requestObject.spec.containers.securityContext.privileged:true OR requestObject.spec.securityContext.privileged:true OR requestObject.spec.hostPID:true OR requestObject.spec.hostNetwork:true OR (requestObject.spec.volumes.hostPath.path:"\/" OR requestObject.spec.volumes.hostPath.path:"\/etc"))
+  sumo: |
+    _sourceCategory=*Kubernetes* OR _sourceCategory=*Cloud*Audit*
+    | json field=_raw "verb" as verb
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "requestObject.spec.containers[*].securityContext.privileged" as privileged
+    | json field=_raw "requestObject.spec.hostPID" as hostPID
+    | json field=_raw "requestObject.spec.hostNetwork" as hostNetwork
+    | json field=_raw "requestObject.spec.volumes[*].hostPath.path" as hostPath
+    | json field=_raw "user.username" as user
+    | json field=_raw "objectRef.namespace" as namespace
+    | json field=_raw "objectRef.name" as pod_name
+    | where verb in ("create", "update") and resource = "pods"
+    | where privileged = "true" OR hostPID = "true" OR hostNetwork = "true" OR hostPath matches "*/*" OR hostPath matches "*/etc*"
+    | fields _messageTime, user, namespace, pod_name, privileged, hostPID, hostNetwork, hostPath
 pseudo_logic: 'create pod with privileged: true OR hostPID/hostNetwork: true OR hostPath volume mounting / and /etc. Container escape / host evasion
   primitive.'
 false_positives:
@@ -109,7 +236,7 @@ references:
 - https://attack.mitre.org/techniques/T1610/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

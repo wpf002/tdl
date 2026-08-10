@@ -19,68 +19,53 @@ queries:
   spl: "index=azure sourcetype=azure:activity operationName IN (\"MICROSOFT.KEYVAULT/VAULTS/DELETE\", \"MICROSOFT.KEYVAULT/VAULTS/DEPLOY/ACTION\"\
     , \"MICROSOFT.KEYVAULT/VAULTS/ACCESSPOLICIES/WRITE\", \"MICROSOFT.KEYVAULT/VAULTS/WRITE\") \n| table _time, user, operationName, resourceId,\
     \ callerIpAddress, resultType, properties\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000655 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Key Vault Modification\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0005\"\n    technique = \"T1213\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AzureActivity
+    | where TimeGenerated > ago(1h)
+    | where OperationNameValue in~ ("MICROSOFT.KEYVAULT/VAULTS/DELETE", "MICROSOFT.KEYVAULT/VAULTS/DEPLOY/ACTION", "MICROSOFT.KEYVAULT/VAULTS/ACCESSPOLICIES/WRITE", "MICROSOFT.KEYVAULT/VAULTS/WRITE")
+    | project TimeGenerated, Caller, OperationNameValue, ResourceGroup, SubscriptionId, ResourceId, ActivityStatusValue, CallerIpAddress
+  aql: |
+    SELECT username, "Azure Activity", "Azure Operation", sourceip, COUNT(*) AS event_count
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Azure%'
+      AND (
+        UPPER("Azure Operation") = 'MICROSOFT.KEYVAULT/VAULTS/DELETE'
+        OR UPPER("Azure Operation") = 'MICROSOFT.KEYVAULT/VAULTS/DEPLOY/ACTION'
+        OR UPPER("Azure Operation") = 'MICROSOFT.KEYVAULT/VAULTS/ACCESSPOLICIES/WRITE'
+        OR UPPER("Azure Operation") = 'MICROSOFT.KEYVAULT/VAULTS/WRITE'
+      )
+    GROUP BY username, "Azure Activity", "Azure Operation", sourceip
+    LAST 24 HOURS
+  yara_l: "rule azure_keyvault_sensitive_operations {\n  meta:\n    author = \"Chronicle Detection Engineering\"\n    description = \"Detects\
+    \ sensitive Azure Key Vault operations that may indicate defense evasion - MITRE T1213\"\n    mitre_attack_tactic = \"Defense Evasion\"\n\
+    \    mitre_attack_technique = \"T1213\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.product_name = \"Azure\"\n    $e.metadata.product_event_type\
+    \ = \"Azure Activity\"\n    (\n      $e.target.resource.attribute.labels[\"operation\"] = \"MICROSOFT.KEYVAULT/VAULTS/DELETE\" or\n      $e.target.resource.attribute.labels[\"\
+    operation\"] = \"MICROSOFT.KEYVAULT/VAULTS/DEPLOY/ACTION\" or\n      $e.target.resource.attribute.labels[\"operation\"] = \"MICROSOFT.KEYVAULT/VAULTS/ACCESSPOLICIES/WRITE\"\
+    \ or\n      $e.target.resource.attribute.labels[\"operation\"] = \"MICROSOFT.KEYVAULT/VAULTS/WRITE\"\n    )\n    $e.principal.user.userid\
+    \ = $user\n    $e.target.resource.name = $resource\n    \n  match:\n    $user over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-azure.activitylogs*
+    | WHERE event.action IN ("MICROSOFT.KEYVAULT/VAULTS/DELETE", "MICROSOFT.KEYVAULT/VAULTS/DEPLOY/ACTION", "MICROSOFT.KEYVAULT/VAULTS/ACCESSPOLICIES/WRITE", "MICROSOFT.KEYVAULT/VAULTS/WRITE")
+    | KEEP @timestamp, event.action, azure.activitylogs.identity.authorization.evidence.principal_id, azure.activitylogs.identity.claims.name, cloud.account.id, azure.resource.name, azure.resource.group
+  leql: |
+    where(source_json.operationName IN ["MICROSOFT.KEYVAULT/VAULTS/DELETE", "MICROSOFT.KEYVAULT/VAULTS/DEPLOY/ACTION", "MICROSOFT.KEYVAULT/VAULTS/ACCESSPOLICIES/WRITE", "MICROSOFT.KEYVAULT/VAULTS/WRITE"])
+  crowdstrike: |
+    #type=azure:activity (operationName="MICROSOFT.KEYVAULT/VAULTS/DELETE" OR operationName="MICROSOFT.KEYVAULT/VAULTS/DEPLOY/ACTION" OR operationName="MICROSOFT.KEYVAULT/VAULTS/ACCESSPOLICIES/WRITE" OR operationName="MICROSOFT.KEYVAULT/VAULTS/WRITE")
+    | table([@timestamp, operationName, callerIpAddress, caller, resourceId, subscriptionId])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "Azure" and operation_name in ("MICROSOFT.KEYVAULT/VAULTS/DELETE", "MICROSOFT.KEYVAULT/VAULTS/DEPLOY/ACTION", "MICROSOFT.KEYVAULT/VAULTS/ACCESSPOLICIES/WRITE", "MICROSOFT.KEYVAULT/VAULTS/WRITE")
+    | fields _time, operation_name, actor_user, resource_name, cloud_provider_project, result_status
+  lucene: |
+    operationName:("MICROSOFT.KEYVAULT/VAULTS/DELETE" OR "MICROSOFT.KEYVAULT/VAULTS/DEPLOY/ACTION" OR "MICROSOFT.KEYVAULT/VAULTS/ACCESSPOLICIES/WRITE" OR "MICROSOFT.KEYVAULT/VAULTS/WRITE")
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*azure*
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "resourceId" as resource_id
+    | json field=_raw "caller" as caller
+    | json field=_raw "callerIpAddress" as caller_ip
+    | where operation_name in ("MICROSOFT.KEYVAULT/VAULTS/DELETE", "MICROSOFT.KEYVAULT/VAULTS/DEPLOY/ACTION", "MICROSOFT.KEYVAULT/VAULTS/ACCESSPOLICIES/WRITE", "MICROSOFT.KEYVAULT/VAULTS/WRITE")
+    | fields _messageTime, caller, caller_ip, operation_name, resource_id
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +75,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '"1 Azure Administrative Activity Event
 

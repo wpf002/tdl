@@ -19,68 +19,72 @@ queries:
     \ \"^system:node\") \n| where NOT match(user.username, \"^system:serviceaccount\") \n| lookup kubernetes_admins username AS user.username\
     \ OUTPUT is_admin \n| where isnull(is_admin) OR is_admin!=1\n| table _time, user.username, verb, objectRef.resource, objectRef.namespace,\
     \ objectRef.name, sourceIPs{}\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000575 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubernetes Secrets File Accessed By Unauthorized User\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1552\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    KubernetesPodInventory
+    | where TimeGenerated > ago(1h)
+    | join kind=inner (
+        KubernetesEvents
+        | where TimeGenerated > ago(1h)
+        | where Verb in ("get", "list")
+        | extend ObjectKind = tostring(ObjectRef.resource)
+        | where ObjectKind == "secrets"
+        | extend SourceUsername = tostring(RequestObject.user.username)
+        | where SourceUsername !startswith "system:node"
+        | where SourceUsername !startswith "system:serviceaccount"
+        | where SourceUsername !in ("kubernetes-admin", "cluster-admin", "admin")
+    ) on $left.PodUid == $right.ObjectRef.uid
+    | project TimeGenerated, SourceUsername, Verb, ObjectKind, Namespace = Namespace1, PodName, Computer
+  aql: |
+    SELECT username AS "Source Username", sourceip AS "Source IP", QIDNAME(qid) AS "Event Name", LOGSOURCENAME(logsourceid) AS "Log Source", COUNT(*) AS "Event Count"
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%kubernetes%'
+      AND ("Verb" IN ('get', 'list') OR "verb" IN ('get', 'list'))
+      AND ("Resource" = 'secrets' OR "resource" = 'secrets')
+      AND username NOT MATCHES 'system:node.*'
+      AND username NOT MATCHES 'system:serviceaccount.*'
+      AND username NOT IN ('kube-admin', 'cluster-admin', 'admin')
+    GROUP BY username, sourceip, qid, logsourceid
+    LAST 1 HOURS
+  yara_l: "rule kubernetes_secret_access_by_user {\n  meta:\n    author = \"TDL\"\n    description = \"Detects non-system users accessing Kubernetes\
+    \ secrets (T1552)\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique = \"T1552\"\n    severity = \"MEDIUM\"\n\
+    \  \n  events:\n    $e.metadata.product_event_type = \"Kubernetes Event\"\n    $e.security_result.action in (\"get\", \"list\")\n    $e.target.resource.name\
+    \ = \"secrets\"\n    $e.principal.user.userid = $username\n    not re.regex($e.principal.user.userid, `^system:node`)\n    not re.regex($e.principal.user.userid,\
+    \ `^system:serviceaccount`)\n    not $e.principal.user.userid in %kubernetes_admin_list\n  \n  match:\n    $username over 5m\n  \n  outcome:\n\
+    \    $risk_score = 65\n  \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-kubernetes.audit-*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND event.action IN ("get", "list")
+      AND kubernetes.audit.objectRef.resource == "secrets"
+      AND NOT RLIKE(kubernetes.audit.user.username, "system:node.*")
+      AND NOT RLIKE(kubernetes.audit.user.username, "system:serviceaccount.*")
+      AND kubernetes.audit.user.username NOT IN ("admin", "cluster-admin", "kubernetes-admin")
+    | STATS event_count = COUNT(*) BY kubernetes.audit.user.username, kubernetes.audit.objectRef.name, kubernetes.audit.objectRef.namespace, host.name
+    | KEEP @timestamp, kubernetes.audit.user.username, kubernetes.audit.objectRef.name, kubernetes.audit.objectRef.namespace, host.name, event_count
+  leql: |
+    where(source_json.verb IN ["get", "list"] AND source_json.objectRef.resource="secrets" AND source_json.user.username!=/^system:node.*/ AND source_json.user.username!=/^system:serviceaccount.*/)
+  crowdstrike: |
+    #type=kubernetes verb IN [get, list] resource=secrets
+    | SourceUsername != /^system:node.*/
+    | SourceUsername != /^system:serviceaccount.*/
+    | table([@timestamp, SourceUsername, verb, resource, namespace, ComputerName])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "KUBERNETES" and action_verb in ("get", "list") and action_resource = "secrets"
+    | filter actor_effective_username !~= "system:node.*" and actor_effective_username !~= "system:serviceaccount.*"
+    | fields _time, actor_effective_username, action_verb, action_resource, agent_hostname, action_result
+  lucene: |
+    kubernetes.audit.verb:("get" OR "list") AND kubernetes.audit.objectRef.resource:"secrets" AND NOT kubernetes.audit.user.username:/system:node.*/ AND NOT kubernetes.audit.user.username:/system:serviceaccount.*/ AND NOT kubernetes.audit.user.username:(admin OR cluster-admin OR system:masters)
+  sumo: |
+    _sourceCategory=*kubernetes* OR _sourceCategory=*k8s*
+    | json field=_raw "verb" as verb
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "user.username" as source_username
+    | where verb in ("get", "list")
+    | where resource = "secrets"
+    | where !(source_username matches "system:node*")
+    | where !(source_username matches "system:serviceaccount*")
+    | fields _messageTime, source_username, verb, resource, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +94,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere Verb is in (\"get\", \"list\")\nWhere Resource is \"secrets\"\nWhere Source Username does NOT match\
   \ \"system:node.*\"\nWhere Source Username does NOT match \"system:serviceaccount.*\"\nWhere the Source Username is Not on the Kubernetes Admin\

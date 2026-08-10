@@ -15,87 +15,114 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=firewall direction=inbound action IN (allow, alert)
+  spl: 'index=firewall direction=inbound action IN (allow, alert)
+
     | lookup threat_intel_list src_ip OUTPUT threat_flag
+
     | where isnotnull(threat_flag)
+
     | lookup dmz_ips dest_ip OUTPUT is_dmz
+
     | where isnull(is_dmz) OR is_dmz!=1
+
     | bin _time span=5m
+
     | stats count dc(event_type) as event_types values(event_type) as event_type_list by _time, src_ip, dest_ip
+
     | where count >= 10
+
     | table _time, src_ip, dest_ip, count, event_type_list
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exe_000106 {\n  meta:\n    author = \"TDL\"\n    description = \"Multiple Allowed Inbound Connections from Threat IP\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0002\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    let ThreatIntelIPs = materialize(
+        ThreatIntelligenceIndicator
+        | where TimeGenerated > ago(14d)
+        | where isnotempty(NetworkIP)
+        | project NetworkIP
+        | distinct NetworkIP
+    );
+    let DMZIPs = dynamic(["10.0.100.0/24", "192.168.100.0/24"]);
+    CommonSecurityLog
+    | where TimeGenerated > ago(5m)
+    | where DeviceVendor has "Firewall" or DeviceProduct has "Firewall"
+    | where DeviceDirection =~ "Inbound"
+    | where DeviceAction in~ ("Allow", "Alert")
+    | where SourceIP in (ThreatIntelIPs)
+    | where not(ipv4_is_in_any_range(DestinationIP, DMZIPs))
+    | summarize EventCount = count() by bin(TimeGenerated, 5m), SourceIP, DestinationIP, DeviceEventCategory
+    | where EventCount >= 10
+    | project TimeGenerated, SourceIP, DestinationIP, DeviceEventCategory, EventCount
+  aql: |
+    SELECT sourceip, destinationip, eventname AS event_type, COUNT(*) AS event_count
+    FROM events
+    WHERE category IN (SELECT category FROM categories WHERE name ILIKE '%firewall%')
+      AND (INOFFENSE(sourceip) OR sourceip IN (SELECT sourceaddress FROM reference_set WHERE name='ThreatIntelligence'))
+      AND direction='Inbound'
+      AND LOWER(eventname) IN ('allow', 'alert')
+      AND destinationip NOT IN (SELECT destinationaddress FROM reference_set WHERE name='DMZ_IPs')
+    GROUP BY sourceip, destinationip, eventname
+    HAVING event_count >= 10
+    LAST 5 MINUTES
+  yara_l: "rule firewall_threat_intel_source_to_internal {\n  meta:\n    author = \"TDL\"\n    description = \"Detects 10+ firewall events from\
+    \ external threat intel IP to internal non-DMZ destination within 5 minutes\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique\
+    \ = \"T1078\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.metadata.vendor_name = /firewall/nocase\n    \n  \
+    \  re.regex($e.security_result.action, `(?i)(allow|alert)`)\n    \n    $e.network.direction = \"INBOUND\"\n    \n    $e.principal.ip = $source_ip\n\
+    \    $e.target.ip = $dest_ip\n    \n    $e.security_result.threat_name != \"\"\n    \n    not re.regex($e.target.ip, `^(10\\.1\\.1\\.|192\\\
+    .168\\.100\\.|172\\.16\\.50\\.)`)\n    \n    $e.metadata.product_event_type = $event_type\n\n  match:\n    $source_ip, $dest_ip, $event_type\
+    \ over 5m\n\n  condition:\n    #e >= 10\n}\n"
+  esql: |
+    FROM logs-network.firewall*
+    | WHERE @timestamp > NOW() - 5 minutes
+      AND network.direction == "inbound"
+      AND TO_LOWER(event.action) IN ("allow", "alert")
+      AND threat.indicator.ip IS NOT NULL
+      AND destination.ip NOT IN ("10.0.0.1", "10.0.0.2", "10.0.0.3")
+    | STATS event_count = COUNT(*) BY source.ip, destination.ip, event.type, window = BUCKET(@timestamp, 5 minutes)
+    | WHERE event_count >= 10
+    | KEEP source.ip, destination.ip, event.type, event_count, window
+  leql: "where(source_json.action ICONTAINS \"allow\" OR source_json.action ICONTAINS \"alert\") \nAND source_json.threat_intelligence_match=true\
+    \ \nAND NOT(destination_address IN [\"<DMZ_IP_1>\", \"<DMZ_IP_2>\", \"<DMZ_IP_3>\"]) \ngroupby(source_address, destination_address, source_json.event_type)\
+    \ \ncalculate(count)\n"
+  crowdstrike: |
+    #type=firewall direction=inbound (action=allow OR action=alert OR action=Allow OR action=Alert)
+    | cidr(field=src_ip, exclude=[known_dmz_ranges], as=not_dmz_dest, outField=dst_ip)
+    | cidr(field=src_ip, include=[threat_intel_ranges], as=threat_src)
+    | threat_src=true
+    | not_dmz_dest=true
+    | bucket(span=5m, field=@timestamp, as=time_window)
+    | groupBy([time_window, src_ip, dst_ip, event_type], function=count(as=event_count))
+    | event_count >= 10
+    | table([@timestamp, src_ip, dst_ip, event_type, event_count])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_direction = "inbound"
+      and (lowercase(action_result) = "allow" or lowercase(action_result) = "alert")
+      and action_external_hostname != null
+      and action_remote_ip_reputation in ("High", "Critical", "Malicious")
+      and action_local_ip not in ("10.0.1.1", "10.0.1.2", "10.0.1.3")
+    | bin _time span = 5m
+    | comp count() as event_count by _time, action_remote_ip, action_local_ip, event_type
+    | filter event_count >= 10
+    | fields _time, action_remote_ip, action_local_ip, event_type, event_count
+  lucene: |
+    event_type:Firewall AND action:(Allow OR alert OR ALLOW OR ALERT) AND threat_intel:true AND NOT destination.ip:(dmz_ip_address_1 OR dmz_ip_address_2 OR dmz_ip_address_3) AND direction:inbound AND _exists_:source.ip AND _exists_:destination.ip
+  sumo: |
+    _sourceCategory=*Firewall* OR _sourceCategory=*firewall*
+    | json field=_raw "action" as action
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "direction" as direction
+    | where toLowerCase(action) matches "*allow*" or toLowerCase(action) matches "*alert*"
+    | where direction matches "*inbound*" or direction matches "*in*"
+    | lookup type, malicious_confidence, threat_intel from threat/intel on threat_intel = src_ip
+    | where !isNull(threat_intel)
+    | where !(dest_ip matches "10.0.1.*" or dest_ip matches "10.0.2.*" or dest_ip matches "172.16.0.*")
+    | timeslice 5m
+    | count as event_count by _timeslice, src_ip, dest_ip, event_type
+    | where event_count >= 10
+    | fields _timeslice, src_ip, dest_ip, event_type, event_count
 false_positives:
 - Authorized pen testing
 - Security research
@@ -105,7 +132,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '10 Firewall Event
 

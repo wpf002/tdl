@@ -17,78 +17,89 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security EventCode IN (528, 540, 4624) Logon_Type IN (2, 10, 11)
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security EventCode IN (528, 540, 4624) Logon_Type IN (2, 10, 11)
+
     | lookup domain_controllers.csv ComputerName OUTPUT is_dc
+
     | where is_dc="true"
+
     | eval event_hour=strftime(_time, "%H")
+
     | eval event_day=strftime(_time, "%w")
+
     | where NOT ((event_day >= 1 AND event_day <= 5) AND (event_hour >= 8 AND event_hour < 18))
+
     | table _time, ComputerName, Account_Name, Logon_Type, src_ip, event_hour, event_day
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4624")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4624')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000010 {\n  meta:\n    author = \"TDL\"\n    description = \"Interactive Logon to Domain Controller - Offhours\"\n\
-    \    severity = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n   \
-    \ $e.event_id = /(4624)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("4624")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4624])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4624)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4624")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4624)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4624")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (528, 540, 4624)
+    | where LogonType in (2, 10, 11)
+    | where Computer has "DC" or Computer has "DomainController"
+    | extend Hour = datetime_part("Hour", TimeGenerated)
+    | where Hour < 6 or Hour >= 18
+    | project TimeGenerated, Computer, Account, TargetAccount, LogonType, IpAddress, WorkstationName
+  aql: |
+    SELECT username, sourceip, destinationip, LOGSOURCENAME(logsourceid) AS destination_host, "Logon Type", eventtime, COUNT(*) AS logon_count
+    FROM events
+    WHERE "EventID" IN ('528', '540', '4624')
+      AND "Logon Type" IN ('2', '10', '11')
+      AND (HOUR(eventtime) < 8 OR HOUR(eventtime) >= 18 OR DAYOFWEEK(eventtime) IN (1, 7))
+    GROUP BY username, sourceip, destinationip, LOGSOURCENAME(logsourceid), "Logon Type", eventtime
+    LAST 24 HOURS
+  yara_l: "rule off_hours_domain_controller_logon {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects successful interactive\
+    \ logons to domain controllers outside production hours - T1078 Initial Access\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1078\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.metadata.product_event_type\
+    \ = /528|540|4624/\n    $e.security_result.action = \"ALLOW\"\n    ($e.metadata.product_log_id = \"2\" or \n     $e.metadata.product_log_id\
+    \ = \"10\" or \n     $e.metadata.product_log_id = \"11\")\n    $e.target.hostname = $dc_host\n    $e.target.user.userid = $user\n    \n  \
+    \  // Off-hours check: outside 08:00-18:00 Monday-Friday\n    not (\n      timestamp.get_hour($e.metadata.event_timestamp) >= 8 and\n    \
+    \  timestamp.get_hour($e.metadata.event_timestamp) < 18 and\n      timestamp.get_day_of_week($e.metadata.event_timestamp) >= 2 and\n     \
+    \ timestamp.get_day_of_week($e.metadata.event_timestamp) <= 6\n    )\n    \n  match:\n    $dc_host, $user over 5m\n    \n  condition:\n  \
+    \  $e\n}\n"
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code IN ("528", "540", "4624")
+      AND winlog.event_data.LogonType IN ("2", "10", "11")
+      AND @timestamp > NOW() - 24 hour
+    | EVAL hour_of_day = DATE_EXTRACT("hour", @timestamp)
+    | EVAL day_of_week = DATE_EXTRACT("dow", @timestamp)
+    | WHERE (day_of_week IN (0, 6)) OR (hour_of_day < 6 OR hour_of_day >= 20)
+    | STATS login_count = COUNT(*) BY user.name, host.name, winlog.event_data.LogonType, winlog.event_data.WorkstationName
+    | KEEP user.name, host.name, winlog.event_data.LogonType, winlog.event_data.WorkstationName, login_count
+  leql: |
+    where(source_json.EventID IN [528, 540, 4624] AND source_json.LogonType IN [2, 10, 11])
+  crowdstrike: |
+    EventCode=4624 LogonType IN [2, 10, 11]
+    | regex("(?<IsDC>DC)", field=ComputerName, strict=false)
+    | IsDC=*
+    | @timestamp.hour < 8 OR @timestamp.hour >= 18
+    | table([@timestamp, ComputerName, TargetUserName, LogonType, IpAddress, WorkstationName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (528, 540, 4624)
+    | filter action_evtlog_event_data_LogonType in ("2", "10", "11")
+    | alter hour_of_day = to_integer(format_timestamp("%H", _time))
+    | alter day_of_week = to_integer(format_timestamp("%u", _time))
+    | filter (hour_of_day < 8 or hour_of_day >= 18) or (day_of_week >= 6)
+    | fields _time, agent_hostname, action_evtlog_event_data_TargetUserName, action_evtlog_event_data_LogonType, action_evtlog_event_data_WorkstationName, action_evtlog_event_data_IpAddress
+  lucene: |
+    event.code:4624 AND winlog.event_data.LogonType:(2 OR 10 OR 11)
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Active*Directory* ("4624" OR "528" OR "540")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "LogonType" as logon_type
+    | json field=_raw "Computer" as destination_host
+    | json field=_raw "TimeCreated" as event_time
+    | where event_id in ("528", "540", "4624")
+    | where logon_type in ("2", "10", "11")
+    | where destination_host matches "*DC*" or destination_host matches "*domain*controller*"
+    | parseDate(event_time, "yyyy-MM-dd'T'HH:mm:ss") as parsed_time
+    | formatDate(parsed_time, "HH") as hour_of_day
+    | formatDate(parsed_time, "u") as day_of_week
+    | where (hour_of_day < "08" or hour_of_day >= "18") or (day_of_week = "6" or day_of_week = "7")
+    | fields event_time, destination_host, event_id, logon_type
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -98,7 +109,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Windows Authentication Success Event
 

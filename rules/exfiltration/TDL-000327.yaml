@@ -15,71 +15,53 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudwatch:guardduty (finding.type="Backdoor:EC2/Spambot" OR finding.type="Behavior:EC2/NetworkPortUnusual" OR finding.type="Behavior:EC2/TrafficVolumeUnusual")
-    | table _time, finding.type, finding.severity, resource.instanceDetails.instanceId, resource.instanceDetails.networkInterfaces{}.privateIpAddress, finding.title, finding.description
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: 'index=aws sourcetype=aws:cloudwatch:guardduty (finding.type="Backdoor:EC2/Spambot" OR finding.type="Behavior:EC2/NetworkPortUnusual" OR
+    finding.type="Behavior:EC2/TrafficVolumeUnusual")
 
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+    | table _time, finding.type, finding.severity, resource.instanceDetails.instanceId, resource.instanceDetails.networkInterfaces{}.privateIpAddress,
+    finding.title, finding.description
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exf_000327 {\n  meta:\n    author = \"TDL\"\n    description = \"EC2 Anomalous Network Activity Detected - GuardDuty\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0010\"\n    technique = \"T1571\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where ActivityType in ("Backdoor:EC2/Spambot", "Behavior:EC2/NetworkPortUnusual", "Behavior:EC2/TrafficVolumeUnusual")
+    | project TimeGenerated, ActivityType, Title, Description, AccountId, Region, ResourceType, InstanceId = tostring(parse_json(Resource).InstanceDetails.InstanceId), Severity
+  aql: |
+    SELECT QIDNAME(qid) AS event_type, sourceip, destinationip, username, LOGSOURCENAME(logsourceid) AS log_source, eventtime, COUNT(*) AS event_count
+    FROM events
+    WHERE (QIDNAME(qid) ILIKE '%Backdoor:EC2/Spambot%' OR QIDNAME(qid) ILIKE '%Behavior:EC2/NetworkPortUnusual%' OR QIDNAME(qid) ILIKE '%Behavior:EC2/TrafficVolumeUnusual%')
+      AND LOGSOURCENAME(logsourceid) ILIKE '%guardduty%'
+    GROUP BY QIDNAME(qid), sourceip, destinationip, username, LOGSOURCENAME(logsourceid), eventtime
+    LAST 24 HOURS
+  yara_l: "rule aws_guardduty_exfiltration_findings {\n  meta:\n    author = \"TDL\"\n    description = \"Detects AWS GuardDuty findings indicative\
+    \ of exfiltration over non-standard ports (T1571)\"\n    mitre_attack_tactic = \"Exfiltration\"\n    mitre_attack_technique = \"T1571\"\n\
+    \    severity = \"HIGH\"\n  \n  events:\n    $e.metadata.vendor_name = \"Amazon AWS\"\n    $e.metadata.product_name = \"GuardDuty\"\n    (\n\
+    \      $e.metadata.product_event_type = \"Backdoor:EC2/Spambot\" or\n      $e.metadata.product_event_type = \"Behavior:EC2/NetworkPortUnusual\"\
+    \ or\n      $e.metadata.product_event_type = \"Behavior:EC2/TrafficVolumeUnusual\"\n    )\n    $e.principal.resource.id = $instance_id\n \
+    \ \n  match:\n    $instance_id over 5m\n  \n  outcome:\n    $risk_score = max(75)\n    $instance_id_out = array_distinct($instance_id)\n \
+    \   $finding_types = array_distinct($e.metadata.product_event_type)\n  \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("Backdoor:EC2/Spambot", "Behavior:EC2/NetworkPortUnusual", "Behavior:EC2/TrafficVolumeUnusual")
+    | KEEP @timestamp, cloud.account.id, cloud.instance.id, cloud.region, event.type, event.severity, source.ip, destination.ip, destination.port, aws.guardduty.finding.id
+  leql: |
+    where(source_json.type IN ["Backdoor:EC2/Spambot", "Behavior:EC2/NetworkPortUnusual", "Behavior:EC2/TrafficVolumeUnusual"])
+  crowdstrike: |
+    #repo=guardduty event.type IN ["Backdoor:EC2/Spambot", "Behavior:EC2/NetworkPortUnusual", "Behavior:EC2/TrafficVolumeUnusual"]
+    | table([@timestamp, event.type, resource.instanceDetails.instanceId, service.action.networkConnectionAction.remoteIpDetails.ipAddressV4, severity])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and vendor_name = "AWS" and event_type = "GuardDuty"
+    | filter json_extract_scalar(raw_log, "$.type") in ("Backdoor:EC2/Spambot", "Behavior:EC2/NetworkPortUnusual", "Behavior:EC2/TrafficVolumeUnusual")
+    | fields _time, cloud_provider, event_type, json_extract_scalar(raw_log, "$.type") as finding_type, json_extract_scalar(raw_log, "$.id") as finding_id, json_extract_scalar(raw_log, "$.resource.instanceDetails.instanceId") as instance_id, json_extract_scalar(raw_log, "$.severity") as severity
+  lucene: |
+    eventName:"GuardDuty Finding" AND finding.type:("Backdoor:EC2/Spambot" OR "Behavior:EC2/NetworkPortUnusual" OR "Behavior:EC2/TrafficVolumeUnusual")
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty* OR _source=*guardduty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("Backdoor:EC2/Spambot", "Behavior:EC2/NetworkPortUnusual", "Behavior:EC2/TrafficVolumeUnusual")
+    | fields _messageTime, event_type, _sourceHost, _raw
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -89,7 +71,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Backdoor:EC2/Spambot\", \"Behavior:EC2/NetworkPortUnusual\", \"Behavior:EC2/TrafficVolumeUnusual\"\
   ]"

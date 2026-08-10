@@ -17,106 +17,152 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    (index=network (sourcetype=snort OR sourcetype=suricata OR sourcetype=ids OR sourcetype=ips) signature IN ("*SQL Injection*", "*sql injection*") src_ip!=10.* src_ip!=172.16.* src_ip!=192.168.* dest_ip IN (10.*, 172.16.*, 192.168.*))
+  spl: "(index=network (sourcetype=snort OR sourcetype=suricata OR sourcetype=ids OR sourcetype=ips) signature IN (\"*SQL Injection*\", \"*sql\
+    \ injection*\") src_ip!=10.* src_ip!=172.16.* src_ip!=192.168.* dest_ip IN (10.*, 172.16.*, 192.168.*))\nOR\n(index=network (sourcetype=firewall\
+    \ OR sourcetype=paloalto OR sourcetype=checkpoint OR sourcetype=fortinet) action IN (allow, allowed, accept) src_ip!=10.* src_ip!=172.16.*\
+    \ src_ip!=192.168.* dest_ip IN (10.*, 172.16.*, 192.168.*) bytes_in>10485760)\nOR\n(index=network (sourcetype=waf OR sourcetype=imperva OR\
+    \ sourcetype=akamai OR sourcetype=cloudflare_waf) signature IN (\"*SQL Injection*\", \"*sql injection*\") action IN (allow, allowed, permit))\n\
+    | eval event_type=case(\n    match(sourcetype, \"(?i)(snort|suricata|ids|ips)\"), \"ids\",\n    match(sourcetype, \"(?i)(firewall|paloalto|checkpoint|fortinet)\"\
+    ), \"firewall\",\n    match(sourcetype, \"(?i)(waf|imperva|akamai|cloudflare)\"), \"waf\",\n    1=1, \"unknown\"\n)\n| eval src_ip=coalesce(src_ip,\
+    \ src, source_ip)\n| eval dest_ip=coalesce(dest_ip, dest, destination_ip, dst_ip)\n| eval src_port=coalesce(src_port, source_port)\n| eval\
+    \ bytes_in=coalesce(bytes_in, bytes_received, recv_bytes)\n| eval signature=lower(coalesce(signature, sig_name, rule_name, message))\n| eval\
+    \ action=lower(coalesce(action, act))\n| eval combo_key=src_ip.\"|\".dest_ip.\"|\".src_port\n| transaction combo_key maxspan=15m startswith=(event_type=\"\
+    ids\") endswith=(event_type=\"firewall\")\n| search event_type=\"ids\" AND event_type=\"firewall\"\n| where match(signature, \"(?i)sql injection\"\
+    ) AND bytes_in>10485760\n| append [\n    search index=network (sourcetype=waf OR sourcetype=imperva OR sourcetype=akamai OR sourcetype=cloudflare_waf)\n\
+    \    | eval signature=lower(coalesce(signature, sig_name, rule_name, message))\n    | eval action=lower(coalesce(action, act))\n    | where\
+    \ match(signature, \"(?i)sql injection\") AND match(action, \"(?i)(allow|permit)\")\n]\n| table _time, src_ip, dest_ip, src_port, event_type,\
+    \ signature, action, bytes_in\n"
+  kql: "let SqlInjectionIDS = \n    CommonSecurityLog\n    | where TimeGenerated > ago(1h)\n    | where DeviceVendor has_any (\"Palo Alto\", \"\
+    Fortinet\", \"Cisco\", \"Check Point\", \"Snort\", \"Suricata\")\n    | where DeviceEventClassID in (\"ids\", \"ips\", \"intrusion\")\n  \
+    \  | where DeviceAction != \"Blocked\" or isempty(DeviceAction)\n    | where Activity contains \"SQL Injection\" or Message contains \"SQL\
+    \ Injection\" or DeviceCustomString1 contains \"SQL Injection\" or DeviceCustomString2 contains \"SQL Injection\"\n    | where CommunicationDirection\
+    \ == \"Inbound\" or (DestinationIP startswith \"10.\" or DestinationIP startswith \"172.\" or DestinationIP startswith \"192.168.\")\n   \
+    \ | where not (SourceIP startswith \"10.\" or SourceIP startswith \"172.\" or SourceIP startswith \"192.168.\")\n    | project IDSTime = TimeGenerated,\
+    \ SourceIP, DestinationIP, SourcePort, DeviceVendor, Activity, Message;\nlet FirewallAfterIDS = \n    CommonSecurityLog\n    | where TimeGenerated\
+    \ > ago(1h)\n    | where DeviceVendor has_any (\"Palo Alto\", \"Fortinet\", \"Cisco\", \"Check Point\", \"Firewall\")\n    | where DeviceAction\
+    \ in (\"Allow\", \"Allowed\", \"Accept\", \"Permit\")\n    | where CommunicationDirection == \"Inbound\" or (DestinationIP startswith \"10.\"\
+    \ or DestinationIP startswith \"172.\" or DestinationIP startswith \"192.168.\")\n    | where not (SourceIP startswith \"10.\" or SourceIP\
+    \ startswith \"172.\" or SourceIP startswith \"192.168.\")\n    | where ReceivedBytes > 10485760\n    | project FWTime = TimeGenerated, SourceIP,\
+    \ DestinationIP, SourcePort, ReceivedBytes, DeviceAction;\nlet WAFSqlInjection = \n    AzureDiagnostics\n    | where TimeGenerated > ago(1h)\n\
+    \    | where Category == \"ApplicationGatewayFirewallLog\" or ResourceType == \"APPLICATIONGATEWAYS\"\n    | where Message contains \"SQL\
+    \ Injection\" or ruleId_s contains \"SQL\" or details_message_s contains \"SQL Injection\"\n    | where action_s =~ \"Allowed\" or Action\
+    \ =~ \"Allowed\"\n    | project WAFTime = TimeGenerated, clientIp_s, hostname_s, Message, action_s, ruleId_s\n    | extend SourceIP = clientIp_s;\n\
+    let CorrelatedIDSFirewall = \n    SqlInjectionIDS\n    | join kind=inner (FirewallAfterIDS) on SourceIP, DestinationIP, SourcePort\n    |\
+    \ where FWTime between (IDSTime .. (IDSTime + 15m))\n    | project IDSTime, FWTime, SourceIP, DestinationIP, SourcePort, ReceivedBytes, Activity,\
+    \ Message;\nunion \n    (CorrelatedIDSFirewall | extend DetectionType = \"IDS + Firewall Correlation\"),\n    (WAFSqlInjection | extend DetectionType\
+    \ = \"WAF Allowed SQL Injection\" | project WAFTime, SourceIP, hostname_s, Message, action_s, ruleId_s, DetectionType)\n"
+  aql: "SELECT sourceip, destinationip, sourceport, \n       FIRST(categoryname(category)) AS first_category,\n       LAST(categoryname(category))\
+    \ AS last_category,\n       FIRST(qidname(qid)) AS first_signature,\n       LAST(qidname(qid)) AS last_signature,\n       MIN(eventtime) AS\
+    \ first_event_time,\n       MAX(eventtime) AS last_event_time,\n       SUM(bytesreceived) AS total_bytes_in\nFROM events\nWHERE (categoryname(category)\
+    \ ILIKE '%IDS%' OR categoryname(category) ILIKE '%IPS%' OR categoryname(category) ILIKE '%Intrusion%' OR categoryname(category) ILIKE '%WAF%'\
+    \ OR categoryname(category) ILIKE '%Firewall%')\n  AND (qidname(qid) ILIKE '%SQL Injection%' OR \"Signature\" ILIKE '%SQL Injection%')\n \
+    \ AND ((categoryname(category) ILIKE '%WAF%' AND (LOWER(\"Action\") = 'allowed' OR LOWER(\"Action\") = 'permit'))\n       OR (categoryname(category)\
+    \ NOT ILIKE '%WAF%'))\n  AND sourceip NOT IN (SELECT destinationip FROM events LAST 15 MINUTES)\nGROUP BY sourceip, destinationip, sourceport\n\
+    HAVING COUNT(DISTINCT category) >= 2\n   AND SUM(bytesreceived) > 10485760\n   AND (MAX(eventtime) - MIN(eventtime)) <= 900000\nLAST 15 MINUTES\n"
+  yara_l: "rule sql_injection_followed_by_large_data_transfer {\n  meta:\n    author = \"TDL\"\n    description = \"Detects SQL injection attempt\
+    \ followed by large data exfiltration or WAF allowed SQL injection\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1190\"\n    severity = \"HIGH\"\n  \n  events:\n    // IDS/IPS SQL Injection detection\n    $ids.metadata.event_type = \"NETWORK_CONNECTION\"\
+    \n    $ids.metadata.product_event_type = \"IDS_ALERT\" or $ids.metadata.product_event_type = \"IPS_ALERT\"\n    $ids.network.direction = \"\
+    INBOUND\"\n    re.regex($ids.security_result.summary, `(?i)sql.?injection`)\n    not net.ip_in_range_cidr($ids.principal.ip, \"10.0.0.0/8\"\
+    )\n    not net.ip_in_range_cidr($ids.principal.ip, \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($ids.principal.ip, \"192.168.0.0/16\"\
+    )\n    net.ip_in_range_cidr($ids.target.ip, \"10.0.0.0/8\") or net.ip_in_range_cidr($ids.target.ip, \"172.16.0.0/12\") or net.ip_in_range_cidr($ids.target.ip,\
+    \ \"192.168.0.0/16\")\n    $ids.principal.ip = $src_ip\n    $ids.target.ip = $dst_ip\n    $ids.principal.port = $src_port\n    \n    // Firewall\
+    \ large data transfer\n    $fw.metadata.event_type = \"NETWORK_CONNECTION\"\n    $fw.metadata.product_event_type = \"FIREWALL\"\n    $fw.network.direction\
+    \ = \"INBOUND\"\n    $fw.network.received_bytes > 10485760\n    not net.ip_in_range_cidr($fw.principal.ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($fw.principal.ip,\
+    \ \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($fw.principal.ip, \"192.168.0.0/16\")\n    net.ip_in_range_cidr($fw.target.ip, \"10.0.0.0/8\"\
+    ) or net.ip_in_range_cidr($fw.target.ip, \"172.16.0.0/12\") or net.ip_in_range_cidr($fw.target.ip, \"192.168.0.0/16\")\n    $fw.principal.ip\
+    \ = $src_ip\n    $fw.target.ip = $dst_ip\n    $fw.principal.port = $src_port\n    $fw.metadata.event_timestamp.seconds > $ids.metadata.event_timestamp.seconds\n\
+    \    \n    // WAF allowed SQL injection\n    $waf.metadata.event_type = \"NETWORK_CONNECTION\"\n    $waf.metadata.product_event_type = \"\
+    WAF_ALERT\"\n    re.regex($waf.security_result.summary, `(?i)sql.?injection`)\n    $waf.security_result.action = \"ALLOW\"\n    \n  match:\n\
+    \    $src_ip, $dst_ip, $src_port over 15m\n    \n  outcome:\n    $risk_score = max(85)\n    $src_ip_out = array_distinct($src_ip)\n    $dst_ip_out\
+    \ = array_distinct($dst_ip)\n    $bytes_transferred = max($fw.network.received_bytes)\n    \n  condition:\n    (#ids >= 1 and #fw >= 1) or\
+    \ #waf >= 1\n}\n"
+  esql: "FROM logs-network.ids*, logs-network.ips*, logs-network.waf*\n| WHERE @timestamp > NOW() - 15 minutes\n| EVAL event_type = CASE(\n  \
+    \  event.dataset LIKE \"*ids*\" OR event.dataset LIKE \"*ips*\", \"ids_ips\",\n    event.dataset LIKE \"*waf*\", \"waf\",\n    \"other\"\n\
+    \  )\n| EVAL is_sql_injection = CASE(\n    TO_LOWER(COALESCE(rule.name, event.action, \"\")) LIKE \"*sql injection*\", 1,\n    0\n  )\n| EVAL\
+    \ is_inbound = CASE(\n    network.direction == \"inbound\" OR (source.nat.ip IS NOT NULL AND destination.nat.ip IS NULL), 1,\n    0\n  )\n\
+    | WHERE (event_type == \"ids_ips\" AND is_sql_injection == 1 AND is_inbound == 1)\n    OR (event_type == \"waf\" AND is_sql_injection == 1\
+    \ AND TO_LOWER(event.action) == \"allowed\")\n    OR (event.dataset LIKE \"*firewall*\" AND is_inbound == 1 AND network.bytes > 10485760)\n\
+    | STATS \n    ids_count = SUM(CASE(event_type == \"ids_ips\" AND is_sql_injection == 1, 1, 0)),\n    fw_count = SUM(CASE(event.dataset LIKE\
+    \ \"*firewall*\" AND network.bytes > 10485760, 1, 0)),\n    waf_count = SUM(CASE(event_type == \"waf\" AND is_sql_injection == 1, 1, 0)),\n\
+    \    min_time = MIN(@timestamp),\n    max_time = MAX(@timestamp),\n    total_bytes = MAX(network.bytes)\n  BY source.ip, destination.ip, source.port\n\
+    | WHERE (ids_count >= 1 AND fw_count >= 1) OR waf_count >= 1\n| EVAL time_diff_minutes = (max_time - min_time) / 60000\n| WHERE (ids_count\
+    \ >= 1 AND fw_count >= 1 AND time_diff_minutes <= 15) OR waf_count >= 1\n| KEEP source.ip, destination.ip, source.port, ids_count, fw_count,\
+    \ waf_count, total_bytes, min_time, max_time, time_diff_minutes\n"
+  leql: |
+    I need to note that Rapid7 InsightIDR LEQL cannot express multi-stage sequential correlation logic ("Followed By...Within 15 minutes") or cross-log-set joins in a single query. LEQL queries are single-pass filters and aggregations over one log set at a time.
+
+    For the detection requirements given (IDS event followed by Firewall event, or WAF event), you would need to create separate queries and use InsightIDR's Alert Rules or Detection Rules to correlate them, or query each stage independently.
+
+    However, I can provide the individual LEQL queries for each component:
+
+    **IDS/IPS SQL Injection Detection:**
+    ```
+    where(signature ICONTAINS "SQL Injection" AND direction=INBOUND)
+    ```
+
+    **Firewall High Data Transfer (to correlate manually with above):**
+    ```
+    where(direction=INBOUND AND bytes_in > 10485760)
+    ```
+
+    **WAF SQL Injection Allowed:**
+    ```
+    where(signature ICONTAINS "SQL Injection" AND action="Allowed")
+    ```
+
+    Since you requested ONE query, the closest single LEQL query for the WAF component would be:
+
+    where(signature ICONTAINS "SQL Injection" AND action="Allowed")
+  crowdstrike: "(#type=ids OR #type=ips OR #type=waf OR #type=firewall)\n| case {\n    (#type=ids OR #type=ips) AND signature=/SQL Injection/i\
+    \ AND direction=inbound | \n      SourceIP=* DestinationIP=* SourcePort=* | \n      groupBy([SourceIP, DestinationIP, SourcePort], function=[min(@timestamp,\
+    \ as=ids_time)]) |\n      rename(field=\"SourceIP\", as=\"src_ip\") |\n      rename(field=\"DestinationIP\", as=\"dst_ip\") |\n      rename(field=\"\
+    SourcePort\", as=\"src_port\") |\n      event_type := \"ids_ips\" ;\n    \n    #type=firewall AND direction=inbound AND bytes_in > 10485760\
+    \ |\n      SourceIP=* DestinationIP=* SourcePort=* |\n      groupBy([SourceIP, DestinationIP, SourcePort], function=[min(@timestamp, as=fw_time)])\
+    \ |\n      rename(field=\"SourceIP\", as=\"src_ip\") |\n      rename(field=\"DestinationIP\", as=\"dst_ip\") |\n      rename(field=\"SourcePort\"\
+    , as=\"src_port\") |\n      event_type := \"firewall\" ;\n    \n    #type=waf AND signature=/SQL Injection/i AND action=allowed |\n      groupBy([SourceIP,\
+    \ DestinationIP], function=[min(@timestamp, as=waf_time)]) |\n      rename(field=\"SourceIP\", as=\"src_ip\") |\n      rename(field=\"DestinationIP\"\
+    , as=\"dst_ip\") |\n      event_type := \"waf\" ;\n    \n    * | drop()\n  }\n| selfJoin(field=[src_ip, dst_ip, src_port], where=[{event_type=ids_ips},\
+    \ {event_type=firewall}], key=correlation)\n| test(fw_time >= ids_time AND fw_time <= ids_time + 15m)\n| table([src_ip, dst_ip, src_port,\
+    \ ids_time, fw_time])\n"
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter threat_category = "vulnerability" and lowercase(threat_name) contains "sql injection" and inbound_outbound = "Inbound"
+    | alter external_src = action_external_hostname, internal_dst = action_local_ip, src_port = action_external_port
+    | join type=inner (
+        dataset = panw_ngfw_traffic_raw
+        | filter inbound_outbound = "Inbound" and bytes_received > 10485760
+        | alter external_src = action_external_hostname, internal_dst = action_local_ip, src_port = action_external_port, traffic_time = _time
+    ) as traffic on external_src = traffic.external_src and internal_dst = traffic.internal_dst and src_port = traffic.src_port
+    | filter traffic.traffic_time >= _time and traffic.traffic_time <= _time + 900000
+    | fields _time, external_src, internal_dst, src_port, threat_name, traffic.bytes_received, traffic.traffic_time
+  lucene: |
+    (event_type:"IDS" OR event_type:"IPS" OR event_type:"Intrusion Detection" OR event_type:"Intrusion Prevention") AND signature:*SQL?Injection* AND network_direction:inbound AND NOT source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND (destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16))
+    ```
+
     OR
-    (index=network (sourcetype=firewall OR sourcetype=paloalto OR sourcetype=checkpoint OR sourcetype=fortinet) action IN (allow, allowed, accept) src_ip!=10.* src_ip!=172.16.* src_ip!=192.168.* dest_ip IN (10.*, 172.16.*, 192.168.*) bytes_in>10485760)
-    OR
-    (index=network (sourcetype=waf OR sourcetype=imperva OR sourcetype=akamai OR sourcetype=cloudflare_waf) signature IN ("*SQL Injection*", "*sql injection*") action IN (allow, allowed, permit))
-    | eval event_type=case(
-        match(sourcetype, "(?i)(snort|suricata|ids|ips)"), "ids",
-        match(sourcetype, "(?i)(firewall|paloalto|checkpoint|fortinet)"), "firewall",
-        match(sourcetype, "(?i)(waf|imperva|akamai|cloudflare)"), "waf",
-        1=1, "unknown"
-    )
-    | eval src_ip=coalesce(src_ip, src, source_ip)
-    | eval dest_ip=coalesce(dest_ip, dest, destination_ip, dst_ip)
-    | eval src_port=coalesce(src_port, source_port)
-    | eval bytes_in=coalesce(bytes_in, bytes_received, recv_bytes)
-    | eval signature=lower(coalesce(signature, sig_name, rule_name, message))
-    | eval action=lower(coalesce(action, act))
-    | eval combo_key=src_ip."|".dest_ip."|".src_port
-    | transaction combo_key maxspan=15m startswith=(event_type="ids") endswith=(event_type="firewall")
-    | search event_type="ids" AND event_type="firewall"
-    | where match(signature, "(?i)sql injection") AND bytes_in>10485760
-    | append [
-        search index=network (sourcetype=waf OR sourcetype=imperva OR sourcetype=akamai OR sourcetype=cloudflare_waf)
-        | eval signature=lower(coalesce(signature, sig_name, rule_name, message))
-        | eval action=lower(coalesce(action, act))
-        | where match(signature, "(?i)sql injection") AND match(action, "(?i)(allow|permit)")
-    ]
-    | table _time, src_ip, dest_ip, src_port, event_type, signature, action, bytes_in
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
 
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000242 {\n  meta:\n    author = \"TDL\"\n    description = \"Successful SQL Injection\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    ```
+    event_type:WAF AND signature:*SQL?Injection* AND (action:Allowed OR action:allowed OR action:ALLOWED)
+  sumo: |
+    _sourceCategory=*IDS* OR _sourceCategory=*IPS* OR _sourceCategory=*Firewall* OR _sourceCategory=*WAF*
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "src_port" as src_port
+    | json field=_raw "signature" as signature
+    | json field=_raw "action" as action
+    | json field=_raw "bytes_in" as bytes_in
+    | json field=_raw "direction" as direction
+    | where (event_type matches "*IDS*" or event_type matches "*IPS*") and direction matches "*inbound*" and signature matches "*(?i)sql injection*"
+       or (event_type matches "*firewall*" and direction matches "*inbound*" and num(bytes_in) > 10485760)
+       or (event_type matches "*WAF*" and signature matches "*(?i)sql injection*" and action matches "*(?i)allowed*")
+    | timeslice 15m
+    | first(_messageTime) as first_time, last(_messageTime) as last_time by _timeslice, src_ip, dest_ip, src_port, event_type, signature, action, bytes_in
+    | transpose row _timeslice, src_ip, dest_ip, src_port column event_type
+    | where (isnotnull(IDS) or isnotnull(IPS)) and isnotnull(firewall)
+       or isnotnull(WAF)
+    | fields _timeslice, src_ip, dest_ip, src_port, IDS, IPS, firewall, WAF
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -126,7 +172,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 IDS/IPS Exploit Event
 

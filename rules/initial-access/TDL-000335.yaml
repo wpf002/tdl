@@ -15,71 +15,50 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=* sourcetype=aws:cloudwatchlogs:guardduty (finding.type="Recon:IAMUser/TorIPCaller" OR finding.type="UnauthorizedAccess:IAMUser/TorIPCaller")
-    | table _time, finding.type, finding.severity, finding.accountId, finding.resource.accessKeyDetails.userName, finding.service.action.awsApiCallAction.remoteIpDetails.ipAddressV4, finding.service.action.awsApiCallAction.api, finding.description
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: 'index=* sourcetype=aws:cloudwatchlogs:guardduty (finding.type="Recon:IAMUser/TorIPCaller" OR finding.type="UnauthorizedAccess:IAMUser/TorIPCaller")
 
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+    | table _time, finding.type, finding.severity, finding.accountId, finding.resource.accessKeyDetails.userName, finding.service.action.awsApiCallAction.remoteIpDetails.ipAddressV4,
+    finding.service.action.awsApiCallAction.api, finding.description
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000335 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS IAM User Activity from TOR Exit Node - GuardDuty\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where ActivityType in ("Recon:IAMUser/TorIPCaller", "UnauthorizedAccess:IAMUser/TorIPCaller")
+    | project TimeGenerated, ActivityType, Title, Description, Severity, AccountId, ResourceType, UserName, IpAddress = tostring(parse_json(ServiceAction).networkConnectionAction.remoteIpDetails.ipAddressV4), City = tostring(parse_json(ServiceAction).networkConnectionAction.remoteIpDetails.city.cityName), Country = tostring(parse_json(ServiceAction).networkConnectionAction.remoteIpDetails.country.countryName)
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS source, sourceip, username, "aws.guardduty.type" AS event_type, "aws.guardduty.severity"
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%guardduty%'
+      AND ("aws.guardduty.type" = 'Recon:IAMUser/TorIPCaller' OR "aws.guardduty.type" = 'UnauthorizedAccess:IAMUser/TorIPCaller')
+    LAST 24 HOURS
+  yara_l: "rule aws_tor_ip_caller_guardduty {\n  meta:\n    author = \"TDL\"\n    description = \"Detects AWS IAM user activity from Tor IP addresses\
+    \ via GuardDuty\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"HIGH\"\n    \n \
+    \ events:\n    $e.metadata.vendor_name = \"AMAZON\"\n    $e.metadata.product_name = \"AWS GuardDuty\"\n    (\n      $e.metadata.product_event_type\
+    \ = \"Recon:IAMUser/TorIPCaller\" or\n      $e.metadata.product_event_type = \"UnauthorizedAccess:IAMUser/TorIPCaller\"\n    )\n    $e.target.user.userid\
+    \ = $user\n    $e.principal.ip = $ip\n    \n  match:\n    $user over 1h\n    \n  outcome:\n    $risk_score = 85\n    \n  condition:\n    $e\n\
+    }\n"
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("Recon:IAMUser/TorIPCaller", "UnauthorizedAccess:IAMUser/TorIPCaller")
+    | KEEP @timestamp, cloud.account.id, user.name, source.ip, event.type, event.action, aws.guardduty.severity
+  leql: |
+    where(source_json.type IN ["Recon:IAMUser/TorIPCaller", "UnauthorizedAccess:IAMUser/TorIPCaller"])
+  crowdstrike: |
+    #repo=guardduty (detail.type="Recon:IAMUser/TorIPCaller" OR detail.type="UnauthorizedAccess:IAMUser/TorIPCaller")
+    | table([@timestamp, detail.type, detail.resource.accessKeyDetails.userName, detail.resource.accessKeyDetails.accessKeyId, detail.service.action.awsApiCallAction.remoteIpDetails.ipAddressV4, detail.accountId, detail.region])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and vendor_name = "Amazon GuardDuty"
+    | filter raw_log contains "Recon:IAMUser/TorIPCaller" or raw_log contains "UnauthorizedAccess:IAMUser/TorIPCaller"
+    | fields _time, cloud_provider, vendor_name, actor_user, resource_type, resource_sub_type, raw_log
+  lucene: |
+    eventName:"GuardDuty Finding" AND (finding.type:"Recon:IAMUser/TorIPCaller" OR finding.type:"UnauthorizedAccess:IAMUser/TorIPCaller")
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty* OR _sourceCategory=*AWS*
+    | json field=_raw "type" as event_type
+    | where event_type in ("Recon:IAMUser/TorIPCaller", "UnauthorizedAccess:IAMUser/TorIPCaller")
+    | fields _messageTime, _sourceHost, event_type
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +68,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Recon:IAMUser/TorIPCaller\", \"UnauthorizedAccess:IAMUser/TorIPCaller\"]"
 suppression:

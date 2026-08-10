@@ -16,76 +16,81 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=antivirus signature_name=* OR action="blocked" OR action="quarantined"
+  spl: 'index=antivirus signature_name=* OR action="blocked" OR action="quarantined"
+
     | lookup high_value_targets.csv host as src_host OUTPUT is_hvt
+
     | where is_hvt="true"
+
     | table _time, src_host, signature_name, file_name, file_path, user, action
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000142 {\n  meta:\n    author = \"TDL\"\n    description = \"Malware Detected on HVT Host\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    let HighValueTargets = dynamic(["DC01","DC02","EXC01","FIN-WKS01","CEO-LAPTOP"]);
+    SecurityAlert
+    | where TimeGenerated > ago(24h)
+    | where ProductName has_any ("Antivirus", "Microsoft Defender", "Windows Defender", "Endpoint Protection", "ATP")
+    | where AlertName has_any ("malware", "virus", "trojan", "ransomware", "threat")
+    | extend SourceHostname = tostring(parse_json(tostring(ExtendedProperties)).["Compromised Host"])
+    | where SourceHostname in~ (HighValueTargets) or CompromiseEntityName in~ (HighValueTargets) or Computer in~ (HighValueTargets)
+    | project TimeGenerated, AlertName, AlertSeverity, SourceHostname, CompromiseEntityName, Computer, Description, ProductName
+  aql: |
+    SELECT sourceip, LOGSOURCENAME(logsourceid) AS source_hostname, qidname(qid) AS event_name, "Malware Name", eventtime
+    FROM events
+    WHERE category IN (2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009)
+      AND LOGSOURCENAME(logsourceid) IN (SELECT "Hostname" FROM reference_data.high_value_targets)
+    LAST 1 HOURS
+  yara_l: |
+    rule malware_on_high_value_target {
+      meta:
+        author = "TDL"
+        description = "T1204 - Malicious file execution detected on high value target host"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "SCAN_VULN_HOST"
+        $e.security_result.action = "BLOCK"
+        $e.principal.hostname = $host
+        re.regex($e.security_result.category, `(?i)malware|virus|trojan|ransomware|backdoor`)
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = max(85)
+        $hostname = array_distinct($e.principal.hostname)
+        $file_path = array_distinct($e.target.file.full_path)
+        $threat_name = array_distinct($e.security_result.summary)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e and #host in %high_value_targets
+    }
+  esql: "FROM .alerts-security.alerts-*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.kind == \"alert\" \n  AND event.category == \"malware\"\
+    \n  AND host.name IN (\"DC01\", \"DC02\", \"EXCH01\", \"EXCH02\", \"BACKUP01\", \"SQLPROD01\", \"FILESERVER01\", \"JUMPHOST01\")\n| KEEP @timestamp,\
+    \ host.name, user.name, file.name, file.path, threat.indicator.description, event.action, rule.name\n"
+  leql: |
+    where(source_json.alert_type="Malware" AND source_json.source_hostname IN [high_value_targets])
+  crowdstrike: |
+    event_simpleName=DetectionSummaryEvent
+    | match(file="high_value_hosts.csv", field=ComputerName, include=[ComputerName], strict=false)
+    | table([@timestamp, ComputerName, UserName, FileName, DetectDescription, Severity, SHA256HashData])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_MALWARE and event_sub_type = ENUM.EVENT_SUB_TYPE_MALWARE_DETECTED
+    | alter is_hvt = arrayindex(regextract(agent_hostname, "(?i)(dc|domain|sql|exchange|pki|ca|jump|vpn|admin|ceo|cfo|exec)"), 0) != null
+    | filter is_hvt = true
+    | fields _time, agent_hostname, action_process_image_name, action_file_path, action_file_sha256, actor_effective_username, event_sub_type
+  lucene: |
+    event.type:"antivirus" AND (event.action:"malware_detected" OR event.category:"malware") AND host.name:(HVT-HOST-1 OR HVT-HOST-2 OR HVT-HOST-3)
+  sumo: |
+    _sourceCategory=*Antivirus* OR _sourceCategory=*AV* OR _sourceCategory=*Malware*
+    | json field=_raw "hostname" as source_host, "event_type" as event_type, "threat_name" as threat_name, "detection" as detection
+    | where event_type matches "*malware*" OR event_type matches "*threat*" OR event_type matches "*detection*" OR detection matches "*detected*" OR detection matches "*blocked*"
+    | lookup high_value_targets on hostname = source_host
+    | where !isNull(high_value_targets)
+    | fields _messageTime, source_host, event_type, threat_name, detection
 false_positives:
 - Security software
 - Authorized admin tools
@@ -95,7 +100,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Malware Detection Event
 

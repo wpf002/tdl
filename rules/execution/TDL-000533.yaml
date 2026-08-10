@@ -23,68 +23,107 @@ queries:
     *okhttp*\" OR userAgent=\"*Go-http-client*\" OR userAgent=\"*HTTPie*\")\nNOT (userAgent=\"*monitoring*\" OR userAgent=\"*scanner*\" OR userAgent=\"\
     *health*check*\")\n| stats count values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN\n| where count >= 1\n\
     | table _time, userIdentity.arn, eventName, resources{}.ARN, count, src_ips\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: "AWSCloudTrail\n| where TimeGenerated > ago(90d)\n| where isnotempty(UserAgent)\n| where UserAgent has_any (\"curl\", \"wget\", \"powershell\"\
+    , \"python\", \"ruby\", \"perl\", \"bash\", \"sh\", \"cmd\", \"pwsh\", \"Invoke-WebRequest\", \"Invoke-RestMethod\")\n| where UserAgent !has_any\
+    \ (\"Amazon\", \"AWS\", \"CloudWatch\", \"Datadog\", \"NewRelic\", \"Pingdom\")\n| summarize \n    event_count = count(),\n    src_ips = make_set(SourceIpAddress),\n\
+    \    first_seen = min(TimeGenerated),\n    last_seen = max(TimeGenerated)\n    by UserIdentityArn, EventName, ResourceArn = tostring(Resources[0].ARN)\n\
+    | where event_count >= 1\n| project TimeGenerated = last_seen, UserIdentityArn, EventName, ResourceArn, event_count, src_ips, first_seen,\
+    \ last_seen\n"
+  aql: |
+    SELECT useridentity.arn AS user_arn, eventname, resources{}.arn AS resource_arn, sourceipaddress, useragent, COUNT(*) AS event_count
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%aws%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%elb%')
+      AND useragent IS NOT NULL
+      AND (useragent ILIKE '%curl%' OR useragent ILIKE '%wget%' OR useragent ILIKE '%python%' OR useragent ILIKE '%powershell%' OR useragent ILIKE '%invoke-webrequest%' OR useragent ILIKE '%boto%' OR useragent ILIKE '%aws-cli%' OR useragent ILIKE '%aws-sdk%' OR useragent ILIKE '%perl%' OR useragent ILIKE '%ruby%' OR useragent ILIKE '%go-http-client%' OR useragent ILIKE '%java%' OR useragent ILIKE '%requests%' OR useragent ILIKE '%libwww%' OR useragent ILIKE '%httpclient%')
+      AND useragent NOT ILIKE '%datadog%'
+      AND useragent NOT ILIKE '%splunk%'
+      AND useragent NOT ILIKE '%prometheus%'
+      AND useragent NOT ILIKE '%newrelic%'
+    GROUP BY useridentity.arn, eventname, resources{}.arn, sourceipaddress, useragent
+    HAVING event_count >= 1
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_elb_script_useragent_t1105 {
+      meta:
+        author = "TDL"
+        description = "Detects HTTP requests via AWS ELB with script or command-line user-agent strings indicating potential ingress tool transfer (T1105)"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1105"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.vendor_name = "AMAZON"
+        $e.metadata.product_name = "AWS CloudTrail"
+        (
+          re.regex($e.metadata.product_event_type, `(?i)UserAgent`) or
+          re.regex($e.network.http.user_agent, `.+`)
+        )
+        (
+          re.regex($e.network.http.user_agent, `(?i)(curl|wget|powershell|pwsh|python|perl|ruby|go-http-client|java|httpclient|winhttp|invoke-webrequest|invoke-restmethod|nmap|masscan|nuclei|sqlmap|metasploit|burp)`) or
+          re.regex($e.security_result.detection_fields["userAgent"], `(?i)(curl|wget|powershell|pwsh|python|perl|ruby|go-http-client|java|httpclient|winhttp|invoke-webrequest|invoke-restmethod|nmap|masscan|nuclei|sqlmap|metasploit|burp)`)
+        )
+        not re.regex($e.network.http.user_agent, `(?i)(datadog|newrelic|dynatrace|prometheus|grafana|splunk|elasticagent|pingdom|uptimerobot|site24x7)`)
+        not re.regex($e.security_result.detection_fields["userAgent"], `(?i)(datadog|newrelic|dynatrace|prometheus|grafana|splunk|elasticagent|pingdom|uptimerobot|site24x7)`)
+        $e.principal.user.userid = $arn
+        $e.metadata.product_event_type = $event_name
+        $e.target.resource.id = $resource_arn
+        $e.principal.ip = $src_ip
 
-    | where eventName matches regex "UserAgent"
+      match:
+        $arn, $event_name, $resource_arn over 1h
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+      outcome:
+        $risk_score = 50
+        $src_ips = array_distinct($src_ip)
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%UserAgent%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000533 {\n  meta:\n    author = \"TDL\"\n    description = \"Script/CLI UserAgent string\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1105\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /UserAgent/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%UserAgent%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/UserAgent/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*UserAgent*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "UserAgent"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*UserAgent*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*UserAgent*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-aws.elb_logs*,logs-aws.cloudtrail*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (user_agent.original LIKE "*curl*" OR user_agent.original LIKE "*wget*" OR user_agent.original LIKE "*python*" OR user_agent.original LIKE "*powershell*" OR user_agent.original LIKE "*bash*" OR user_agent.original LIKE "*ruby*" OR user_agent.original LIKE "*perl*" OR user_agent.original LIKE "*go-http-client*" OR user_agent.original LIKE "*Java/*" OR user_agent.original LIKE "*ansible*" OR user_agent.original LIKE "*chef*" OR user_agent.original LIKE "*puppet*")
+        OR (aws.cloudtrail.user_agent LIKE "*curl*" OR aws.cloudtrail.user_agent LIKE "*wget*" OR aws.cloudtrail.user_agent LIKE "*python*" OR aws.cloudtrail.user_agent LIKE "*powershell*" OR aws.cloudtrail.user_agent LIKE "*bash*" OR aws.cloudtrail.user_agent LIKE "*ruby*" OR aws.cloudtrail.user_agent LIKE "*perl*" OR aws.cloudtrail.user_agent LIKE "*go-http-client*" OR aws.cloudtrail.user_agent LIKE "*Java/*" OR aws.cloudtrail.user_agent LIKE "*ansible*" OR aws.cloudtrail.user_agent LIKE "*chef*" OR aws.cloudtrail.user_agent LIKE "*puppet*")
+      )
+      AND NOT (user_agent.original LIKE "*authorized_scanner*" OR user_agent.original LIKE "*monitoring_agent*" OR aws.cloudtrail.user_agent LIKE "*authorized_scanner*" OR aws.cloudtrail.user_agent LIKE "*monitoring_agent*")
+    | EVAL user_arn = COALESCE(aws.cloudtrail.user_identity.arn, user.id)
+    | EVAL event_name = COALESCE(event.action, aws.cloudtrail.event_name)
+    | EVAL resource_arn = COALESCE(aws.cloudtrail.resources.arn, cloud.resource.id)
+    | EVAL src_ip = COALESCE(source.ip, client.ip, source.address)
+    | STATS event_count = COUNT(*), src_ips = VALUES(src_ip) BY user_arn, event_name, resource_arn
+    | WHERE event_count >= 1
+    | KEEP @timestamp, user_arn, event_name, resource_arn, event_count, src_ips
+  leql: |
+    where(source_json.eventName!=null AND source_json.userAgent!=null AND (source_json.userAgent ICONTAINS "curl" OR source_json.userAgent ICONTAINS "wget" OR source_json.userAgent ICONTAINS "python" OR source_json.userAgent ICONTAINS "powershell" OR source_json.userAgent ICONTAINS "aws-cli" OR source_json.userAgent ICONTAINS "boto" OR source_json.userAgent ICONTAINS "ruby" OR source_json.userAgent ICONTAINS "perl" OR source_json.userAgent ICONTAINS "java/" OR source_json.userAgent ICONTAINS "go-http-client" OR source_json.userAgent ICONTAINS "libwww")) groupby(source_json.userIdentity.arn, source_json.eventName) calculate(count)
+  crowdstrike: |
+    #repo=aws #type=elb userAgent=/curl|wget|python|powershell|invoke-webrequest|httpclient|java|ruby|perl|go-http-client/i
+    | groupBy([userIdentity.arn, eventName, resources{}.ARN], function=[count(as=hits), collect(sourceIPAddress, as=src_ips)])
+    | hits >= 1
+    | userAgent!=/authorized-scanner|monitoring-agent|healthcheck/i
+    | table([userIdentity.arn, eventName, "resources{}.ARN", hits, src_ips, userAgent, sourceIPAddress, @timestamp])
+  xql: "dataset = cloud_audit_logs\n| filter cloud_provider = ENUM.AWS and raw_log_json.eventName != null and (raw_log_json.userAgent ~= \"(?i)(curl|wget|powershell|python|perl|ruby|bash|sh|pwsh|go-http-client|java|node)\"\
+    \ or raw_log_json.userAgent ~= \"(?i)(invoke-webrequest|invoke-restmethod|httpclient|requests|urllib)\")\n| alter \n    user_arn = coalesce(raw_log_json.userIdentity.arn,\
+    \ \"unknown\"),\n    event_name = raw_log_json.eventName,\n    resource_arn = arrayindex(regextract(to_json_string(raw_log_json.resources),\
+    \ \"\\\"ARN\\\":\\\"([^\\\"]+)\\\"\"), 0),\n    source_ip = coalesce(raw_log_json.sourceIPAddress, \"unknown\"),\n    user_agent = raw_log_json.userAgent\n\
+    | filter user_agent != null \n    and user_agent != \"AWS Internal\"\n    and user_agent != \"console.amazonaws.com\"\n    and user_agent\
+    \ != \"Boto3\"\n    and user_agent !~= \"(?i)(cloudwatch|guardduty|securityhub|inspector|macie|aws-sdk)\"\n| comp count() as event_count,\
+    \ values(source_ip) as src_ips by user_arn, event_name, resource_arn\n| filter event_count >= 1\n| fields user_arn, event_name, resource_arn,\
+    \ event_count, src_ips\n"
+  lucene: |
+    eventName:*UserAgent* AND userAgent:(*curl* OR *wget* OR *python* OR *powershell* OR *invoke-webrequest* OR *go-http-client* OR *libwww-perl* OR *httpx* OR *requests* OR *axios* OR *urllib* OR *boto3*)
+  sumo: |
+    _sourceCategory=*elb* OR _sourceCategory=*cloudtrail*
+    | json field=_raw "userAgent" as user_agent
+    | json field=_raw "userIdentity.arn" as user_arn
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "sourceIPAddress" as source_ip
+    | json field=_raw "resources[0].ARN" as resource_arn
+    | where user_agent matches "*curl*" OR user_agent matches "*wget*" OR user_agent matches "*python*" OR user_agent matches "*powershell*" OR user_agent matches "*ansible*" OR user_agent matches "*boto*" OR user_agent matches "*aws-cli*" OR user_agent matches "*Go-http-client*" OR user_agent matches "*ruby*" OR user_agent matches "*perl*"
+    | where !(user_agent matches "*ELB-HealthChecker*" OR user_agent matches "*Amazon-Route53*" OR user_agent matches "*CloudWatch*" OR user_agent matches "*Pingdom*" OR user_agent matches "*StatusCake*")
+    | count as event_count, values(source_ip) as src_ips by user_arn, event_name, resource_arn
+    | where event_count >= 1
+    | fields user_arn, event_name, resource_arn, event_count, src_ips
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -94,7 +133,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'

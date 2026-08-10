@@ -19,74 +19,83 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    (index=okta sourcetype=OktaIM:log eventType="user.mfa.okta_verify.deny_push") OR (index=azure sourcetype=azure:signinlogs (resultType=500121 OR failureReason="*mfa denied*" OR failureReason="*user declined*authentication*"))
-    | eval source_platform=case(
-        sourcetype="OktaIM:log", "okta",
-        sourcetype="azure:signinlogs", "azure",
-        1=1, "unknown"
-    )
-    | eval normalized_user=coalesce(actor.alternateId, user, userPrincipalName, User)
+  spl: "(index=okta sourcetype=OktaIM:log eventType=\"user.mfa.okta_verify.deny_push\") OR (index=azure sourcetype=azure:signinlogs (resultType=500121\
+    \ OR failureReason=\"*mfa denied*\" OR failureReason=\"*user declined*authentication*\"))\n| eval source_platform=case(\n    sourcetype=\"\
+    OktaIM:log\", \"okta\",\n    sourcetype=\"azure:signinlogs\", \"azure\",\n    1=1, \"unknown\"\n)\n| eval normalized_user=coalesce(actor.alternateId,\
+    \ user, userPrincipalName, User)\n| bin _time span=5m\n| stats count by _time, normalized_user, source_platform\n| where count >= 5\n| table\
+    \ _time, normalized_user, source_platform, count\n"
+  kql: "let oktaDenials = \n    OktaSSO\n    | where TimeGenerated > ago(5m)\n    | where eventType_s == \"user.mfa.okta_verify.deny_push\"\n\
+    \    | summarize OktaDenyCount = count(), OktaEvents = make_list(TimeGenerated) by actor_alternateId_s\n    | where OktaDenyCount >= 5\n \
+    \   | project Username = actor_alternateId_s, OktaDenyCount, OktaEvents;\nlet azureDenials = \n    SigninLogs\n    | where TimeGenerated >\
+    \ ago(5m)\n    | where ResultType == \"500121\"\n    | where ResultDescription has \"MFA denied; user declined the authentication\"\n    |\
+    \ summarize AzureDenyCount = count(), AzureEvents = make_list(TimeGenerated) by UserPrincipalName\n    | where AzureDenyCount >= 5\n    |\
+    \ project Username = UserPrincipalName, AzureDenyCount, AzureEvents;\noktaDenials\n| union azureDenials\n| summarize TotalDenials = sum(coalesce(OktaDenyCount,\
+    \ 0) + coalesce(AzureDenyCount, 0)), \n            OktaCount = max(OktaDenyCount), \n            AzureCount = max(AzureDenyCount),\n     \
+    \       Events = make_set(coalesce(OktaEvents, AzureEvents))\n    by Username\n| where OktaCount >= 5 or AzureCount >= 5\n| project Username,\
+    \ TotalDenials, OktaCount, AzureCount, Events\n"
+  aql: |
+    SELECT username, sourceip, COUNT(*) AS denials
+    FROM events
+    WHERE (qidname(qid) ILIKE '%okta%' AND "Event Type" = 'user.mfa.okta_verify.deny_push')
+       OR (qidname(qid) ILIKE '%azure%' AND "Failure Code" = '500121')
+    GROUP BY username, sourceip
+    HAVING denials >= 5
+    LAST 5 MINUTES
+  yara_l: "rule okta_azure_mfa_push_denial {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects multiple MFA push notification\
+    \ denials across Okta and Azure indicating potential unauthorized access attempts (T1078)\"\n    mitre_attack_tactic = \"Initial Access\"\n\
+    \    mitre_attack_technique = \"T1078\"\n    severity = \"Medium\"\n\n  events:\n    $okta.metadata.vendor_name = \"Okta\"\n    $okta.metadata.product_event_type\
+    \ = \"user.mfa.okta_verify.deny_push\"\n    $okta.target.user.userid = $user\n    \n    $azure.metadata.vendor_name = \"Microsoft\"\n    $azure.metadata.product_name\
+    \ = \"Azure Active Directory\"\n    $azure.metadata.product_log_id = \"SignInLogs\"\n    $azure.security_result.summary = \"500121\"\n   \
+    \ re.regex($azure.security_result.description, `(?i)mfa denied.*user declined.*authentication`)\n    $azure.target.user.userid = $user\n\n\
+    \  match:\n    $user over 5m\n\n  outcome:\n    $risk_score = max(65)\n    $okta_denials = count_distinct($okta.metadata.id)\n    $azure_denials\
+    \ = count_distinct($azure.metadata.id)\n    $total_denials = $okta_denials + $azure_denials\n\n  condition:\n    #okta >= 5 or #azure >= 5\n\
+    }\n"
+  esql: |
+    FROM logs-okta*, logs-azure*
+    | WHERE @timestamp > NOW() - 5 minutes
+      AND (
+        (event.dataset LIKE "okta*" AND event.action == "user.mfa.okta_verify.deny_push")
+        OR
+        (event.dataset LIKE "azure*" AND azure.signinlogs.properties.status.errorCode == "500121" AND azure.signinlogs.properties.status.failureReason LIKE "*mfa denied*user declined*")
+      )
+    | EVAL username = COALESCE(user.name, okta.actor.alternate_id, azure.signinlogs.properties.userPrincipalName)
+    | STATS denials = COUNT(*) BY username, source_system = event.dataset, window = BUCKET(@timestamp, 5 minutes)
+    | WHERE denials >= 5
+    | KEEP window, username, source_system, denials
+  leql: |
+    where((log_source_name="Okta" AND source_json.eventType="user.mfa.okta_verify.deny_push") OR (log_source_name="Azure" AND source_json.operationName="Sign-in activity" AND (source_json.status.errorCode=500121 OR source_json.status.failureReason ICONTAINS "mfa denied; user declined the authentication"))) groupby(user) calculate(count)
+  crowdstrike: |
+    (#type=okta eventType="user.mfa.okta_verify.deny_push") OR (#type=azure "Sign-in activity" resultType=500121 failureReason=*"mfa denied"*)
+    | case {
+        #type=okta | username := actor.alternateId | source := "okta" ;
+        #type=azure | username := userPrincipalName | source := "azure" ;
+        * | username := "" | source := "" ;
+      }
+    | groupBy([username, source], function=count(as=denials))
+    | denials >= 5
+    | table([username, source, denials])
+  xql: |
+    dataset = okta_logs
+    | filter event_type = "user.mfa.okta_verify.deny_push"
     | bin _time span=5m
-    | stats count by _time, normalized_user, source_platform
-    | where count >= 5
-    | table _time, normalized_user, source_platform, count
-  kql: "union\n  (SigninLogs\n    | where ResultType == \"500121\"\n    | extend User = UserPrincipalName, SrcIp = IPAddress),\n  (OktaSSO_CL\n\
-    \    | where eventType_s == \"user.mfa.okta_verify.deny_push\"\n    | extend User = actor_alternateId_s, SrcIp = client_ipAddress_s)\n| where\
-    \ TimeGenerated > ago(1h)\n| summarize Count = count(), SrcIps = make_set(SrcIp) by User, bin(TimeGenerated, 5m)\n| where Count >= 5\n| order\
-    \ by Count desc\n"
-  aql: "SELECT username, sourceip, COUNT(*) as deny_count\nFROM events\nWHERE (\n  (LOGSOURCETYPENAME(devicetype) ILIKE '%Okta%' AND \"eventType\"\
-    \ = 'user.mfa.okta_verify.deny_push')\n  OR (LOGSOURCETYPENAME(devicetype) ILIKE '%Azure Active Directory%' AND \"errorCode\" = '500121')\n\
-    )\nGROUP BY username\nHAVING COUNT(*) >= 5\nLAST 5 MINUTES\n"
-  yara_l: "rule tdl_auth_000007_mfa_push_rejection_burst {\n  meta:\n    author = \"TDL\"\n    description = \"Multiple MFA Push Rejections Detected\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    (\n      $e.metadata.product_name = \"Okta\"\n\
-    \      and $e.metadata.product_event_type = \"user.mfa.okta_verify.deny_push\"\n    ) or (\n      $e.metadata.product_name = \"Azure AD\"\n\
-    \      and $e.security_result.action_details = /500121/\n    )\n    $user = $e.principal.user.userid\n  match:\n    $user over 5m\n  outcome:\n\
-    \    $count = count_distinct($e.metadata.id)\n  condition:\n    $count >= 5\n}\n"
-  esql: "FROM logs-okta*,logs-azure.signinlogs*\n| WHERE @timestamp > NOW() - 5 minutes\n| WHERE event.action == \"user.mfa.okta_verify.deny_push\"\
-    \n     OR azure.signinlogs.properties.status.error_code == \"500121\"\n| EVAL user = COALESCE(okta.actor.alternate_id, azure.signinlogs.properties.user_principal_name)\n\
-    | STATS deny_count = COUNT(*) BY user\n| WHERE deny_count >= 5\n| SORT deny_count DESC\n"
-  leql: "where(\n  (logset=\"Okta\" AND eventType=user.mfa.okta_verify.deny_push)\n  OR (logset=\"Azure AD Sign-In\" AND errorCode=500121)\n)\n\
-    groupby(user)\ncalculate(count)\nhaving(count >= 5)\ntimeslice(5m)\n"
-  crowdstrike: '(#vendor=okta eventType="user.mfa.okta_verify.deny_push")
-
-    OR (#vendor=microsoft properties.status.errorCode=500121)
-
-    | user := if(#vendor="okta", actor.alternateId, properties.userPrincipalName)
-
-    | groupBy([user, bucket(span=5m)], function=count())
-
-    | _count >= 5
-
-    | sort(_count, order=desc)
-
-    '
-  xql: "dataset in (okta_raw, msft_azure_ad_signinlogs_raw)\n| filter (event_type = \"user.mfa.okta_verify.deny_push\")\n      or (action_evtlog_message\
-    \ contains \"500121\")\n| comp count() as fail_count by actor_effective_username, bin(_time, 5m)\n| filter fail_count >= 5\n| sort desc fail_count\n"
-  lucene: '(event.dataset:"okta.system" AND okta.event_type:"user.mfa.okta_verify.deny_push")
-
-    OR (event.dataset:"azure.signinlogs" AND azure.signinlogs.properties.status.error_code:"500121")
-
-    '
-  sumo: '(_sourceCategory=*okta* AND _raw="*user.mfa.okta_verify.deny_push*")
-
-    OR (_sourceCategory=*azure*signin* AND _raw="*\"errorCode\":500121*")
-
-    | parse "\"alternateId\":\"*\"" as okta_user nodrop
-
-    | parse "\"userPrincipalName\":\"*\"" as az_user nodrop
-
-    | if(!isEmpty(okta_user), okta_user, az_user) as user
-
+    | comp count() as deny_count by _time, actor_alternate_id
+    | filter deny_count >= 5
+    | fields _time, actor_alternate_id, deny_count
+  lucene: |
+    (system:"Okta" AND eventType:"user.mfa.okta_verify.deny_push") OR (system:"Azure" AND operationName:"Sign-in activity" AND resultType:"500121" AND resultDescription:(*"MFA denied"* OR *"user declined the authentication"*))
+  sumo: |
+    _sourceCategory=*Okta* OR _sourceCategory=*Azure*
+    | json field=_raw "eventType" as okta_event_type
+    | json field=_raw "actor.alternateId" as okta_user
+    | json field=_raw "properties.resultDescription" as azure_failure_reason
+    | json field=_raw "properties.status.errorCode" as azure_error_code
+    | json field=_raw "userPrincipalName" as azure_user
+    | where (okta_event_type = "user.mfa.okta_verify.deny_push") OR (azure_error_code = "500121" AND azure_failure_reason matches "*mfa denied*user declined*")
+    | if(isNull(okta_user), azure_user, okta_user) as username
     | timeslice 5m
-
-    | count by user, _timeslice
-
-    | where _count >= 5
-
-    | sort by _count desc
-
-    '
+    | count as denials by _timeslice, username
+    | where denials >= 5
+    | fields _timeslice, username, denials
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -96,7 +105,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '5 Okta Event
 

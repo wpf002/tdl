@@ -16,76 +16,89 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=azure sourcetype=azure:aad:audit operationName="Invite external user"
+  spl: 'index=azure sourcetype=azure:aad:audit operationName="Invite external user"
+
     | eval event_time=_time
+
     | eval src_user=coalesce(initiatedBy.user.userPrincipalName, initiatedBy.app.displayName)
+
     | eval username=coalesce(targetResources{}.userPrincipalName, targetResources{}.displayName)
+
     | eval src_ip=coalesce(initiatedBy.user.ipAddress, initiatedBy.app.ipAddress)
+
     | table event_time, src_user, username, src_ip
+
     | outputlookup append=true "TDL - Azure Guest Account Tracker"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000376 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure External Guest User Invitation\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AuditLogs
+    | where TimeGenerated > ago(90d)
+    | where OperationName == "Invite external user"
+    | extend SrcUser = tostring(InitiatedBy.user.userPrincipalName)
+    | extend SrcIP = tostring(InitiatedBy.user.ipAddress)
+    | extend InvitedUser = tostring(TargetResources[0].userPrincipalName)
+    | project TimeGenerated, SrcUser, InvitedUser, SrcIP, OperationName, ResultDescription, CorrelationId
+  aql: |
+    SELECT eventtime, username AS src_user, "Target Username" AS invited_user, sourceip AS src_ip, "Event Name"
+    FROM events
+    WHERE "Event Name" = 'Invite External User'
+      AND LOGSOURCETYPENAME(devicetype) ILIKE '%Azure%'
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_guest_invite_tracking {
+      meta:
+        author = "TDL"
+        description = "Tracks Azure AD external user invitations for guest account monitoring"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "Low"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Microsoft"
+        $e.metadata.product_name = "Azure Active Directory"
+        $e.metadata.product_event_type = "Invite External User"
+        $e.principal.user.userid = $src_user
+        $e.target.user.userid = $username
+        $e.principal.ip = $src_ip
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $src_user, $username, $src_ip over 1h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $event_time = $e.metadata.event_timestamp.seconds
+        $inviter = $src_user
+        $invited_user = $username
+        $source_ip = $src_ip
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-azure.auditlogs*\n| WHERE @timestamp > NOW() - 24 hours \n  AND azure.auditlogs.operation_name == \"Invite external user\"\n\
+    | EVAL src_user = azure.auditlogs.properties.initiated_by.user.userPrincipalName\n| EVAL username = azure.auditlogs.properties.target_resources.userPrincipalName\n\
+    | EVAL src_ip = azure.auditlogs.properties.initiated_by.user.ipAddress\n| KEEP @timestamp, src_user, username, src_ip, host.name, azure.auditlogs.operation_name,\
+    \ azure.auditlogs.result_signature\n"
+  leql: |
+    where(source_json.operationName="Invite external user") groupby(source_json.initiatedBy.user.userPrincipalName, source_json.targetResources.userPrincipalName, source_json.callerIpAddress) calculate(count)
+  crowdstrike: |
+    #repo=azure* Operation="Invite external user"
+    | table([@timestamp, event_time, InitiatedBy, UserId, UserPrincipalName, IPAddress, TargetResources])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AZURE" and operation_name = "Invite external user"
+    | fields event_time, actor_effective_username as src_user, action_account_name as username, action_remote_ip as src_ip, agent_hostname
+  lucene: |
+    event.action:"Invite external user" OR event.category:"AuditLogs" AND operation_name:"Invite external user"
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*AzureAD* "Invite external user"
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "time" as event_time
+    | json field=_raw "callerIpAddress" as src_ip
+    | json field=_raw "identity.claims.http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name" as src_user
+    | json field=_raw "properties.targetResources[0].userPrincipalName" as username
+    | where operation_name = "Invite external user"
+    | fields event_time, src_user, username, src_ip
+    | save /shared/TDL_Azure_Guest_Account_Tracker
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -95,7 +108,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure AD Event
 

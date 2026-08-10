@@ -17,84 +17,69 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=4625 OR EventCode=528 OR EventCode=540 OR EventCode=4624)
-    | eval event_type=case(
-        EventCode=4625, "failed",
-        EventCode=528 OR EventCode=540 OR EventCode=4624, "success",
-        1=1, "other"
-    )
-    | eval src_identifier=coalesce(Source_Network_Address, Workstation_Name, IpAddress, src)
-    | sort 0 _time
-    | streamstats time_window=5m count(eval(event_type="failed")) as failed_count, count(eval(event_type="success")) as success_count by src_identifier
-    | where failed_count >= 1 AND success_count >= 1
-    | where event_type="success"
-    | dedup src_identifier, Account_Name
-    | table _time, src_identifier, Account_Name, ComputerName, EventCode, Logon_Type
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4624")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4624')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000286 {\n  meta:\n    author = \"TDL\"\n    description = \"Successful Password Spray\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(4624)/\n\
-    \    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("4624")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4624])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4624)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4624")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4624)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4624")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+  spl: "index=wineventlog sourcetype=WinEventLog:Security (EventCode=4625 OR EventCode=528 OR EventCode=540 OR EventCode=4624)\n| eval event_type=case(\n\
+    \    EventCode=4625, \"failed\",\n    EventCode=528 OR EventCode=540 OR EventCode=4624, \"success\",\n    1=1, \"other\"\n)\n| eval src_identifier=coalesce(Source_Network_Address,\
+    \ Workstation_Name, IpAddress, src)\n| sort 0 _time\n| streamstats time_window=5m count(eval(event_type=\"failed\")) as failed_count, count(eval(event_type=\"\
+    success\")) as success_count by src_identifier\n| where failed_count >= 1 AND success_count >= 1\n| where event_type=\"success\"\n| dedup\
+    \ src_identifier, Account_Name\n| table _time, src_identifier, Account_Name, ComputerName, EventCode, Logon_Type\n"
+  kql: "SecurityEvent\n| where TimeGenerated > ago(1h)\n| where EventID in (4625, 528, 540, 4624)\n| extend SourceIdentifier = coalesce(IpAddress,\
+    \ WorkstationName, Computer)\n| summarize \n    FailedLogons = countif(EventID == 4625),\n    SuccessfulLogons = countif(EventID in (528,\
+    \ 540, 4624)),\n    FirstFailure = minif(TimeGenerated, EventID == 4625),\n    FirstSuccess = minif(TimeGenerated, EventID in (528, 540, 4624)),\n\
+    \    Accounts = make_set(TargetAccount)\n    by SourceIdentifier, bin(TimeGenerated, 5m)\n| where FailedLogons >= 1 and SuccessfulLogons >=\
+    \ 1\n| where FirstSuccess >= FirstFailure and FirstSuccess <= FirstFailure + 5m\n| project TimeGenerated, SourceIdentifier, FailedLogons,\
+    \ SuccessfulLogons, FirstFailure, FirstSuccess, Accounts\n"
+  aql: "SELECT \n    sourceip,\n    username,\n    LOGSOURCENAME(logsourceid) AS target_host,\n    COUNT(*) AS successful_logons,\n    UNIQUECOUNT(username)\
+    \ AS unique_users\nFROM events\nWHERE \"EventID\" IN ('528', '540', '4624')\nGROUP BY sourceip, username, LOGSOURCENAME(logsourceid)\nHAVING\
+    \ unique_users >= 2\nLAST 5 MINUTES\n"
+  yara_l: "rule password_spray_followed_by_success {\n  meta:\n    author = \"TDL\"\n    description = \"Detects password spraying followed by\
+    \ successful authentication from same source\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1078\"\n   \
+    \ severity = \"High\"\n    \n  events:\n    $spray.metadata.event_type = \"USER_LOGIN\"\n    $spray.security_result.action = \"BLOCK\"\n \
+    \   $spray.principal.ip = $source_ip\n    \n    $success.metadata.event_type = \"USER_LOGIN\"\n    $success.security_result.action = \"ALLOW\"\
+    \n    (\n      $success.metadata.product_event_type = \"528\" or\n      $success.metadata.product_event_type = \"540\" or\n      $success.metadata.product_event_type\
+    \ = \"4624\"\n    )\n    $success.principal.ip = $source_ip\n    \n    $spray.metadata.event_timestamp.seconds <= $success.metadata.event_timestamp.seconds\n\
+    \    \n  match:\n    $source_ip over 5m\n    \n  outcome:\n    $risk_score = 75\n    \n  condition:\n    $spray and $success\n}\n"
+  esql: "FROM logs-system.security*\n| WHERE @timestamp > NOW() - 1 day\n| WHERE event.code IN (\"528\", \"540\", \"4624\")\n| EVAL source_identifier\
+    \ = COALESCE(source.ip, host.name)\n| STATS \n    first_success = MIN(@timestamp),\n    success_count = COUNT(*) BY source_identifier, user.name\n\
+    | WHERE success_count >= 1\n| STATS \n    unique_users = COUNT_DISTINCT(user.name),\n    users = VALUES(user.name),\n    min_time = MIN(first_success),\n\
+    \    max_time = MAX(first_success) BY source_identifier\n| EVAL time_diff_minutes = (max_time - min_time) / 60000\n| WHERE unique_users >\
+    \ 1 AND time_diff_minutes <= 5\n| KEEP source_identifier, unique_users, users, min_time, max_time, time_diff_minutes\n"
+  leql: |
+    where(source_json.EventID=4624 AND result=SUCCESS) groupby(source_address) calculate(count)
+  crowdstrike: |
+    EventCode IN [528, 540, 4624]
+    | groupBy([IpAddress, TargetUserName], function=[count(as=authCount), selectLast([@timestamp, ComputerName, LogonType, SubjectUserName])])
+    | authCount >= 2
+    | table([IpAddress, TargetUserName, authCount, @timestamp, ComputerName, LogonType, SubjectUserName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (528, 540, 4624)
+    | bin _time span=5m
+    | comp count_distinct(actor_effective_username) as unique_users by _time, action_remote_ip, agent_hostname
+    | filter unique_users > 1
+    | fields _time, action_remote_ip, agent_hostname, unique_users
+  lucene: |
+    event.code:4624 AND _exists_:source.ip
+  sumo: |
+    _sourceCategory=*Windows*Security*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "IpAddress" as src_ip
+    | json field=_raw "WorkstationName" as src_host
+    | json field=_raw "TargetUserName" as target_user
+    | json field=_raw "LogonType" as logon_type
+    | where event_id in ("528", "540", "4624", "4625")
+    | if(event_id = "4625", "spray", "success") as event_type
+    | sort by src_ip, _messageTime
+    | timeslice 5m
+    | first(event_type) as first_event by _timeslice, src_ip
+    | where first_event = "spray"
+    | join (
+        _sourceCategory=*Windows*Security*
+        | json field=_raw "EventID" as event_id
+        | json field=_raw "IpAddress" as src_ip
+        | where event_id in ("528", "540", "4624")
+      ) as success on src_ip
+    | where success._messageTime > _messageTime and success._messageTime <= _messageTime + 300000
+    | fields _messageTime, src_ip, target_user, success.event_id
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -104,7 +89,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Password Spraying Event\n\nFollowed By\n\n1 Windows Authentication Success Event\nWhere the Event ID is in [528, 540, 4624]\n\
   With the same Source IP/Hostname\n\t\nWithin 5 minutes"

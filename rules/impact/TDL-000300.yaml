@@ -18,71 +18,78 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=google_workspace sourcetype=gsuite:gmail:admin (events.name="CREATE_GMAIL_SETTING" OR events.name="CHANGE_GMAIL_SETTING") (SETTING_NAME="email_route" OR SETTING_NAME="message_security_rule")
+  spl: 'index=google_workspace sourcetype=gsuite:gmail:admin (events.name="CREATE_GMAIL_SETTING" OR events.name="CHANGE_GMAIL_SETTING") (SETTING_NAME="email_route"
+    OR SETTING_NAME="message_security_rule")
+
     | table _time, actor.email, events.name, SETTING_NAME, events.parameters{}.value, org_unit_name
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_000300 {\n  meta:\n    author = \"TDL\"\n    description = \"Custom Google Workspace Email Route Created or Modified\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0040\"\n    technique = \"T1498\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    GWorkspace
+    | where TimeGenerated > ago(24h)
+    | where EventName in ("CREATE_GMAIL_SETTING", "CHANGE_GMAIL_SETTING")
+    | where SettingName in ("email_route", "message_security_rule")
+    | project TimeGenerated, EventName, SettingName, ActorEmail, ActorIpAddress, RecordId
+  aql: |
+    SELECT eventtime, username, LOGSOURCENAME(logsourceid) AS log_source, "events.name", "SETTING_NAME", sourceip
+    FROM events
+    WHERE ("events.name" = 'CREATE_GMAIL_SETTING' OR "events.name" = 'CHANGE_GMAIL_SETTING')
+      AND ("SETTING_NAME" = 'email_route' OR "SETTING_NAME" = 'message_security_rule')
+    LAST 24 HOURS
+  yara_l: |
+    rule google_workspace_gmail_route_or_security_rule_modification {
+      meta:
+        author = "TDL"
+        description = "Detects modification of Gmail routing or message security rules in Google Workspace (T1498 - Impact)"
+        mitre_attack_tactic = "Impact"
+        mitre_attack_technique = "T1498"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Google Workspace"
+        (
+          $e.metadata.product_event_type = "CREATE_GMAIL_SETTING" or
+          $e.metadata.product_event_type = "CHANGE_GMAIL_SETTING"
+        )
+        (
+          re.regex($e.target.resource.attribute.labels["SETTING_NAME"], `(?i)email_route`) or
+          re.regex($e.target.resource.attribute.labels["SETTING_NAME"], `(?i)message_security_rule`)
+        )
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $resource
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-google_workspace*
+    | WHERE event.action IN ("CREATE_GMAIL_SETTING", "CHANGE_GMAIL_SETTING")
+      AND (google_workspace.admin.setting.name == "email_route" OR google_workspace.admin.setting.name == "message_security_rule")
+    | KEEP @timestamp, user.name, user.email, event.action, google_workspace.admin.setting.name, google_workspace.admin.new_value, google_workspace.admin.old_value, source.ip
+  leql: |
+    where(source_json.events.name IN ["CREATE_GMAIL_SETTING", "CHANGE_GMAIL_SETTING"] AND source_json.SETTING_NAME IN ["email_route", "message_security_rule"])
+  crowdstrike: |
+    #type=google_workspace events.name IN ["CREATE_GMAIL_SETTING", "CHANGE_GMAIL_SETTING"] SETTING_NAME IN ["email_route", "message_security_rule"]
+    | table([@timestamp, actor.email, events.name, SETTING_NAME, ComputerName])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Google" and logon_type = "Workspace"
+    | filter outcome = "success" and operation_name in ("CREATE_GMAIL_SETTING", "CHANGE_GMAIL_SETTING")
+    | filter action_resource_name contains "email_route" or action_resource_name contains "message_security_rule"
+    | fields _time, actor_user, operation_name, action_resource_name, action_resource, caller_ip, target_resource
+  lucene: |
+    events.name:("CREATE_GMAIL_SETTING" OR "CHANGE_GMAIL_SETTING") AND SETTING_NAME:("email_route" OR "message_security_rule")
+  sumo: |
+    _sourceCategory=*Google*Workspace* (events.name="CREATE_GMAIL_SETTING" OR events.name="CHANGE_GMAIL_SETTING")
+    | json field=_raw "events[*].name" as event_name
+    | json field=_raw "events[*].parameters[*].name" as param_name
+    | json field=_raw "events[*].parameters[*].value" as param_value
+    | where event_name in ("CREATE_GMAIL_SETTING", "CHANGE_GMAIL_SETTING")
+    | where param_name = "SETTING_NAME" and param_value in ("email_route", "message_security_rule")
+    | fields _messageTime, _sourceHost, event_name, param_name, param_value
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -92,7 +99,7 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Google Workspace Event
 

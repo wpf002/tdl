@@ -17,74 +17,87 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=windows sourcetype=WinEventLog:Security EventCode=4688 New_Process_Name="*\\lsass.exe" Creator_Process_Name!="*\\wininit.exe" Creator_Process_Name!=null
+  spl: 'index=windows sourcetype=WinEventLog:Security EventCode=4688 New_Process_Name="*\\lsass.exe" Creator_Process_Name!="*\\wininit.exe" Creator_Process_Name!=null
+
     | table _time, ComputerName, New_Process_Name, Creator_Process_Name, Account_Name, Process_Command_Line
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("lsass.exe", "wininit.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('lsass.exe', 'wininit.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000205 {\n  meta:\n    author = \"TDL\"\n    description = \"Non-standard Process Launching LSASS\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1003\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(lsass.exe|wininit.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (592, 4688)
+    | where Process has "lsass.exe" or NewProcessName has "lsass.exe"
+    | extend ProcessName = coalesce(Process, NewProcessName)
+    | extend ParentProcessName = coalesce(ParentProcessName, "")
+    | where ProcessName endswith "\\lsass.exe"
+    | where ParentProcessName != ""
+    | where ParentProcessName !endswith "\\wininit.exe"
+    | project TimeGenerated, Computer, Account, ProcessName, ParentProcessName, CommandLine, SubjectUserName, SubjectDomainName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Parent Process Name", "Process CommandLine"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Process Name" ILIKE '%lsass.exe'
+      AND "Parent Process Name" IS NOT NULL
+      AND "Parent Process Name" NOT ILIKE '%wininit.exe'
+    LAST 24 HOURS
+  yara_l: |
+    rule lsass_spawn_suspicious_parent {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects lsass.exe process creation with suspicious parent process"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1003"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688"
+        )
+        re.regex($e.target.process.file.full_path, `(?i)\\lsass\.exe$`)
+        $e.principal.process.file.full_path != ""
+        not re.regex($e.principal.process.file.full_path, `(?i)\\wininit\.exe$`)
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name IN ("lsass.exe", "wininit.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [lsass.exe, wininit.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (lsass.exe, wininit.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("lsass.exe", "wininit.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(lsass.exe OR wininit.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("lsass.exe", "wininit.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code IN ("592", "4688")
+      AND process.name == "lsass.exe"
+      AND process.parent.name IS NOT NULL
+      AND process.parent.name != "wininit.exe"
+    | KEEP @timestamp, host.name, user.name, process.name, process.parent.name, process.command_line, process.executable
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND process_name="lsass.exe" AND parent_process_name!=null AND parent_process_name!="wininit.exe")
+  crowdstrike: |
+    EventCode=4688 FileName=lsass.exe ParentBaseFileName=* ParentBaseFileName!=wininit.exe
+    | table([@timestamp, ComputerName, UserName, FileName, ParentBaseFileName, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter lowercase(action_process_image_name) contains "lsass.exe"
+    | filter actor_process_image_name != null
+    | filter actor_process_image_name ~= ".*" and not array_length(regextract(lowercase(actor_process_image_name), "wininit\.exe")) > 0
+    | fields _time, agent_hostname, action_process_image_name, actor_process_image_name, actor_effective_username, action_process_image_command_line
+  lucene: |
+    event.code:4688 AND process.name:lsass.exe AND _exists_:process.parent.name AND NOT process.parent.name:wininit.exe
+  sumo: |
+    _sourceCategory=*Windows* ("592" OR "4688")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "ParentProcessName" as parent_process_name
+    | where event_id in ("592", "4688")
+    | where process_name matches "*lsass.exe"
+    | where !isNull(parent_process_name)
+    | where !(parent_process_name matches "*wininit.exe")
+    | fields _messageTime, _sourceHost, event_id, process_name, parent_process_name
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +107,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Process Creation Event
 

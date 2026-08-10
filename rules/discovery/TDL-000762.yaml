@@ -18,75 +18,89 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    (index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (CommandLine="*wevtutil*el*" OR CommandLine="*Get-WinEvent*-ListLog*") (User!="*admin*" AND User!="*engineer*")) OR (index=linux sourcetype=linux_secure (comm="journalctl" OR COMMAND="*journalctl*") cmdline="*--list-boots*" (user!="*admin*" AND user!="*engineer*" AND user!="root"))
-    | eval process=coalesce(Image, comm, process_name), cmdline=coalesce(CommandLine, cmdline), user_field=coalesce(User, user), host_field=coalesce(ComputerName, host)
+  spl: '(index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (CommandLine="*wevtutil*el*" OR CommandLine="*Get-WinEvent*-ListLog*")
+    (User!="*admin*" AND User!="*engineer*")) OR (index=linux sourcetype=linux_secure (comm="journalctl" OR COMMAND="*journalctl*") cmdline="*--list-boots*"
+    (user!="*admin*" AND user!="*engineer*" AND user!="root"))
+
+    | eval process=coalesce(Image, comm, process_name), cmdline=coalesce(CommandLine, cmdline), user_field=coalesce(User, user), host_field=coalesce(ComputerName,
+    host)
+
     | table _time, host_field, user_field, process, cmdline
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000762 {\n  meta:\n    author = \"TDL\"\n    description = \"wevtutil el or Get-WinEvent Enumerating All Logs\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0007\"\n    technique = \"T1654\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
-    \n    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
+  kql: "union \n(SecurityEvent\n| where TimeGenerated > ago(1h)\n| where EventID == 4688\n| where (Process endswith \"\\\\wevtutil.exe\" and CommandLine\
+    \ has_any (\"el\", \"enum-logs\"))\n    or (Process endswith \"\\\\powershell.exe\" and CommandLine has_any (\"Get-WinEvent\", \"-ListLog\"\
+    ))\n    or (Process endswith \"\\\\pwsh.exe\" and CommandLine has_any (\"Get-WinEvent\", \"-ListLog\"))\n| where SubjectUserName !endswith\
+    \ \"$\"\n| where SubjectUserName !in~ (\"admin\", \"administrator\", \"svc-admin\")\n| project TimeGenerated, Computer, Account = SubjectUserName,\
+    \ Process, CommandLine, ParentProcessName),\n(Event\n| where TimeGenerated > ago(1h)\n| where Source == \"Microsoft-Windows-Sysmon\" and EventID\
+    \ == 1\n| extend CommandLine = tostring(EventData.CommandLine)\n| extend User = tostring(EventData.User)\n| extend Image = tostring(EventData.Image)\n\
+    | extend ParentImage = tostring(EventData.ParentImage)\n| where (Image endswith \"/wevtutil.exe\" and CommandLine has_any (\"el\", \"enum-logs\"\
+    ))\n    or (Image endswith \"/powershell.exe\" and CommandLine has_any (\"Get-WinEvent\", \"-ListLog\"))\n    or (Image endswith \"/pwsh.exe\"\
+    \ and CommandLine has_any (\"Get-WinEvent\", \"-ListLog\"))\n| where User !endswith \"$\"\n| where User !in~ (\"admin\", \"administrator\"\
+    , \"svc-admin\")\n| project TimeGenerated, Computer, Account = User, Process = Image, CommandLine, ParentProcessName = ParentImage),\n(Syslog\n\
+    | where TimeGenerated > ago(1h)\n| where SyslogMessage has \"journalctl\" and SyslogMessage has \"--list-boots\"\n| where SyslogMessage !has\
+    \ \"root\"\n| where SyslogMessage !has_any (\"admin\", \"engineer\", \"svc-\")\n| project TimeGenerated, Computer, Account = \"extracted\"\
+    , Process = \"journalctl\", CommandLine = SyslogMessage, ParentProcessName = \"\")\n| project TimeGenerated, Computer, Account, Process, CommandLine,\
+    \ ParentProcessName\n"
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process Name", "Process CommandLine", "Parent Process Name"
+    FROM events
+    WHERE (
+      ("Process Name" ILIKE '%wevtutil.exe%' AND "Process CommandLine" ILIKE '%el%')
+      OR ("Process Name" ILIKE '%powershell.exe%' AND "Process CommandLine" ILIKE '%Get-WinEvent%' AND "Process CommandLine" ILIKE '%-ListLog%')
+      OR ("Process Name" ILIKE '%journalctl%' AND "Process CommandLine" ILIKE '%--list-boots%')
+    )
+    AND username NOT ILIKE '%admin%'
+    AND username NOT ILIKE '%engineer%'
+    AND username NOT ILIKE '%service%'
+    LAST 1 HOURS
+  yara_l: "rule log_enumeration_t1654 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects Log Enumeration Discovery (T1654) via wevtutil,\
+    \ Get-WinEvent, or journalctl\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1654\"\n    severity = \"Medium\"\
+    \n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      re.regex($e.principal.process.command_line, `(?i)wevtutil\\\
+    s+el`) or\n      re.regex($e.principal.process.command_line, `(?i)Get-WinEvent\\s+-ListLog`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)journalctl\\s+--list-boots`)\n    )\n    $e.principal.hostname = $host\n    $e.principal.user.userid = $user\n    not re.regex($e.principal.user.userid,\
+    \ `(?i)(admin|administrator|root|engineer|svc)`)\n    \n  match:\n    $host, $user over 5m\n    \n  outcome:\n    $risk_score = 50\n    \n\
+    \  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-endpoint.events.process*, logs-windows.sysmon_operational*, logs-system.sysmon*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      AND (
+        (process.name IN ("wevtutil.exe", "powershell.exe", "pwsh.exe") AND (process.command_line LIKE "*wevtutil*el*" OR process.command_line LIKE "*Get-WinEvent*-ListLog*"))
+        OR (process.name IN ("journalctl", "sh", "bash") AND process.command_line LIKE "*journalctl*--list-boots*")
+      )
+      AND NOT (user.name IN ("admin", "administrator", "root") OR user.name LIKE "*admin*" OR user.name LIKE "*engineer*" OR user.name LIKE "*svc*")
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.executable
+  leql: |
+    where((process_name ICONTAINS "wevtutil.exe" AND process_cmd_line ICONTAINS " el") OR (process_name ICONTAINS "powershell" AND process_cmd_line ICONTAINS "Get-WinEvent" AND process_cmd_line ICONTAINS "-ListLog") OR (process_name ICONTAINS "journalctl" AND process_cmd_line ICONTAINS "--list-boots")) AND user NOT IN ["Administrator", "SYSTEM", "root"] AND user NOT ICONTAINS "admin" AND user NOT ICONTAINS "engineer"
+  crowdstrike: |
+    (event_simpleName=ProcessRollup2 OR EventCode=1) (CommandLine=*wevtutil* CommandLine=*el* OR CommandLine=*Get-WinEvent* CommandLine=*-ListLog* OR CommandLine=*journalctl* CommandLine=*--list-boots*)
+    | regex("(?i)(wevtutil\\s+el|get-winevent\\s+-listlog|journalctl\\s+--list-boots)", field=CommandLine, as=enum_cmd)
+    | enum_cmd=*
+    | table([@timestamp, ComputerName, UserName, FileName, ParentBaseFileName, CommandLine, event_simpleName])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter (
+        (actor_process_image_name contains "wevtutil" and action_process_image_command_line ~= ".*wevtutil.*el.*")
+        or (actor_process_image_name contains "powershell" and action_process_image_command_line ~= ".*Get-WinEvent.*-ListLog.*")
+        or (actor_process_image_name contains "journalctl" and action_process_image_command_line ~= ".*journalctl.*--list-boots.*")
+    )
+    | filter actor_effective_username not in ("Administrator", "SYSTEM", "root")
+    | filter not (actor_effective_username ~= ".*admin.*" or actor_effective_username ~= ".*engineer.*")
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_command_line
+  lucene: |
+    (process.name:(wevtutil.exe OR wevtutil) AND process.command_line:*el*) OR (process.name:(powershell.exe OR pwsh.exe OR pwsh) AND process.command_line:(*Get-WinEvent* AND *-ListLog*)) OR (process.name:journalctl AND process.command_line:*--list-boots*)
+  sumo: |
+    _sourceCategory=*Sysmon* OR _sourceCategory=*Auditd*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as cmd
+    | json field=_raw "Image" as image
+    | json field=_raw "User" as user
+    | json field=_raw "ParentImage" as parent_image
+    | parse regex field=cmd "(?<command_name>wevtutil|Get-WinEvent|journalctl)"
+    | where (cmd matches "*wevtutil*el*" OR cmd matches "*Get-WinEvent*-ListLog*" OR cmd matches "*journalctl*--list-boots*")
+    | where !(user matches "*admin*" OR user matches "*administrator*" OR user matches "*engineer*" OR user matches "*root*" OR user matches "*svc*")
+    | fields _messageTime, _sourceHost, user, cmd, image, parent_image
 pseudo_logic: wevtutil el / Get-WinEvent -ListLog * / journalctl --list-boots invoked from non-admin / non-engineer context.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -103,7 +117,7 @@ references:
 - https://attack.mitre.org/techniques/T1654/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

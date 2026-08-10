@@ -19,77 +19,74 @@ queries:
     \ as daily_bytes by day, src_ip\n| eventstats avg(daily_bytes) as avg_baseline, stdev(daily_bytes) as stdev_baseline by src_ip\n| where daily_bytes\
     \ > (avg_baseline + (3 * stdev_baseline)) AND daily_bytes >= 1000000\n| eval days_in_baseline=mvcount(mvdedup(split(day, \",\")))\n| where\
     \ days_in_baseline >= 30\n| table day, src_ip, daily_bytes, avg_baseline, stdev_baseline\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "smb"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: "let LearningPeriod = 90d;\nlet BaselinePeriod = 30d;\nlet DetectionPeriod = 1d;\nlet Sensitivity = 3;\nlet MinimumBytes = 1000000;\nlet\
+    \ BaselineData = \n    CommonSecurityLog\n    | where TimeGenerated between (ago(LearningPeriod) .. ago(DetectionPeriod))\n    | where DeviceAction\
+    \ != \"Deny\" and DeviceAction != \"Drop\"\n    | where SourceIP startswith \"10.\" or SourceIP startswith \"172.\" or SourceIP startswith\
+    \ \"192.168.\"\n    | where not(DestinationIP startswith \"10.\" or DestinationIP startswith \"172.\" or DestinationIP startswith \"192.168.\"\
+    )\n    | where isnotempty(SentBytes)\n    | summarize \n        avg_bytes = avg(tolong(SentBytes)),\n        stdev_bytes = stdev(tolong(SentBytes))\n\
+    \        by SourceIP, bin(TimeGenerated, 1d)\n    | summarize \n        baseline_avg = avg(avg_bytes),\n        baseline_stdev = avg(stdev_bytes)\n\
+    \        by SourceIP;\nlet CurrentData = \n    CommonSecurityLog\n    | where TimeGenerated > ago(DetectionPeriod)\n    | where DeviceAction\
+    \ != \"Deny\" and DeviceAction != \"Drop\"\n    | where SourceIP startswith \"10.\" or SourceIP startswith \"172.\" or SourceIP startswith\
+    \ \"192.168.\"\n    | where not(DestinationIP startswith \"10.\" or DestinationIP startswith \"172.\" or DestinationIP startswith \"192.168.\"\
+    )\n    | where isnotempty(SentBytes)\n    | summarize current_bytes = avg(tolong(SentBytes)) by SourceIP;\nCurrentData\n| join kind=inner\
+    \ (BaselineData) on SourceIP\n| where current_bytes >= MinimumBytes\n| where current_bytes > (baseline_avg + (Sensitivity * baseline_stdev))\n\
+    | project TimeGenerated = now(), SourceIP, current_bytes, baseline_avg, baseline_stdev, deviation = (current_bytes - baseline_avg) / baseline_stdev\n"
+  aql: |
+    SELECT sourceip, destinationip, SUM(bytesout) AS total_bytes_out, AVG(bytesout) AS avg_bytes_out, COUNT(*) AS flow_count
     FROM flows
-
-    WHERE "network.protocol" LIKE ''%smb%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exf_000495 {\n  meta:\n    author = \"TDL\"\n    description = \"Spike in BytesOut from an Internal IP\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0010\"\n    technique = \"T1030\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /smb/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%smb%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/smb/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*smb*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "smb"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*smb*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*smb*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    WHERE INOFFENSE(sourceip) = 'false' AND (destinationip NOT IN (SELECT sourceip FROM flows WHERE INOFFENSE(sourceip) = 'false' LAST 30 DAYS)) AND bytesout > 1000000
+    GROUP BY sourceip, destinationip
+    HAVING total_bytes_out > (SELECT AVG(bytesout) * 3 FROM flows WHERE sourceip = sourceip LAST 30 DAYS)
+    LAST 24 HOURS
+  yara_l: "rule data_transfer_size_outlier {\n  meta:\n    author = \"TDL\"\n    description = \"Detects anomalous outbound data transfer volumes\
+    \ (T1030)\"\n    mitre_attack_tactic = \"Exfiltration\"\n    mitre_attack_technique = \"T1030\"\n    severity = \"Medium\"\n    \n  events:\n\
+    \    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.metadata.product_name = /firewall/i\n    net.ip_in_range_cidr($e.principal.ip,\
+    \ \"10.0.0.0/8\") or\n    net.ip_in_range_cidr($e.principal.ip, \"172.16.0.0/12\") or\n    net.ip_in_range_cidr($e.principal.ip, \"192.168.0.0/16\"\
+    )\n    not net.ip_in_range_cidr($e.target.ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($e.target.ip, \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($e.target.ip,\
+    \ \"192.168.0.0/16\")\n    $e.network.sent_bytes >= 1000000\n    $e.principal.ip = $src_ip\n    \n  match:\n    $src_ip over 1d\n    \n  outcome:\n\
+    \    $total_bytes = sum($e.network.sent_bytes)\n    $risk_score = max(75)\n    \n  condition:\n    #e > 0 and $total_bytes >= 1000000\n}\n"
+  esql: |
+    FROM logs-firewall*
+    | WHERE @timestamp > NOW() - 90 days
+      AND network.direction == "outbound"
+      AND source.ip NOT LIKE "0.0.0.0/0"
+      AND destination.ip NOT IN (CIDR_MATCH(destination.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+    | EVAL day = DATE_TRUNC(1 day, @timestamp)
+    | STATS daily_bytes = SUM(network.bytes) BY source.ip, day
+    | STATS avg_bytes = AVG(daily_bytes), stddev_bytes = STDDEV(daily_bytes), max_bytes = MAX(daily_bytes), baseline_days = COUNT_DISTINCT(day) BY source.ip
+    | WHERE baseline_days >= 30
+      AND max_bytes >= (avg_bytes + (3 * stddev_bytes))
+      AND max_bytes >= 1000000
+    | KEEP source.ip, avg_bytes, stddev_bytes, max_bytes, baseline_days
+  leql: |
+    where(direction=OUTBOUND AND source_address=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND NOT destination_address=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND bytes_out>1000000) groupby(source_address) calculate(average:bytes_out)
+  crowdstrike: "#type=firewall direction=outbound \n| case {\n    destination=/^10\\.|^172\\.(1[6-9]|2[0-9]|3[01])\\.|^192\\.168\\./ | internal=true;\n\
+    \    * | internal=false;\n  }\n| internal=false\n| groupBy([src_ip], function=[sum(bytes_out, as=bytesOut), avg(bytes_out, as=avgBytes)])\n\
+    | bytesOut >= 1000000\n| baseline(field=avgBytes, by=[src_ip], unit=1d, span=30d, outlier=avg, sensitivity=3)\n| table([src_ip, bytesOut,\
+    \ avgBytes, _baseline])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_source_translated_ip != null and action_destination_translated_ip != null
+    | filter not incidr(action_destination_translated_ip, "10.0.0.0/8") and not incidr(action_destination_translated_ip, "172.16.0.0/12") and not incidr(action_destination_translated_ip, "192.168.0.0/16")
+    | alter bytes_out = to_number(action_upload_bytes)
+    | filter bytes_out >= 1000000
+    | bin _time span=1d
+    | comp avg(bytes_out) as avg_bytes_out by _time, action_source_translated_ip
+    | fields _time, action_source_translated_ip, avg_bytes_out
+  lucene: |
+    _exists_:bytesOut AND bytesOut:[1000000 TO *] AND (source.ip:10.0.0.0/8 OR source.ip:172.16.0.0/12 OR source.ip:192.168.0.0/16) AND NOT (destination.ip:10.0.0.0/8 OR destination.ip:172.16.0.0/12 OR destination.ip:192.168.0.0/16)
+  sumo: |
+    _sourceCategory=*firewall*
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "bytesOut" as bytes_out
+    | json field=_raw "direction" as direction
+    | where direction = "outbound" or (isPrivateIP(src_ip) and !isPrivateIP(dest_ip))
+    | where bytes_out >= 1000000
+    | timeslice 1d
+    | avg(bytes_out) as avg_bytes_out by _timeslice, src_ip
+    | sort by _timeslice asc
+    | outlier avg_bytes_out by src_ip window=30,threshold=3,consecutive=1,direction=+
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -99,7 +96,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: 'Firewall Events
 

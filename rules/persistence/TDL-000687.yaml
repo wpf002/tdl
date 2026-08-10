@@ -15,71 +15,62 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=slack action="intune_disabled"
+  spl: 'index=slack action="intune_disabled"
+
     | table _time, user, action, host, src, dest
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000687 {\n  meta:\n    author = \"TDL\"\n    description = \"Microsoft Intune Disabled - Slack\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    OfficeActivity
+    | where TimeGenerated > ago(24h)
+    | where OfficeWorkload == "Slack"
+    | where Operation == "intune_disabled"
+    | project TimeGenerated, UserId, ClientIP, Operation, OfficeWorkload, OrganizationId, ResultStatus
+  aql: |
+    SELECT eventtime, username, sourceip, "Action", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "Action" = 'intune_disabled'
+    LAST 24 HOURS
+  yara_l: |
+    rule slack_intune_disabled_persistence {
+      meta:
+        author = "TDL"
+        description = "Detects Intune disabled action in Slack logs - T1098 Persistence"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1098"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Slack"
+        $e.metadata.product_event_type = "intune_disabled"
+        $e.principal.hostname = $host
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-slack.audit*
+    | WHERE action == "intune_disabled"
+    | KEEP @timestamp, user.name, user.email, action, host.name, source.ip
+  leql: |
+    where(source_json.Action="intune_disabled")
+  crowdstrike: |
+    #type=slack action=intune_disabled
+    | table([@timestamp, user, action, ComputerName, TargetUserName])
+  xql: |
+    dataset = slack_audit_logs
+    | filter action = "intune_disabled"
+    | fields _time, actor_user_email, actor_user_name, action, entity_type, entity_id
+  lucene: |
+    action:"intune_disabled"
+  sumo: |
+    _sourceCategory=*Slack* "intune_disabled"
+    | json field=_raw "action" as action
+    | where action = "intune_disabled"
+    | fields _messageTime, _sourceHost, action
 false_positives:
 - Authorized pen testing
 - Security research
@@ -89,7 +80,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Slack Event
 

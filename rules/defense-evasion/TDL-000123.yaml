@@ -15,76 +15,92 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=* sourcetype IN ("WinEventLog:Application", "WinEventLog:System", "xmlwineventlog:application", "xmlwineventlog:system") (EventCode=7040 OR EventCode=7045 OR EventCode=4719 OR EventCode=1102 OR EventCode=104)
+  spl: 'index=* sourcetype IN ("WinEventLog:Application", "WinEventLog:System", "xmlwineventlog:application", "xmlwineventlog:system") (EventCode=7040
+    OR EventCode=7045 OR EventCode=4719 OR EventCode=1102 OR EventCode=104)
+
     | eval authorized_users="admin,svc_admin,domain_admin"
+
     | where NOT match(User, "(?i)(admin|svc_admin|domain_admin)")
+
     | table _time, host, EventCode, User, Service_Name, ServiceName, Message
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000123 {\n  meta:\n    author = \"TDL\"\n    description = \"Configuration Change by Unauthorized User\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1562\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    Event
+    | where TimeGenerated > ago(1h)
+    | where EventLog == "Operations Manager" or Source == "ConfigMgr" or Source contains "Configuration" or EventLevelName in ("Warning", "Error", "Informational")
+    | where RenderedDescription has_any ("configuration", "setting", "policy", "changed", "modified", "updated")
+    | extend SourceUser = coalesce(UserName, User, Account, "")
+    | where isnotempty(SourceUser)
+    | where SourceUser !in ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "Administrator", "sccm_admin", "config_service", "authorized_admin1", "authorized_admin2")
+    | project TimeGenerated, Computer, EventLog, Source, EventID, SourceUser, RenderedDescription, ParameterXml
+  aql: |
+    SELECT username, sourceip, LOGSOURCENAME(logsourceid) AS host, CATEGORYNAME(category) AS event_category, qidname(qid) AS event_name, eventtime
+    FROM events
+    WHERE CATEGORYNAME(category) ILIKE '%configuration%'
+      AND username NOT IN ('admin', 'svc_automation', 'system', 'administrator')
+    LAST 24 HOURS
+  yara_l: |
+    rule unauthorized_configuration_change {
+      meta:
+        author = "TDL"
+        description = "Detects configuration changes made by unauthorized users - T1562 Defense Evasion"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1562"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "SETTING_MODIFICATION"
+        $e.principal.user.userid = $user
+        not $user in %authorized_config_users
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host, $user over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
+        $user_name = $user
+        $hostname = $host
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-system.security*, logs-endpoint.events.*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        event.code IN ("4719", "4738", "4670", "4657", "1")
+        OR event.action IN ("configuration-change", "registry-value-set", "modification")
+      )
+      AND user.name NOT IN ("SYSTEM", "Administrator", "LocalSystem", "NT AUTHORITY\\SYSTEM", "backup_admin", "svc_config")
+    | STATS config_changes = COUNT(*) BY user.name, host.name, event.code, event.action
+    | WHERE config_changes >= 1
+    | KEEP @timestamp, host.name, user.name, event.code, event.action, config_changes
+  leql: |
+    where(source_json.EventID=4719 AND source_user NOT IN ["AuthorizedUser1","AuthorizedUser2","AuthorizedUser3"])
+  crowdstrike: |
+    #type=configuration_change event_platform=Win
+    | UserName!=*authorized_user1* UserName!=*authorized_user2* UserName!=*authorized_user3*
+    | table([@timestamp, ComputerName, UserName, ConfigurationChangeType, ChangeDetails])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_CONFIGURATION_CHANGE
+    | filter actor_effective_username not in ("admin", "svc_automation", "system_admin")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_message, action_evtlog_event_id
+  lucene: |
+    (event.category:"configuration" OR event.type:"change" OR event.action:("configuration_change" OR "config_change" OR "system_configuration_change")) AND NOT user.name:("authorized_admin1" OR "authorized_admin2" OR "service_account")
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*IT* (configuration OR config OR change OR modified OR updated)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "User" as user
+    | json field=_raw "SourceUser" as source_user
+    | json field=_raw "UserName" as username
+    | json field=_raw "EventType" as event_type
+    | json field=_raw "Action" as action
+    | where (event_type matches "*config*" OR action matches "*config*" OR event_type matches "*change*" OR action matches "*change*" OR action matches "*modif*")
+    | where !(user in ("admin", "system", "Administrator", "SYSTEM", "NT AUTHORITY\\SYSTEM") OR source_user in ("admin", "system", "Administrator", "SYSTEM", "NT AUTHORITY\\SYSTEM") OR username in ("admin", "system", "Administrator", "SYSTEM", "NT AUTHORITY\\SYSTEM"))
+    | fields _messageTime, _sourceHost, event_id, user, source_user, username, event_type, action
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -94,7 +110,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Configuration Change Event
 

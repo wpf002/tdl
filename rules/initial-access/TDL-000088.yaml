@@ -18,74 +18,99 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=email (sourcetype=mimecast_ttp OR sourcetype=proofpoint_tap OR sourcetype=email_security) action=blocked (event_type="url_click" OR category="url_click" OR action_reason="*URL*")
+  spl: 'index=email (sourcetype=mimecast_ttp OR sourcetype=proofpoint_tap OR sourcetype=email_security) action=blocked (event_type="url_click"
+    OR category="url_click" OR action_reason="*URL*")
+
     | bin _time span=5m
+
     | stats dc(user) as unique_users values(user) as users by _time, url
+
     | where unique_users >= 3
+
     | table _time, url, unique_users, users
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000088 {\n  meta:\n    author = \"TDL\"\n    description = \"Excessive Phishing Clicks Blocked by User\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1566\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    EmailUrlInfo
+    | where TimeGenerated > ago(5m)
+    | where UrlClickAction == "Blocked" or ThreatTypes has "Phish" or DeliveryAction == "Blocked"
+    | summarize ClickCount = dcount(RecipientEmailAddress), Users = make_set(RecipientEmailAddress), FirstClick = min(TimeGenerated), LastClick = max(TimeGenerated) by Url
+    | where ClickCount >= 3
+    | where datetime_diff('minute', LastClick, FirstClick) <= 5
+    | project Url, ClickCount, Users, FirstClick, LastClick
+  aql: |
+    SELECT "URL" AS url, UNIQUECOUNT(username) AS unique_users, COUNT(*) AS blocked_clicks, LISTAGG(username) AS usernames
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%mimecast%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%proofpoint%' OR categoryname(category) ILIKE '%email%')
+      AND (qidname(qid) ILIKE '%click%blocked%' OR qidname(qid) ILIKE '%url%blocked%' OR qidname(qid) ILIKE '%blocked%click%')
+      AND "URL" IS NOT NULL
+    GROUP BY "URL"
+    HAVING blocked_clicks >= 3 AND unique_users >= 3
+    LAST 5 MINUTES
+  yara_l: |
+    rule phishing_multiple_users_blocked_url {
+      meta:
+        author = "Chronicle Detection Engineering"
+        description = "Detects 3 or more users clicking the same blocked URL within 5 minutes, indicating potential phishing campaign"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1566"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.security_result.action = "BLOCK"
+        $e.target.url = $url
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $url over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #user >= 3
+    }
+  esql: "FROM logs-email.security*, logs-mimecast.ttp*, logs-proofpoint.tap*\n| WHERE @timestamp > NOW() - 5 minutes \n  AND (event.action ==\
+    \ \"blocked\" OR event.outcome == \"blocked\" OR threat.enrichments.indicator.action == \"blocked\")\n  AND (url.full != null OR url.original\
+    \ != null)\n| EVAL normalized_url = COALESCE(url.full, url.original)\n| STATS click_count = COUNT(*), users = COUNT_DISTINCT(user.name) BY\
+    \ normalized_url, window = BUCKET(@timestamp, 5 minutes)\n| WHERE click_count >= 3 AND users >= 3\n| KEEP window, normalized_url, click_count,\
+    \ users\n"
+  leql: |
+    where(source_json.event_type="URL Click Blocked") groupby(source_json.url, source_json.username) calculate(count)
+  crowdstrike: |
+    #type=email* (action=blocked OR threatAction=blocked OR disposition=blocked) (url=* OR clickedUrl=*)
+    | case {
+        url=* | url := url;
+        clickedUrl=* | url := clickedUrl;
+        * | url := "";
+      }
+    | user := coalesce([sourceUser, recipient, user, userName])
+    | url!="" user!=""
+    | groupBy([url, user], function=count(as=clicks), span=5m)
+    | clicks >= 3
+    | table([_bucket, url, user, clicks])
+  xql: |
+    dataset = msft_365_defender_email_url_clicks_raw
+    | alter normalized_time = to_timestamp(_time)
+    | bin normalized_time span=5m
+    | comp count() as click_count by normalized_time, url, source_user
+    | filter click_count >= 3 and action_type = "blocked"
+    | fields normalized_time, url, source_user, click_count
+    | sort desc normalized_time
+  lucene: |
+    event.type:"url_click" AND action:"blocked" AND _exists_:url AND _exists_:user.name
+  sumo: |
+    _sourceCategory=*Email* OR _sourceCategory=*Mimecast* OR _sourceCategory=*ProofPoint* ("blocked" OR "click blocked" OR "url blocked")
+    | json field=_raw "url" as url
+    | json field=_raw "user" as user
+    | json field=_raw "username" as username
+    | json field=_raw "recipient" as recipient
+    | json field=_raw "action" as action
+    | where action matches "*block*" OR _raw matches "*blocked*"
+    | if(isNull(user), if(isNull(username), recipient, username), user) as source_user
+    | where !isNull(url) and !isNull(source_user)
+    | timeslice 5m
+    | count_distinct(source_user) as user_count by _timeslice, url
+    | where user_count >= 3
+    | fields _timeslice, url, user_count
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -95,7 +120,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '3 URL Click Blocked Events
 

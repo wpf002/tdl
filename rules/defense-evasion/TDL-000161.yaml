@@ -16,74 +16,85 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail eventName IN ("ModifySnapshotAttribute", "SharedSnapshotCopyInitiated")
+  spl: 'index=aws sourcetype=aws:cloudtrail eventName IN ("ModifySnapshotAttribute", "SharedSnapshotCopyInitiated")
+
     | eval is_modify_with_add=if(eventName="ModifySnapshotAttribute" AND like(requestParameters, "%add%"), 1, 0)
+
     | eval is_shared_snapshot=if(eventName="SharedSnapshotCopyInitiated", 1, 0)
+
     | where is_modify_with_add=1 OR is_shared_snapshot=1
+
     | table _time, userIdentity.principalId, userIdentity.arn, eventName, requestParameters, sourceIPAddress, awsRegion
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000161 {\n  meta:\n    author = \"TDL\"\n    description = \"EC2 Snapshot Sharing\"\n    severity = \"MEDIUM\"\n  \
-    \  tactic = \"TA0005\"\n    technique = \"T1578\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n\
-    \    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(24h)
+    | where EventName in ("ModifySnapshotAttribute", "SharedSnapshotCopyInitiated")
+    | where EventName == "SharedSnapshotCopyInitiated" or (EventName == "ModifySnapshotAttribute" and RequestParameters has "add")
+    | project TimeGenerated, EventName, UserIdentityArn, SourceIpAddress, UserAgent, RequestParameters, ResponseElements, AWSRegion, RecipientAccountId
+  aql: "SELECT eventtime, username, sourceip, QIDNAME(qid), \"Event Name\", \"Request Parameters\", \"User Agent\", \"Error Code\"\nFROM events\n\
+    WHERE ((\"Event Name\" = 'ModifySnapshotAttribute' AND \"Request Parameters\" ILIKE '%add%') \n       OR \"Event Name\" = 'SharedSnapshotCopyInitiated')\n\
+    \  AND LOGSOURCETYPENAME(devicetype) ILIKE '%cloudtrail%'\nLAST 24 HOURS\n"
+  yara_l: |
+    rule aws_snapshot_sharing_defense_evasion {
+      meta:
+        author = "Chronicle Security"
+        description = "Detects AWS snapshot sharing activity that may indicate defense evasion via T1578"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1578"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "AWS CloudTrail"
+        $e.metadata.event_type = "NETWORK_CONNECTION" or $e.metadata.event_type = "GENERIC_EVENT" or $e.metadata.event_type = "USER_RESOURCE_ACCESS"
+        (
+          (
+            $e.metadata.product_event_type = "ModifySnapshotAttribute"
+            and re.regex($e.security_result.summary, `(?i)add`)
+          )
+          or
+          $e.metadata.product_event_type = "SharedSnapshotCopyInitiated"
+        )
+        $e.principal.user.userid = $user
+        $e.target.resource.attribute.cloud.availability_zone = $region
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 50
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE event.action == "ModifySnapshotAttribute" AND event.outcome == "success" AND aws.cloudtrail.request_parameters LIKE "*add*"
+       OR event.action == "SharedSnapshotCopyInitiated" AND event.outcome == "success"
+    | STATS event_count = COUNT(*) BY cloud.account.id, user.name, event.action, aws.cloudtrail.request_parameters, @timestamp
+    | KEEP @timestamp, cloud.account.id, user.name, event.action, aws.cloudtrail.request_parameters, event_count
+  leql: |
+    where(source_json.eventName IN [ModifySnapshotAttribute, SharedSnapshotCopyInitiated] AND (source_json.requestParameters ICONTAINS "add" OR source_json.eventName=SharedSnapshotCopyInitiated))
+  crowdstrike: |
+    #type=cloudtrail (eventName=ModifySnapshotAttribute requestParameters=*add*) OR eventName=SharedSnapshotCopyInitiated
+    | table([@timestamp, eventName, userIdentity.principalId, userIdentity.arn, sourceIPAddress, requestParameters, responseElements, awsRegion, errorCode, errorMessage])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and operation_type = "AWS API Call"
+    | filter (operation_name = "ModifySnapshotAttribute" and raw_log contains "add") or operation_name = "SharedSnapshotCopyInitiated"
+    | fields _time, cloud_provider, operation_name, identity_name, actor_user, resource_name, raw_log
+  lucene: |
+    (eventName:ModifySnapshotAttribute AND requestParameters:*add*) OR eventName:SharedSnapshotCopyInitiated
+  sumo: |
+    _sourceCategory=*cloudtrail* AND (eventName=ModifySnapshotAttribute OR eventName=SharedSnapshotCopyInitiated)
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "requestParameters" as request_params
+    | json field=_raw "userIdentity.principalId" as principal_id
+    | json field=_raw "sourceIPAddress" as src_ip
+    | json field=_raw "awsRegion" as region
+    | where (event_name = "ModifySnapshotAttribute" and request_params matches "*add*") or event_name = "SharedSnapshotCopyInitiated"
+    | fields _messageTime, event_name, principal_id, src_ip, region, request_params
 false_positives:
 - 'Reviewing logic - High false positive rate.
 
@@ -96,7 +107,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 AWS APICall Event
 

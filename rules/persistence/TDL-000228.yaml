@@ -18,78 +18,63 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    (index=windows (EventCode=592 OR EventCode=4688) ParentImage="*\\netsh.exe" Image!=conhost.exe Image!=NULL Image!="-") OR (index=windows (EventCode=567 OR EventCode=4657) (Object_Name="*\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Netsh*" OR Object_Name="*HKLM\\SOFTWARE\\Microsoft\\Netsh*" OR Object_Name="*HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Netsh*"))
-    | eval detection_type=case(
-        (EventCode=592 OR EventCode=4688), "Process Execution",
-        (EventCode=567 OR EventCode=4657), "Registry Modification"
-    )
-    | table _time, ComputerName, EventCode, detection_type, ParentImage, Image, CommandLine, Object_Name, Process_Name
-  kql: 'DeviceRegistryEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where registry_key matches regex ".+"
-
-    | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Registry Key\", \"Registry Value Name\", \"Registry Value Data\", \"Process Name\"\nFROM events\nWHERE\
-    \ LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n  AND \"EventID\" IN ('12','13','14')\n  AND \"registry_key\" LIKE '%.+%'\n\
-    LAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000228 {\n  meta:\n    author = \"TDL\"\n    description = \"Netsh Helper DLL Injection\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0003\"\n    technique = \"T1574\"\n  events:\n    $e.metadata.event_type = \"REGISTRY_MODIFICATION\"\n    $e.registry_key\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "registry" AND registry_key LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/.+/)
-
-    groupby(asset, registry_key, registry_value)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*.+*
-
-    | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
-
-    | sort -changes
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.REGISTRY AND registry_key ~= ".+"
-
-    | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
-
-    | sort desc changes
-
-    '
-  lucene: 'event.category:"registry" AND registry_key:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id IN ("12","13","14") AND registry_key matches "*.+*"
-
-    | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc
-
-    '
+  spl: "(index=windows (EventCode=592 OR EventCode=4688) ParentImage=\"*\\\\netsh.exe\" Image!=conhost.exe Image!=NULL Image!=\"-\") OR (index=windows\
+    \ (EventCode=567 OR EventCode=4657) (Object_Name=\"*\\\\REGISTRY\\\\MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Netsh*\" OR Object_Name=\"*HKLM\\\\\
+    SOFTWARE\\\\Microsoft\\\\Netsh*\" OR Object_Name=\"*HKEY_LOCAL_MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Netsh*\"))\n| eval detection_type=case(\n\
+    \    (EventCode=592 OR EventCode=4688), \"Process Execution\",\n    (EventCode=567 OR EventCode=4657), \"Registry Modification\"\n)\n| table\
+    \ _time, ComputerName, EventCode, detection_type, ParentImage, Image, CommandLine, Object_Name, Process_Name\n"
+  kql: |
+    union
+    (SecurityEvent
+    | where EventID == 4688
+    | where ParentProcessName has "netsh.exe"
+    | where isnotempty(NewProcessName) and NewProcessName !has "conhost.exe"
+    | project TimeGenerated, Computer, Account, ParentProcessName, NewProcessName, CommandLine, EventID, DetectionType = "Process Execution"),
+    (SecurityEvent
+    | where EventID == 4657
+    | where ObjectName has_any ("REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Netsh", "HKLM\\SOFTWARE\\Microsoft\\Netsh", "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Netsh")
+    | project TimeGenerated, Computer, Account, ObjectName, OperationType, EventID, DetectionType = "Registry Modification")
+    | project TimeGenerated, Computer, Account, EventID, DetectionType, ParentProcessName, NewProcessName, CommandLine, ObjectName, OperationType
+  aql: |
+    SELECT eventtime, sourceip, username, "Process Name" AS child_process, "Parent Process Name", "Process CommandLine", LOGSOURCENAME(logsourceid) AS host
+    FROM events
+    WHERE (("EventID" = '4688' AND "Parent Process Name" ILIKE '%netsh.exe%' AND "Process Name" IS NOT NULL AND "Process Name" NOT ILIKE '%conhost.exe%')
+    OR ("EventID" = '4657' AND ("ObjectName" ILIKE '%REGISTRY\MACHINE\SOFTWARE\Microsoft\Netsh%' OR "ObjectName" ILIKE '%HKLM\SOFTWARE\Microsoft\Netsh%' OR "ObjectName" ILIKE '%HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Netsh%')))
+    LAST 1 HOURS
+  yara_l: "rule netsh_helper_dll_persistence {\n  meta:\n    author = \"TDL\"\n    description = \"Detects potential netsh helper DLL persistence\
+    \ via process execution and registry modification\"\n    mitre_attack_tactic = \"Persistence\"\n    mitre_attack_technique = \"T1574\"\n \
+    \   \n  events:\n    $proc.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      $proc.metadata.product_event_type = \"592\" or\n      $proc.metadata.product_event_type\
+    \ = \"4688\"\n    )\n    re.regex($proc.principal.process.file.full_path, `(?i)\\\\netsh\\.exe$`)\n    $proc.target.process.file.full_path\
+    \ != \"\"\n    not re.regex($proc.target.process.file.full_path, `(?i)\\\\conhost\\.exe$`)\n    $proc.principal.hostname = $host\n    \n \
+    \   $reg.metadata.event_type = \"REGISTRY_MODIFICATION\"\n    (\n      $reg.metadata.product_event_type = \"567\" or\n      $reg.metadata.product_event_type\
+    \ = \"4657\"\n    )\n    (\n      re.regex($reg.target.registry.registry_key, `(?i)REGISTRY\\\\MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Netsh`)\
+    \ or\n      re.regex($reg.target.registry.registry_key, `(?i)HKLM\\\\SOFTWARE\\\\Microsoft\\\\Netsh`) or\n      re.regex($reg.target.registry.registry_key,\
+    \ `(?i)HKEY_LOCAL_MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Netsh`)\n    )\n    $reg.principal.hostname = $host\n    \n  match:\n    $host over\
+    \ 1h\n    \n  condition:\n    $proc and $reg\n}\n"
+  esql: "FROM logs-system.security*, logs-endpoint.events.process*, winlogbeat-*\n| WHERE (\n    (event.code IN (\"592\", \"4688\") AND process.parent.name\
+    \ == \"netsh.exe\" AND process.name IS NOT NULL AND process.name != \"conhost.exe\")\n    OR\n    (event.code IN (\"567\", \"4657\") AND (\n\
+    \      winlog.event_data.ObjectName LIKE \"*\\\\SOFTWARE\\\\Microsoft\\\\Netsh*\" \n      OR winlog.event_data.ObjectName LIKE \"REGISTRY\\\
+    \\MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Netsh*\"\n      OR winlog.event_data.ObjectName LIKE \"HKLM\\\\SOFTWARE\\\\Microsoft\\\\Netsh*\"\n \
+    \     OR winlog.event_data.ObjectName LIKE \"HKEY_LOCAL_MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Netsh*\"\n    ))\n  )\n| KEEP @timestamp, host.name,\
+    \ user.name, event.code, process.parent.name, process.name, process.command_line, winlog.event_data.ObjectName\n"
+  leql: |
+    where((source_json.EventID IN [592, 4688] AND parent_process_name ICONTAINS "netsh.exe" AND process_name != "" AND process_name NOT ICONTAINS "conhost.exe") OR (source_json.EventID IN [567, 4657] AND (source_json.ObjectName ICONTAINS "REGISTRY\MACHINE\SOFTWARE\Microsoft\Netsh" OR source_json.ObjectName ICONTAINS "HKLM\SOFTWARE\Microsoft\Netsh" OR source_json.ObjectName ICONTAINS "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Netsh")))
+  crowdstrike: |
+    (EventCode=4688 ParentBaseFileName=netsh.exe FileName!=conhost.exe FileName!=NULL) OR (EventCode=4657 (RegistryKey=*REGISTRY\MACHINE\SOFTWARE\Microsoft\Netsh* OR RegistryKey=*HKLM\SOFTWARE\Microsoft\Netsh* OR RegistryKey=*HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Netsh*))
+    | table([@timestamp, ComputerName, EventCode, UserName, FileName, ParentBaseFileName, CommandLine, RegistryKey, RegistryValueName])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) and actor_process_image_name = "netsh.exe" and action_process_image_name != "" and action_process_image_name != "conhost.exe")
+       or (action_evtlog_event_id in (567, 4657) and (action_registry_key_name contains "REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Netsh" or action_registry_key_name contains "HKLM\\SOFTWARE\\Microsoft\\Netsh" or action_registry_key_name contains "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Netsh"))
+    | fields _time, agent_hostname, action_evtlog_event_id, actor_process_image_name, action_process_image_name, action_process_image_command_line, action_registry_key_name, actor_effective_username
+  lucene: |
+    (event.code:(4688 OR 592) AND process.parent.name:netsh.exe AND NOT process.name:(conhost.exe OR "")) OR (event.code:(4657 OR 567) AND (registry.path:*REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Netsh* OR registry.path:*HKLM\\SOFTWARE\\Microsoft\\Netsh* OR registry.path:*HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Netsh*))
+  sumo: "_sourceCategory=*Windows* (event_id=\"4688\" OR event_id=\"4657\")\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"ParentProcessName\"\
+    \ as parent_process\n| json field=_raw \"NewProcessName\" as child_process\n| json field=_raw \"ObjectName\" as registry_key\n| where (event_id\
+    \ = \"4688\" AND parent_process matches \"*netsh.exe\" AND child_process != \"\" AND NOT child_process matches \"*conhost.exe\") \n   OR (event_id\
+    \ = \"4657\" AND (registry_key matches \"*REGISTRY\\\\MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Netsh*\" OR registry_key matches \"*HKLM\\\\SOFTWARE\\\
+    \\Microsoft\\\\Netsh*\" OR registry_key matches \"*HKEY_LOCAL_MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Netsh*\"))\n| fields _messageTime, _sourceHost,\
+    \ event_id, parent_process, child_process, registry_key\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -99,7 +84,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Process Execution Event
 

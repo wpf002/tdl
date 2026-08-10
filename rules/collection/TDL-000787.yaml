@@ -18,85 +18,113 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=cloud_audit (eventName=GetObject OR action=storage.objects.get OR operationName=BlobStorage.ReadBlob)
-    | eval bucket=coalesce(requestParameters.bucketName, resource.labels.bucket_name, json_extract(properties, "$.container"))
-    | eval identity=coalesce(userIdentity.principalId, user.email, caller.email, identity.claims.sub)
-    | eval aws_region=coalesce(awsRegion, region, location)
-    | lookup sensitive_buckets bucket OUTPUT is_sensitive
-    | where is_sensitive="true" OR
-        [search index=cloud_audit earliest=-90d latest=-5m
-         | eval identity=coalesce(userIdentity.principalId, user.email, caller.email, identity.claims.sub)
-         | eval aws_region=coalesce(awsRegion, region, location)
-         | stats values(aws_region) as historical_regions by identity
-         | mvexpand historical_regions
-         | return $identity $historical_regions]
+  spl: "index=cloud_audit (eventName=GetObject OR action=storage.objects.get OR operationName=BlobStorage.ReadBlob)\n| eval bucket=coalesce(requestParameters.bucketName,\
+    \ resource.labels.bucket_name, json_extract(properties, \"$.container\"))\n| eval identity=coalesce(userIdentity.principalId, user.email,\
+    \ caller.email, identity.claims.sub)\n| eval aws_region=coalesce(awsRegion, region, location)\n| lookup sensitive_buckets bucket OUTPUT is_sensitive\n\
+    | where is_sensitive=\"true\" OR\n    [search index=cloud_audit earliest=-90d latest=-5m\n     | eval identity=coalesce(userIdentity.principalId,\
+    \ user.email, caller.email, identity.claims.sub)\n     | eval aws_region=coalesce(awsRegion, region, location)\n     | stats values(aws_region)\
+    \ as historical_regions by identity\n     | mvexpand historical_regions\n     | return $identity $historical_regions]\n| bin _time span=5m\n\
+    | stats count by _time, identity, bucket, aws_region\n| where count >= 1000\n| table _time, identity, bucket, aws_region, count\n"
+  kql: "let lookback = 14d;\nlet threshold = 1000;\nlet window = 5m;\nlet historicalRegions = \n    AWSCloudTrail\n    | where TimeGenerated between\
+    \ (ago(lookback) .. ago(window))\n    | where EventName == \"GetObject\"\n    | summarize HistoricalRegions = make_set(AWSRegion) by UserIdentityArn;\n\
+    AWSCloudTrail\n| where TimeGenerated > ago(window)\n| where EventName == \"GetObject\"\n| extend BucketName = tostring(parse_json(RequestParameters).bucketName)\n\
+    | extend IsSensitive = BucketName has_any (\"sensitive\", \"confidential\", \"secret\", \"private\")\n| join kind=leftouter (historicalRegions)\
+    \ on UserIdentityArn\n| extend IsNewRegion = isnotnull(HistoricalRegions) and not(set_has_element(HistoricalRegions, AWSRegion))\n| summarize\
+    \ \n    GetObjectCount = count(),\n    Buckets = make_set(BucketName),\n    Regions = make_set(AWSRegion),\n    HasSensitiveBucket = max(toint(IsSensitive)),\n\
+    \    HasNewRegion = max(toint(IsNewRegion))\n    by bin(TimeGenerated, window), UserIdentityArn, UserIdentityType, SourceIpAddress\n| where\
+    \ GetObjectCount >= threshold and (HasSensitiveBucket == 1 or HasNewRegion == 1)\n| project TimeGenerated, UserIdentityArn, UserIdentityType,\
+    \ SourceIpAddress, GetObjectCount, Buckets, Regions, HasSensitiveBucket, HasNewRegion\n"
+  aql: |
+    SELECT "Identity", "BucketName", "SourceRegion", COUNT(*) AS get_object_count, UNIQUECOUNT("ObjectKey") AS unique_objects
+    FROM events
+    WHERE ("EventName" = 'GetObject' OR "EventName" = 's3:GetObject' OR "EventName" = 'storage.objects.get' OR "EventName" = 'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read')
+      AND ("BucketTags" ILIKE '%sensitive%' OR "BucketTags" ILIKE '%confidential%' OR "ResourceLabels" ILIKE '%sensitive%' OR "ResourceTags" ILIKE '%sensitive%')
+    GROUP BY "Identity", "BucketName", "SourceRegion"
+    HAVING get_object_count >= 1000
+    LAST 5 MINUTES
+  yara_l: |
+    rule cloud_storage_exfiltration_t1530 {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects potential data exfiltration from cloud storage via high-volume GetObject calls from a single identity against sensitive buckets or from anomalous regions"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1530"
+        severity = "HIGH"
+
+      events:
+        $e.metadata.event_type = "RESOURCE_READ"
+        (
+          $e.metadata.product_event_type = "storage.objects.get" or
+          $e.metadata.product_event_type = "GetObject" or
+          $e.metadata.product_event_type = "Microsoft.Storage.BlobRead"
+        )
+        $e.principal.user.userid = $identity
+        $e.target.resource.name = $bucket
+
+      match:
+        $identity, $bucket over 5m
+
+      outcome:
+        $risk_score = max(85)
+        $total_calls = count_distinct($e.metadata.id)
+        $source_regions = array_distinct($e.principal.location.country_or_region)
+
+      condition:
+        #e >= 1000
+    }
+  esql: |
+    FROM logs-aws.cloudtrail*, logs-azure.activitylogs*, logs-gcp.audit*
+    | WHERE @timestamp > NOW() - 5 minutes
+      AND (
+        (event.dataset == "aws.cloudtrail" AND event.action == "GetObject" AND aws.cloudtrail.resources.type == "AWS::S3::Bucket" AND aws.s3.bucket.tags.sensitivity == "high")
+        OR (event.dataset == "azure.activitylogs" AND event.action LIKE "*Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read*" AND azure.resource.tags.sensitivity == "high")
+        OR (event.dataset == "gcp.audit" AND event.action == "storage.objects.get" AND cloud.resource.tags.sensitivity == "high")
+      )
+    | STATS call_count = COUNT(*) BY user.name, cloud.account.id, cloud.region, bucket = COALESCE(aws.s3.bucket.name, azure.storage.container, gcp.storage.bucket), window = BUCKET(@timestamp, 5 minutes)
+    | WHERE call_count >= 1000
+    | KEEP @timestamp, window, user.name, cloud.account.id, cloud.region, bucket, call_count
+  leql: |
+    where(source_json.eventName="GetObject" AND source_json.requestParameters.bucketName IN ["sensitive-bucket-1","sensitive-bucket-2"]) groupby(source_json.userIdentity.principalId, source_json.awsRegion) calculate(count)
+  crowdstrike: |
+    (#type=cloudaudit OR event_simpleName=CloudAudit*) (eventName=GetObject OR action=storage.objects.get OR operationName=*BlobRead*)
+    | bucket:=coalesce(requestParameters.bucketName, resource.name, container)
+    | actor:=coalesce(userIdentity.principalId, caller, user)
+    | sourceRegion:=coalesce(awsRegion, resource.location, location)
+    | groupBy([actor, bucket], function=[count(as=getObjectCount), collect([sourceRegion], limit=100)])
+    | getObjectCount >= 1000
+    | table([actor, bucket, getObjectCount, sourceRegion])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider in ("AWS", "Azure", "GCP")
+      and (
+        (cloud_provider = "AWS" and action_name = "GetObject")
+        or (cloud_provider = "Azure" and action_name = "BlobDownload")
+        or (cloud_provider = "GCP" and action_name = "storage.objects.get")
+      )
     | bin _time span=5m
-    | stats count by _time, identity, bucket, aws_region
-    | where count >= 1000
-    | table _time, identity, bucket, aws_region, count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GetObject"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GetObject%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000787 {\n  meta:\n    author = \"TDL\"\n    description = \"Bulk GetObject from Sensitive Bucket\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0009\"\n    technique = \"T1530\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /GetObject/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GetObject%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GetObject/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GetObject*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GetObject"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GetObject*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GetObject*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    | comp count() as get_count by _time, actor_user, cloud_provider, resource_name, action_country
+    | filter get_count >= 1000
+    | fields _time, actor_user, cloud_provider, resource_name, action_country, get_count
+  lucene: |
+    (event.action:"GetObject" OR event.action:"s3:GetObject" OR event.action:"storage.objects.get" OR event.action:"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read") AND (resource.labels.sensitivity:"sensitive" OR resource.tags.sensitivity:"sensitive" OR bucket.tags.sensitivity:"sensitive" OR tags.sensitivity:"sensitive")
+  sumo: |
+    _sourceCategory=*CloudTrail* OR _sourceCategory=*AzureAudit* OR _sourceCategory=*GCP* "GetObject" OR "Storage.objects.get" OR "BlobService.GetBlob"
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "userIdentity.principalId" as principal_id
+    | json field=_raw "userIdentity.arn" as user_arn
+    | json field=_raw "requestParameters.bucketName" as bucket_name
+    | json field=_raw "awsRegion" as region
+    | json field=_raw "sourceIPAddress" as src_ip
+    | json field=_raw "resourceName" as gcp_resource
+    | json field=_raw "callerIdentity.principalId" as azure_principal
+    | json field=_raw "properties.resourceUri" as azure_resource
+    | where event_name in ("GetObject", "Storage.objects.get", "BlobService.GetBlob") or event_name matches "*GetObject*" or event_name matches "*GetBlob*"
+    | if(isNull(principal_id), if(isNull(azure_principal), user_arn, azure_principal), principal_id) as identity
+    | if(isNull(bucket_name), if(isNull(gcp_resource), azure_resource, gcp_resource), bucket_name) as resource
+    | timeslice 5m
+    | count as get_count by _timeslice, identity, resource, region
+    | where get_count >= 1000
+    | fields _timeslice, identity, resource, region, get_count
 pseudo_logic: ≥1000 GetObject calls in 5m from one identity against a tagged-sensitive bucket, or from a region the identity has never used.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -114,7 +142,7 @@ references:
 - https://attack.mitre.org/techniques/T1530/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'

@@ -16,74 +16,66 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=mcas sourcetype=mcas:events (event_name="Risky sign-in: Malicious IP address" OR event_name="Logon from a risky IP address")
+  spl: 'index=mcas sourcetype=mcas:events (event_name="Risky sign-in: Malicious IP address" OR event_name="Logon from a risky IP address")
+
     | table _time, user, src_ip, event_name, app, device_type, country
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000290 {\n  meta:\n    author = \"TDL\"\n    description = \"Successful Logon from Risky IP\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    CloudAppEvents
+    | where TimeGenerated > ago(1h)
+    | where ActionType in~ ("Risky sign-in: Malicious IP address", "Logon from a risky IP address")
+    | project TimeGenerated, AccountObjectId, AccountDisplayName, IPAddress, Application, ActionType, RawEventData, DeviceType, ISP, City, CountryCode
+  aql: |
+    SELECT DATEFORMAT(devicetime, 'YYYY-MM-dd HH:mm:ss') AS event_time, username, sourceip, destinationip, UTF8(payload) AS event_details, qidname(qid) AS event_name, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE (LOGSOURCENAME(logsourceid) ILIKE '%MCAS%' OR LOGSOURCENAME(logsourceid) ILIKE '%Cloud App Security%' OR LOGSOURCENAME(logsourceid) ILIKE '%Microsoft Cloud App Security%')
+      AND (qidname(qid) ILIKE '%Risky sign-in%Malicious IP address%' OR qidname(qid) ILIKE '%Logon from a risky IP address%' OR UTF8(payload) ILIKE '%Risky sign-in%Malicious IP address%' OR UTF8(payload) ILIKE '%Logon from a risky IP address%')
+    LAST 24 HOURS
+  yara_l: |
+    rule mcas_risky_signin_malicious_ip {
+      meta:
+        author = "TDL"
+        description = "Detects MCAS risky sign-in events from malicious or risky IP addresses - MITRE T1078 Initial Access"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Microsoft"
+        $e.metadata.product_name = "Cloud App Security"
+        (
+          $e.metadata.product_event_type = "Risky sign-in: Malicious IP address" or
+          $e.metadata.product_event_type = "Logon from a risky IP address"
+        )
+        $e.target.user.userid = $user
+        $e.principal.ip = $ip
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $user, $ip over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-o365.audit*\n| WHERE @timestamp > NOW() - 24 hours \n  AND (event.action == \"Risky sign-in: Malicious IP address\" OR event.action\
+    \ == \"Logon from a risky IP address\")\n| KEEP @timestamp, user.name, source.ip, host.name, event.action, event.outcome, event.dataset\n"
+  leql: |
+    where(source_json.eventName IN ["Risky sign-in: Malicious IP address", "Logon from a risky IP address"])
+  crowdstrike: |
+    #type=mcas (EventName="Risky sign-in: Malicious IP address" OR EventName="Logon from a risky IP address")
+    | table([@timestamp, EventName, UserName, IPAddress, ComputerName, RiskLevel])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Microsoft" and logon_type = "MCAS"
+    | filter raw_log contains "Risky sign-in: Malicious IP address" or raw_log contains "Logon from a risky IP address"
+    | fields _time, actor_user, source_ip, raw_log
+  lucene: |
+    event.name:("Risky sign-in: Malicious IP address" OR "Logon from a risky IP address")
+  sumo: |
+    _sourceCategory=*MCAS* ("Risky sign-in: Malicious IP address" OR "Logon from a risky IP address")
+    | json field=_raw "EventName" as event_name
+    | where event_name in ("Risky sign-in: Malicious IP address", "Logon from a risky IP address")
+    | fields _messageTime, _sourceHost, event_name, *
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -93,7 +85,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 MCAS Event Where Event Name is "Risky sign-in: Malicious IP address" OR "Logon from a risky IP address"'
 suppression:

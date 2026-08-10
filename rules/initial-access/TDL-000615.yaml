@@ -23,68 +23,57 @@ queries:
     \ user, userName, userIdentity.userName)\n| lookup break_glass_accounts.csv account_name as user OUTPUT is_break_glass\n| where is_break_glass=\"\
     true\" OR user IN (\"breakglass*\", \"emergency*\", \"bg-*\", \"emerg-*\")\n| table _time, user, src_ip, resultType, eventName, userAgent,\
     \ location\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000615 {\n  meta:\n    author = \"TDL\"\n    description = \"Logon with Break Glass Account\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SigninLogs
+    | where TimeGenerated > ago(1h)
+    | where ResultType == 0
+    | where UserPrincipalName in ("breakglass1@domain.com", "breakglass2@domain.com")
+    | project TimeGenerated, UserPrincipalName, AppDisplayName, IPAddress, Location, DeviceDetail, AuthenticationRequirement, ConditionalAccessStatus, RiskLevelDuringSignIn
+  aql: |
+    SELECT username, sourceip, LOGSOURCENAME(logsourceid) AS log_source, CATEGORYNAME(category) AS event_category, eventtime, "User Agent", "Application", "Location"
+    FROM events
+    WHERE (LOGSOURCENAME(logsourceid) ILIKE '%Azure%' OR LOGSOURCENAME(logsourceid) ILIKE '%AWS%' OR category IN (SELECT category FROM categories WHERE name ILIKE '%Authentication%' OR name ILIKE '%Sign%In%'))
+      AND (CATEGORYNAME(category) ILIKE '%Success%' OR CATEGORYNAME(category) ILIKE '%Logon%' OR "Event Name" ILIKE '%Success%' OR "EventID" = '4624' OR "Activity" ILIKE '%Sign%in%success%' OR "Result" ILIKE '%Success%')
+      AND (username IN ('break-glass-admin@company.com', 'emergency-access@company.com', 'breakglass@company.com') OR username ILIKE '%breakglass%' OR username ILIKE '%emergency%access%')
+    LAST 24 HOURS
+  yara_l: "rule break_glass_account_signin {\n  meta:\n    author = \"TDL\"\n    description = \"Detects successful sign-in events from break\
+    \ glass accounts\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"HIGH\"\n    \n\
+    \  events:\n    $signin.metadata.event_type = \"USER_LOGIN\"\n    $signin.security_result.action = \"ALLOW\"\n    $signin.target.user.userid\
+    \ = $user\n    \n    // Break glass accounts - update with actual account identifiers\n    (\n      re.regex($user, `(?i)breakglass`) or\n\
+    \      re.regex($user, `(?i)emergency`) or\n      re.regex($user, `(?i)bg-admin`) or\n      re.regex($user, `(?i)fireglass`)\n    )\n    \n\
+    \  match:\n    $user over 5m\n    \n  outcome:\n    $risk_score = 85\n    $user_email = array_distinct($signin.target.user.userid)\n    $source_ip\
+    \ = array_distinct($signin.principal.ip)\n    $application = array_distinct($signin.target.application)\n    \n  condition:\n    $signin\n\
+    }\n"
+  esql: "FROM .ds-logs-azure.signinlogs-*, .ds-logs-azure.auditlogs-*, logs-aws.cloudtrail-*\n| WHERE @timestamp > NOW() - 24 hour\n| WHERE \n\
+    \  (event.dataset == \"azure.signinlogs\" AND azure.signinlogs.properties.status.error_code == 0 AND event.outcome == \"success\")\n  OR\n\
+    \  (event.dataset == \"azure.auditlogs\" AND event.outcome == \"success\" AND event.action LIKE \"*sign*\")\n  OR\n  (event.dataset == \"\
+    aws.cloudtrail\" AND event.action IN (\"ConsoleLogin\", \"AssumeRole\") AND event.outcome == \"success\")\n| WHERE \n  user.name IN (\"break-glass-admin@company.com\"\
+    , \"emergency-access@company.com\", \"breakglass@company.com\", \"bg-admin@company.com\")\n  OR user.id IN (\"break-glass-account-id-1\",\
+    \ \"break-glass-account-id-2\")\n  OR azure.signinlogs.properties.user_principal_name IN (\"break-glass-admin@company.com\", \"emergency-access@company.com\"\
+    )\n  OR aws.cloudtrail.user_identity.arn LIKE \"*break-glass*\"\n| STATS sign_ins = COUNT(*) BY user.name, user.id, source.ip, source.geo.country_name,\
+    \ user_agent.original, @timestamp\n| KEEP @timestamp, user.name, user.id, source.ip, source.geo.country_name, user_agent.original, sign_ins\n"
+  leql: |
+    where(result=SUCCESS AND user IN ["break-glass-account-1@domain.com", "break-glass-account-2@domain.com"])
+  crowdstrike: |
+    (#repo="azure" event.category="authentication" event.outcome="success" OR #repo="aws" eventName="ConsoleLogin" responseElements.ConsoleLogin="Success")
+    | UserName in [breakglass1@example.com, breakglass2@example.com, breakglass-admin@example.com]
+    | table([@timestamp, #repo, UserName, ComputerName, SourceIP, event.action, eventName])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider in ("AWS", "Azure")
+    | filter (cloud_provider = "Azure" and action_result = "SUCCESS" and operation_name = "Sign-in activity")
+       or (cloud_provider = "AWS" and action_result = "SUCCESS" and operation_name = "ConsoleLogin")
+    | alter break_glass_accounts = ["break-glass-admin-1", "break-glass-admin-2", "emergency-access-admin"]
+    | filter identity_name in (break_glass_accounts)
+    | fields _time, cloud_provider, identity_name, actor_user, operation_name, action_result, src_ipv4, user_agent
+  lucene: |
+    (event.dataset:"azure.signinlogs" OR event.dataset:"azure.auditlogs" OR eventName:"ConsoleLogin" OR eventName:"AssumeRole") AND event.outcome:success AND user.name:(*breakglass* OR *emergency* OR *break-glass* OR *emergencyaccess* OR *bga-* OR *emer-*)
+  sumo: "_sourceCategory=*Azure* OR _sourceCategory=*AWS*\n| json field=_raw \"eventName\" as aws_event_name\n| json field=_raw \"userIdentity.userName\"\
+    \ as aws_user\n| json field=_raw \"errorCode\" as aws_error\n| json field=_raw \"operationName\" as azure_operation\n| json field=_raw \"\
+    userPrincipalName\" as azure_user\n| json field=_raw \"resultType\" as azure_result\n| where (aws_event_name = \"ConsoleLogin\" and isNull(aws_error))\
+    \ \n       OR (azure_operation = \"Sign-in activity\" and azure_result = \"0\")\n| if(isNull(aws_user), azure_user, aws_user) as user_name\n\
+    | where user_name in (\"break-glass-admin@company.com\", \"emergency-access@company.com\", \"break-glass-1\", \"break-glass-2\")\n| fields\
+    \ _messageTime, _sourceCategory, user_name, aws_event_name, azure_operation, _sourceHost\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -94,7 +83,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Successful Sign-In Event
 

@@ -16,71 +16,50 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=gcp sourcetype=gcp:cloudaudit protoPayload.methodName="*UpdateSink*"
-    | table _time, protoPayload.authenticationInfo.principalEmail, protoPayload.methodName, protoPayload.resourceName, protoPayload.serviceName, resource.labels.project_id
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: 'index=gcp sourcetype=gcp:cloudaudit protoPayload.methodName="*UpdateSink*"
 
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+    | table _time, protoPayload.authenticationInfo.principalEmail, protoPayload.methodName, protoPayload.resourceName, protoPayload.serviceName,
+    resource.labels.project_id
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000318 {\n  meta:\n    author = \"TDL\"\n    description = \"Logging Disabled - GCP\"\n    severity = \"HIGH\"\n  \
-    \  tactic = \"TA0006\"\n    technique = \"T1562.008\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    GCPAuditLogs
+    | where TimeGenerated > ago(1h)
+    | where MethodName contains "UpdateSink"
+    | project TimeGenerated, CallerIpAddress, PrincipalEmail, MethodName, ResourceName, RequestMetadata=todynamic(RequestMetadata), Response=todynamic(Response)
+  aql: |
+    SELECT eventtime, username, sourceip, "protoPayload.methodName", "protoPayload.resourceName", "protoPayload.serviceName", COUNT(*) AS event_count
+    FROM events
+    WHERE "protoPayload.methodName" ILIKE '%UpdateSink%'
+    GROUP BY eventtime, username, sourceip, "protoPayload.methodName", "protoPayload.resourceName", "protoPayload.serviceName"
+    LAST 24 HOURS
+  yara_l: "rule gcp_logging_sink_modification {\n  meta:\n    author = \"TDL\"\n    description = \"Detects modification of GCP logging sinks\
+    \ which may indicate attempt to impair defenses\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique = \"T1562.008\"\
+    \n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.product_name = \"GCP\"\n    $e.metadata.vendor_name = \"Google Cloud Platform\"\
+    \n    $e.metadata.product_event_type = \"google.logging.v2.ConfigServiceV2.UpdateSink\"\n    re.regex($e.metadata.description, `(?i)UpdateSink`)\n\
+    \    $e.principal.user.userid = $user\n    $e.target.resource.name = $sink\n    \n  match:\n    $user over 5m\n    \n  condition:\n    $e\n\
+    }\n"
+  esql: |
+    FROM logs-gcp.audit*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND message.data.protoPayload.methodName LIKE "*UpdateSink*"
+    | KEEP @timestamp, cloud.account.id, cloud.project.id, user.name, source.ip, message.data.protoPayload.methodName, message.data.protoPayload.resourceName, message.data.protoPayload.request
+  leql: |
+    where(source_json.protoPayload.methodName ICONTAINS "UpdateSink")
+  crowdstrike: |
+    #type=gcp_audit message.data.protoPayload.methodName=*UpdateSink*
+    | table([@timestamp, message.data.protoPayload.authenticationInfo.principalEmail, message.data.protoPayload.resourceName, message.data.protoPayload.methodName, message.data.protoPayload.request])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = GCP and json_extract_scalar(raw_log, "$.protoPayload.methodName") ~= ".*UpdateSink.*"
+    | fields _time, cloud_provider, json_extract_scalar(raw_log, "$.protoPayload.authenticationInfo.principalEmail") as principal_email, json_extract_scalar(raw_log, "$.protoPayload.methodName") as method_name, json_extract_scalar(raw_log, "$.protoPayload.resourceName") as resource_name, json_extract_scalar(raw_log, "$.protoPayload.serviceName") as service_name
+  lucene: |
+    message.data.protoPayload.methodName:*UpdateSink*
+  sumo: |
+    _sourceCategory=*GCP* OR _sourceCategory=*gcp* OR _source=*gcp* OR _source=*GCP*
+    | json field=_raw "protoPayload.methodName" as method_name
+    | where method_name matches "*UpdateSink*"
+    | fields _messageTime, _sourceHost, method_name, _raw
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +69,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Cloud Audit event
 

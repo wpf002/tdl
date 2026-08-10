@@ -18,74 +18,91 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=mac sourcetype="MAC Operating System" (EventCode=567 OR EventCode=4663) (file_name="*Library/LaunchDaemons/*" OR file_name="*Library/LaunchAgents/*" OR file_name="*etc/rc.common*" OR file_name="*etc/launchd.conf*") NOT (process_name IN ("installd", "shove", "mdworker", "mds", "backup"))
+  spl: 'index=mac sourcetype="MAC Operating System" (EventCode=567 OR EventCode=4663) (file_name="*Library/LaunchDaemons/*" OR file_name="*Library/LaunchAgents/*"
+    OR file_name="*etc/rc.common*" OR file_name="*etc/launchd.conf*") NOT (process_name IN ("installd", "shove", "mdworker", "mds", "backup"))
+
     | table _time, host, EventCode, file_name, process_name, user
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4663")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4663')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000229 {\n  meta:\n    author = \"TDL\"\n    description = \"Startup File Modification - OSX\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1037\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id =\
-    \ /(4663)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (567, 4663)
+    | where ObjectName has_any ("Library/LaunchDaemons/", "Library/LaunchAgents/", "etc/rc.common", "etc/launchd.conf")
+    | where ProcessName !has_any ("installd", "shove", "mdworker", "mds", "backup")
+    | project TimeGenerated, Computer, Account, EventID, ProcessName, ObjectName, AccessMask
+  aql: "SELECT eventtime, sourceip, username, \"Process Name\", \"File Name\", LOGSOURCENAME(logsourceid) AS host\nFROM events\nWHERE \"EventID\"\
+    \ IN ('567', '4663')\n  AND (\"File Name\" ILIKE '%Library/LaunchDaemons/%' \n       OR \"File Name\" ILIKE '%Library/LaunchAgents/%' \n \
+    \      OR \"File Name\" ILIKE '%etc/rc.common%' \n       OR \"File Name\" ILIKE '%etc/launchd.conf%')\n  AND \"Process Name\" NOT ILIKE '%installd%'\n\
+    \  AND \"Process Name\" NOT ILIKE '%shove%'\n  AND \"Process Name\" NOT ILIKE '%mdworker%'\n  AND \"Process Name\" NOT ILIKE '%mds%'\n  AND\
+    \ \"Process Name\" NOT ILIKE '%backup%'\nLAST 24 HOURS\n"
+  yara_l: |
+    rule macos_persistence_logon_script_modification {
+      meta:
+        author = "TDL"
+        description = "Detects modifications to macOS logon script directories and files for persistence (T1037)"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1037"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "FILE_MODIFICATION"
+        (
+          $e.metadata.product_event_type = "567" or
+          $e.metadata.product_event_type = "4663"
+        )
+        (
+          re.regex($e.target.file.full_path, `Library/LaunchDaemons/`) or
+          re.regex($e.target.file.full_path, `Library/LaunchAgents/`) or
+          re.regex($e.target.file.full_path, `etc/rc\.common`) or
+          re.regex($e.target.file.full_path, `etc/launchd\.conf`)
+        )
+        not (
+          re.regex($e.principal.process.file.full_path, `(?i)installd$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)shove$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)mdworker$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)mds$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)backup$`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND event_id IN ("4663")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4663])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4663)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4663")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4663)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4663")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-system.security*, winlogbeat-*
+    | WHERE winlog.event_id IN (567, 4663)
+      AND (file.path LIKE "*Library/LaunchDaemons/*" OR file.path LIKE "*Library/LaunchAgents/*" OR file.path LIKE "*etc/rc.common*" OR file.path LIKE "*etc/launchd.conf*")
+      AND process.name NOT IN ("installd", "shove", "mdworker", "mds", "backup")
+    | KEEP @timestamp, host.name, user.name, process.name, file.path, winlog.event_id
+  leql: |
+    where(source_json.EventID IN [567, 4663] AND (source_json.FileName ICONTAINS "Library/LaunchDaemons/" OR source_json.FileName ICONTAINS "Library/LaunchAgents/" OR source_json.FileName ICONTAINS "etc/rc.common" OR source_json.FileName ICONTAINS "etc/launchd.conf") AND process_name NOT IN [installd, shove, mdworker, mds, backup])
+  crowdstrike: |
+    EventCode IN [567, 4663]
+    (FileName=*Library/LaunchDaemons/* OR FileName=*Library/LaunchAgents/* OR FileName=*etc/rc.common* OR FileName=*etc/launchd.conf*)
+    NOT ProcessName IN [installd, shove, mdworker, mds, backup]
+    | table([@timestamp, ComputerName, ProcessName, FileName, EventCode])
+  xql: "dataset = xdr_data\n| filter action_evtlog_event_id in (567, 4663)\n  and (action_file_path contains \"Library/LaunchDaemons/\" \n   \
+    \    or action_file_path contains \"Library/LaunchAgents/\" \n       or action_file_path contains \"etc/rc.common\" \n       or action_file_path\
+    \ contains \"etc/launchd.conf\")\n  and actor_process_image_name not in (\"installd\", \"shove\", \"mdworker\", \"mds\", \"backup\")\n| fields\
+    \ _time, agent_hostname, actor_process_image_name, action_file_path, actor_effective_username, action_evtlog_event_id\n"
+  lucene: |
+    (event.code:(567 OR 4663) OR EventID:(567 OR 4663)) AND (file.path:(*Library\/LaunchDaemons\/* OR *Library\/LaunchAgents\/* OR *etc\/rc.common* OR *etc\/launchd.conf*) OR FileName:(*Library\/LaunchDaemons\/* OR *Library\/LaunchAgents\/* OR *etc\/rc.common* OR *etc\/launchd.conf*)) AND NOT (process.name:(installd OR shove OR mdworker OR mds OR backup) OR ProcessName:(installd OR shove OR mdworker OR mds OR backup))
+  sumo: |
+    _sourceCategory=*MAC* OR _sourceCategory=*macOS* ("567" OR "4663")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ObjectName" as file_name
+    | json field=_raw "ProcessName" as process_name
+    | where event_id in ("567", "4663")
+    | where file_name matches "*Library/LaunchDaemons/*" OR file_name matches "*Library/LaunchAgents/*" OR file_name matches "*etc/rc.common*" OR file_name matches "*etc/launchd.conf*"
+    | where !(process_name in ("installd", "shove", "mdworker", "mds", "backup"))
+    | fields _messageTime, _sourceHost, event_id, file_name, process_name
 false_positives:
 - Security software
 - Authorized admin tools
@@ -95,7 +112,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Modification Event
 

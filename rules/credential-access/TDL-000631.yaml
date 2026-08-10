@@ -16,77 +16,71 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=keeper sourcetype=keeper:logs action="login_failed" OR action="login_success"
+  spl: 'index=keeper sourcetype=keeper:logs action="login_failed" OR action="login_success"
+
     | bin _time span=15m
-    | stats count(eval(action="login_failed")) as failed_count, count(eval(action="login_success")) as success_count, values(src_ip) as source_ips by _time, user
+
+    | stats count(eval(action="login_failed")) as failed_count, count(eval(action="login_success")) as success_count, values(src_ip) as source_ips
+    by _time, user
+
     | where failed_count >= 5 AND success_count >= 1
+
     | table _time, user, failed_count, success_count, source_ips
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000631 {\n  meta:\n    author = \"TDL\"\n    description = \"Password Vault email changed\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: "SecurityEvent\n| where TimeGenerated > ago(24h)\n| where EventID == 4624\n| where LogonType in (2, 10)\n| where AccountType == \"User\"\
+    \n| where Account !endswith \"$\"\n| summarize \n    LogonCount = count(),\n    ComputerCount = dcount(Computer),\n    Computers = make_set(Computer)\n\
+    \    by Account, bin(TimeGenerated, 1h)\n| where ComputerCount >= 5\n| project TimeGenerated, Account, LogonCount, ComputerCount, Computers\n"
+  aql: |
+    SELECT username, sourceip, COUNT(*) AS login_attempts
+    FROM events
+    WHERE username IS NOT NULL
+      AND username != 'SYSTEM'
+      AND username != 'ANONYMOUS LOGON'
+    GROUP BY username, sourceip
+    HAVING login_attempts >= 5
+    LAST 1 HOURS
+  yara_l: "rule arcis_credential_access_t1078 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects potential credential access via T1078\
+    \ - Valid Accounts on Windows using Keeper data source\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique = \"\
+    T1078\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.vendor_name = \"Keeper\"\n    $e.metadata.product_name = \"Keeper\"\n\
+    \    $e.target.platform = \"WINDOWS\"\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.target.user.userid = $user\n    $e.principal.hostname\
+    \ = $host\n    \n  match:\n    $user, $host over 1h\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.process*, logs-system.security*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (winlog.event_id == "4624" AND winlog.event_data.LogonType IN ("2", "10", "3"))
+        OR (event.code == "4624" AND winlog.event_data.LogonType IN ("2", "10", "3"))
+      )
+    | STATS login_count = COUNT(*), distinct_hosts = COUNT_DISTINCT(host.name), distinct_source_ips = COUNT_DISTINCT(source.ip) BY user.name, window = BUCKET(@timestamp, 1 hour)
+    | WHERE login_count >= 10 OR distinct_hosts >= 5 OR distinct_source_ips >= 3
+    | KEEP @timestamp, window, user.name, login_count, distinct_hosts, distinct_source_ips
+  leql: |
+    where(source_json.EventID=4625 AND source_json.TargetUserName != "ANONYMOUS LOGON" AND source_json.TargetUserName != "" AND source_json.TargetUserName NOT ICONTAINS "$") groupby(source_json.TargetUserName, source_json.WorkstationName) calculate(count)
+  crowdstrike: "#repo=keeper event_simpleName=UserActivityAuditEvent action=login \n| groupBy([UserName, ComputerName], function=count(as=login_count))\n\
+    | login_count >= 5\n| table([UserName, ComputerName, login_count])\n"
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_AUTHENTICATION
+    | filter action_evtlog_event_id in (4624, 4625)
+    | bin _time span=24h
+    | comp count() as auth_attempts, count_distinct(agent_hostname) as unique_hosts by _time, actor_effective_username
+    | filter auth_attempts >= 1 and unique_hosts >= 1
+    | fields _time, actor_effective_username, auth_attempts, unique_hosts
+  lucene: |
+    _exists_:user.name AND _exists_:source.ip AND user.name:* AND source.ip:*
+  sumo: |
+    _sourceCategory=*Keeper* OR _sourceCategory=*Arcis*
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "user" as user
+    | json field=_raw "action" as action
+    | json field=_raw "status" as status
+    | json field=_raw "source_ip" as source_ip
+    | where event_type matches "*login*" OR action matches "*authentication*" OR action matches "*access*"
+    | timeslice 1h
+    | count as login_attempts by _timeslice, user, source_ip
+    | where login_attempts >= 5
+    | fields _timeslice, user, source_ip, login_attempts
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -96,7 +90,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: Arcis
 triage_steps:

@@ -16,71 +16,78 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=azure sourcetype=azure:audit (("Additional Details"="*PowerShell*") OR (Operation_Name="Add application") OR (Operation_Name="*Update application*"))
+  spl: 'index=azure sourcetype=azure:audit (("Additional Details"="*PowerShell*") OR (Operation_Name="Add application") OR (Operation_Name="*Update
+    application*"))
+
     | table _time, User, Operation_Name, "Additional Details", Result, Target_Resource, Caller_IP_Address
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GraphRunner"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GraphRunner%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000625 {\n  meta:\n    author = \"TDL\"\n    description = \"Potential GraphRunner Invoke-InjectOAuthApp Usage\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1133\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GraphRunner/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AuditLogs
+    | where TimeGenerated > ago(90d)
+    | where (OperationName has "Update application" or OperationName == "Add application")
+    | extend AdditionalDetailsString = tostring(AdditionalDetails)
+    | where AdditionalDetailsString has "PowerShell" or OperationName == "Add application"
+    | project TimeGenerated, OperationName, Identity, TargetResources, ActivityDisplayName, Result, AdditionalDetails, InitiatedBy, CorrelationId
+  aql: |
+    SELECT eventtime, username, "Operation Name", "Additional Details", sourceip, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE (LOWER("Additional Details") LIKE '%powershell%' OR "Operation Name" = 'Add application' OR "Operation Name" LIKE '%Update application%')
+      AND (logsourceid IN (SELECT logsourceid FROM logssources WHERE logsourcetypename ILIKE '%azure%') OR LOGSOURCENAME(logsourceid) ILIKE '%azure%')
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_external_remote_services_persistence {
+      meta:
+        author = "TDL"
+        description = "Detects T1133 External Remote Services persistence via Azure application modifications"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1133"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "MICROSOFT"
+        $e.metadata.product_name = "AZURE"
+        $e.metadata.event_type = "SYSTEM_AUDIT_LOG_UNCATEGORIZED"
+        (
+          re.regex($e.security_result.summary, `(?i)PowerShell`) or
+          $e.target.resource.name = "Add application" or
+          re.regex($e.target.resource.name, `(?i)Update application`)
+        )
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $operation
 
-    | WHERE eventName LIKE "%GraphRunner%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GraphRunner/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GraphRunner*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GraphRunner"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GraphRunner*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GraphRunner*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-azure*
+    | WHERE event.dataset == "azure.auditlogs" OR event.dataset == "azure.activitylogs"
+    | WHERE (azure.auditlogs.properties.additional_details LIKE "*PowerShell*" OR azure.activitylogs.properties.additional_details LIKE "*PowerShell*" OR event.action == "Add application" OR azure.auditlogs.operation_name == "Add application" OR azure.activitylogs.operation_name == "Add application") OR (event.action LIKE "*Update application*" OR azure.auditlogs.operation_name LIKE "*Update application*" OR azure.activitylogs.operation_name LIKE "*Update application*")
+    | KEEP @timestamp, event.action, azure.auditlogs.operation_name, azure.activitylogs.operation_name, azure.auditlogs.properties.additional_details, azure.activitylogs.properties.additional_details, azure.auditlogs.properties.target_resources, user.name, source.ip
+  leql: |
+    where((source_json.properties.additionalDetails ICONTAINS "PowerShell" OR source_json.operationName="Add application") AND source_json.operationName ICONTAINS "Update application")
+  crowdstrike: "#type=azure:audit \n(AdditionalDetails=*PowerShell* OR OperationName=\"Add application\" OR OperationName=*Update*application*)\n\
+    | table([@timestamp, OperationName, Identity, AdditionalDetails, ResultDescription, IPAddress])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "azure"
+      and (
+        (vendor_event_action ~= "(?i)update.*application")
+        or (vendor_event_action = "Add application")
+        or (raw_log ~= "(?i)PowerShell" and vendor_event_type = "AuditEvent")
+      )
+    | fields _time, vendor_event_action, actor_user, resource_name, raw_log
+  lucene: |
+    (AdditionalDetails:*PowerShell* OR OperationName:"Add application") AND OperationName:*Update?application*
+  sumo: |
+    _sourceCategory=*Azure* (PowerShell OR "Add application" OR "Update application")
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "properties.additionalDetails" as additional_details
+    | where (additional_details matches "*PowerShell*") OR (operation_name = "Add application") OR (operation_name matches "*Update application*")
+    | fields _messageTime, _sourceHost, operation_name, additional_details
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +97,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Azure Audit Event \nWhere the Additional Details contains \"PowerShell\"\nOR\nWhere the Operation Name is \"Add application\"\
   \n\nWhere the Operation Name contains \"Update application\""

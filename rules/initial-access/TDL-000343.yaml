@@ -23,68 +23,59 @@ risk_score: 30
 queries:
   spl: "index=aws sourcetype=aws:cloudwatchlogs:guardduty \n(type=\"UnauthorizedAccess:EC2/MetadataDNSRebind\" OR type=\"UnauthorizedAccess:Runtime/MetadataDNSRebind\"\
     )\n| table _time, type, region, accountId, resource.instanceDetails.instanceId, service.action.actionType, severity, title, description\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where Type in ("UnauthorizedAccess:EC2/MetadataDNSRebind", "UnauthorizedAccess:Runtime/MetadataDNSRebind")
+    | project TimeGenerated, Type, Severity, AccountId, Region, ResourceType, Title, Description
+  aql: "SELECT eventtime, sourceip, destinationip, LOGSOURCENAME(logsourceid) AS source, qidname(qid) AS event_name, \"finding.type\" AS finding_type,\
+    \ \"resource.instanceDetails.instanceId\" AS instance_id, \"service.action.networkConnectionAction.remoteIpDetails.ipAddressV4\" AS remote_ip\n\
+    FROM events\nWHERE LOGSOURCENAME(logsourceid) ILIKE '%GuardDuty%' \n  AND (\"finding.type\" = 'UnauthorizedAccess:EC2/MetadataDNSRebind' OR\
+    \ \"finding.type\" = 'UnauthorizedAccess:Runtime/MetadataDNSRebind')\nLAST 24 HOURS\n"
+  yara_l: |
+    rule aws_guardduty_metadata_dns_rebind {
+      meta:
+        author = "TDL"
+        description = "Detects AWS GuardDuty alerts for Metadata DNS Rebind attacks indicating potential SSRF exploitation (T1190)"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1190"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.product_name = "Amazon GuardDuty"
+        (
+          $e.metadata.product_event_type = "UnauthorizedAccess:EC2/MetadataDNSRebind" or
+          $e.metadata.product_event_type = "UnauthorizedAccess:Runtime/MetadataDNSRebind"
+        )
+        $e.principal.resource.id = $resource_id
 
-    | where eventName matches regex "GuardDuty"
+      match:
+        $resource_id over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000343 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS DNS Rebinding - GuardDuty\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.action IN ("UnauthorizedAccess:EC2/MetadataDNSRebind", "UnauthorizedAccess:Runtime/MetadataDNSRebind")
+    | KEEP @timestamp, cloud.account.id, cloud.region, event.action, event.severity, aws.guardduty.resource.instance_details.instance_id, source.ip, event.id
+  leql: |
+    where(source_json.type IN ["UnauthorizedAccess:EC2/MetadataDNSRebind", "UnauthorizedAccess:Runtime/MetadataDNSRebind"])
+  crowdstrike: |
+    #repo=guardduty eventType IN ["UnauthorizedAccess:EC2/MetadataDNSRebind", "UnauthorizedAccess:Runtime/MetadataDNSRebind"]
+    | table([@timestamp, accountId, region, eventType, severity, resource.instanceDetails.instanceId, resource.instanceDetails.imageId, service.action.awsApiCallAction.remoteIpDetails.ipAddressV4, title, description])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and vendor = "AWS" and event_type = "GuardDuty Finding"
+    | filter raw_log contains "UnauthorizedAccess:EC2/MetadataDNSRebind" or raw_log contains "UnauthorizedAccess:Runtime/MetadataDNSRebind"
+    | fields _time, cloud_provider, vendor, event_type, raw_log
+  lucene: |
+    event.provider:guardduty AND event.type:(UnauthorizedAccess:EC2/MetadataDNSRebind OR UnauthorizedAccess:Runtime/MetadataDNSRebind)
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("UnauthorizedAccess:EC2/MetadataDNSRebind", "UnauthorizedAccess:Runtime/MetadataDNSRebind")
+    | fields _messageTime, _sourceHost, event_type
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -94,7 +85,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"UnauthorizedAccess:EC2/MetadataDNSRebind\", \"UnauthorizedAccess:Runtime/MetadataDNSRebind\"\
   ]"

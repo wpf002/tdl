@@ -21,77 +21,71 @@ queries:
     */wp-content/*.php*\" OR url=\"*/favicon.ico.php*\")\nNOT (src_ip IN (\"10.50.1.10\", \"10.50.1.11\", \"172.16.5.100\"))\n| stats count sum(bytes_out)\
     \ as total_bytes_out dc(dest_ip) as unique_destinations by src_ip, dest_ip, dest_port\n| where count >= 1\n| sort - total_bytes_out\n| table\
     \ src_ip, dest_ip, dest_port, count, unique_destinations, total_bytes_out\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(90d)\n| where DeviceVendor has_any (\"Palo Alto\", \"Fortinet\", \"Cisco\", \"Zscaler\"\
+    , \"Check Point\", \"Barracuda\", \"Squid\", \"BlueCoat\", \"McAfee\")\n| where ApplicationProtocol =~ \"tcp\" or Protocol =~ \"TCP\"\n| where\
+    \ RequestURL matches regex @\"(?i)(/[a-z]{7,12}\\.(avi|dat|gif)$|/images/[a-z]{5,10}\\.(jpeg|gif|png)$|/[0-9]{8,12}/[a-z0-9]{10,16}\\.(cab|exe|dat)$)\"\
+    \n| where SourceIP !in (\"10.1.1.100\", \"10.1.1.101\", \"172.16.1.50\")\n| summarize \n    connection_count = count(),\n    unique_destinations\
+    \ = dcount(DestinationIP),\n    total_bytes_out = sum(SentBytes)\n    by SourceIP, DestinationIP, DestinationPort\n| where connection_count\
+    \ >= 1\n| sort by total_bytes_out desc\n| project SourceIP, DestinationIP, DestinationPort, connection_count, unique_destinations, total_bytes_out\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS connection_count, UNIQUECOUNT(destinationip) AS unique_destinations, SUM(destinationbytes) AS total_bytes_out
     FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+    WHERE protocol = 6 AND (destinationip MATCHES '.*\.(?:exe|bin|dll|tmp|dat|zip|rar|7z|cab|msi)(?:\?.*)?$' OR destinationip MATCHES '.*\/(?:gate|panel|connect|upload|download|install|config|update)\.php(?:\?.*)?$' OR destinationip MATCHES '.*\/[a-z0-9]{8,}\.(?:php|asp|jsp)(?:\?.*)?$')
+    AND sourceip NOT IN ('10.0.0.50', '10.0.0.51', '172.16.0.100')
     GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000458 {\n  meta:\n    author = \"TDL\"\n    description = \"Ursnif Malware URL Pattern\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1566\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    HAVING connection_count >= 1
+    ORDER BY total_bytes_out DESC
+    LAST 24 HOURS
+  yara_l: "rule ursnif_malware_url_pattern {\n  meta:\n    author = \"TDL\"\n    description = \"Detects Ursnif malware URL patterns in network\
+    \ traffic\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1566\"\n    severity = \"HIGH\"\n    \n  events:\n\
+    \    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.network.ip_protocol = \"TCP\"\n    (\n      re.regex($e.target.url, `(?i)/[a-z]{1,3}\\\
+    d{1,3}\\.(?:avi|dat|gif)`) or\n      re.regex($e.target.url, `(?i)/images/[a-z0-9]{8,12}\\.(?:avi|bmp|gif)`) or\n      re.regex($e.target.url,\
+    \ `(?i)/(?:content|includes|templates)/[a-z0-9]{8,}\\.(?:avi|dat|jpg)`)\n    )\n    $e.principal.ip = $src_ip\n    $e.target.ip = $dest_ip\n\
+    \    $e.target.port = $dest_port\n    not (\n      $e.principal.hostname = /(?i)(scanner|monitor|nagios|zabbix|splunk)/\n    )\n    \n  match:\n\
+    \    $src_ip, $dest_ip, $dest_port over 1h\n    \n  outcome:\n    $risk_score = max(75)\n    $total_bytes_out = sum($e.network.sent_bytes)\n\
+    \    $unique_dest_count = count_distinct($e.target.ip)\n    \n  condition:\n    #e >= 1\n}\n"
+  esql: |
+    FROM logs-network*
+    | WHERE @timestamp > NOW() - 24 hour AND network.transport == "tcp" AND (url.full LIKE "*/images/*/data.php*" OR url.full LIKE "*/upload.php?*" OR url.full LIKE "*/?[a-z][a-z][a-z][a-z][a-z]*=*" OR url.path LIKE "*/data.php" OR url.path LIKE "*/cabinet.php" OR url.query RLIKE "[a-z]{5,}=[A-Za-z0-9+/=]{100,}")
+    | WHERE NOT (source.ip IN ("10.0.0.10", "10.0.0.11", "192.168.1.100") OR user_agent.original LIKE "*scanner*" OR user_agent.original LIKE "*monitoring*")
+    | STATS connections = COUNT(*), unique_destinations = COUNT_DISTINCT(destination.ip), total_bytes_out = SUM(source.bytes) BY source.ip, destination.ip, destination.port
+    | WHERE connections >= 1
+    | SORT total_bytes_out DESC
+    | KEEP source.ip, destination.ip, destination.port, connections, unique_destinations, total_bytes_out
+  leql: |
+    where(source_json.url=/\/(images|content|data)\/[a-z0-9]{32,}\.(php|dat|bin)/ OR source_json.url=/.php\?[a-z]=[a-z0-9]{32,}/ OR source_json.url ICONTAINS "/forum.php?" OR source_json.url ICONTAINS "/login.php?" AND source_json.url ICONTAINS "&" AND source_json.url=/[a-z0-9]{32,}/) groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    (#type=firewall OR #type=ids OR #type=proxy) network.protocol=*tcp* (url=*/images/*/faq/* OR url=*/images/*/about/* OR url=*/images/*/policy/* OR url=*/css/*/faq/* OR url=*/css/*/about/* OR url=*/css/*/policy/* OR url=*/include/*.rar OR url=*/include/*.cab OR url=*/include/*.dat OR url=*/.well-known/*.rar OR url=*/.well-known/*.cab OR url=*/.well-known/*.dat OR url=*/jquery-*.min.js?*=* OR url=*/bootstrap-*.min.js?*=*)
+    | !in(field=src_ip, values=["10.0.0.5","10.0.0.10","172.16.250.5"])
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=connections), count(dest_ip, distinct=true, as=unique_destinations), sum(bytes_out, as=total_bytes)])
+    | connections >= 1
+    | sort(field=total_bytes, order=desc, limit=10000)
+    | table([src_ip, dest_ip, dest_port, connections, unique_destinations, total_bytes])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter protocol = \"tcp\"\n  and (url_path ~= \".*\\/[a-z]{2,4}_[A-Za-z0-9]{8,16}\\.(avi|dat|php|gif|jpg).*\"\
+    \ \n       or url_path ~= \".*\\/[a-z]{3,5}\\/[0-9]{2,5}\\.dat.*\"\n       or url_path ~= \".*\\/images\\/[a-z0-9]{8,}\\.avi.*\")\n| alter\
+    \ bytes_out_val = coalesce(bytes_sent, 0)\n| comp count() as conn_count, count_distinct(dest_ip) as unique_dests, sum(bytes_out_val) as total_bytes_out\
+    \ by src_ip, dest_ip, dest_port\n| filter conn_count >= 1\n  and src_ip not in (\"10.0.0.100\", \"10.0.0.101\", \"192.168.1.50\")\n  and not\
+    \ (src_user contains \"scanner\" or src_user contains \"monitor\")\n| sort desc total_bytes_out\n| fields src_ip, dest_ip, dest_port, conn_count,\
+    \ unique_dests, total_bytes_out\n"
+  lucene: |
+    network.protocol:tcp AND (url:*/images/[a-zA-Z0-9]{8,12}\.avi* OR url:*/images/[a-zA-Z0-9]{8,12}\.jpg* OR url:*/images/[a-zA-Z0-9]{8,12}\.png* OR url:*/images/[a-zA-Z0-9]{8,12}\.gif* OR url:*\/[a-zA-Z0-9]{32,}* OR url:*\/[a-zA-Z0-9]{8,12}\/_* OR uri_path:*/images/[a-zA-Z0-9]{8,12}\.avi OR uri_path:*/images/[a-zA-Z0-9]{8,12}\.jpg OR uri_path:*/images/[a-zA-Z0-9]{8,12}\.png OR uri_path:*/images/[a-zA-Z0-9]{8,12}\.gif OR uri_path:*\/[a-zA-Z0-9]{32,}* OR uri_path:*\/[a-zA-Z0-9]{8,12}\/_* OR http.url:*/images/[a-zA-Z0-9]{8,12}\.avi OR http.url:*/images/[a-zA-Z0-9]{8,12}\.jpg OR http.url:*/images/[a-zA-Z0-9]{8,12}\.png OR http.url:*/images/[a-zA-Z0-9]{8,12}\.gif OR http.url:*\/[a-zA-Z0-9]{32,}* OR http.url:*\/[a-zA-Z0-9]{8,12}\/_*) AND NOT (source.ip:(10.0.0.100 OR 10.0.0.101 OR 10.0.0.102) OR src_ip:(10.0.0.100 OR 10.0.0.101 OR 10.0.0.102) OR tags:scanner OR tags:monitoring_agent)
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*ids*
+    | where protocol = "tcp" OR protocol matches "*tcp*"
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dest.*?(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | json field=_raw "src_ip" as src_ip nodrop
+    | json field=_raw "dest_ip" as dest_ip nodrop
+    | json field=_raw "dest_port" as dest_port nodrop
+    | json field=_raw "bytes_out" as bytes_out nodrop
+    | json field=_raw "url" as url nodrop
+    | json field=_raw "uri" as uri nodrop
+    | where url matches "*\/[a-z]{6,12}_[a-z]{6,12}\/*" OR uri matches "*\/[a-z]{6,12}_[a-z]{6,12}\/*" OR url matches "*\/(images|content|static|data)\/[a-z0-9]{16,32}\.(jpg|gif|png|dat|bin)*" OR uri matches "*\/(images|content|static|data)\/[a-z0-9]{16,32}\.(jpg|gif|png|dat|bin)*"
+    | where !(src_ip in ("10.0.0.10", "10.0.0.11", "192.168.1.100"))
+    | sum(bytes_out) as total_bytes_out, count_distinct(dest_ip) as unique_destinations, count as connection_count by src_ip, dest_ip, dest_port
+    | where connection_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, connection_count, unique_destinations, total_bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -101,7 +95,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

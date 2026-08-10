@@ -20,68 +20,66 @@ queries:
     \ OR detail.type=\"Execution:Runtime/SuspiciousCommand\" OR detail.type=\"Persistence:Runtime/SuspiciousCommand\" OR detail.type=\"PrivilegeEscalation:Runtime/SuspiciousCommand\"\
     )\n| table _time, detail.type, detail.accountId, detail.resource.instanceDetails.instanceId, detail.resource.instanceDetails.imageId, detail.severity,\
     \ detail.title, detail.description\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(24h)
+    | where FindingType in ("DefenseEvasion:Runtime/SuspiciousCommand", "Discovery:Runtime/SuspiciousCommand", "Execution:Runtime/SuspiciousCommand", "Persistence:Runtime/SuspiciousCommand", "PrivilegeEscalation:Runtime/SuspiciousCommand")
+    | project TimeGenerated, FindingType, AccountId, Region, Resource, Severity, Title, Description
+  aql: |
+    SELECT "AWS Account ID", "Finding Type", "Resource Type", "Instance ID", "Severity", eventtime, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%guardduty%'
+      AND "Finding Type" IN ('DefenseEvasion:Runtime/SuspiciousCommand', 'Discovery:Runtime/SuspiciousCommand', 'Execution:Runtime/SuspiciousCommand', 'Persistence:Runtime/SuspiciousCommand', 'PrivilegeEscalation:Runtime/SuspiciousCommand')
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_suspicious_command_execution {
+      meta:
+        author = "TDL"
+        description = "Detects AWS GuardDuty suspicious command execution findings (MITRE T1204)"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.vendor_name = "Amazon AWS"
+        $e.metadata.product_name = "GuardDuty"
+        (
+          $e.metadata.product_event_type = "DefenseEvasion:Runtime/SuspiciousCommand" or
+          $e.metadata.product_event_type = "Discovery:Runtime/SuspiciousCommand" or
+          $e.metadata.product_event_type = "Execution:Runtime/SuspiciousCommand" or
+          $e.metadata.product_event_type = "Persistence:Runtime/SuspiciousCommand" or
+          $e.metadata.product_event_type = "PrivilegeEscalation:Runtime/SuspiciousCommand"
+        )
+        $e.principal.resource.id = $resource_id
 
-    | where eventName matches regex "GuardDuty"
+      match:
+        $resource_id over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000557 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Runtime Suspicious Command Executed - GuardDuty\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("DefenseEvasion:Runtime/SuspiciousCommand", "Discovery:Runtime/SuspiciousCommand", "Execution:Runtime/SuspiciousCommand", "Persistence:Runtime/SuspiciousCommand", "PrivilegeEscalation:Runtime/SuspiciousCommand")
+    | KEEP @timestamp, cloud.account.id, cloud.region, aws.guardduty.finding.type, aws.guardduty.resource.instance_details.instance_id, event.type, event.severity
+  leql: |
+    where(source_json.type IN ["DefenseEvasion:Runtime/SuspiciousCommand", "Discovery:Runtime/SuspiciousCommand", "Execution:Runtime/SuspiciousCommand", "Persistence:Runtime/SuspiciousCommand", "PrivilegeEscalation:Runtime/SuspiciousCommand"])
+  crowdstrike: |
+    #event_type=guardduty
+    | finding.type in ["DefenseEvasion:Runtime/SuspiciousCommand", "Discovery:Runtime/SuspiciousCommand", "Execution:Runtime/SuspiciousCommand", "Persistence:Runtime/SuspiciousCommand", "PrivilegeEscalation:Runtime/SuspiciousCommand"]
+    | table([@timestamp, finding.type, resource.instanceDetails.instanceId, account.id, finding.severity])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and log_name = "GuardDuty"
+    | filter event_type in ("DefenseEvasion:Runtime/SuspiciousCommand", "Discovery:Runtime/SuspiciousCommand", "Execution:Runtime/SuspiciousCommand", "Persistence:Runtime/SuspiciousCommand", "PrivilegeEscalation:Runtime/SuspiciousCommand")
+    | fields _time, event_type, resource_name, identity_name, project
+  lucene: |
+    event.type:"GuardDuty" AND finding.type:("DefenseEvasion:Runtime/SuspiciousCommand" OR "Discovery:Runtime/SuspiciousCommand" OR "Execution:Runtime/SuspiciousCommand" OR "Persistence:Runtime/SuspiciousCommand" OR "PrivilegeEscalation:Runtime/SuspiciousCommand")
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty* OR _source=*guardduty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("DefenseEvasion:Runtime/SuspiciousCommand", "Discovery:Runtime/SuspiciousCommand", "Execution:Runtime/SuspiciousCommand", "Persistence:Runtime/SuspiciousCommand", "PrivilegeEscalation:Runtime/SuspiciousCommand")
+    | fields _messageTime, event_type, _sourceHost, _raw
 false_positives:
 - Security software
 - Authorized admin tools
@@ -91,7 +89,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"DefenseEvasion:Runtime/SuspiciousCommand\", \"Discovery:Runtime/SuspiciousCommand\"\
   , \"Execution:Runtime/SuspiciousCommand\", \"Persistence:Runtime/SuspiciousCommand\", \"PrivilegeEscalation:Runtime/SuspiciousCommand\"]"

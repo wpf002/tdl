@@ -18,87 +18,105 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=wineventlog (EventCode=4688 Image="*\\psexec.exe") OR (EventCode=5140 (Share_Name="\\\\*\\C$" OR Share_Name="\\\\*\\ADMIN$")) OR (EventCode=4697)
-    | eval event_type=case(
-        EventCode=4688 AND match(Image, "(?i)psexec\.exe$"), "psexec_execution",
-        EventCode=5140 AND (match(Share_Name, "(?i)\\\\[^\\]+\\C\$") OR match(Share_Name, "(?i)\\\\[^\\]+\\ADMIN\$")), "share_access",
-        EventCode=4697, "service_install",
-        1=1, "other"
-    )
-    | eval src_dest_pair=coalesce(ComputerName, Computer).":".coalesce(IpAddress, src, dest, "-")
-    | where event_type IN ("share_access", "service_install")
-    | sort 0 _time
-    | streamstats time_window=2m earliest(_time) as window_start latest(_time) as window_end by src_dest_pair
-    | eventstats values(event_type) as event_types by src_dest_pair, window_start
-    | eval has_share=if(mvfind(event_types, "share_access")>=0, 1, 0)
-    | eval has_service=if(mvfind(event_types, "service_install")>=0, 1, 0)
-    | where has_share=1 AND has_service=1 AND event_type="service_install"
-    | table _time, ComputerName, src_dest_pair, Share_Name, Service_Name, Service_File_Name
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4688", "5140", "4697", "5145")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4688', '5140', '4697', '5145')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000152 {\n  meta:\n    author = \"TDL\"\n    description = \"PSEXEC Detection\"\n    severity = \"MEDIUM\"\n    tactic\
-    \ = \"TA0002\"\n    technique = \"T1021\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(4688|5140|4697|5145)/\n\
-    \    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("4688", "5140", "4697", "5145")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4688, 5140, 4697, 5145])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4688, 5140, 4697, 5145)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4688", "5140", "4697", "5145")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4688 OR 5140 OR 4697 OR 5145)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4688", "5140", "4697", "5145")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+  spl: "index=wineventlog (EventCode=4688 Image=\"*\\\\psexec.exe\") OR (EventCode=5140 (Share_Name=\"\\\\\\\\*\\\\C$\" OR Share_Name=\"\\\\\\\
+    \\*\\\\ADMIN$\")) OR (EventCode=4697)\n| eval event_type=case(\n    EventCode=4688 AND match(Image, \"(?i)psexec\\.exe$\"), \"psexec_execution\"\
+    ,\n    EventCode=5140 AND (match(Share_Name, \"(?i)\\\\\\\\[^\\\\]+\\\\C\\$\") OR match(Share_Name, \"(?i)\\\\\\\\[^\\\\]+\\\\ADMIN\\$\")),\
+    \ \"share_access\",\n    EventCode=4697, \"service_install\",\n    1=1, \"other\"\n)\n| eval src_dest_pair=coalesce(ComputerName, Computer).\"\
+    :\".coalesce(IpAddress, src, dest, \"-\")\n| where event_type IN (\"share_access\", \"service_install\")\n| sort 0 _time\n| streamstats time_window=2m\
+    \ earliest(_time) as window_start latest(_time) as window_end by src_dest_pair\n| eventstats values(event_type) as event_types by src_dest_pair,\
+    \ window_start\n| eval has_share=if(mvfind(event_types, \"share_access\")>=0, 1, 0)\n| eval has_service=if(mvfind(event_types, \"service_install\"\
+    )>=0, 1, 0)\n| where has_share=1 AND has_service=1 AND event_type=\"service_install\"\n| table _time, ComputerName, src_dest_pair, Share_Name,\
+    \ Service_Name, Service_File_Name\n"
+  kql: |
+    let psexecActivity = SecurityEvent
+    | where TimeGenerated > ago(2h)
+    | where EventID == 4688
+    | where Process has "psexec.exe"
+    | project TimeGenerated, Computer, Account, Process;
+    let shareAccess = SecurityEvent
+    | where TimeGenerated > ago(2h)
+    | where EventID == 5140
+    | where ShareName in (@"\\*\C$", @"\\*\ADMIN$") or ShareName endswith @"\C$" or ShareName endswith @"\ADMIN$"
+    | project ShareTime = TimeGenerated, ShareComputer = Computer, ShareAccount = Account, ShareName, IpAddress;
+    let serviceInstall = SecurityEvent
+    | where TimeGenerated > ago(2h)
+    | where EventID == 4697
+    | project ServiceTime = TimeGenerated, ServiceComputer = Computer, ServiceAccount = Account, ServiceName, ServiceFileName;
+    psexecActivity
+    | join kind=inner (
+        shareAccess
+        | join kind=inner (
+            serviceInstall
+        ) on $left.ShareComputer == $right.ServiceComputer
+        | where ServiceTime between (ShareTime .. (ShareTime + 2m))
+    ) on $left.Computer == $right.ShareComputer
+    | project TimeGenerated, Computer, Account, Process, ShareTime, ShareName, IpAddress, ServiceTime, ServiceName, ServiceFileName
+  aql: "SELECT \n    e1.sourceip,\n    e1.destinationip,\n    e1.username,\n    e1.eventtime AS psexec_time,\n    e1.\"Process Name\" AS process_name,\n\
+    \    e2.eventtime AS share_access_time,\n    e2.\"Share Name\" AS share_name,\n    e3.eventtime AS service_install_time,\n    e3.\"Service\
+    \ Name\" AS service_name,\n    e3.\"Service File Name\" AS service_file_name\nFROM events e1\nJOIN events e2 ON e1.sourceip = e2.sourceip\
+    \ AND e1.destinationip = e2.destinationip\nJOIN events e3 ON e2.sourceip = e3.sourceip AND e2.destinationip = e3.destinationip\nWHERE e1.\"\
+    EventID\" IN ('592', '4688')\n    AND e1.\"Process Name\" ILIKE '%psexec.exe%'\n    AND e2.\"EventID\" IN ('5140', '5145')\n    AND (e2.\"\
+    Share Name\" ILIKE '%\\\\C$%' OR e2.\"Share Name\" ILIKE '%\\\\ADMIN$%')\n    AND e3.\"EventID\" IN ('601', '4697')\n    AND e2.eventtime\
+    \ >= e1.eventtime\n    AND e3.eventtime >= e2.eventtime\n    AND e3.eventtime <= e2.eventtime + 120000\nLAST 2 HOURS\n"
+  yara_l: "rule psexec_lateral_movement {\n  meta:\n    author = \"TDL\"\n    description = \"Detects PsExec lateral movement via process execution,\
+    \ admin share access, and service installation\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1021\"\n    severity\
+    \ = \"HIGH\"\n\n  events:\n    $process.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      $process.metadata.product_event_type = \"592\"\
+    \ or\n      $process.metadata.product_event_type = \"4688\"\n    )\n    re.regex($process.principal.process.file.full_path, `(?i)psexec\\\
+    .exe$`)\n    $process.principal.hostname = $src_host\n    \n    $share.metadata.event_type = \"NETWORK_CONNECTION\"\n    (\n      $share.metadata.product_event_type\
+    \ = \"5140\" or\n      $share.metadata.product_event_type = \"5145\"\n    )\n    (\n      re.regex($share.target.resource.name, `(?i)\\\\\\\
+    \\.*\\\\C\\$`) or\n      re.regex($share.target.resource.name, `(?i)\\\\\\\\.*\\\\ADMIN\\$`)\n    )\n    $share.principal.hostname = $src_host\n\
+    \    $share.target.hostname = $dst_host\n    \n    $service.metadata.event_type = \"SERVICE_CREATION\"\n    (\n      $service.metadata.product_event_type\
+    \ = \"601\" or\n      $service.metadata.product_event_type = \"4697\"\n    )\n    $service.principal.hostname = $src_host\n    $service.target.hostname\
+    \ = $dst_host\n\n  match:\n    $src_host, $dst_host over 2m\n\n  condition:\n    $process and $share and $service\n}\n"
+  esql: "FROM logs-system.security*, logs-windows.sysmon_operational*, winlogbeat-*\n| WHERE @timestamp > NOW() - 1 hour\n| WHERE (event.code\
+    \ IN (\"592\", \"4688\") AND TO_LOWER(process.name) LIKE \"*psexec.exe*\")\n   OR (event.code IN (\"5140\", \"5145\") AND (winlog.event_data.ShareName\
+    \ LIKE \"*\\\\C$\" OR winlog.event_data.ShareName LIKE \"*\\\\ADMIN$\"))\n   OR (event.code IN (\"601\", \"4697\"))\n| EVAL event_type = CASE(\n\
+    \    event.code IN (\"592\", \"4688\"), \"process\",\n    event.code IN (\"5140\", \"5145\"), \"share\",\n    event.code IN (\"601\", \"4697\"\
+    ), \"service\",\n    \"other\"\n  )\n| EVAL src = COALESCE(source.ip, host.name)\n| EVAL dst = COALESCE(destination.ip, winlog.event_data.IpAddress,\
+    \ winlog.computer_name)\n| STATS \n    min_time = MIN(@timestamp),\n    max_time = MAX(@timestamp),\n    has_process = MAX(CASE(event_type\
+    \ == \"process\", 1, 0)),\n    has_share = MAX(CASE(event_type == \"share\", 1, 0)),\n    has_service = MAX(CASE(event_type == \"service\"\
+    , 1, 0)),\n    share_time = MIN(CASE(event_type == \"share\", @timestamp, NULL)),\n    service_time = MIN(CASE(event_type == \"service\",\
+    \ @timestamp, NULL))\n  BY src, dst\n| WHERE has_process == 1 AND has_share == 1 AND has_service == 1\n| EVAL time_diff_seconds = (service_time\
+    \ - share_time) / 1000000000\n| WHERE time_diff_seconds >= 0 AND time_diff_seconds <= 120\n| KEEP src, dst, min_time, max_time, time_diff_seconds\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND process_name ICONTAINS "psexec.exe")
+    OR
+    (source_json.EventID IN [5140, 5145] AND (source_json.ShareName ICONTAINS "\\C$" OR source_json.ShareName ICONTAINS "\\ADMIN$"))
+    OR
+    (source_json.EventID IN [601, 4697])
+  crowdstrike: |
+    EventCode=4688 FileName=*psexec.exe
+    | ComputerName=* AND UserName=*
+    | rename(field=ComputerName, as=src_host)
+    | join({
+        EventCode=5140 (ShareName="\\*\\C$" OR ShareName="\\*\\ADMIN$")
+        | rename(field=ComputerName, as=dest_host)
+      }, field=[src_host], key=[dest_host], mode=left)
+    | join({
+        EventCode=4697
+        | rename(field=ComputerName, as=svc_host)
+      }, field=[dest_host], key=[svc_host], mode=left, window=2m)
+    | table([@timestamp, src_host, dest_host, UserName, ShareName, ServiceName, ImagePath])
+  xql: "dataset = xdr_data\n| filter action_evtlog_event_id in (592, 4688, 5140, 5145, 601, 4697)\n| alter \n    is_psexec = if(action_evtlog_event_id\
+    \ in (592, 4688) and lowercase(action_process_image_name) contains \"psexec.exe\", 1, 0),\n    is_share_access = if(action_evtlog_event_id\
+    \ in (5140, 5145) and (action_evtlog_event_data_ShareName ~= \".*\\\\\\\\C\\$\" or action_evtlog_event_data_ShareName ~= \".*\\\\\\\\ADMIN\\\
+    $\"), 1, 0),\n    is_service_install = if(action_evtlog_event_id in (601, 4697), 1, 0),\n    source_host = coalesce(agent_hostname, action_evtlog_event_data_WorkstationName),\n\
+    \    dest_host = coalesce(action_evtlog_event_data_TargetServerName, agent_hostname)\n| filter is_psexec = 1 or is_share_access = 1 or is_service_install\
+    \ = 1\n| sort asc _time\n| alter time_bucket = to_epoch(_time, \"MILLIS\") / 120000\n| comp count_distinct(if(is_psexec = 1, _time, null))\
+    \ as psexec_count,\n       count_distinct(if(is_share_access = 1, _time, null)) as share_count,\n       count_distinct(if(is_service_install\
+    \ = 1, _time, null)) as service_count,\n       min(_time) as first_event,\n       max(_time) as last_event\n       by source_host, dest_host,\
+    \ time_bucket\n| filter psexec_count >= 1 and share_count >= 1 and service_count >= 1\n| filter to_epoch(last_event, \"MILLIS\") - to_epoch(first_event,\
+    \ \"MILLIS\") <= 120000\n| fields first_event, last_event, source_host, dest_host\n"
+  lucene: |
+    (event.code:(4688 OR 592) AND process.name:psexec.exe) OR (event.code:(5140 OR 5145) AND share.name:(\\*\C$ OR \\*\ADMIN$)) OR (event.code:(4697 OR 601))
+  sumo: "_sourceCategory=*Windows* (EventID=4688 OR EventID=5140 OR EventID=4697)\n| json field=_raw \"EventID\" as event_id\n| json field=_raw\
+    \ \"NewProcessName\" as process_name\n| json field=_raw \"ShareName\" as share_name\n| json field=_raw \"Computer\" as computer\n| json field=_raw\
+    \ \"IpAddress\" as src_ip\n| json field=_raw \"ServiceName\" as service_name\n| where (event_id=\"4688\" and process_name matches \"*psexec.exe\"\
+    ) \n    OR (event_id=\"5140\" and (share_name matches \"*\\\\C$\" OR share_name matches \"*\\\\ADMIN$\"))\n    OR event_id=\"4697\"\n| sort\
+    \ by _messageTime asc\n| timeslice 2m\n| if(event_id=\"4688\" and process_name matches \"*psexec.exe\", 1, 0) as psexec_event\n| if(event_id=\"\
+    5140\" and (share_name matches \"*\\\\C$\" OR share_name matches \"*\\\\ADMIN$\"), 1, 0) as share_event\n| if(event_id=\"4697\", 1, 0) as\
+    \ service_event\n| sum(psexec_event) as psexec_cnt, sum(share_event) as share_cnt, sum(service_event) as service_cnt by _timeslice, computer,\
+    \ src_ip\n| where psexec_cnt >= 1 and share_cnt >= 1 and service_cnt >= 1\n| fields _timeslice, computer, src_ip, psexec_cnt, share_cnt, service_cnt\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -108,7 +126,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is psexec.exe\n\n---------------------------------------------------------------------------------------------------------------\n\
   \n1 Windows Network Share Object Accessed Event\nWhere the Event ID is in [5140, 5145]\nWhere the Share Name is in [\\\\*\\C$, \\\\*\\ADMIN$]\n\

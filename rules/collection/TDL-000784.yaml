@@ -19,93 +19,151 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=* (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1) OR (sourcetype IN (linux_secure, syslog, edr*))
-    (
-      (Image="*\\powershell.exe" OR Image="*\\pwsh.exe" OR ParentImage="*\\powershell.exe" OR ParentImage="*\\pwsh.exe" OR process_name IN ("powershell.exe", "pwsh.exe"))
-      (CommandLine="*Get-ChildItem*" OR CommandLine="*gci*" OR CommandLine="*ls*" OR CommandLine="*dir*")
-      (CommandLine="*-Recurse*" OR CommandLine="*-r*")
-      (CommandLine="*.doc*" OR CommandLine="*.xls*" OR CommandLine="*.pdf*" OR CommandLine="*.txt*" OR CommandLine="*.kdbx*")
-      (CommandLine="*Copy-Item*" OR CommandLine="*copy*" OR CommandLine="*cp*" OR CommandLine="*move*" OR CommandLine="*mv*")
-      (CommandLine="*Users\\*" OR CommandLine="*home/*" OR CommandLine="*/Users/*")
+  spl: "index=* (sourcetype=\"WinEventLog:Microsoft-Windows-Sysmon/Operational\" EventCode=1) OR (sourcetype IN (linux_secure, syslog, edr*))\n\
+    (\n  (Image=\"*\\\\powershell.exe\" OR Image=\"*\\\\pwsh.exe\" OR ParentImage=\"*\\\\powershell.exe\" OR ParentImage=\"*\\\\pwsh.exe\" OR\
+    \ process_name IN (\"powershell.exe\", \"pwsh.exe\"))\n  (CommandLine=\"*Get-ChildItem*\" OR CommandLine=\"*gci*\" OR CommandLine=\"*ls*\"\
+    \ OR CommandLine=\"*dir*\")\n  (CommandLine=\"*-Recurse*\" OR CommandLine=\"*-r*\")\n  (CommandLine=\"*.doc*\" OR CommandLine=\"*.xls*\" OR\
+    \ CommandLine=\"*.pdf*\" OR CommandLine=\"*.txt*\" OR CommandLine=\"*.kdbx*\")\n  (CommandLine=\"*Copy-Item*\" OR CommandLine=\"*copy*\" OR\
+    \ CommandLine=\"*cp*\" OR CommandLine=\"*move*\" OR CommandLine=\"*mv*\")\n  (CommandLine=\"*Users\\\\*\" OR CommandLine=\"*home/*\" OR CommandLine=\"\
+    */Users/*\")\n)\nOR\n(\n  (Image=\"*/bash\" OR Image=\"*/sh\" OR process_name IN (\"bash\", \"sh\", \"zsh\"))\n  (CommandLine=\"*find*\" OR\
+    \ CommandLine=\"*grep*\")\n  (CommandLine=\"*.doc*\" OR CommandLine=\"*.xls*\" OR CommandLine=\"*.pdf*\" OR CommandLine=\"*.txt*\" OR CommandLine=\"\
+    *.kdbx*\")\n  (CommandLine=\"*home/*\" OR CommandLine=\"*/Users/*\")\n  (CommandLine=\"*cp*\" OR CommandLine=\"*mv*\" OR CommandLine=\"*rsync*\"\
+    )\n)\n| eval staging_indicator=if(match(CommandLine, \"(?i)(temp|tmp|appdata|programdata|public|stage|collect|archive)\"), 1, 0)\n| where\
+    \ staging_indicator=1\n| stats count earliest(_time) as first_seen latest(_time) as last_seen values(CommandLine) as commands by ComputerName,\
+    \ host, User, SourceUser, user, Image, process_name\n| table first_seen, last_seen, ComputerName, host, User, SourceUser, user, Image, process_name,\
+    \ count, commands\n"
+  kql: "let timeframe = 1h;\nlet stagingPaths = dynamic([\"temp\", \"tmp\", \"public\", \"appdata\\\\local\\\\temp\", \"programdata\", \"/tmp\"\
+    , \"/var/tmp\", \"/dev/shm\"]);\nlet fileExtensions = dynamic([\"*.doc*\", \"*.xls*\", \"*.pdf\", \"*.txt\", \"*.kdbx\"]);\nlet recursiveCommands\
+    \ = dynamic([\"Get-ChildItem\", \"gci\", \"ls\", \"dir\", \"find\"]);\nlet copyCommands = dynamic([\"Copy-Item\", \"copy\", \"cp\", \"xcopy\"\
+    , \"robocopy\", \"mv\", \"move\"]);\nDeviceProcessEvents\n| where TimeGenerated > ago(timeframe)\n| where (FileName in~ (\"powershell.exe\"\
+    , \"pwsh.exe\", \"bash\", \"sh\", \"zsh\") or InitiatingProcessFileName in~ (\"powershell.exe\", \"pwsh.exe\", \"bash\", \"sh\", \"zsh\"))\n\
+    | where ProcessCommandLine has_any (fileExtensions)\n| where ProcessCommandLine has_any (recursiveCommands) or ProcessCommandLine has \"-Recurse\"\
+    \ or ProcessCommandLine has \"-r\" or ProcessCommandLine has \"-R\"\n| where ProcessCommandLine has_any (stagingPaths) and ProcessCommandLine\
+    \ has_any (copyCommands)\n| where ProcessCommandLine has_any (\"Users\\\\\", \"home/\", \"/Users/\", \"C:\\\\Users\\\\\", \"/home/\")\n| summarize\
+    \ \n    FirstSeen = min(TimeGenerated),\n    LastSeen = max(TimeGenerated),\n    CommandCount = count(),\n    UniqueCommands = make_set(ProcessCommandLine,\
+    \ 10)\n    by DeviceName, AccountName, FileName, InitiatingProcessFileName\n| where CommandCount >= 2\n| project FirstSeen, LastSeen, DeviceName,\
+    \ AccountName, FileName, InitiatingProcessFileName, CommandCount, UniqueCommands\n"
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process Name", "Process CommandLine", "Parent Process Name"
+    FROM events
+    WHERE (
+      ("Process Name" ILIKE '%powershell.exe%' OR "Process Name" ILIKE '%pwsh%' OR "Process Name" ILIKE '%bash%' OR "Process Name" ILIKE '%sh%')
+      AND (
+        ("Process CommandLine" ILIKE '%Get-ChildItem%' AND ("Process CommandLine" ILIKE '%-Recurse%' OR "Process CommandLine" ILIKE '%-R %'))
+        OR ("Process CommandLine" ILIKE '%gci %' AND ("Process CommandLine" ILIKE '%-Recurse%' OR "Process CommandLine" ILIKE '%-R %'))
+        OR ("Process CommandLine" ILIKE '%ls %' AND "Process CommandLine" ILIKE '%-R%')
+        OR ("Process CommandLine" ILIKE '%find %' AND ("Process CommandLine" ILIKE '%.doc%' OR "Process CommandLine" ILIKE '%.xls%' OR "Process CommandLine" ILIKE '%.pdf%' OR "Process CommandLine" ILIKE '%.txt%' OR "Process CommandLine" ILIKE '%.kdbx%'))
+      )
+      AND (
+        "Process CommandLine" ILIKE '%.doc%'
+        OR "Process CommandLine" ILIKE '%.xls%'
+        OR "Process CommandLine" ILIKE '%.pdf%'
+        OR "Process CommandLine" ILIKE '%.txt%'
+        OR "Process CommandLine" ILIKE '%.kdbx%'
+      )
+      AND (
+        "Process CommandLine" ILIKE '%Copy-Item%'
+        OR "Process CommandLine" ILIKE '%cp %'
+        OR "Process CommandLine" ILIKE '%copy %'
+        OR "Process CommandLine" ILIKE '%move %'
+        OR "Process CommandLine" ILIKE '%mv %'
+      )
+      AND (
+        "Process CommandLine" ILIKE '%Users\\%'
+        OR "Process CommandLine" ILIKE '%home\\%'
+        OR "Process CommandLine" ILIKE '%/home/%'
+        OR "Process CommandLine" ILIKE '%/Users/%'
+      )
     )
-    OR
-    (
-      (Image="*/bash" OR Image="*/sh" OR process_name IN ("bash", "sh", "zsh"))
-      (CommandLine="*find*" OR CommandLine="*grep*")
-      (CommandLine="*.doc*" OR CommandLine="*.xls*" OR CommandLine="*.pdf*" OR CommandLine="*.txt*" OR CommandLine="*.kdbx*")
-      (CommandLine="*home/*" OR CommandLine="*/Users/*")
-      (CommandLine="*cp*" OR CommandLine="*mv*" OR CommandLine="*rsync*")
-    )
-    | eval staging_indicator=if(match(CommandLine, "(?i)(temp|tmp|appdata|programdata|public|stage|collect|archive)"), 1, 0)
-    | where staging_indicator=1
-    | stats count earliest(_time) as first_seen latest(_time) as last_seen values(CommandLine) as commands by ComputerName, host, User, SourceUser, user, Image, process_name
-    | table first_seen, last_seen, ComputerName, host, User, SourceUser, user, Image, process_name, count, commands
-  kql: 'DeviceProcessEvents
+    LAST 1 HOURS
+  yara_l: |
+    rule automated_collection_staging {
+      meta:
+        author = "TDL"
+        description = "Detects automated collection of documents via shell commands with staging behavior - T1119"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1119"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          re.regex($e.principal.process.file.full_path, `(?i)powershell\.exe$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)pwsh\.exe$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)/bin/(ba)?sh$`)
+        )
+        (
+          re.regex($e.principal.process.command_line, `(?i).*-recurse.*\*\.(doc|xls|pdf|txt|kdbx)`) or
+          re.regex($e.principal.process.command_line, `(?i).*find.*/(home|Users)/.*\.(doc|xls|pdf|txt|kdbx)`) or
+          re.regex($e.principal.process.command_line, `(?i).*Get-ChildItem.*-Recurse.*\*\.(doc|xls|pdf|txt|kdbx)`) or
+          re.regex($e.principal.process.command_line, `(?i).*gci.*-r.*\*\.(doc|xls|pdf|txt|kdbx)`)
+        )
+        (
+          re.regex($e.principal.process.command_line, `(?i).*(copy|cp|move|mv|Copy-Item|robocopy).*`) or
+          re.regex($e.principal.process.command_line, `(?i).*(temp|tmp|staging|collect|exfil|\\\\[a-z]:\\\\[a-z0-9_-]+)`)
+        )
+        (
+          re.regex($e.principal.process.command_line, `(?i).*(Users|home|Documents|Desktop|Downloads)`) or
+          re.regex($e.principal.process.command_line, `(?i).*(/home/|C:\\\\Users\\\\)`)
+        )
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $user
 
-    | where process_name matches regex ".+"
+      match:
+        $host, $user over 15m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      outcome:
+        $risk_score = max(75)
+        $user_sessions = count_distinct($e.principal.user.userid)
+        $command_lines = array_distinct($e.principal.process.command_line)
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000784 {\n  meta:\n    author = \"TDL\"\n    description = \"Scripted File Globbing of User Documents\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0009\"\n    technique = \"T1119\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-endpoint.events.process*, logs-windows.sysmon_operational*\n| WHERE @timestamp > NOW() - 1 hour\n  AND (\n    (process.name\
+    \ IN (\"powershell.exe\", \"pwsh.exe\", \"bash\", \"sh\") \n     AND (\n       process.command_line RLIKE \".*(-r|-recurse|find|grep).*\\\\\
+    *\\\\.(doc|xls|pdf|txt|kdbx).*\"\n       OR process.command_line RLIKE \".*(Get-ChildItem|gci|ls|find).*-recurse.*\\\\*\\\\.(doc|xls|pdf|txt|kdbx).*\"\
+    \n       OR process.command_line RLIKE \".*find.*/home/.*-name.*\\\\*\\\\.(doc|xls|pdf|txt|kdbx).*\"\n     )\n     AND (\n       process.command_line\
+    \ LIKE \"*copy*\"\n       OR process.command_line LIKE \"*cp *\"\n       OR process.command_line LIKE \"*Copy-Item*\"\n       OR process.command_line\
+    \ LIKE \"*mv *\"\n       OR process.command_line LIKE \"*Move-Item*\"\n     )\n     AND (\n       process.command_line LIKE \"*Users\\\\*\"\
+    \n       OR process.command_line LIKE \"*home/*\"\n       OR process.command_line LIKE \"*C:\\\\Users\\\\*\"\n     )\n    )\n  )\n| STATS\
+    \ events = COUNT(*) BY host.name, user.name, process.name, process.command_line\n| WHERE events >= 1\n| KEEP @timestamp, host.name, user.name,\
+    \ process.name, process.command_line, events\n"
+  leql: |
+    where((process_name ICONTAINS "powershell.exe" OR process_name ICONTAINS "pwsh.exe" OR process_name ICONTAINS "bash" OR process_name ICONTAINS "sh") AND (process_cmd_line ICONTAINS "*.doc" OR process_cmd_line ICONTAINS "*.xls" OR process_cmd_line ICONTAINS "*.pdf" OR process_cmd_line ICONTAINS "*.txt" OR process_cmd_line ICONTAINS "*.kdbx") AND (process_cmd_line ICONTAINS "Copy-Item" OR process_cmd_line ICONTAINS "cp " OR process_cmd_line ICONTAINS "copy " OR process_cmd_line ICONTAINS "move " OR process_cmd_line ICONTAINS "Move-Item" OR process_cmd_line ICONTAINS "xcopy") AND (process_cmd_line ICONTAINS "/Users/" OR process_cmd_line ICONTAINS "C:\\Users\\" OR process_cmd_line ICONTAINS "/home/") AND (process_cmd_line ICONTAINS "-Recurse" OR process_cmd_line ICONTAINS "-r " OR process_cmd_line ICONTAINS "/s")) groupby(asset, user, process_cmd_line) calculate(count)
+  crowdstrike: "(event_simpleName=ProcessRollup2 OR EventCode=1) \n(\n  (FileName=powershell.exe OR FileName=pwsh.exe OR FileName=bash OR FileName=sh)\
+    \ \n  AND \n  (\n    (CommandLine=*Get-ChildItem* OR CommandLine=*gci* OR CommandLine=*ls* OR CommandLine=*find* OR CommandLine=*dir*)\n \
+    \   AND\n    (CommandLine=*-Recurse* OR CommandLine=*-r* OR CommandLine=*-R*)\n    AND\n    (CommandLine=*.doc* OR CommandLine=*.xls* OR CommandLine=*.pdf\
+    \ OR CommandLine=*.txt OR CommandLine=*.kdbx)\n  )\n  OR\n  (\n    (CommandLine=*Copy-Item* OR CommandLine=*copy* OR CommandLine=*cp* OR CommandLine=*mv*\
+    \ OR CommandLine=*move*)\n    AND\n    (CommandLine=*.doc* OR CommandLine=*.xls* OR CommandLine=*.pdf OR CommandLine=*.txt OR CommandLine=*.kdbx)\n\
+    \  )\n)\nAND\n(CommandLine=*Users* OR CommandLine=*home* OR CommandLine=*/Users/* OR CommandLine=*/home/*)\n| regex(\"(Copy-Item|copy|cp|mv|move|xcopy)\\\
+    \\s+.*\\\\s+(\\\\S+staging\\\\S*|\\\\S+temp\\\\S*|\\\\S+tmp\\\\S*|C:\\\\\\\\[^\\\\\\\\]+$|/tmp/[^/]+$)\", field=CommandLine, strict=false)\n\
+    | groupBy([ComputerName, UserName, FileName], function=count(as=file_ops), limit=max)\n| file_ops >= 1\n| table([@timestamp, ComputerName,\
+    \ UserName, FileName, ParentBaseFileName, CommandLine, file_ops])\n"
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter (actor_process_image_name contains "powershell" or actor_process_image_name contains "pwsh" or actor_process_image_name contains "bash" or actor_process_image_name contains "sh")
+    | filter (action_process_image_command_line ~= ".*(\*\.doc|\*\.xls|\*\.pdf|\*\.txt|\*\.kdbx).*" and (action_process_image_command_line ~= ".*(copy|cp|move|mv|xcopy|robocopy|Get-ChildItem|gci|ls|find).*" and action_process_image_command_line ~= ".*(recurse|-r|-R|/s).*"))
+    | filter (action_process_image_command_line contains "Users" or action_process_image_command_line contains "home" or action_process_image_command_line contains "Documents" or action_process_image_command_line contains "Desktop" or action_process_image_command_line contains "Downloads")
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_command_line, action_process_image_path
+  lucene: |
+    (process.name:(powershell.exe OR pwsh.exe OR bash.exe OR bash) AND process.command_line:(*-Recurse* OR *-R* OR *-r*) AND (process.command_line:(*\\*.doc* OR *\\*.xls* OR *\\*.pdf* OR *\\*.txt* OR *\\*.kdbx* OR */*.doc* OR */*.xls* OR */*.pdf* OR */*.txt* OR */*.kdbx*) AND (process.command_line:(*Copy-Item* OR *copy* OR *cp* OR *move* OR *mv* OR *xcopy* OR *robocopy*) AND (process.command_line:(*\\Users\\* OR *\\home\\* OR */Users/* OR */home/*)))))
+  sumo: |
+    _sourceCategory=*Sysmon* OR _sourceCategory=*EDR* OR _sourceCategory=*Windows* OR _sourceCategory=*Linux*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as cmd
+    | json field=_raw "Image" as image
+    | json field=_raw "ProcessCommandLine" as proc_cmd
+    | json field=_raw "process_name" as proc_name
+    | json field=_raw "command_line" as cmd_line
+    | where (cmd matches "*powershell*" OR cmd matches "*pwsh*" OR cmd matches "*bash*" OR image matches "*powershell.exe" OR image matches "*pwsh.exe" OR image matches "*bash" OR proc_name matches "*powershell*" OR proc_name matches "*bash*")
+    | where (cmd matches "*Get-ChildItem*" OR cmd matches "*gci*" OR cmd matches "*ls*" OR cmd matches "*dir*" OR cmd matches "*find*" OR cmd_line matches "*Get-ChildItem*" OR cmd_line matches "*gci*" OR cmd_line matches "*ls*" OR cmd_line matches "*dir*" OR cmd_line matches "*find*" OR proc_cmd matches "*Get-ChildItem*" OR proc_cmd matches "*gci*" OR proc_cmd matches "*ls*" OR proc_cmd matches "*dir*" OR proc_cmd matches "*find*")
+    | where (cmd matches "*-Recurse*" OR cmd matches "*-r*" OR cmd matches "*-R*" OR cmd_line matches "*-Recurse*" OR cmd_line matches "*-r*" OR cmd_line matches "*-R*" OR proc_cmd matches "*-Recurse*" OR proc_cmd matches "*-r*" OR proc_cmd matches "*-R*")
+    | where (cmd matches "**.doc*" OR cmd matches "**.xls*" OR cmd matches "**.pdf*" OR cmd matches "**.txt*" OR cmd matches "**.kdbx*" OR cmd_line matches "**.doc*" OR cmd_line matches "**.xls*" OR cmd_line matches "**.pdf*" OR cmd_line matches "**.txt*" OR cmd_line matches "**.kdbx*" OR proc_cmd matches "**.doc*" OR proc_cmd matches "**.xls*" OR proc_cmd matches "**.pdf*" OR proc_cmd matches "**.txt*" OR proc_cmd matches "**.kdbx*")
+    | where (cmd matches "*Users*" OR cmd matches "*home*" OR cmd matches "*/Users/*" OR cmd matches "*/home/*" OR cmd_line matches "*Users*" OR cmd_line matches "*home*" OR cmd_line matches "*/Users/*" OR cmd_line matches "*/home/*" OR proc_cmd matches "*Users*" OR proc_cmd matches "*home*" OR proc_cmd matches "*/Users/*" OR proc_cmd matches "*/home/*")
+    | where (cmd matches "*Copy-Item*" OR cmd matches "*copy*" OR cmd matches "*cp*" OR cmd matches "*mv*" OR cmd matches "*move*" OR cmd_line matches "*Copy-Item*" OR cmd_line matches "*copy*" OR cmd_line matches "*cp*" OR cmd_line matches "*mv*" OR cmd_line matches "*move*" OR proc_cmd matches "*Copy-Item*" OR proc_cmd matches "*copy*" OR proc_cmd matches "*cp*" OR proc_cmd matches "*mv*" OR proc_cmd matches "*move*")
+    | fields _messageTime, _sourceHost, cmd, cmd_line, proc_cmd, image, proc_name
 pseudo_logic: PowerShell / bash recursively globbing *.doc*, *.xls*, *.pdf, *.txt, *.kdbx under user profiles, then copying to a staging dir.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -122,7 +180,7 @@ references:
 - https://attack.mitre.org/techniques/T1119/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'

@@ -16,73 +16,115 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=4728 OR EventCode=4732 OR EventCode=4756)
-    (Group_Name IN ("Domain Admins", "Enterprise Admins", "Administrators", "Schema Admins", "Account Operators", "Backup Operators", "Server Operators", "Print Operators"))
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=4728 OR EventCode=4732 OR EventCode=4756)
+
+    (Group_Name IN ("Domain Admins", "Enterprise Admins", "Administrators", "Schema Admins", "Account Operators", "Backup Operators", "Server
+    Operators", "Print Operators"))
+
     NOT (TargetUserName="admin*" OR TargetUserName="*-admin" OR TargetUserName="*-adm" OR TargetUserName="svc-*" OR TargetUserName="*service*")
+
     | table _time, ComputerName, EventCode, Group_Name, TargetUserName, SubjectUserName
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000016 {\n  meta:\n    author = \"TDL\"\n    description = \"Privileged Account Created with Abnormal Name\"\n  \
-    \  severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (632, 4728, 636, 4732, 660, 4756)
+    | where TargetUserName in (
+        "Domain Admins",
+        "Enterprise Admins",
+        "Schema Admins",
+        "Administrators",
+        "Account Operators",
+        "Backup Operators",
+        "Print Operators",
+        "Server Operators",
+        "Domain Controllers",
+        "Read-only Domain Controllers",
+        "Group Policy Creator Owners",
+        "Cryptographic Operators",
+        "Distributed COM Users"
+    )
+    | where SubjectUserName !startswith "adm" and SubjectUserName !startswith "admin" and SubjectUserName !endswith "-admin" and SubjectUserName !endswith "_admin"
+    | project TimeGenerated, Computer, SubjectUserName, SubjectDomainName, TargetUserName, MemberName, MemberSid, EventID
+  aql: |
+    SELECT eventtime, username, destinationusername, "Group Name", LOGSOURCENAME(logsourceid) AS host
+    FROM events
+    WHERE "EventID" IN ('632', '4728', '636', '4732', '660', '4756')
+      AND "Group Name" IN ('Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Administrators', 'Account Operators', 'Backup Operators', 'Print Operators', 'Server Operators', 'Domain Controllers', 'Read-only Domain Controllers', 'Group Policy Creator Owners', 'Cryptographic Operators')
+      AND destinationusername NOT ILIKE 'admin%'
+      AND destinationusername NOT ILIKE '%adm%'
+      AND destinationusername NOT ILIKE 'svc%'
+    LAST 24 HOURS
+  yara_l: |
+    rule user_added_to_privileged_group {
+      meta:
+        author = "TDL"
+        description = "Detects user added to high-value security group by non-admin account"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "GROUP_MODIFICATION"
+        (
+          $e.metadata.product_event_type = "632" or
+          $e.metadata.product_event_type = "4728" or
+          $e.metadata.product_event_type = "636" or
+          $e.metadata.product_event_type = "4732" or
+          $e.metadata.product_event_type = "660" or
+          $e.metadata.product_event_type = "4756"
+        )
+        (
+          re.regex($e.target.group.group_display_name, `(?i)(Domain Admins|Enterprise Admins|Administrators|Schema Admins|Account Operators|Backup Operators|Server Operators|Print Operators|Domain Controllers|Read-only Domain Controllers|Group Policy Creator Owners|Cryptographic Operators|Distributed COM Users)`) or
+          re.regex($e.security_result.about.group.group_display_name, `(?i)(Domain Admins|Enterprise Admins|Administrators|Schema Admins|Account Operators|Backup Operators|Server Operators|Print Operators|Domain Controllers|Read-only Domain Controllers|Group Policy Creator Owners|Cryptographic Operators|Distributed COM Users)`)
+        )
+        not re.regex($e.target.user.userid, `(?i)(admin|administrator|svc|service|privileged|adm_|_adm)`)
+        $e.principal.hostname = $host
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 75
+        $target_user = array_distinct($e.target.user.userid)
+        $group_name = coalesce($e.target.group.group_display_name, $e.security_result.about.group.group_display_name)
+        $principal_user = array_distinct($e.principal.user.userid)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*, logs-windows.security*, winlogbeat-*
+    | WHERE event.code IN ("632", "4728", "636", "4732", "660", "4756")
+    | WHERE winlog.event_data.TargetUserName IN ("Domain Admins", "Enterprise Admins", "Schema Admins", "Administrators", "Account Operators", "Backup Operators", "Server Operators", "Domain Controllers", "Read-only Domain Controllers", "Group Policy Creator Owners", "Cryptographic Operators", "Distributed COM Users")
+    | WHERE NOT (winlog.event_data.MemberName LIKE "*admin*" OR winlog.event_data.MemberName LIKE "*adm-*" OR winlog.event_data.MemberName LIKE "*svc-*" OR winlog.event_data.MemberName LIKE "*service*")
+    | KEEP @timestamp, host.name, event.code, winlog.event_data.TargetUserName, winlog.event_data.MemberName, winlog.event_data.SubjectUserName, user.name
+  leql: |
+    where(source_json.EventID IN [632, 4728, 636, 4732, 660, 4756] AND source_json.TargetUserName IN ["Domain Admins", "Enterprise Admins", "Schema Admins", "Administrators", "Account Operators", "Backup Operators", "Server Operators", "Domain Controllers", "Enterprise Domain Controllers", "Group Policy Creator Owners", "Read-only Domain Controllers", "DnsAdmins"] AND source_json.SubjectUserName NOT ICONTAINS "admin" AND source_json.SubjectUserName NOT ICONTAINS "svc" AND source_json.SubjectUserName NOT ICONTAINS "service")
+  crowdstrike: |
+    EventCode IN [632, 4728, 636, 4732, 660, 4756]
+    | TargetUserName IN [Domain Admins, Enterprise Admins, Schema Admins, Administrators, Account Operators, Backup Operators, Server Operators, Print Operators, DnsAdmins]
+    | NOT TargetUserName=/^(adm|admin|priv|svc)[-_].*/i
+    | table([@timestamp, ComputerName, EventCode, TargetUserName, MemberName, SubjectUserName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (632, 4728, 636, 4732, 660, 4756)
+    | filter action_evtlog_event_data_TargetUserName in ("Domain Admins", "Enterprise Admins", "Administrators", "Schema Admins", "Account Operators", "Backup Operators", "Server Operators", "Domain Controllers")
+    | filter action_evtlog_event_data_MemberName !~= "(?i)(admin|svc|service|privileged)"
+    | fields _time, agent_hostname, action_evtlog_event_id, action_evtlog_event_data_TargetUserName, action_evtlog_event_data_MemberName, action_evtlog_event_data_SubjectUserName
+  lucene: |
+    event.code:(4728 OR 4732 OR 4756) AND winlog.event_data.TargetUserName:(*Domain Admins* OR *Enterprise Admins* OR *Schema Admins* OR *Administrators* OR *Backup Operators* OR *Account Operators* OR *Server Operators* OR *Print Operators* OR *Replicator* OR *Domain Controllers* OR *Group Policy Creator Owners* OR *Cryptographic Operators* OR *Distributed COM Users*) AND NOT winlog.event_data.TargetUserName:(*admin* OR *adm-* OR *-adm* OR *svc-* OR *service-*)
+  sumo: |
+    _sourceCategory=*Windows*Security* (EventID=4728 OR EventID=4732 OR EventID=4756 OR EventID=632 OR EventID=636 OR EventID=660)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetUserName" as target_user
+    | json field=_raw "MemberName" as member_name
+    | json field=_raw "TargetSid" as group_sid
+    | where event_id in ("632", "4728", "636", "4732", "660", "4756")
+    | where target_user matches "*Administrators*" or target_user matches "*Domain Admins*" or target_user matches "*Enterprise Admins*" or target_user matches "*Schema Admins*" or target_user matches "*Account Operators*" or target_user matches "*Backup Operators*" or target_user matches "*Server Operators*" or target_user matches "*Print Operators*"
+    | where !(member_name matches "*admin*" or member_name matches "*adm-*" or member_name matches "*svc-*" or member_name matches "*service*" or member_name matches "*privileged*")
+    | fields _messageTime, _sourceHost, event_id, target_user, member_name, group_sid
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -92,7 +134,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows User Added to Security Group Event\nWhere the Event ID is in [632, 4728, 636, 4732, 660, 4756] \nWhere the Group Name\
   \ is in the High Value Target Groups List\nWhere the Destination Username does NOT match the Admin/Privileged User Naming Convention"

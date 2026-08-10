@@ -15,71 +15,70 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudwatch:guardduty (finding.type="Impact:EC2/WinRMBruteForce" OR finding.type="UnauthorizedAccess:EC2/RDPBruteForce" OR finding.type="UnauthorizedAccess:EC2/SSHBruteForce")
-    | table _time, finding.type, finding.severity, resource.instanceDetails.instanceId, service.action.networkConnectionAction.remoteIpDetails.ipAddressV4, finding.description
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: 'index=aws sourcetype=aws:cloudwatch:guardduty (finding.type="Impact:EC2/WinRMBruteForce" OR finding.type="UnauthorizedAccess:EC2/RDPBruteForce"
+    OR finding.type="UnauthorizedAccess:EC2/SSHBruteForce")
 
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+    | table _time, finding.type, finding.severity, resource.instanceDetails.instanceId, service.action.networkConnectionAction.remoteIpDetails.ipAddressV4,
+    finding.description
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000352 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Brute Force Activity  - GuardDuty\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0006\"\n    technique = \"T1110\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where ActivityType in ("Impact:EC2/WinRMBruteForce", "UnauthorizedAccess:EC2/RDPBruteForce", "UnauthorizedAccess:EC2/SSHBruteForce")
+    | project TimeGenerated, ActivityType, Title, Description, Severity, AccountId, Region, ResourceType, InstanceId = tostring(parse_json(tostring(parse_json(Resources)[0])).InstanceDetails.InstanceId), SourceIpAddress = tostring(parse_json(Service).Action.NetworkConnectionAction.RemoteIpDetails.IpAddressV4)
+  aql: |
+    SELECT sourceip, destinationip, qidname(qid) AS event_type, COUNT(*) AS event_count
+    FROM events
+    WHERE (qidname(qid) ILIKE '%Impact:EC2/WinRMBruteForce%' OR qidname(qid) ILIKE '%UnauthorizedAccess:EC2/RDPBruteForce%' OR qidname(qid) ILIKE '%UnauthorizedAccess:EC2/SSHBruteForce%')
+      AND LOGSOURCETYPENAME(devicetype) ILIKE '%GuardDuty%'
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_brute_force_attempts {
+      meta:
+        author = "TDL"
+        description = "Detects AWS GuardDuty brute force findings for WinRM, RDP, and SSH"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1110"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Amazon AWS"
+        $e.metadata.product_name = "GuardDuty"
+        (
+          $e.metadata.product_event_type = "Impact:EC2/WinRMBruteForce" or
+          $e.metadata.product_event_type = "UnauthorizedAccess:EC2/RDPBruteForce" or
+          $e.metadata.product_event_type = "UnauthorizedAccess:EC2/SSHBruteForce"
+        )
+        $e.principal.resource.id = $resource_id
 
-    | WHERE eventName LIKE "%GuardDuty%"
+      match:
+        $resource_id over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("Impact:EC2/WinRMBruteForce", "UnauthorizedAccess:EC2/RDPBruteForce", "UnauthorizedAccess:EC2/SSHBruteForce")
+    | KEEP @timestamp, cloud.account.id, cloud.region, event.type, event.severity, source.ip, destination.ip, cloud.instance.id
+  leql: |
+    where(source_json.type IN ["Impact:EC2/WinRMBruteForce", "UnauthorizedAccess:EC2/RDPBruteForce", "UnauthorizedAccess:EC2/SSHBruteForce"])
+  crowdstrike: |
+    #repo=guardduty event.type IN ["Impact:EC2/WinRMBruteForce", "UnauthorizedAccess:EC2/RDPBruteForce", "UnauthorizedAccess:EC2/SSHBruteForce"]
+    | table([@timestamp, event.type, event.id, service.action.networkConnectionAction.remoteIpDetails.ipAddressV4, resource.instanceDetails.instanceId, resource.instanceDetails.instanceType])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and vendor_name = "AWS" and raw_log_content ~= "GuardDuty"
+    | filter operation_name in ("Impact:EC2/WinRMBruteForce", "UnauthorizedAccess:EC2/RDPBruteForce", "UnauthorizedAccess:EC2/SSHBruteForce")
+    | fields _time, cloud_provider, operation_name, resource_name, identity_name, raw_log_content
+  lucene: |
+    event.dataset:guardduty AND finding.type:("Impact:EC2/WinRMBruteForce" OR "UnauthorizedAccess:EC2/RDPBruteForce" OR "UnauthorizedAccess:EC2/SSHBruteForce")
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("Impact:EC2/WinRMBruteForce", "UnauthorizedAccess:EC2/RDPBruteForce", "UnauthorizedAccess:EC2/SSHBruteForce")
+    | fields _messageTime, event_type, _sourceHost, _raw
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +88,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Impact:EC2/WinRMBruteForce\", \"UnauthorizedAccess:EC2/RDPBruteForce\", \"UnauthorizedAccess:EC2/SSHBruteForce\"\
   ]"

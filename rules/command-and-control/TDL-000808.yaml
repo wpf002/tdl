@@ -25,77 +25,162 @@ queries:
     permitted\"), 1, 0)\n| bin _time span=5m\n| stats sum(icmp_anomaly) as icmp_count sum(tcp443_out) as tcp443_count earliest(_time) as first_icmp\
     \ latest(_time) as last_tcp by src_ip, _time\n| where icmp_count>0 AND tcp443_count>=10\n| eval time_diff=last_tcp-first_icmp\n| where time_diff>=0\
     \ AND time_diff<=300\n| table _time, src_ip, icmp_count, tcp443_count, time_diff\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  kql: |
+    let suspiciousICMP = (
+        CommonSecurityLog
+        | where TimeGenerated > ago(1h)
+        | where DeviceVendor has_any ("Palo Alto", "Fortinet", "Cisco", "Check Point") or DeviceProduct has_any ("IDS", "IPS", "Firewall")
+        | where Protocol == "ICMP" or ApplicationProtocol == "ICMP" or DestinationPort == 0
+        | where Activity has "echo" or Message has "echo"
+        | extend PayloadSize = tolong(SentBytes)
+        | where PayloadSize > 100 or PayloadSize == 0
+        | project ICMPTime=TimeGenerated, DestinationIP, SourceIP, PayloadSize, DeviceName
+    );
+    let outboundBurst = (
+        CommonSecurityLog
+        | where TimeGenerated > ago(1h)
+        | where DeviceAction in ("allowed", "accept", "permit") or DeviceAction has "allow"
+        | where DestinationPort == 443
+        | where CommunicationDirection == "Outbound" or (isempty(CommunicationDirection) and DestinationIP !startswith "10." and DestinationIP !startswith "192.168." and DestinationIP !startswith "172.")
+        | summarize ConnectionCount=count(), FirstConnection=min(TimeGenerated), LastConnection=max(TimeGenerated) by bin(TimeGenerated, 5m), SourceIP, DestinationIP, DeviceName
+        | where ConnectionCount >= 10
+        | project BurstTime=TimeGenerated, SourceIP, DestinationIP, ConnectionCount, FirstConnection, LastConnection, DeviceName
+    );
+    suspiciousICMP
+    | join kind=inner (outboundBurst) on $left.DestinationIP == $right.SourceIP
+    | where BurstTime > ICMPTime and datetime_diff('minute', BurstTime, ICMPTime) <= 15
+    | project ICMPTime, BurstTime, HostIP=DestinationIP, ICMPSource=SourceIP, C2Destination=DestinationIP1, ConnectionCount, PayloadSize, DeviceName
+    | summarize ICMPCount=count(), arg_min(ICMPTime, *) by HostIP, C2Destination
+    | project TimeGenerated=ICMPTime, HostIP, ICMPSource, C2Destination, ICMPCount, ConnectionCount, PayloadSize, DeviceName
+  aql: "SELECT sourceip, destinationip, COUNT(*) AS icmp_events, LAST(\"Payload Size\") AS last_payload_size\nFROM events\nWHERE (protocolid =\
+    \ 1 OR protocol = 'ICMP') \n  AND (qidname(qid) ILIKE '%echo%' OR categoryname(category) ILIKE '%icmp%')\n  AND (\"Payload Size\" > 100 OR\
+    \ \"Payload Size\" IS NOT NULL)\nGROUP BY sourceip, destinationip\nHAVING icmp_events >= 3\nLAST 5 MINUTES\n\nUNION\n\nSELECT flows.sourceip,\
+    \ flows.destinationip, COUNT(*) AS tcp443_flows, SUM(flows.bytes) AS total_bytes\nFROM flows\nWHERE flows.protocolid = 6 \n  AND flows.destinationport\
+    \ = 443\n  AND flows.sourceip IN (\n    SELECT DISTINCT sourceip \n    FROM events \n    WHERE (protocolid = 1 OR protocol = 'ICMP')\n   \
+    \   AND (qidname(qid) ILIKE '%echo%' OR categoryname(category) ILIKE '%icmp%')\n      AND (\"Payload Size\" > 100 OR \"Payload Size\" IS NOT\
+    \ NULL)\n    LAST 5 MINUTES\n  )\nGROUP BY flows.sourceip, flows.destinationip\nHAVING tcp443_flows >= 10\nLAST 5 MINUTES\n"
+  yara_l: |
+    rule icmp_trigger_then_beacon_c2 {
+      meta:
+        author = "TDL"
+        description = "Detects ICMP echo with anomalous payload followed by sudden outbound HTTPS burst - T1205 Traffic Signaling"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1205"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $icmp.metadata.event_type = "NETWORK_CONNECTION"
+        $icmp.network.ip_protocol = "ICMP"
+        $icmp.target.ip = $target_ip
+        $icmp.principal.ip = $external_ip
+        (
+          $icmp.network.sent_bytes > 100 or
+          $icmp.network.received_bytes > 100
+        )
+        $icmp.principal.hostname = $host
 
-    | where network.protocol matches regex "icmp"
+        $tcp.metadata.event_type = "NETWORK_CONNECTION"
+        $tcp.network.ip_protocol = "TCP"
+        $tcp.target.port = 443
+        $tcp.network.direction = "OUTBOUND"
+        $tcp.principal.hostname = $host
+        $tcp.principal.ip = $target_ip
+        $tcp.metadata.event_timestamp.seconds > $icmp.metadata.event_timestamp.seconds
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+      match:
+        $host, $target_ip over 15m
 
-    | order by Bytes desc
+      outcome:
+        $risk_score = 75
 
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%icmp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000808 {\n  meta:\n    author = \"TDL\"\n    description = \"Beacon Activated by ICMP Trigger Pattern\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1205\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /icmp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%icmp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/icmp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*icmp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "icmp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*icmp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*icmp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #icmp >= 1 and #tcp >= 5 and $tcp and $icmp
+    }
+  esql: |
+    FROM logs-network.netflow*, logs-zeek.conn*, logs-suricata.eve*, packetbeat-*
+    | WHERE @timestamp > NOW() - 15 minute
+    | EVAL is_icmp = CASE(network.transport == "icmp" OR destination.port == 0 AND network.protocol == "icmp", 1, 0),
+           is_https = CASE(destination.port == 443 AND network.transport == "tcp", 1, 0),
+           payload_size = COALESCE(network.bytes, source.bytes, 0)
+    | EVAL anomalous_icmp = CASE(is_icmp == 1 AND (payload_size > 100 OR payload_size < 8), 1, 0)
+    | STATS icmp_events = SUM(anomalous_icmp),
+            https_events = SUM(is_https),
+            first_icmp = MIN(CASE(anomalous_icmp == 1, @timestamp, null)),
+            first_https = MIN(CASE(is_https == 1, @timestamp, null)),
+            https_burst = COUNT(*) BY source.ip, dest_ip = destination.ip, time_bucket = BUCKET(@timestamp, 5 minute)
+    | WHERE icmp_events >= 1 AND https_events >= 5 AND first_icmp < first_https
+    | KEEP source.ip, dest_ip, time_bucket, icmp_events, https_events, https_burst, first_icmp, first_https
+  leql: |
+    where(source_json.protocol ICONTAINS "icmp" AND (source_json.payload_size > 100 OR source_json.icmp_type=8)) groupby(destination_address, asset) calculate(count)
+  crowdstrike: |
+    (event_simpleName=NetworkReceiveAcceptIP4 OR event_simpleName=NetworkConnectIP4 OR #type=firewall OR #type=ids)
+    | case {
+        event_simpleName=NetworkReceiveAcceptIP4 Protocol=1 | PayloadSize := PacketSize | eval(icmp_flag=1) | drop([icmp_flag]);
+        event_simpleName=NetworkConnectIP4 RemotePort=443 | eval(tcp_flag=1) | drop([tcp_flag]);
+        #type=ids protocol=icmp | PayloadSize := packet_length | eval(icmp_flag=1) | drop([icmp_flag]);
+        #type=firewall action=allow dest_port=443 protocol=tcp | eval(tcp_flag=1) | drop([tcp_flag]);
+        * | drop(@rawstring)
+      }
+    | (Protocol=1 OR protocol=icmp OR (PayloadSize>0 AND icmp_flag=*)) OR ((RemotePort=443 OR dest_port=443) AND (Protocol=6 OR protocol=tcp OR tcp_flag=*))
+    | ComputerName := coalesce(ComputerName, host, src_ip, LocalAddressIP4)
+    | groupBy([ComputerName], function=collect([Protocol, protocol, PayloadSize, RemotePort, dest_port, @timestamp]))
+    | array:sort(field="@timestamp", array=_collect, reverse=false)
+    | test(array:length(_collect) >= 2)
+    | icmp_events := array:filter(array=_collect, function={var.Protocol=1 OR var.protocol="icmp"})
+    | tcp_events := array:filter(array=_collect, function={var.RemotePort=443 OR var.dest_port=443})
+    | test(array:length(icmp_events) >= 1 AND array:length(tcp_events) >= 3)
+    | icmp_time := min(array:map(array=icmp_events, function=var."@timestamp"))
+    | tcp_time := min(array:map(array=tcp_events, function=var."@timestamp"))
+    | time_diff := tcp_time - icmp_time
+    | test(time_diff > 0 AND time_diff < 300000)
+    | icmp_size := avg(array:map(array=icmp_events, function=var.PayloadSize))
+    | test(icmp_size > 100 OR icmp_size < 8)
+    | tcp_burst := array:length(tcp_events)
+    | test(tcp_burst >= 3)
+    | table([ComputerName, icmp_size, tcp_burst, time_diff, icmp_time, tcp_time])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter protocol = "icmp" and icmp_type = 8
+    | alter payload_size = coalesce(bytes, 0)
+    | filter payload_size > 100 or payload_size < 32
+    | alter icmp_time = _time, icmp_host = dest_ip
+    | join type=inner (
+        dataset = panw_ngfw_traffic_raw
+        | filter protocol = "tcp" and dest_port = 443
+        | bin _time span=5m
+        | comp count() as tcp_count by _time, source_ip
+        | filter tcp_count >= 20
+        | alter join_time = _time, join_host = source_ip
+    ) join_host = icmp_host and join_time > icmp_time and join_time < add_time(icmp_time, 15m)
+    | fields icmp_time, icmp_host, payload_size, join_time, tcp_count
+  lucene: |
+    (event.dataset:firewall OR event.dataset:zeek OR event.dataset:suricata OR log_source:firewall OR log_source:ids) AND (network.protocol:icmp OR protocol:icmp OR proto:icmp) AND (event.action:allowed OR action:accept OR action:allow) AND (icmp.type:8 OR icmp_type:8 OR icmp.request.type:8) AND (network.bytes:>100 OR bytes:>100 OR payload_length:>100 OR icmp.length:>100)
+  sumo: |
+    _sourceCategory=*Network* OR _sourceCategory=*Firewall* OR _sourceCategory=*IDS*
+    | json field=_raw "protocol" as protocol
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "payload_size" as payload_size
+    | json field=_raw "icmp_type" as icmp_type
+    | where (protocol = "ICMP" or protocol = "1") or (protocol = "TCP" or protocol = "6")
+    | parse regex field=_raw "(?<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})" nodrop
+    | where (protocol matches "*ICMP*" or protocol = "1") and (icmp_type = "8" or icmp_type = "0") and (payload_size > 100 or payload_size < 32)
+    | timeslice 5m
+    | fields _timeslice, src_ip, dest_ip, protocol, payload_size, dest_port, _messageTime
+    | join (
+        _sourceCategory=*Network* OR _sourceCategory=*Firewall* OR _sourceCategory=*IDS*
+        | json field=_raw "protocol" as protocol
+        | json field=_raw "src_ip" as src_ip
+        | json field=_raw "dest_port" as dest_port
+        | where (protocol = "TCP" or protocol = "6") and dest_port = "443"
+        | timeslice 5m
+        | count as tcp_443_count by _timeslice, src_ip
+        | where tcp_443_count >= 10
+    ) as tcp_data on src_ip = tcp_data.src_ip
+    | where tcp_data._timeslice - _timeslice <= 300000
+    | count by src_ip, dest_ip
+    | where _count >= 1
 pseudo_logic: ICMP echo with anomalous payload size or pattern preceding a sudden outbound TCP/443 burst from the receiving host. Trigger-then-beacon
   C2.
 false_positives:
@@ -114,7 +199,7 @@ references:
 - https://attack.mitre.org/techniques/T1205/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

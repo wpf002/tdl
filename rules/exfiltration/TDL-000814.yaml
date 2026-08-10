@@ -23,77 +23,115 @@ queries:
     \ src_ip, dest_ip\n| eval time_diff=transfer_times - prev_time\n| where time_diff >= 540 AND time_diff <= 660\n| stats count as consistent_intervals\
     \ dc(transfer_times) as interval_count sum(total_bytes) as total_exfil by src_ip, dest_ip\n| where consistent_intervals >= 2\n| eval total_exfil_mb=round(total_exfil/1048576,\
     \ 2)\n| table src_ip, dest_ip, interval_count, total_exfil_mb\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: |
+    let TimeWindow = 7d;
+    let TransferThreshold = 26214400; // 25MB in bytes
+    let IntervalVariance = 10m;
+    let StartHour = 1;
+    let EndHour = 5;
+    CommonSecurityLog
+    | where TimeGenerated > ago(TimeWindow)
+    | where DeviceAction in ("accept", "allow", "permitted")
+    | where DeviceDirection == "outbound"
+    | extend LocalTime = datetime_utc_to_local(TimeGenerated, "US/Eastern")
+    | extend Hour = datetime_part("hour", LocalTime)
+    | where Hour >= StartHour and Hour < EndHour
+    | where isnotempty(DestinationIP) and not(ipv4_is_private(DestinationIP))
+    | where BytesSent > 0
+    | summarize TotalBytes = sum(BytesSent), TransferTimes = make_list(TimeGenerated), TransferCount = count() by SourceIP, DestinationIP, bin(TimeGenerated, 1h)
+    | where TotalBytes >= TransferThreshold
+    | where TransferCount >= 2
+    | extend TimeDiffs = array_slice(TransferTimes, 1, array_length(TransferTimes))
+    | mv-expand TimeGenerated = TransferTimes, NextTime = TimeDiffs to typeof(datetime)
+    | extend IntervalMinutes = datetime_diff("minute", NextTime, TimeGenerated)
+    | where isnotnull(IntervalMinutes)
+    | summarize AvgInterval = avg(IntervalMinutes), StdDevInterval = stdev(IntervalMinutes), Intervals = make_list(IntervalMinutes), TotalTransferred = max(TotalBytes) by SourceIP, DestinationIP
+    | where StdDevInterval <= 10 or isnan(StdDevInterval)
+    | project SourceIP, DestinationIP, TotalTransferred, AvgInterval, StdDevInterval, Intervals
+  aql: |
+    SELECT sourceip, destinationip, SUM(totalbytes) AS total_bytes, COUNT(*) AS connection_count, AVG(totalbytes) AS avg_bytes
     FROM flows
+    WHERE ISEXTERNAL(destinationip) = 'true'
+      AND INOFFENSE(sourceip) = 'false'
+      AND HOUR(starttime) >= 1 AND HOUR(starttime) <= 5
+      AND totalbytes > 25000000
+    GROUP BY sourceip, destinationip
+    HAVING connection_count >= 3 AND total_bytes > 25000000
+    LAST 24 HOURS
+  yara_l: |
+    rule scheduled_exfiltration_t1029 {
+      meta:
+        author = "TDL"
+        description = "Detects scheduled exfiltration with large outbound transfers to same external destination at consistent intervals during off-hours"
+        mitre_attack_tactic = "Exfiltration"
+        mitre_attack_technique = "T1029"
+        severity = "HIGH"
 
-    WHERE "network.protocol" LIKE ''%tcp%''
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.direction = "OUTBOUND"
+        $e.network.sent_bytes >= 26214400
+        $e.target.ip = $dst_ip
+        $e.principal.hostname = $host
+        not net.ip_in_range_cidr($dst_ip, "10.0.0.0/8")
+        not net.ip_in_range_cidr($dst_ip, "172.16.0.0/12")
+        not net.ip_in_range_cidr($dst_ip, "192.168.0.0/16")
+        $e.metadata.event_timestamp.seconds = $ts
 
-    GROUP BY sourceip, destinationip, destinationport
+      match:
+        $host, $dst_ip over 4h
 
-    LAST 1 HOURS
+      outcome:
+        $risk_score = max(85)
+        $total_bytes = sum($e.network.sent_bytes)
+        $connection_count = count_distinct($e.metadata.id)
 
-    '
-  yara_l: "rule tdl_tdl_exf_000814 {\n  meta:\n    author = \"TDL\"\n    description = \"Periodic Off-Hours Outbound Bulk Transfer\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0010\"\n    technique = \"T1029\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 3 and
+        $e
+    }
+  esql: "FROM logs-network.firewall*\n| WHERE @timestamp > NOW() - 7 days\n  AND network.direction == \"outbound\"\n  AND NOT CIDR_MATCH(destination.ip,\
+    \ \"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\")\n  AND network.bytes > 25000000\n| EVAL hour = DATE_EXTRACT(\"hour\", @timestamp)\n\
+    | WHERE hour >= 1 AND hour < 5\n| STATS total_bytes = SUM(network.bytes), \n        event_times = VALUES(@timestamp),\n        event_count\
+    \ = COUNT(*) \n  BY source.ip, destination.ip, time_bucket = BUCKET(@timestamp, 10 minute)\n| WHERE event_count >= 3\n| STATS connections\
+    \ = COUNT(*), \n        total_transfer = SUM(total_bytes),\n        unique_buckets = COUNT_DISTINCT(time_bucket)\n  BY source.ip, destination.ip\n\
+    | WHERE unique_buckets >= 3 AND total_transfer > 75000000\n| KEEP source.ip, destination.ip, connections, total_transfer, unique_buckets\n"
+  leql: |
+    where(direction=outbound AND bytes_out>25000000 AND destination_address NOT IN [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16] AND hour>=1 AND hour<=5) groupby(source_address, destination_address) calculate(count)
+  crowdstrike: |
+    #type=firewall action=allow direction=outbound
+    | @timestamp.hour >= 1 AND @timestamp.hour < 5
+    | test(destination_ip != /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/)
+    | groupBy([source_ip, destination_ip], function=[sum(bytes_out, as=total_bytes), collect([destination_ip])])
+    | total_bytes >= 25000000
+    | groupBy([source_ip, destination_ip], function=count(as=transfer_count))
+    | transfer_count >= 3
+    | bucket(span=10m, function=[sum(bytes_out, as=interval_bytes), count(as=interval_count)])
+    | interval_count >= 1
+    | groupBy([source_ip, destination_ip], function=[avg(interval_bytes, as=avg_bytes), stddev(interval_bytes, as=stddev_bytes)])
+    | stddev_bytes <= (avg_bytes * 0.3)
+    | table([source_ip, destination_ip, total_bytes, transfer_count, avg_bytes, stddev_bytes])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action = "allow" and direction = "outbound" and dest_ip not in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    | alter hour_local = to_integer(format_timestamp("%H", _time)), total_bytes = coalesce(bytes_sent, 0)
+    | filter hour_local >= 1 and hour_local < 5 and total_bytes > 26214400
+    | bin _time span=10m
+    | comp sum(total_bytes) as bytes_transferred, count() as connection_count by _time, src_ip, dest_ip
+    | filter bytes_transferred > 26214400
+    | sort asc _time
+    | alter prev_time = lag(_time, 1) by src_ip, dest_ip
+    | alter time_diff_minutes = to_integer((timestamp_diff(_time, prev_time, "SECOND")) / 60)
+    | filter time_diff_minutes >= 50 and time_diff_minutes <= 70
+    | comp count() as interval_count by src_ip, dest_ip
+    | filter interval_count >= 2
+    | fields src_ip, dest_ip, interval_count
+  lucene: |
+    event.action:"allowed" AND direction:"outbound" AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND network.bytes:>26214400 AND @timestamp:[01:00:00 TO 05:00:00]
+  sumo: "_sourceCategory=*Firewall* \n| parse regex \"(?<src_ip>\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}).*(?<dest_ip>\\d{1,3}\\.\\d{1,3}\\.\\\
+    d{1,3}\\.\\d{1,3}).*(?<bytes_out>\\d+)\" nodrop\n| where !isPrivateIP(dest_ip)\n| timeslice 10m\n| sum(bytes_out) as total_bytes by _timeslice,\
+    \ src_ip, dest_ip\n| where total_bytes > 26214400\n| formatDate(_timeslice, \"HH\") as hour\n| where hour >= \"01\" and hour < \"05\"\n| count\
+    \ by src_ip, dest_ip, hour\n| where _count >= 3\n| fields src_ip, dest_ip, hour, _count\n"
 pseudo_logic: Outbound transfer >25MB to same external destination at consistent intervals (±10m) between 0100–0500 local. Scheduled exfil.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -110,7 +148,7 @@ references:
 - https://attack.mitre.org/techniques/T1029/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination, total bytes transferred, and the protocol used.'

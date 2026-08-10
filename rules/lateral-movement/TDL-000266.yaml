@@ -19,71 +19,79 @@ queries:
     ) \n    (ApplicationCategory=\"P2P\" OR \n     [| inputlookup threat_intel_ip.csv | fields dest_ip | rename dest_ip as DestinationIP] OR \n\
     \     [| inputlookup threat_intel_domain.csv | fields domain | rename domain as DestinationDomain])\n| table _time, ComputerName, host, ApplicationName,\
     \ ApplicationCategory, DestinationIP, DestinationDomain, User, ProcessName, CommandLine\n"
-  kql: 'DeviceProcessEvents
+  kql: "union \n(AppControlCodeIntegrityEvents\n| where TimeGenerated > ago(24h)\n| where ApplicationCategory =~ \"P2P\"\n| project TimeGenerated,\
+    \ DeviceName, FileName, FolderPath, SHA256, ApplicationCategory, InitiatingProcessFileName, InitiatingProcessCommandLine, ActionType),\n(AppControlCodeIntegrityEvents\n\
+    | where TimeGenerated > ago(24h)\n| extend DestinationIP = tostring(parse_json(AdditionalFields).DestinationIP), DestinationDomain = tostring(parse_json(AdditionalFields).DestinationDomain)\n\
+    | join kind=inner (ThreatIntelligenceIndicator | where TimeGenerated > ago(30d) | where isnotempty(NetworkIP) or isnotempty(DomainName) |\
+    \ extend ThreatIP = NetworkIP, ThreatDomain = DomainName | project ThreatIP, ThreatDomain, ThreatType, ConfidenceScore) on $left.DestinationIP\
+    \ == $right.ThreatIP or $left.DestinationDomain == $right.ThreatDomain\n| project TimeGenerated, DeviceName, FileName, FolderPath, SHA256,\
+    \ DestinationIP, DestinationDomain, ThreatType, ConfidenceScore, InitiatingProcessFileName, InitiatingProcessCommandLine, ActionType)\n"
+  aql: "SELECT sourceip, destinationip, \"Destination Domain\", \"Application Category\", LOGSOURCENAME(logsourceid) AS host, COUNT(*) AS event_count\n\
+    FROM events\nWHERE (categoryname(category) ILIKE '%application control%' OR category IN (SELECT category FROM categories WHERE name ILIKE\
+    \ '%application control%'))\n  AND (\"Application Category\" = 'P2P' \n       OR destinationip IN (SELECT sourceip FROM events WHERE category\
+    \ IN (SELECT category FROM categories WHERE name ILIKE '%threat%')) \n       OR \"Destination Domain\" IN (SELECT \"Domain\" FROM events WHERE\
+    \ category IN (SELECT category FROM categories WHERE name ILIKE '%threat%')))\nGROUP BY sourceip, destinationip, \"Destination Domain\", \"\
+    Application Category\", logsourceid\nLAST 1 HOURS\n"
+  yara_l: |
+    rule lateral_movement_p2p_or_threat_intel {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects lateral movement via P2P applications or connections to threat intel listed IPs/domains"
+        mitre_attack_tactic = "Lateral Movement"
+        mitre_attack_technique = "T1021"
+        severity = "High"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.principal.hostname = $host
+        (
+          $e.principal.application = "P2P"
+          or
+          (
+            $e.target.ip = $threat_ip
+            and $threat_ip in %threat_intel_ip_list%
+          )
+          or
+          (
+            $e.target.hostname = $threat_domain
+            and $threat_domain in %threat_intel_domain_list%
+          )
+        )
 
-    | where process_name matches regex ".+"
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_lm_000266 {\n  meta:\n    author = \"TDL\"\n    description = \"Malicious P2P Traffic - Outbound\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0008\"\n    technique = \"T1021\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-windows.applocker*, logs-windows.application_control*, logs-endpoint.events.network*\n| WHERE \n    (event.category == \"network\"\
+    \ OR event.action == \"application_control\")\n    AND (\n      TO_LOWER(network.application.category) == \"p2p\"\n      OR threat.indicator.matched.type\
+    \ == \"ipv4-addr\"\n      OR threat.indicator.matched.type == \"domain-name\"\n    )\n| KEEP @timestamp, host.name, user.name, process.name,\
+    \ process.executable, destination.ip, destination.domain, network.application.category, threat.indicator.matched.atomic, threat.indicator.matched.type,\
+    \ source.ip\n"
+  leql: |
+    where(source_json.application_category="P2P" OR destination_address IN threat_list OR destination_domain IN threat_list)
+  crowdstrike: "event_simpleName=AppControlExecutionEvent \n(ApplicationCategory=P2P OR \n (DestinationIp=* | match(file=\"threatintel_ips.csv\"\
+    , field=DestinationIp, include=[DestinationIp], strict=false)) OR\n (DestinationDomain=* | match(file=\"threatintel_domains.csv\", field=DestinationDomain,\
+    \ include=[DestinationDomain], strict=false)))\n| table([@timestamp, ComputerName, UserName, ApplicationCategory, DestinationIp, DestinationDomain,\
+    \ FileName, CommandLine])\n"
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_NETWORK and event_sub_type = ENUM.EVENT_SUB_TYPE_APPLICATION_CONTROL\n| filter\
+    \ action_app_id_category = \"P2P\" \n   or action_remote_ip in (\n       select dst_ip from (dataset = threat_intel | fields dst_ip)\n   )\n\
+    \   or dns_query_name in (\n       select domain from (dataset = threat_intel | fields domain)\n   )\n| fields _time, agent_hostname, actor_effective_username,\
+    \ action_app_id_category, action_remote_ip, dns_query_name, action_remote_port, action_app_id_name\n"
+  lucene: |
+    (application.category:"P2P" OR destination.ip_threat_intel:true OR destination.domain_threat_intel:true)
+  sumo: |
+    _sourceCategory=*Application*Control* OR _sourceCategory=*AppControl*
+    | json field=_raw "ApplicationCategory" as app_category
+    | json field=_raw "DestinationIP" as dest_ip
+    | json field=_raw "DestinationDomain" as dest_domain
+    | json field=_raw "ThreatIntelMatch" as threat_intel
+    | json field=_raw "Application" as application
+    | json field=_raw "SourceIP" as src_ip
+    | json field=_raw "SourceHost" as src_host
+    | where app_category = "P2P" OR threat_intel = "true" OR dest_ip matches "*malicious*" OR dest_domain matches "*malicious*"
+    | fields _messageTime, src_host, src_ip, application, app_category, dest_ip, dest_domain, threat_intel
 false_positives:
 - Authorized pen testing
 - Security research
@@ -93,7 +101,7 @@ tags:
 - lateral-movement
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Application Control Event\nWhere the Application Category is \"P2P\"\nOR\n\tWhere the Destination IP is on a Threat Intelligence\
   \ List\n\t\n\tWhere the Destination Domain is on a Threat Intelligence List"

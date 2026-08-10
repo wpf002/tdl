@@ -19,68 +19,48 @@ queries:
   spl: "index=azure sourcetype=azure:activity \n(operationName=\"MICROSOFT.NETWORK/*/STARTPACKETCAPTURE/ACTION\" OR operationName=\"MICROSOFT.NETWORK/*/VPNCONNECTIONS/STARTPACKETCAPTURE/ACTION\"\
     \ OR operationName=\"MICROSOFT.NETWORK/*/PACKETCAPTURES/WRITE\")\nstatus=Success\n| table _time, user, operationName, resourceId, subscriptionId,\
     \ resourceGroup, activityStatusValue, callerIpAddress\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000650 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Network Packet Capture Detected\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0006\"\n    technique = \"T1040\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AzureActivity
+    | where TimeGenerated > ago(24h)
+    | where OperationNameValue in~ ("MICROSOFT.NETWORK/NETWORKWATCHERS/STARTPACKETCAPTURE/ACTION", "MICROSOFT.NETWORK/NETWORKWATCHERS/PACKETCAPTURES/STARTPACKETCAPTURE/ACTION", "MICROSOFT.NETWORK/VIRTUALNETWORKGATEWAYS/STARTPACKETCAPTURE/ACTION", "MICROSOFT.NETWORK/VPNGATEWAYS/STARTPACKETCAPTURE/ACTION", "MICROSOFT.NETWORK/P2SVPNGATEWAYS/STARTPACKETCAPTURE/ACTION", "MICROSOFT.NETWORK/VPNCONNECTIONS/STARTPACKETCAPTURE/ACTION", "MICROSOFT.NETWORK/NETWORKWATCHERS/PACKETCAPTURES/WRITE")
+    | where ActivityStatusValue =~ "Success"
+    | project TimeGenerated, Caller, CallerIpAddress, OperationNameValue, ActivityStatusValue, ResourceGroup, SubscriptionId, ResourceId, Properties
+  aql: "SELECT username, \"Operation\", sourceip, eventtime, LOGSOURCENAME(logsourceid) AS log_source\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ ILIKE '%Azure%'\n  AND categoryname(category) ILIKE '%Administrative%'\n  AND (UPPER(\"Operation\") = 'MICROSOFT.NETWORK/*/STARTPACKETCAPTURE/ACTION'\
+    \ \n       OR UPPER(\"Operation\") = 'MICROSOFT.NETWORK/*/VPNCONNECTIONS/STARTPACKETCAPTURE/ACTION'\n       OR UPPER(\"Operation\") = 'MICROSOFT.NETWORK/*/PACKETCAPTURES/WRITE')\n\
+    \  AND (LOWER(\"Status\") = 'success' OR LOWER(\"Result\") = 'success' OR LOWER(\"Activity Status\") = 'success')\nLAST 24 HOURS\n"
+  yara_l: "rule azure_network_packet_capture {\n  meta:\n    author = \"TDL\"\n    description = \"Detects Azure packet capture operations indicating\
+    \ potential network sniffing - T1040\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique = \"T1040\"\n    severity\
+    \ = \"Medium\"\n    \n  events:\n    $e.metadata.product_name = \"Azure\"\n    $e.metadata.event_type = \"SYSTEM_AUDIT_LOG_UNCATEGORIZED\"\
+    \n    (\n      re.regex($e.metadata.product_event_type, `(?i)MICROSOFT\\.NETWORK/.*/STARTPACKETCAPTURE/ACTION`) or\n      re.regex($e.metadata.product_event_type,\
+    \ `(?i)MICROSOFT\\.NETWORK/.*/VPNCONNECTIONS/STARTPACKETCAPTURE/ACTION`) or\n      re.regex($e.metadata.product_event_type, `(?i)MICROSOFT\\\
+    .NETWORK/.*/PACKETCAPTURES/WRITE`)\n    )\n    $e.security_result.action = \"ALLOW\"\n    $e.principal.user.userid = $user\n    \n  match:\n\
+    \    $user over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-azure.activitylogs*\n| WHERE event.outcome == \"success\" \n  AND (\n    TO_UPPER(azure.activitylogs.operation_name) == \"\
+    MICROSOFT.NETWORK/*/STARTPACKETCAPTURE/ACTION\" \n    OR TO_UPPER(azure.activitylogs.operation_name) == \"MICROSOFT.NETWORK/*/VPNCONNECTIONS/STARTPACKETCAPTURE/ACTION\"\
+    \ \n    OR TO_UPPER(azure.activitylogs.operation_name) == \"MICROSOFT.NETWORK/*/PACKETCAPTURES/WRITE\"\n  )\n| KEEP @timestamp, azure.activitylogs.operation_name,\
+    \ event.outcome, user.name, azure.resource.id, source.ip, azure.subscription_id\n"
+  leql: |
+    where(source_json.operationName IN ["MICROSOFT.NETWORK/*/STARTPACKETCAPTURE/ACTION", "MICROSOFT.NETWORK/*/VPNCONNECTIONS/STARTPACKETCAPTURE/ACTION", "MICROSOFT.NETWORK/*/PACKETCAPTURES/WRITE"] AND source_json.resultType="Success")
+  crowdstrike: |
+    #type=AzureActivity event_platform=Azure
+    (OperationNameValue="MICROSOFT.NETWORK/*/STARTPACKETCAPTURE/ACTION" OR OperationNameValue="MICROSOFT.NETWORK/*/VPNCONNECTIONS/STARTPACKETCAPTURE/ACTION" OR OperationNameValue="MICROSOFT.NETWORK/*/PACKETCAPTURES/WRITE")
+    ActivityStatusValue=Success
+    | table([@timestamp, CallerIpAddress, Caller, OperationNameValue, ResourceGroup, SubscriptionId, ActivityStatusValue])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "Azure" and operation_name_orig in ("MICROSOFT.NETWORK/*/STARTPACKETCAPTURE/ACTION", "MICROSOFT.NETWORK/*/VPNCONNECTIONS/STARTPACKETCAPTURE/ACTION", "MICROSOFT.NETWORK/*/PACKETCAPTURES/WRITE") and operation_status = "Success"
+    | fields _time, cloud_provider, operation_name_orig, operation_status, identity_name, resource_name, resource_type, cloud_provider_project
+  lucene: |
+    azure.activitylogs.operation_name:("MICROSOFT.NETWORK/*/STARTPACKETCAPTURE/ACTION" OR "MICROSOFT.NETWORK/*/VPNCONNECTIONS/STARTPACKETCAPTURE/ACTION" OR "MICROSOFT.NETWORK/*/PACKETCAPTURES/WRITE") AND azure.activitylogs.result_type:"Success"
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*azure*
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "resultType" as result_type
+    | json field=_raw "status" as status
+    | where (operation_name matches "*MICROSOFT.NETWORK/*/STARTPACKETCAPTURE/ACTION*" OR operation_name matches "*MICROSOFT.NETWORK/*/VPNCONNECTIONS/STARTPACKETCAPTURE/ACTION*" OR operation_name matches "*MICROSOFT.NETWORK/*/PACKETCAPTURES/WRITE*")
+    | where (result_type matches "*Success*" OR status matches "*Success*" OR result_type matches "*Succeeded*" OR status matches "*Succeeded*")
+    | fields _messageTime, operation_name, result_type, status
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -90,7 +70,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure Administrative Activity Event
 

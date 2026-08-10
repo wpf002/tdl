@@ -18,78 +18,94 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=azure OR index=o365 OR index=vpn (action=success OR ResultType=0 OR EventCode=4624) (Logon_Type=10 OR logonTypeName="Remote*" OR Category=RemoteAccess OR eventName="UserLoggedIn")
+  spl: 'index=azure OR index=o365 OR index=vpn (action=success OR ResultType=0 OR EventCode=4624) (Logon_Type=10 OR logonTypeName="Remote*" OR
+    Category=RemoteAccess OR eventName="UserLoggedIn")
+
     | search src_ip!=10.* src_ip!=172.16.* src_ip!=192.168.*
+
     | iplocation src_ip
+
     | lookup high_value_targets.csv user_name AS user OUTPUT is_hvt
+
     | lookup authorized_countries.csv Country AS Country OUTPUT is_authorized
+
     | where is_hvt="true" AND is_authorized!="true"
+
     | stats count by _time, user, src_ip, Country, dest, app
+
     | where count >= 1
+
     | table _time, user, src_ip, Country, dest, app, count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000021 {\n  meta:\n    author = \"TDL\"\n    description = \"HVT Remote Login from Unauthorized Country\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "let HighValueTargets = dynamic([\"admin@contoso.com\", \"ceo@contoso.com\", \"cfo@contoso.com\"]);\nlet AuthorizedCountries = dynamic([\"\
+    United States\", \"Canada\", \"United Kingdom\"]);\nunion \n    (SigninLogs\n    | where TimeGenerated > ago(1h)\n    | where ResultType ==\
+    \ 0\n    | where Location !in (AuthorizedCountries)\n    | where UserPrincipalName in (HighValueTargets)\n    | where NetworkLocationDetails\
+    \ has \"externalIpAddress\" or IPAddress !startswith \"10.\" and IPAddress !startswith \"172.\" and IPAddress !startswith \"192.168.\"\n \
+    \   | project TimeGenerated, UserPrincipalName, IPAddress, Location, AppDisplayName, DeviceDetail, LocationDetails, NetworkLocationDetails,\
+    \ AuthenticationDetails),\n    (OfficeActivity\n    | where TimeGenerated > ago(1h)\n    | where ResultStatus == \"Succeeded\"\n    | where\
+    \ UserId in (HighValueTargets)\n    | extend Country = tostring(parse_json(ExtendedProperties)[0].Value)\n    | where Country !in (AuthorizedCountries)\n\
+    \    | where ClientIP !startswith \"10.\" and ClientIP !startswith \"172.\" and ClientIP !startswith \"192.168.\"\n    | project TimeGenerated,\
+    \ UserId, ClientIP, Country, Operation, OfficeWorkload)\n| summarize FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), LoginCount\
+    \ = count() by User = coalesce(UserPrincipalName, UserId), SourceIP = coalesce(IPAddress, ClientIP), SourceCountry = coalesce(Location, Country)\n"
+  aql: |
+    SELECT username, sourceip, GEOCOUNTRYCODE(sourceip) AS source_country, destinationip, LOGSOURCENAME(logsourceid) AS log_source, eventtime
+    FROM events
+    WHERE (qidname(qid) ILIKE '%logon%' OR qidname(qid) ILIKE '%login%' OR qidname(qid) ILIKE '%sign%in%' OR qidname(qid) ILIKE '%authentication%' OR "EventID" IN ('4624', '4625') OR categoryname(category) ILIKE '%authentication%')
+      AND (logsourcetypename(devicetype) ILIKE '%vpn%' OR logsourcetypename(devicetype) ILIKE '%azure%' OR logsourcetypename(devicetype) ILIKE '%office%365%' OR logsourcetypename(devicetype) ILIKE '%o365%')
+      AND username IN (SELECT username FROM events WHERE "HighValueUser" = 'true' LAST 1 DAYS)
+      AND GEOCOUNTRYCODE(sourceip) NOT IN (SELECT "AuthorizedCountry" FROM events WHERE "AuthorizedCountry" IS NOT NULL LAST 1 DAYS)
+      AND sourceip NOT IN (INOFFENSE, INLOCAL)
+    LAST 24 HOURS
+  yara_l: "rule high_value_user_login_from_unauthorized_country {\n  meta:\n    author = \"TDL\"\n    description = \"Detects successful remote\
+    \ login to high-value account from unauthorized country\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1078\"\
+    \n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.security_result.action = \"ALLOW\"\n    $e.target.user.userid\
+    \ = $user\n    $e.principal.ip = $source_ip\n    $e.principal.location.country_or_region = $source_country\n    \n    // High value target\
+    \ user list\n    $user in %high_value_users\n    \n    // External source (not RFC1918)\n    not net.ip_in_range_cidr($source_ip, \"10.0.0.0/8\"\
+    )\n    not net.ip_in_range_cidr($source_ip, \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($source_ip, \"192.168.0.0/16\")\n    \n    //\
+    \ Exclude authorized countries\n    not $source_country in %authorized_remote_countries\n    \n  match:\n    $user, $source_ip over 5m\n \
+    \   \n  outcome:\n    $risk_score = 85\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-azure.signinlogs*, logs-o365.audit*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND event.outcome == "success"
+      AND (event.category == "authentication" OR event.action == "UserLoggedIn")
+      AND source.ip IS NOT NULL
+      AND NOT CIDR_MATCH(source.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    | EVAL user_lower = TO_LOWER(user.name)
+    | WHERE user_lower IN ("admin@company.com", "ceo@company.com", "cfo@company.com", "sysadmin@company.com")
+      AND NOT source.geo.country_name IN ("United States", "Canada", "United Kingdom")
+    | STATS event_count = COUNT(*) BY source.ip, user.name, source.geo.country_name, host.name
+    | WHERE event_count >= 1
+    | KEEP @timestamp, source.ip, user.name, source.geo.country_name, host.name, event.action, event.outcome
+  leql: |
+    where(result=SUCCESS AND source_address NOT IN rfc1918 AND user IN high_value_targets AND source_location.country NOT IN authorized_countries)
+  crowdstrike: "event_simpleName=UserLogon* LogonType_decimal=10 \n| in(field=UserName, values=[HVT_USER_LIST])\n| !in(field=SourceCountry, values=[AUTHORIZED_COUNTRY_LIST])\n\
+    | groupBy([UserName, RemoteAddressIP4, SourceCountry], function=count(as=login_count))\n| login_count >= 1\n| table([@timestamp, UserName,\
+    \ RemoteAddressIP4, SourceCountry, ComputerName, login_count])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "azure" and event_type = "sign_in" and outcome = "success" and login_type in ("remote", "vpn", "external") and not incidr(source_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    | alter is_hvt = if(user_name in ("admin@company.com", "ceo@company.com", "cfo@company.com"), "true", "false")
+    | alter is_authorized_country = if(source_country in ("US", "CA", "GB", "DE", "FR"), "true", "false")
+    | filter is_hvt = "true" and is_authorized_country = "false"
+    | fields _time, user_name, source_ip, source_country, destination_host, login_type, user_agent
+  lucene: |
+    event.category:authentication AND event.outcome:success AND (event.dataset:(azure.signinlogs OR o365.audit) OR event.provider:(AzureActiveDirectory OR OfficeAudit OR VPN)) AND NOT source.geo.country_iso_code:(US OR CA OR GB) AND user.name:(admin* OR *service* OR executive* OR ceo* OR cfo* OR cto* OR ciso*)
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*Office365* OR _sourceCategory=*VPN*
+    | json field=_raw "ResultType" as result_type
+    | json field=_raw "ResultDescription" as result_desc
+    | json field=_raw "UserPrincipalName" as user
+    | json field=_raw "IPAddress" as src_ip
+    | json field=_raw "Location.countryOrRegion" as src_country
+    | json field=_raw "Status" as status
+    | where (result_type = "0" OR status = "Success" OR result_desc matches "*success*")
+    | where src_ip != "" and NOT (src_ip matches "10.*" OR src_ip matches "172.16.*" OR src_ip matches "192.168.*")
+    | lookup high_value_targets on user = username as is_hvt
+    | lookup authorized_countries on src_country = country as is_authorized
+    | where is_hvt = "true" and (is_authorized = "" OR is_authorized = "false")
+    | fields _messageTime, user, src_ip, src_country, result_type, result_desc
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -99,7 +115,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Successful Remote Login Event \nFrom one external source\nWhere the Destination Username is on the High Value Target User List\n\
   Where the Source Country is NOT on the Authorized Remote Login Countries List"

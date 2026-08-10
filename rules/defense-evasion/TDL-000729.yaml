@@ -19,80 +19,136 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 50
 queries:
-  spl: |
-    index=* sourcetype IN ("WinEventLog:Microsoft-Windows-Sysmon/Operational", "edr", "carbon_black", "crowdstrike") (EventCode=1 OR event_simpleName=ProcessRollup* OR event_type=proc_create)
+  spl: 'index=* sourcetype IN ("WinEventLog:Microsoft-Windows-Sysmon/Operational", "edr", "carbon_black", "crowdstrike") (EventCode=1 OR event_simpleName=ProcessRollup*
+    OR event_type=proc_create)
+
     | bin _time span=10s
-    | stats min(_time) as first_seen, max(_time) as last_seen, values(Image) as process_image, values(CommandLine) as cmdline, dc(EventCode) as event_variety, values(loaded_modules) as modules, values(network_connections) as net_conns by ComputerName, process_guid
+
+    | stats min(_time) as first_seen, max(_time) as last_seen, values(Image) as process_image, values(CommandLine) as cmdline, dc(EventCode) as
+    event_variety, values(loaded_modules) as modules, values(network_connections) as net_conns by ComputerName, process_guid
+
     | eval process_lifetime=last_seen - first_seen
+
     | where process_lifetime <= 5
-    | search (modules="*GetComputerNameEx*" OR modules="*NetWkstaGetInfo*" OR modules="*GetUserGeoID*" OR cmdline="*GetComputerNameEx*" OR cmdline="*NetWkstaGetInfo*" OR cmdline="*GetUserGeoID*")
+
+    | search (modules="*GetComputerNameEx*" OR modules="*NetWkstaGetInfo*" OR modules="*GetUserGeoID*" OR cmdline="*GetComputerNameEx*" OR cmdline="*NetWkstaGetInfo*"
+    OR cmdline="*GetUserGeoID*")
+
     | where event_variety <= 2 AND (isnull(net_conns) OR net_conns="")
+
     | table _time, ComputerName, process_image, cmdline, process_lifetime, event_variety
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000729 {\n  meta:\n    author = \"TDL\"\n    description = \"Process Reads Domain Membership / Geo Before Execution\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1480\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
-    \n    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: "DeviceProcessEvents\n| where TimeGenerated > ago(1h)\n| where ProcessCommandLine has_any (\"GetComputerNameEx\", \"NetWkstaGetInfo\",\
+    \ \"GetUserGeoID\")\n   or InitiatingProcessCommandLine has_any (\"GetComputerNameEx\", \"NetWkstaGetInfo\", \"GetUserGeoID\")\n| extend ProcessDuration\
+    \ = datetime_diff('second', ProcessVersionInfoCompany, Timestamp)\n| where ProcessDuration <= 5 or isempty(ProcessDuration)\n| summarize \n\
+    \    FirstSeen = min(TimeGenerated),\n    LastSeen = max(TimeGenerated),\n    CommandLines = make_set(ProcessCommandLine),\n    InitiatingProcesses\
+    \ = make_set(InitiatingProcessFileName),\n    EventCount = count()\n    by DeviceId, DeviceName, AccountName, FileName, ProcessId\n| extend\
+    \ ExecutionWindow = datetime_diff('second', LastSeen, FirstSeen)\n| where ExecutionWindow <= 10 and EventCount <= 3\n| project FirstSeen,\
+    \ LastSeen, DeviceName, AccountName, FileName, CommandLines, InitiatingProcesses, ExecutionWindow, EventCount\n"
+  aql: |
+    SELECT sourceip, "Process Name", "Process CommandLine", "Parent Process Name", username, COUNT(*) AS api_calls, UNIQUECOUNT("API Call") AS unique_apis, MIN(eventtime) AS first_seen, MAX(eventtime) AS last_seen
+    FROM events
+    WHERE ("API Call" ILIKE '%GetComputerNameEx%' OR "API Call" ILIKE '%NetWkstaGetInfo%' OR "API Call" ILIKE '%GetUserGeoID%')
+      AND "Process Name" IS NOT NULL
+    GROUP BY sourceip, "Process Name", "Process CommandLine", "Parent Process Name", username
+    HAVING (MAX(eventtime) - MIN(eventtime)) < 5000 AND unique_apis >= 2
+    LAST 1 HOURS
+  yara_l: |
+    rule execution_guardrails_environment_query {
+      meta:
+        author = "TDL"
+        description = "Detects T1480 - short-lived process checking environment via GetComputerNameEx, NetWkstaGetInfo, GetUserGeoID then exiting"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1480"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $launch.metadata.event_type = "PROCESS_LAUNCH"
+        $launch.principal.process.pid = $pid
+        $launch.principal.hostname = $host
+        $launch.metadata.event_timestamp.seconds = $start_time
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+        $api.metadata.event_type = "PROCESS_MODULE_LOAD"
+        $api.principal.process.pid = $pid
+        $api.principal.hostname = $host
+        (
+          re.regex($api.target.process.command_line, `(?i)(GetComputerNameEx|NetWkstaGetInfo|GetUserGeoID)`) or
+          re.regex($api.principal.process.command_line, `(?i)(GetComputerNameEx|NetWkstaGetInfo|GetUserGeoID)`)
+        )
+        $api.metadata.event_timestamp.seconds = $api_time
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+        $exit.metadata.event_type = "PROCESS_TERMINATION"
+        $exit.principal.process.pid = $pid
+        $exit.principal.hostname = $host
+        $exit.metadata.event_timestamp.seconds = $exit_time
 
-    | SORT count DESC
+        $api_time >= $start_time
+        $exit_time >= $api_time
+        $exit_time - $start_time <= 60
 
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
+      match:
+        $host, $pid over 2m
 
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $launch and $api and $exit
+    }
+  esql: "FROM logs-endpoint.events.process*, logs-windows.sysmon_operational*\n| WHERE @timestamp > NOW() - 1 hour\n  AND event.category == \"\
+    process\"\n  AND (\n    process.command_line LIKE \"*GetComputerNameEx*\"\n    OR process.command_line LIKE \"*NetWkstaGetInfo*\"\n    OR\
+    \ process.command_line LIKE \"*GetUserGeoID*\"\n    OR winlog.event_data.CallTrace LIKE \"*GetComputerNameEx*\"\n    OR winlog.event_data.CallTrace\
+    \ LIKE \"*NetWkstaGetInfo*\"\n    OR winlog.event_data.CallTrace LIKE \"*GetUserGeoID*\"\n  )\n| STATS \n    first_seen = MIN(@timestamp),\n\
+    \    last_seen = MAX(@timestamp),\n    event_count = COUNT(*)\n    BY process.entity_id, process.name, process.executable, process.command_line,\
+    \ host.name, user.name\n| EVAL duration_seconds = (last_seen - first_seen) / 1000\n| WHERE duration_seconds <= 5 AND event_count <= 3\n| KEEP\
+    \ @timestamp, host.name, user.name, process.name, process.executable, process.command_line, duration_seconds, event_count\n"
+  leql: |
+    where(source_json.EventID=1 AND (process_cmd_line ICONTAINS "GetComputerNameEx" OR process_cmd_line ICONTAINS "NetWkstaGetInfo" OR process_cmd_line ICONTAINS "GetUserGeoID")) groupby(asset, process_name, process_cmd_line) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2
+    | groupBy([TargetProcessId_decimal, aid], function=[collect([FileName, CommandLine, ParentBaseFileName]), min(@timestamp, as=start_time), max(@timestamp, as=end_time)])
+    | duration := end_time - start_time
+    | duration <= 5000
+    | join({event_simpleName=SyntheticProcessRollup2 (ImageFileName=*GetComputerNameEx* OR ImageFileName=*NetWkstaGetInfo* OR ImageFileName=*GetUserGeoID*)}, field=[TargetProcessId_decimal, aid], include=[api_call])
+    | isnotnull(api_call)
+    | join({event_simpleName IN [NetworkConnectIP4, DnsRequest, FileWritten, RegistryKeyValueWritten] | groupBy([ContextProcessId_decimal, aid], function=count(as=activity_count))}, field=[TargetProcessId_decimal, aid], mode=left, include=[activity_count])
+    | default(field=activity_count, value=0)
+    | activity_count = 0
+    | table([aid, FileName, CommandLine, ParentBaseFileName, duration, start_time])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | alter process_lifetime = timestamp_diff(action_process_termination_date, _time)
+    | filter process_lifetime != null and process_lifetime <= 10000
+    | filter action_process_image_command_line ~= "(?i)(GetComputerNameEx|NetWkstaGetInfo|GetUserGeoID)"
+    | comp count() as api_calls, min(_time) as first_seen, max(action_process_termination_date) as last_seen by action_process_image_name, action_process_image_sha256, agent_hostname, actor_effective_username
+    | alter total_lifetime = timestamp_diff(last_seen, first_seen)
+    | filter total_lifetime <= 10000 and api_calls >= 2
+    | fields agent_hostname, actor_effective_username, action_process_image_name, action_process_image_sha256, first_seen, last_seen, total_lifetime, api_calls
+  lucene: |
+    (event.action:"GetComputerNameEx" OR event.action:"NetWkstaGetInfo" OR event.action:"GetUserGeoID" OR winlog.event_data.CallTrace:*GetComputerNameEx* OR winlog.event_data.CallTrace:*NetWkstaGetInfo* OR winlog.event_data.CallTrace:*GetUserGeoID* OR process.command_line:*GetComputerNameEx* OR process.command_line:*NetWkstaGetInfo* OR process.command_line:*GetUserGeoID*) AND event.duration:[0 TO 5000]
+  sumo: |
+    _sourceCategory=*EDR* OR _sourceCategory=*Sysmon*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ProcessId" as process_id
+    | json field=_raw "Image" as image
+    | json field=_raw "TargetFilename" as target_file
+    | json field=_raw "CallTrace" as call_trace
+    | json field=_raw "Computer" as host
+    | where (call_trace matches "*GetComputerNameEx*" OR call_trace matches "*NetWkstaGetInfo*" OR call_trace matches "*GetUserGeoID*") OR (target_file matches "*kernel32.dll*" OR target_file matches "*netapi32.dll*" OR target_file matches "*kernelbase.dll*")
+    | timeslice 5s
+    | count as api_calls by _timeslice, process_id, image, host
+    | where api_calls >= 1
+    | join (
+        _sourceCategory=*EDR* OR _sourceCategory=*Sysmon*
+        | json field=_raw "EventID" as event_id
+        | json field=_raw "ProcessId" as process_id
+        | json field=_raw "Computer" as host
+        | where event_id = "5" OR event_id = "1"
+        | timeslice 5s
+        | first(_messageTime) as start_time, last(_messageTime) as end_time by process_id, host
+        | (end_time - start_time) / 1000 as lifetime_seconds
+        | where lifetime_seconds <= 10
+    ) as t2 on process_id=t2.process_id, host=t2.host
+    | fields host, image, process_id, api_calls, t2.lifetime_seconds
 pseudo_logic: Short-lived process queries GetComputerNameEx, NetWkstaGetInfo, GetUserGeoID and exits with no further activity. Likely environment-keyed
   payload bailing on a non-target host.
 false_positives:
@@ -110,7 +166,7 @@ references:
 - https://attack.mitre.org/techniques/T1480/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

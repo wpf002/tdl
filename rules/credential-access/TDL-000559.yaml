@@ -15,71 +15,64 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=kubernetes sourcetype=kube:apiserver-audit user.username="system:anonymous" user.groups{}="system:unauthenticated" responseStatus.code=200
+  spl: 'index=kubernetes sourcetype=kube:apiserver-audit user.username="system:anonymous" user.groups{}="system:unauthenticated" responseStatus.code=200
+
     | table _time, user.username, user.groups{}, responseStatus.code, verb, objectRef.resource, objectRef.namespace, sourceIPs{}
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000559 {\n  meta:\n    author = \"TDL\"\n    description = \"Anonymous Access Detected\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    KubeEvents
+    | where TimeGenerated > ago(24h)
+    | where UserName == "system:anonymous"
+    | where Groups has "system:unauthenticated"
+    | where ResponseCode == 200
+    | project TimeGenerated, ClusterName, Namespace, UserName, Groups, Verb, ObjectRef, ResponseCode, SourceIPs
+  aql: |
+    SELECT username, "Group", "Response Code", sourceip, eventtime, COUNT(*) AS event_count
+    FROM events
+    WHERE username = 'system:anonymous'
+      AND "Group" = 'system:unauthenticated'
+      AND "Response Code" = '200'
+    GROUP BY username, "Group", "Response Code", sourceip, eventtime
+    LAST 24 HOURS
+  yara_l: |
+    rule anonymous_kubernetes_access {
+      meta:
+        author = "TDL"
+        description = "Detects successful anonymous access to Kubernetes API (T1078)"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $k.metadata.product_name = "Kubernetes"
+        $k.target.user.userid = "system:anonymous"
+        $k.target.user.group_identifiers = "system:unauthenticated"
+        $k.security_result.action_details = "200"
+        $k.principal.hostname = $host
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $k
+    }
+  esql: "FROM logs-kubernetes.audit*\n| WHERE kubernetes.audit.user.username == \"system:anonymous\" \n  AND kubernetes.audit.user.groups == \"\
+    system:unauthenticated\"\n  AND event.outcome == \"success\"\n| KEEP @timestamp, host.name, kubernetes.audit.user.username, kubernetes.audit.user.groups,\
+    \ kubernetes.audit.requestURI, kubernetes.audit.verb, kubernetes.audit.objectRef.resource, source.ip\n"
+  leql: |
+    where(source_json.user.username="system:anonymous" AND source_json.user.groups CONTAINS "system:unauthenticated" AND source_json.responseStatus.code=200)
+  crowdstrike: |
+    #type=kubernetes event.username="system:anonymous" event.group="system:unauthenticated" event.responseCode=200
+    | table([@timestamp, event.username, event.group, event.responseCode, event.verb, event.objectRef.resource, event.sourceIPs])
+  xql: "dataset = k8s_audit_raw\n| filter to_string(k8s_user_username) = \"system:anonymous\" \n  and arrayindex(regextract(to_string(k8s_user_groups),\
+    \ \"\\\"([^\\\"]+)\\\"\"), 0) = \"system:unauthenticated\"\n  and k8s_response_code = 200\n| fields _time, k8s_cluster_name, k8s_user_username,\
+    \ k8s_user_groups, k8s_response_code, k8s_verb, k8s_objectref_resource, k8s_objectref_name, k8s_source_ips\n"
+  lucene: |
+    event.dataset:kubernetes.audit AND user.name:"system:anonymous" AND group.name:"system:unauthenticated" AND http.response.status_code:200
+  sumo: "_sourceCategory=*Kubernetes* \n| json field=_raw \"user.username\" as username\n| json field=_raw \"user.groups\" as groups\n| json field=_raw\
+    \ \"responseStatus.code\" as response_code\n| where username = \"system:anonymous\" \n| where groups matches \"*system:unauthenticated*\"\n\
+    | where response_code = \"200\"\n| fields _messageTime, _sourceHost, username, groups, response_code\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +82,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere the Username is \"system:anonymous\"\nWhere the Group is \"system:unauthenticated\"\nWhere the Response\
   \ Code is 200"

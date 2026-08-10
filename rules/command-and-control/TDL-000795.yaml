@@ -18,79 +18,114 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 60
 queries:
-  spl: |
-    index=* (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=11 TargetFilename="*\\.*" DriveType=2) OR (sourcetype=linux_audit type=PATH name="*/.*" AND name="*/media/*")
+  spl: 'index=* (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=11 TargetFilename="*\\.*" DriveType=2) OR (sourcetype=linux_audit
+    type=PATH name="*/.*" AND name="*/media/*")
+
     | eval hidden_file=if(match(TargetFilename, "\\\\[^\\\\.]+\\\\.") OR match(name, "/\\."), 1, 0)
+
     | where hidden_file=1
+
     | bin _time span=1h
+
     | stats count dc(_time) as time_windows earliest(_time) as first_seen latest(_time) as last_seen by host, TargetFilename, name, Image, exe
+
     | where count >= 5 AND time_windows >= 3
+
     | table host, Image, exe, TargetFilename, name, count, time_windows, first_seen, last_seen
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000795 {\n  meta:\n    author = \"TDL\"\n    description = \"Hidden File Polled on Removable Volume\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1092\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    Event
+    | where TimeGenerated > ago(24h)
+    | where Source == "Microsoft-Windows-Sysmon" and EventID == 23
+    | extend EventData = parse_xml(EventData)
+    | extend TargetFilename = tostring(EventData.DataItem.EventData.Data[5])
+    | extend ProcessId = tostring(EventData.DataItem.EventData.Data[3])
+    | extend Image = tostring(EventData.DataItem.EventData.Data[4])
+    | extend Computer = Computer
+    | where TargetFilename startswith "D:\\" or TargetFilename startswith "E:\\" or TargetFilename startswith "F:\\" or TargetFilename startswith "G:\\" or TargetFilename startswith "H:\\"
+    | where TargetFilename contains "\\." or TargetFilename matches regex @"\\\..*"
+    | summarize FileAccessCount = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Files = make_set(TargetFilename) by Computer, Image, ProcessId
+    | where FileAccessCount >= 10
+    | where datetime_diff('hour', LastSeen, FirstSeen) >= 1
+    | project Computer, Image, ProcessId, FileAccessCount, FirstSeen, LastSeen, Files
+  aql: |
+    SELECT "Image" AS process_name, "TargetFilename" AS hidden_file, sourceip AS host, COUNT(*) AS read_count, MIN(eventtime) AS first_seen, MAX(eventtime) AS last_seen
+    FROM events
+    WHERE ("EventID" = '11' OR "EventID" = '23')
+      AND "TargetFilename" MATCHES '.*[/\\]\\..*'
+      AND "DriveType" = '2'
+    GROUP BY "Image", "TargetFilename", sourceip
+    HAVING read_count >= 5 AND (last_seen - first_seen) >= 300000
+    LAST 24 HOURS
+  yara_l: |
+    rule usb_air_gap_c2_repeated_hidden_file_reads {
+      meta:
+        author = "TDL"
+        description = "Detects repeated reads of hidden files on removable media (DriveType=2) suggesting air-gap C2 via USB"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1092"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "FILE_OPEN"
+        $e.target.file.full_path = $filepath
+        (
+          re.regex($e.target.file.full_path, `(?i)^[A-Z]:\\\.`) or
+          re.regex($e.target.file.full_path, `(?i)/\.`)
+        )
+        (
+          re.regex($e.target.file.full_path, `(?i)^[D-Z]:\\`) or
+          re.regex($e.metadata.description, `(?i)removable`) or
+          $e.target.resource.attribute.labels.key = "DriveType" and $e.target.resource.attribute.labels.value = "2"
+        )
+        $e.principal.process.pid = $pid
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host, $pid, $filepath over 30m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 5
+    }
+  esql: "FROM logs-windows.sysmon_operational*, logs-endpoint.events.file*\n| WHERE @timestamp > NOW() - 1 hour \n  AND event.action IN (\"FileAccess\"\
+    , \"open\", \"read\")\n  AND (file.name LIKE \".*\" OR file.path LIKE \"*\\\\.*\" OR file.path LIKE \"*/.*\")\n  AND file.drive.type == \"\
+    2\"\n| STATS read_count = COUNT(*), first_seen = MIN(@timestamp), last_seen = MAX(@timestamp), unique_files = COUNT_DISTINCT(file.path) BY\
+    \ process.pid, process.name, process.executable, host.name, file.drive.letter\n| WHERE read_count >= 5 \n  AND (TO_LONG(last_seen) - TO_LONG(first_seen))\
+    \ >= 600000\n| KEEP host.name, process.name, process.executable, process.pid, file.drive.letter, read_count, unique_files, first_seen, last_seen\n"
+  leql: |
+    where(source_json.EventID=11 AND source_json.TargetFilename ICONTAINS ":\." AND source_json.Image NOT CONTAINS "explorer.exe") groupby(source_json.Image, source_json.TargetFilename, asset) calculate(count)
+  crowdstrike: |
+    (event_simpleName=ProcessRollup2 OR EventID=11 OR EventID=1 OR event.action=execve OR event.action=open)
+    | match(file=["CommandLine", "TargetFilename", "ImageLoaded", "file.path"], pattern=/[A-Z]:\\.*\\\..*/, include=true)
+    | match(file=["CommandLine", "TargetFilename", "ImageLoaded", "file.path"], pattern=/(removable|usb|drive.*type.*2)/i, include=true)
+    | regex("(?<HiddenFile>\\\\\\.[^\\\\]+)$", field=["TargetFilename", "ImageLoaded", "file.path", "CommandLine"], strict=false)
+    | HiddenFile=*
+    | groupBy([ComputerName, ContextProcessId, HiddenFile], function=[count(as=read_count), min(@timestamp, as=first_seen), max(@timestamp, as=last_seen)])
+    | eval(duration=(last_seen - first_seen)/1000)
+    | duration >= 3600
+    | read_count >= 10
+    | table([ComputerName, ContextProcessId, HiddenFile, read_count, duration, first_seen, last_seen])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_FILE and action_file_path ~= ".*[/\\]\\.[^/\\\\]+$" and action_file_access_mode in ("READ", "READ_ONLY")
+    | alter drive_letter = arrayindex(regextract(action_file_path, "^([A-Z]):"), 0)
+    | filter drive_letter != null or action_file_path ~= "^/media/.*" or action_file_path ~= "^/mnt/.*"
+    | bin _time span=1h
+    | comp count() as read_count, min(_time) as first_seen, max(_time) as last_seen by actor_process_image_name, actor_process_id, agent_hostname, action_file_path
+    | alter duration_seconds = to_epoch(last_seen, "SECONDS") - to_epoch(first_seen, "SECONDS")
+    | filter read_count >= 5 and duration_seconds >= 1800
+    | fields _time, agent_hostname, actor_process_image_name, actor_process_id, action_file_path, read_count, duration_seconds
+  lucene: |
+    (event.code:(11 OR 23) AND (file.path:*\\.\:\$* OR file.path:*/.*) AND winlog.event_data.DriveType:2) OR (event.type:file AND file.path:*/\..* AND (event.action:opened OR event.action:read) AND process.uptime:>3600)
+  sumo: "_sourceCategory=*Sysmon* OR _sourceCategory=*Auditd*\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"Image\" as image\n\
+    | json field=_raw \"TargetFilename\" as target_file\n| json field=_raw \"ProcessId\" as process_id\n| json field=_raw \"exe\" as exe\n| json\
+    \ field=_raw \"name\" as name\n| json field=_raw \"key\" as key\n| where (event_id = \"11\" OR name = \"open\") \n| where (target_file matches\
+    \ \"*:\\\\*\" AND target_file matches \"*\\\\.*\" AND target_file matches \"*removable*\") OR (key matches \"*/media/*\" OR key matches \"\
+    */mnt/*\")\n| where target_file matches \"*\\\\.*\" OR key matches \"*/.*\"\n| parse regex field=target_file \"(?<drive_letter>[A-Z]):\\\\\
+    \" nodrop\n| parse regex field=key \"(?<file_path>/media/[^/]+/\\..+|/mnt/[^/]+/\\..+)\" nodrop\n| where isNotNull(drive_letter) OR isNotNull(file_path)\n\
+    | timeslice 1h\n| count as read_count by _timeslice, process_id, image, exe, target_file, key, _sourceHost\n| where read_count >= 5\n| fields\
+    \ _timeslice, _sourceHost, process_id, image, exe, target_file, key, read_count\n"
 pseudo_logic: Repeated reads of a hidden file on a DriveType=2 volume by a long-running process. Air-gap C2 via shared USB.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -107,7 +142,7 @@ references:
 - https://attack.mitre.org/techniques/T1092/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

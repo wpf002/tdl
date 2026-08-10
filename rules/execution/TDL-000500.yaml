@@ -16,77 +16,97 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1 process_name=*.exe
+  spl: 'index=endpoint sourcetype=Sysmon EventCode=1 process_name=*.exe
+
     | stats count values(host) as hosts values(user) as users by process_name, parent_process_name, command_line
-    | where count >= 1 AND NOT (process_name IN ("MsMpEng.exe", "MsSense.exe", "CSFalconService.exe", "SentinelAgent.exe", "cb.exe", "CylanceSvc.exe") OR parent_process_name IN ("MsMpEng.exe", "MsSense.exe", "CSFalconService.exe", "SentinelAgent.exe", "cb.exe", "CylanceSvc.exe"))
+
+    | where count >= 1 AND NOT (process_name IN ("MsMpEng.exe", "MsSense.exe", "CSFalconService.exe", "SentinelAgent.exe", "cb.exe", "CylanceSvc.exe")
+    OR parent_process_name IN ("MsMpEng.exe", "MsSense.exe", "CSFalconService.exe", "SentinelAgent.exe", "cb.exe", "CylanceSvc.exe"))
+
     | sort - count
+
     | table process_name, parent_process_name, command_line, count, hosts, users
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000500 {\n  meta:\n    author = \"TDL\"\n    description = \"High Severity Malware Detected\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(90d)
+    | where DeviceVendor == "CrowdStrike" and DeviceProduct == "FalconHost"
+    | where DeviceEventClassID == "DetectionSummaryEvent" or Activity has "detection"
+    | where SeverityLevel == "High" or Severity == "High"
+    | where Activity has "malware" or Message has "malware" or ThreatName != ""
+    | extend ProcessName = coalesce(DeviceCustomString1, FileName, ProcessName)
+    | extend ParentProcessName = coalesce(DeviceCustomString2, ParentProcessName)
+    | extend CommandLine = coalesce(DeviceCustomString3, CommandLine)
+    | where isnotempty(ProcessName)
+    | where ProcessName !in~ ("MsMpEng.exe", "MsSense.exe", "SenseIR.exe", "SenseCncProxy.exe", "SenseSampleUploader.exe", "csagent.exe", "CSFalconService.exe", "CSFalconContainer.exe", "taniumclient.exe", "cb.exe", "RepMgr.exe", "winlogbeat.exe", "splunk.exe", "nessus.exe")
+    | where ParentProcessName !in~ ("MsMpEng.exe", "MsSense.exe", "csagent.exe", "CSFalconService.exe", "taniumclient.exe")
+    | summarize EventCount = count(), Hosts = make_set(Computer), Users = make_set(SourceUserName) by ProcessName, ParentProcessName, CommandLine
+    | where EventCount >= 1
+    | sort by EventCount desc
+  aql: "SELECT LOGSOURCENAME(logsourceid) AS host, username AS user, \"Process Name\" AS process_name, \"Parent Process Name\" AS parent_process_name,\
+    \ \"Process CommandLine\" AS command_line, COUNT(*) AS event_count\nFROM events\nWHERE CATEGORYNAME(category) ILIKE '%malware%' \n  AND (qidname(qid)\
+    \ ILIKE '%high severity%' OR qidname(qid) ILIKE '%malware detected%')\n  AND LOGSOURCENAME(logsourceid) ILIKE '%crowdstrike%'\n  AND \"Process\
+    \ Name\" IS NOT NULL\n  AND \"Process Name\" != ''\n  AND \"Process Name\" NOT ILIKE '%mcafee%'\n  AND \"Process Name\" NOT ILIKE '%symantec%'\n\
+    \  AND \"Process Name\" NOT ILIKE '%trendmicro%'\n  AND \"Process Name\" NOT ILIKE '%carbonblack%'\n  AND \"Process Name\" NOT ILIKE '%crowdstrike%'\n\
+    \  AND \"Process Name\" NOT ILIKE '%defender%'\n  AND \"Process Name\" NOT ILIKE '%windows\\\\system32\\\\svchost.exe%'\n  AND \"Process Name\"\
+    \ NOT ILIKE '%windows\\\\system32\\\\services.exe%'\nGROUP BY LOGSOURCENAME(logsourceid), username, \"Process Name\", \"Parent Process Name\"\
+    , \"Process CommandLine\"\nHAVING event_count >= 1\nORDER BY event_count DESC\nLAST 24 HOURS\n"
+  yara_l: "rule crowdstrike_high_severity_malware_detected {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects high\
+    \ severity malware detection events from CrowdStrike antivirus\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"\
+    T1204\"\n    severity = \"High\"\n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.metadata.product_name = \"CrowdStrike\"\
+    \n    $e.security_result.severity = \"HIGH\"\n    $e.security_result.detection_fields[\"malware_detected\"] != \"\"\n    $e.principal.process.file.full_path\
+    \ != \"\"\n    not re.regex($e.principal.process.file.full_path, `(?i)\\\\(windows defender|mcafee|symantec|trendmicro|carbonblack|crowdstrike)\\\
+    \\`)\n    not re.regex($e.principal.process.file.full_path, `(?i)\\\\(svchost|services|lsass|csrss|wininit|winlogon)\\.exe$`)\n    $e.principal.hostname\
+    \ = $host\n    $e.principal.user.userid = $user\n    $e.principal.process.file.full_path = $process_name\n    $e.principal.process.parent_process.file.full_path\
+    \ = $parent_process_name\n    $e.principal.process.command_line = $command_line\n    \n  match:\n    $host, $user, $process_name, $parent_process_name,\
+    \ $command_line over 24h\n    \n  outcome:\n    $risk_score = max(85)\n    $event_count = count_distinct($e.metadata.id)\n    \n  condition:\n\
+    \    #e >= 1\n}\n"
+  esql: "FROM logs-endpoint.events.file*,logs-endpoint.alerts*,.alerts-security.alerts-*\n| WHERE event.severity == \"high\" \n  AND event.category\
+    \ == \"malware\"\n  AND event.action LIKE \"*detected*\"\n  AND process.name IS NOT NULL\n  AND process.name != \"\"\n  AND process.name NOT\
+    \ IN (\"MsMpEng.exe\", \"MpCmdRun.exe\", \"SenseIR.exe\", \"SenseCncProxy.exe\", \"SenseNdr.exe\", \"MsSense.exe\", \"HMPALERT.exe\", \"CSFalconService.exe\"\
+    , \"CSFalconContainer.exe\", \"mcshield.exe\", \"mfemms.exe\", \"SentinelAgent.exe\", \"SentinelHelperService.exe\", \"cb.exe\", \"RepMgr.exe\"\
+    , \"CylanceSvc.exe\")\n  AND process.parent.name NOT IN (\"MsMpEng.exe\", \"MpCmdRun.exe\", \"CSFalconService.exe\", \"mcshield.exe\", \"\
+    SentinelAgent.exe\", \"cb.exe\", \"CylanceSvc.exe\")\n| STATS event_count = COUNT(*), hosts = VALUES(host.name), users = VALUES(user.name)\
+    \ BY process.name, process.parent.name, process.command_line\n| WHERE event_count >= 1\n| SORT event_count DESC\n| KEEP process.name, process.parent.name,\
+    \ process.command_line, event_count, hosts, users\n"
+  leql: |
+    where(source_json.EventID=1 AND process_name!="" AND (process_name ICONTAINS ".exe" OR process_name ICONTAINS ".dll" OR process_name ICONTAINS ".scr" OR process_name ICONTAINS ".com" OR process_name ICONTAINS ".bat" OR process_name ICONTAINS ".cmd" OR process_name ICONTAINS ".ps1") AND process_name NOT ICONTAINS "mcafee" AND process_name NOT ICONTAINS "symantec" AND process_name NOT ICONTAINS "defender" AND process_name NOT ICONTAINS "crowdstrike" AND process_name NOT ICONTAINS "carbonblack" AND process_name NOT ICONTAINS "cylance" AND process_name NOT ICONTAINS "sentinelone" AND parent_process_name NOT ICONTAINS "mcafee" AND parent_process_name NOT ICONTAINS "symantec" AND parent_process_name NOT ICONTAINS "defender" AND parent_process_name NOT ICONTAINS "crowdstrike" AND parent_process_name NOT ICONTAINS "carbonblack" AND parent_process_name NOT ICONTAINS "cylance" AND parent_process_name NOT ICONTAINS "sentinelone") groupby(process_name, parent_process_name, process_cmd_line, asset, user) calculate(count)
+  crowdstrike: |
+    event_simpleName=DetectionSummaryEvent SeverityName="High"
+    | groupBy([ComputerName, UserName, FileName, ParentBaseFileName, CommandLine], function=count(as=detections))
+    | detections >= 1
+    | !in(field=FileName, values=["MsMpEng.exe", "NisSrv.exe", "MpCmdRun.exe", "SenseIR.exe", "SenseCncProxy.exe", "SenseNdr.exe", "CSFalconService.exe", "CSFalconContainer.exe"])
+    | !in(field=ParentBaseFileName, values=["MsMpEng.exe", "NisSrv.exe", "MpCmdRun.exe", "SenseIR.exe", "SenseCncProxy.exe", "SenseNdr.exe", "CSFalconService.exe", "CSFalconContainer.exe"])
+    | sort(detections, order=desc)
+    | table([ComputerName, UserName, FileName, ParentBaseFileName, CommandLine, detections])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_ALERT and alert_name ~= ".*malware.*" and alert_severity = "High"
+    | comp count() as event_count by agent_hostname, actor_effective_username, action_process_image_name, actor_process_image_name, action_process_image_command_line
+    | filter event_count >= 1
+    | filter action_process_image_name != "" and action_process_image_name != null
+    | filter not (lowercase(action_process_image_name) contains "defender" or lowercase(action_process_image_name) contains "mcafee" or lowercase(action_process_image_name) contains "symantec" or lowercase(action_process_image_name) contains "carbon" or lowercase(action_process_image_name) contains "cylance")
+    | sort desc event_count
+    | fields agent_hostname, actor_effective_username, action_process_image_name, actor_process_image_name, action_process_image_command_line, event_count
+  lucene: |
+    event_severity:"High" AND event_type:"Malware Detected" AND event_source:"CrowdStrike"
+  sumo: |
+    _sourceCategory=*CrowdStrike* OR _sourceCategory=*Antivirus* OR _sourceCategory=*Endpoint*
+    | json field=_raw "Severity" as severity
+    | json field=_raw "DetectionSummary" as detection_summary
+    | json field=_raw "FileName" as process_name
+    | json field=_raw "ComputerName" as host
+    | json field=_raw "UserName" as user
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "ParentProcessName" as parent_process_name
+    | where severity matches "*High*" and detection_summary matches "*Malware*"
+    | where !isEmpty(process_name)
+    | where !(process_name matches "*MsMpEng.exe*" or process_name matches "*SentinelAgent.exe*" or process_name matches "*CrowdStrike*" or process_name matches "*Defender*" or process_name matches "*mcafee*" or process_name matches "*symantec*" or process_name matches "*carbon*")
+    | count as event_count by process_name, parent_process_name, command_line, host, user
+    | where event_count >= 1
+    | sort by event_count desc
+    | fields host, user, process_name, parent_process_name, command_line, event_count
 false_positives:
 - Security software
 - Authorized admin tools
@@ -96,7 +116,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'

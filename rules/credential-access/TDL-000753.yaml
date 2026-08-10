@@ -18,75 +18,101 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=edr (file_path="*\\Network\\Cookies" OR file_path="*cookies.sqlite" OR file_path="*Cookies.binarycookies") action=read
-    | where (process_name!="chrome.exe" AND process_name!="msedge.exe" AND process_name!="firefox.exe" AND process_name!="Safari" AND process_name!="Google Chrome" AND process_name!="Microsoft Edge")
+  spl: 'index=edr (file_path="*\\Network\\Cookies" OR file_path="*cookies.sqlite" OR file_path="*Cookies.binarycookies") action=read
+
+    | where (process_name!="chrome.exe" AND process_name!="msedge.exe" AND process_name!="firefox.exe" AND process_name!="Safari" AND process_name!="Google
+    Chrome" AND process_name!="Microsoft Edge")
+
     | table _time, host, user, process_name, process_path, file_path, parent_process_name
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000753 {\n  meta:\n    author = \"TDL\"\n    description = \"Non-Browser Process Reading Browser Cookie Database\"\n\
-    \    severity = \"HIGH\"\n    tactic = \"TA0006\"\n    technique = \"T1539\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceFileEvents
+    | where TimeGenerated > ago(24h)
+    | where ActionType == "FileOpened"
+    | where FileName has_any ("Cookies", "cookies.sqlite", "Cookies.binarycookies")
+    | where FolderPath has_any (
+        @"\Google\Chrome\User Data\",
+        @"\Microsoft\Edge\User Data\",
+        @"\.mozilla\firefox\",
+        @"/Google/Chrome/",
+        @"/Microsoft Edge/",
+        @"/.mozilla/firefox/",
+        @"/Library/Cookies/"
+    )
+    | where (FolderPath has @"\Network\Cookies" or FolderPath has @"/Network/Cookies" or FileName =~ "cookies.sqlite" or FileName =~ "Cookies.binarycookies")
+    | where InitiatingProcessFileName !in~ ("chrome.exe", "msedge.exe", "firefox.exe", "Safari", "Google Chrome", "Microsoft Edge")
+    | project TimeGenerated, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, FolderPath, FileName, ActionType
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Target FileName", "Process CommandLine"
+    FROM events
+    WHERE ("Target FileName" ILIKE '%\Google\Chrome\User Data\%\Network\Cookies%'
+       OR "Target FileName" ILIKE '%\Microsoft\Edge\User Data\%\Network\Cookies%'
+       OR "Target FileName" ILIKE '%\Mozilla\Firefox\Profiles\%\cookies.sqlite%'
+       OR "Target FileName" ILIKE '%/Library/Cookies/Cookies.binarycookies%'
+       OR "Target FileName" ILIKE '%/.config/google-chrome/%/Cookies%'
+       OR "Target FileName" ILIKE '%/.mozilla/firefox/%/cookies.sqlite%')
+    AND "Process Name" NOT ILIKE '%chrome.exe%'
+    AND "Process Name" NOT ILIKE '%msedge.exe%'
+    AND "Process Name" NOT ILIKE '%firefox.exe%'
+    AND "Process Name" NOT ILIKE '%Safari%'
+    LAST 24 HOURS
+  yara_l: "rule steal_web_cookies {\n  meta:\n    author = \"TDL\"\n    description = \"Detects non-browser process reading browser cookie files\"\
+    \n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique = \"T1539\"\n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.event_type\
+    \ = \"FILE_OPEN\"\n    (\n      re.regex($e.target.file.full_path, `(?i)\\\\Google\\\\Chrome\\\\User Data\\\\.*\\\\Network\\\\Cookies`) or\n\
+    \      re.regex($e.target.file.full_path, `(?i)\\\\Microsoft\\\\Edge\\\\User Data\\\\.*\\\\Network\\\\Cookies`) or\n      re.regex($e.target.file.full_path,\
+    \ `(?i)\\\\Mozilla\\\\Firefox\\\\Profiles\\\\.*\\\\cookies\\.sqlite`) or\n      re.regex($e.target.file.full_path, `(?i)/Library/Cookies/Cookies\\\
+    .binarycookies`) or\n      re.regex($e.target.file.full_path, `(?i)\\.config/google-chrome/.*?/Cookies`) or\n      re.regex($e.target.file.full_path,\
+    \ `(?i)\\.mozilla/firefox/.*?/cookies\\.sqlite`)\n    )\n    not re.regex($e.principal.process.file.full_path, `(?i)(chrome\\.exe|msedge\\\
+    .exe|firefox\\.exe|safari)$`)\n    $e.principal.hostname = $host\n    $e.principal.process.file.full_path = $proc\n    \n  match:\n    $host,\
+    \ $proc over 5m\n    \n  outcome:\n    $risk_score = 75\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-endpoint.events.file*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.action == "open"
+      AND (
+        file.path LIKE "*\\AppData\\Local\\Google\\Chrome\\User Data\\*\\Network\\Cookies*"
+        OR file.path LIKE "*\\AppData\\Local\\Microsoft\\Edge\\User Data\\*\\Network\\Cookies*"
+        OR file.path LIKE "*\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\*\\cookies.sqlite*"
+        OR file.path LIKE "*/.mozilla/firefox/*/cookies.sqlite*"
+        OR file.path LIKE "*/Library/Application Support/Google/Chrome/*/Cookies*"
+        OR file.path LIKE "*/Library/Application Support/Microsoft Edge/*/Cookies*"
+        OR file.path LIKE "*/Library/Application Support/Firefox/Profiles/*/cookies.sqlite*"
+        OR file.path LIKE "*/Library/Cookies/Cookies.binarycookies*"
+      )
+      AND NOT (
+        TO_LOWER(process.name) IN ("chrome.exe", "msedge.exe", "firefox.exe", "safari.exe", "chrome", "msedge", "firefox", "safari")
+      )
+    | KEEP @timestamp, host.name, user.name, process.name, process.executable, process.command_line, file.path
+  leql: |
+    where((process_cmd_line ICONTAINS "Network\Cookies" OR process_cmd_line ICONTAINS "cookies.sqlite" OR process_cmd_line ICONTAINS "Cookies.binarycookies" OR source_json.TargetFilename ICONTAINS "Network\Cookies" OR source_json.TargetFilename ICONTAINS "cookies.sqlite" OR source_json.TargetFilename ICONTAINS "Cookies.binarycookies") AND process_name NOT ICONTAINS "chrome.exe" AND process_name NOT ICONTAINS "msedge.exe" AND process_name NOT ICONTAINS "firefox.exe" AND process_name NOT ICONTAINS "safari.exe") groupby(asset, process_name, user) calculate(count)
+  crowdstrike: "event_simpleName=ProcessRollup2 \n(CommandLine=*\"Network\\\\Cookies\"* OR CommandLine=*cookies.sqlite* OR CommandLine=*Cookies.binarycookies*\
+    \ OR TargetFileName=*\"Network\\\\Cookies\"* OR TargetFileName=*cookies.sqlite* OR TargetFileName=*Cookies.binarycookies*)\nNOT (FileName=chrome.exe\
+    \ OR FileName=msedge.exe OR FileName=firefox.exe OR FileName=Safari.exe OR ParentBaseFileName=chrome.exe OR ParentBaseFileName=msedge.exe\
+    \ OR ParentBaseFileName=firefox.exe OR ParentBaseFileName=Safari.exe)\n| table([@timestamp, ComputerName, UserName, FileName, ParentBaseFileName,\
+    \ CommandLine, TargetFileName])\n"
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_FILE
+      and (
+        (action_file_path ~= ".*Chrome.*Network.*Cookies" or action_file_path ~= ".*Edge.*Network.*Cookies")
+        or action_file_path ~= ".*Firefox.*cookies\.sqlite"
+        or action_file_path ~= ".*Safari.*Cookies\.binarycookies"
+      )
+      and actor_process_image_name not in ("chrome.exe", "msedge.exe", "firefox.exe", "Safari")
+      and lowercase(actor_process_image_name) not contains "chrome"
+      and lowercase(actor_process_image_name) not contains "edge"
+      and lowercase(actor_process_image_name) not contains "firefox"
+      and lowercase(actor_process_image_name) not contains "safari"
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_file_path, action_file_access_mode
+  lucene: |
+    (file.path:(*Chrome*Network*Cookies* OR *Edge*Network*Cookies* OR *cookies.sqlite* OR *Cookies.binarycookies*) AND event.action:(open OR read OR access)) AND NOT (process.name:(chrome.exe OR msedge.exe OR firefox.exe OR Safari OR Google\ Chrome OR Microsoft\ Edge OR Firefox) OR process.executable:(*chrome* OR *msedge* OR *firefox* OR *Safari*))
+  sumo: "_sourceCategory=*EDR* (cookies.sqlite OR Cookies.binarycookies OR \"Network\\Cookies\" OR \"Network\\\\Cookies\")\n| json field=_raw\
+    \ \"process_name\" as process_name\n| json field=_raw \"file_path\" as file_path\n| json field=_raw \"action\" as action\n| json field=_raw\
+    \ \"hostname\" as hostname\n| where (file_path matches \"*cookies.sqlite*\" OR file_path matches \"*Cookies.binarycookies*\" OR file_path\
+    \ matches \"*Network*Cookies*\") \n  AND (action matches \"*read*\" OR action matches \"*open*\" OR action matches \"*access*\")\n  AND NOT\
+    \ (process_name matches \"*chrome*\" OR process_name matches \"*msedge*\" OR process_name matches \"*firefox*\" OR process_name matches \"\
+    *safari*\")\n| fields _messageTime, hostname, process_name, file_path, action\n"
 pseudo_logic: Read of Chrome/Edge "Network\Cookies" SQLite, Firefox cookies.sqlite, or Safari Cookies.binarycookies by a process other than the
   browser itself.
 false_positives:
@@ -105,7 +131,7 @@ references:
 - https://attack.mitre.org/techniques/T1539/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'

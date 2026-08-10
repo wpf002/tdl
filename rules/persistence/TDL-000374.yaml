@@ -15,74 +15,96 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=azure sourcetype="azure:aad:audit" operationName="Update user" properties.targetResources{}.modifiedProperties{}.newValue="*member*"
-    | eval targetUser=mvindex('properties.targetResources{}.userPrincipalName', 0)
+  spl: 'index=azure sourcetype="azure:aad:audit" operationName="Update user" properties.targetResources{}.modifiedProperties{}.newValue="*member*"
+
+    | eval targetUser=mvindex(''properties.targetResources{}.userPrincipalName'', 0)
+
     | lookup "TDL - Azure Guest Account Tracker" GuestUser as targetUser OUTPUT GuestUser
+
     | where isnotnull(GuestUser)
+
     | table _time, properties.initiatedBy.user.userPrincipalName, targetUser, properties.targetResources{}.modifiedProperties{}.displayName, properties.targetResources{}.modifiedProperties{}.newValue
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000374 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Guest User Privilege Escalation\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AuditLogs
+    | where TimeGenerated > ago(24h)
+    | where OperationName =~ "update user"
+    | mv-expand TargetResources
+    | mv-expand TargetResources.modifiedProperties
+    | where TargetResources_modifiedProperties.newValue has "member"
+    | extend TargetUser = tostring(TargetResources.userPrincipalName)
+    | join kind=inner (
+        _GetWatchlist('TDL - Azure Guest Account Tracker')
+        | extend GuestUser = tostring(SearchKey)
+    ) on $left.TargetUser == $right.GuestUser
+    | project TimeGenerated, OperationName, TargetUser, InitiatedBy = tostring(InitiatedBy.user.userPrincipalName), modifiedProperty = tostring(TargetResources_modifiedProperties.displayName), newValue = tostring(TargetResources_modifiedProperties.newValue), ActivityDisplayName, CorrelationId
+  aql: |
+    SELECT username, "Azure AD Event Name", "Modified Property", "Modified Property New Value", "Target User", LOGSOURCENAME(logsourceid) AS log_source, eventtime
+    FROM events
+    WHERE "Azure AD Event Name" ILIKE '%update user%'
+      AND "Modified Property New Value" ILIKE '%member%'
+      AND "Target User" IN (SELECT "Guest User" FROM REFERENCE_SET('TDL - Azure Guest Account Tracker'))
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_guest_user_modified_to_member {
+      meta:
+        author = "TDL"
+        description = "Detects Azure AD guest users modified to member accounts (T1098 - Persistence)"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1098"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Azure Active Directory"
+        $e.metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT"
+        re.regex($e.metadata.product_event_type, `(?i)update user`)
+        re.regex($e.about.resource.attribute.labels["modified_property_new_value"], `(?i)member`)
+        $e.target.user.userid = $target_user
+        $e.principal.hostname = $host
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $target_user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 85
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e and #target_user in %azure_guest_account_tracker
+    }
+  esql: |
+    FROM logs-azure.auditlogs*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND azure.auditlogs.operation_name == "Update user"
+      AND azure.auditlogs.properties.target_resources.modified_properties.new_value == "member"
+    | ENRICH TDL_Azure_Guest_Account_Tracker ON azure.auditlogs.properties.target_resources.user_principal_name
+    | KEEP @timestamp, azure.auditlogs.operation_name, azure.auditlogs.properties.target_resources.user_principal_name, azure.auditlogs.properties.initiated_by.user.user_principal_name, azure.auditlogs.properties.target_resources.modified_properties.new_value
+  leql: |
+    where(source_json.operationName="Update user" AND source_json.targetResources.modifiedProperties.newValue ICONTAINS "member" AND source_json.targetResources.userPrincipalName IN lookup:"TDL - Azure Guest Account Tracker")
+  crowdstrike: "#repo=azure* event_name=\"Update user\" \n| ModifiedProperties=*\"Member\"*\n| match(file=\"TDL - Azure Guest Account Tracker.csv\"\
+    , field=TargetUserPrincipalName, include=[GuestUser], ignoreCase=true, strict=false)\n| TargetUserPrincipalName=GuestUser\n| table([@timestamp,\
+    \ TargetUserPrincipalName, InitiatedBy, ModifiedProperties, event_name])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AZURE" and cloud_application = "AAD"
+    | filter operation_name = "Update user"
+    | filter json_extract_scalar(additional_data, "$.ModifiedProperties[*].NewValue") contains "member"
+    | alter target_user_upn = coalesce(identity_sub_type, identity_name, affected_user)
+    | lookup azure_guest_account_tracker on target_user_upn = guest_user_upn
+    | filter guest_user_upn != null
+    | fields _time, operation_name, identity_name, target_user_upn, additional_data, cloud_resource
+  lucene: |
+    event.action:"Update user" AND properties.targetResources.modifiedProperties.newValue:*member* AND properties.targetResources.userPrincipalName:*#EXT#*
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*AzureAD* OR _sourceCategory=*azure*
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "properties.targetResources[*].modifiedProperties" as modified_properties
+    | json field=_raw "properties.targetResources[*].userPrincipalName" as target_user
+    | where operation_name matches "*update user*" OR operation_name matches "*Update user*"
+    | where modified_properties matches "*member*"
+    | lookup email from shared://AzureGuestAccountTracker on target_user = email
+    | where !isNull(email)
+    | fields _messageTime, operation_name, target_user, modified_properties, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -92,7 +114,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure AD Event
 

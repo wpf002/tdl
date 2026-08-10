@@ -23,71 +23,90 @@ queries:
     *\\\\EXCEL.EXE\" OR Image=\"*\\\\POWERPNT.EXE\" OR Image=\"*\\\\OUTLOOK.EXE\" OR Image=\"*\\\\MSACCESS.EXE\" OR Image=\"*\\\\MSPUB.EXE\" OR\
     \ Image=\"*\\\\VISIO.EXE\") \n(CommandLine=\"*MSScriptControl*\" OR CommandLine=\"*DDEAUTO*\" OR CommandLine=\"*DDE*\" OR CommandLine=\"*OLE*\"\
     )\n| table _time, ComputerName, User, Image, CommandLine, ParentImage, ParentCommandLine\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    DeviceEvents
+    | where TimeGenerated > ago(24h)
+    | where ActionType in ("OleObjectLoadEvents", "DdeServerInitiated", "ComObjectCreated")
+    | where InitiatingProcessFileName has_any ("winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe")
+    | where FileName has_any ("MSScriptControl", "DDEAUTO", "scrrun.dll", "wshom.ocx")
+       or AdditionalFields has_any ("MSScriptControl.ScriptControl", "DDEAUTO", "DDE")
+    | project TimeGenerated, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ActionType, AdditionalFields
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Target Object"
+    FROM events
+    WHERE ("Process Name" ILIKE '%winword.exe%' OR "Process Name" ILIKE '%excel.exe%' OR "Process Name" ILIKE '%powerpnt.exe%' OR "Process Name" ILIKE '%outlook.exe%')
+      AND ("Target Object" ILIKE '%MSScriptControl%' OR "Target Object" ILIKE '%DDEAUTO%' OR "Process CommandLine" ILIKE '%MSScriptControl%' OR "Process CommandLine" ILIKE '%DDEAUTO%' OR "Image Loaded" ILIKE '%msscript.ocx%')
+    LAST 24 HOURS
+  yara_l: |
+    rule office_com_dde_execution {
+      meta:
+        author = "TDL"
+        description = "Detects Office processes invoking COM scripting (MSScriptControl) or DDEAUTO for code execution - MITRE T1559"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1559"
+        severity = "High"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          re.regex($e.principal.process.file.full_path, `(?i)(winword|excel|powerpnt|msaccess|outlook)\.exe$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)\\Microsoft Office\\.*\\(WINWORD|EXCEL|POWERPNT|MSACCESS|OUTLOOK)\.EXE$`)
+        )
+        (
+          re.regex($e.principal.process.command_line, `(?i)MSScriptControl`) or
+          re.regex($e.principal.process.command_line, `(?i)DDEAUTO`) or
+          re.regex($e.target.process.command_line, `(?i)MSScriptControl`) or
+          re.regex($e.target.process.command_line, `(?i)DDEAUTO`)
+        )
+        $e.principal.hostname = $host
 
-    | where process_name matches regex ".+"
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000702 {\n  meta:\n    author = \"TDL\"\n    description = \"DDE/COM Object Invoked from Office Application\"\n  \
-    \  severity = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1559\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-windows.sysmon_operational*, logs-endpoint.events.*\n| WHERE @timestamp > NOW() - 24 hours\n  AND (\n    (winlog.event_id ==\
+    \ 7 AND TO_LOWER(winlog.event_data.ImageLoaded) LIKE \"*msscript.ocx*\")\n    OR (process.name IN (\"winword.exe\", \"excel.exe\", \"powerpnt.exe\"\
+    , \"outlook.exe\", \"msaccess.exe\", \"mspub.exe\", \"visio.exe\")\n        AND (TO_LOWER(process.command_line) LIKE \"*ddeauto*\" \n    \
+    \         OR TO_LOWER(process.command_line) LIKE \"*msscriptcontrol*\"\n             OR TO_LOWER(file.path) LIKE \"*msscript.ocx*\"))\n  )\n\
+    \  AND process.parent.name IN (\"winword.exe\", \"excel.exe\", \"powerpnt.exe\", \"outlook.exe\", \"msaccess.exe\", \"mspub.exe\", \"visio.exe\"\
+    )\n| STATS event_count = COUNT(*) BY host.name, process.name, process.parent.name, process.command_line, winlog.event_data.ImageLoaded\n|\
+    \ KEEP @timestamp, host.name, process.name, process.parent.name, process.command_line, winlog.event_data.ImageLoaded, event_count\n"
+  leql: |
+    where((process_name ICONTAINS "winword.exe" OR process_name ICONTAINS "excel.exe" OR process_name ICONTAINS "powerpnt.exe" OR process_name ICONTAINS "outlook.exe") AND (process_cmd_line ICONTAINS "MSScriptControl" OR process_cmd_line ICONTAINS "DDEAUTO" OR source_json.TargetObject ICONTAINS "MSScriptControl" OR source_json.ImageLoaded ICONTAINS "msscript.ocx" OR parent_process_name ICONTAINS "dde"))
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 (ParentBaseFileName=/(?i)(winword|excel|powerpnt|outlook)\.exe/) (CommandLine=/(?i)(MSScriptControl|DDEAUTO)/ OR CommandLine=*DDE* OR ImageFileName=/(?i)(wscript\.exe|cscript\.exe|mshta\.exe|rundll32\.exe|regsvr32\.exe|powershell\.exe)/)
+    | table([@timestamp, ComputerName, UserName, ParentBaseFileName, FileName, CommandLine, SHA256HashData])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter (lowercase(actor_process_image_name) contains "winword.exe"
+        or lowercase(actor_process_image_name) contains "excel.exe"
+        or lowercase(actor_process_image_name) contains "powerpnt.exe"
+        or lowercase(actor_process_image_name) contains "outlook.exe"
+        or lowercase(actor_process_image_name) contains "msaccess.exe")
+    | filter (lowercase(action_process_image_command_line) ~= "(?i)msscriptcontrol"
+        or lowercase(action_process_image_command_line) ~= "(?i)ddeauto"
+        or lowercase(action_process_image_command_line) ~= "(?i)dde\s"
+        or lowercase(action_process_image_name) contains "wscript.exe"
+        or lowercase(action_process_image_name) contains "cscript.exe"
+        or lowercase(action_process_image_name) contains "cmd.exe"
+        or lowercase(action_process_image_name) contains "powershell.exe")
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_command_line
+  lucene: |
+    (process.parent.name:(WINWORD.EXE OR EXCEL.EXE OR POWERPNT.EXE OR OUTLOOK.EXE) AND (process.command_line:*MSScriptControl* OR process.command_line:*DDEAUTO* OR winlog.event_data.GrantedAccess:*MSScriptControl* OR winlog.event_data.CallTrace:*MSScriptControl*)) OR (event.code:10 AND winlog.event_data.SourceImage:(*\\WINWORD.EXE OR *\\EXCEL.EXE OR *\\POWERPNT.EXE OR *\\OUTLOOK.EXE) AND winlog.event_data.TargetImage:*scrobj.dll*) OR (event.code:7 AND winlog.event_data.ImageLoaded:(*scrobj.dll OR *msscript.ocx) AND winlog.event_data.Image:(*\\WINWORD.EXE OR *\\EXCEL.EXE OR *\\POWERPNT.EXE OR *\\OUTLOOK.EXE))
+  sumo: |
+    _sourceCategory=*Sysmon* OR _sourceCategory=*EDR*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Image" as image
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "ParentImage" as parent_image
+    | json field=_raw "TargetObject" as target_object
+    | json field=_raw "Details" as details
+    | where (image matches "*\\WINWORD.EXE" OR image matches "*\\EXCEL.EXE" OR image matches "*\\POWERPNT.EXE" OR image matches "*\\MSACCESS.EXE" OR image matches "*\\OUTLOOK.EXE" OR parent_image matches "*\\WINWORD.EXE" OR parent_image matches "*\\EXCEL.EXE" OR parent_image matches "*\\POWERPNT.EXE" OR parent_image matches "*\\MSACCESS.EXE" OR parent_image matches "*\\OUTLOOK.EXE")
+    | where (command_line matches "*MSScriptControl*" OR command_line matches "*ScriptControl*" OR command_line matches "*DDEAUTO*" OR target_object matches "*MSScriptControl*" OR details matches "*MSScriptControl*" OR details matches "*DDEAUTO*")
+    | fields _messageTime, _sourceHost, event_id, parent_image, image, command_line, target_object, details
 pseudo_logic: Office process invokes COM scripting (MSScriptControl) or DDEAUTO. Legacy OLE/DDE abuse for code execution.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -105,7 +124,7 @@ references:
 - https://attack.mitre.org/techniques/T1559/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'

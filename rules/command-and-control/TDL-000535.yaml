@@ -15,78 +15,142 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=cloud (sourcetype="aws:cloudtrail" OR sourcetype="aws:elb:accesslogs" OR sourcetype="azure:auditlogs" OR sourcetype="gcp:audit")
-    (url="*cmd.exe*" OR url="*powershell*" OR url="*whoami*" OR url="*net.exe*" OR url="*tasklist*" OR url="*ipconfig*" OR url="*systeminfo*" OR url="*netstat*" OR url="*ping.exe*" OR url="*certutil*" OR url="*bitsadmin*" OR url="*wmic*" OR url="*wscript*" OR url="*cscript*" OR url="*regsvr32*" OR url="*rundll32*" OR url="*mshta*" OR url="*C:\\Windows\\*" OR url="*C:\\Users\\*" OR url="*C:\\Temp\\*" OR url="*..\\..\\*" OR url="*%5c%5c*" OR url="*%2e%2e%2f*" OR url="*%2e%2e%5c*" OR url="*&cmd=*" OR url="*;cmd=*" OR url="*|cmd*" OR url="*shell.php*" OR url="*webshell*" OR url="*.aspx?cmd*" OR url="*.jsp?cmd*" OR eventName="*cmd.exe*" OR eventName="*powershell*" OR eventName="*../*" OR eventName="*..\\*" OR eventName="*%2e%2e*" OR requestURI="*cmd.exe*" OR requestURI="*powershell*" OR requestURI="*C:\\Windows\\*" OR requestURI="*..\\*" OR requestURI="*%2e%2e*")
-    NOT (src_ip IN ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16") OR userAgent="*Pingdom*" OR userAgent="*StatusCake*" OR userAgent="*Datadog*" OR userAgent="*CloudWatch*" OR userAgent="*HealthCheck*" OR user_agent="*Pingdom*" OR user_agent="*StatusCake*" OR user_agent="*Datadog*" OR user_agent="*CloudWatch*" OR user_agent="*HealthCheck*")
+  spl: 'index=cloud (sourcetype="aws:cloudtrail" OR sourcetype="aws:elb:accesslogs" OR sourcetype="azure:auditlogs" OR sourcetype="gcp:audit")
+
+    (url="*cmd.exe*" OR url="*powershell*" OR url="*whoami*" OR url="*net.exe*" OR url="*tasklist*" OR url="*ipconfig*" OR url="*systeminfo*"
+    OR url="*netstat*" OR url="*ping.exe*" OR url="*certutil*" OR url="*bitsadmin*" OR url="*wmic*" OR url="*wscript*" OR url="*cscript*" OR url="*regsvr32*"
+    OR url="*rundll32*" OR url="*mshta*" OR url="*C:\\Windows\\*" OR url="*C:\\Users\\*" OR url="*C:\\Temp\\*" OR url="*..\\..\\*" OR url="*%5c%5c*"
+    OR url="*%2e%2e%2f*" OR url="*%2e%2e%5c*" OR url="*&cmd=*" OR url="*;cmd=*" OR url="*|cmd*" OR url="*shell.php*" OR url="*webshell*" OR url="*.aspx?cmd*"
+    OR url="*.jsp?cmd*" OR eventName="*cmd.exe*" OR eventName="*powershell*" OR eventName="*../*" OR eventName="*..\\*" OR eventName="*%2e%2e*"
+    OR requestURI="*cmd.exe*" OR requestURI="*powershell*" OR requestURI="*C:\\Windows\\*" OR requestURI="*..\\*" OR requestURI="*%2e%2e*")
+
+    NOT (src_ip IN ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16") OR userAgent="*Pingdom*" OR userAgent="*StatusCake*" OR userAgent="*Datadog*"
+    OR userAgent="*CloudWatch*" OR userAgent="*HealthCheck*" OR user_agent="*Pingdom*" OR user_agent="*StatusCake*" OR user_agent="*Datadog*"
+    OR user_agent="*CloudWatch*" OR user_agent="*HealthCheck*")
+
     | eval src_ip=coalesce(sourceIPAddress, src_ip, client_ip, clientip)
+
     | eval user_arn=coalesce(userIdentity.arn, user_identity_arn, user)
-    | eval resource_arn=coalesce('resources{}.ARN', resource_arn, resource)
+
+    | eval resource_arn=coalesce(''resources{}.ARN'', resource_arn, resource)
+
     | stats count values(src_ip) as src_ips by user_arn, eventName, resource_arn
+
     | where count >= 1
+
     | sort - count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000535 {\n  meta:\n    author = \"TDL\"\n    description = \"Suspicious Windows Strings In URL\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(90d)
+    | where EventName has_any ("\\", "cmd.exe", "powershell", "whoami", "net user", "net localgroup", "wget", "curl", "chmod", "sh -c", "bash -c", "/etc/passwd", "/etc/shadow", "C:\\", "\\\\", "%20", "%2e", "%2f", "%5c", "..\\", "../", "eval(", "base64", "<?php", "<%", "system(", "exec(", "shell_exec", "passthru")
+    | where UserAgent !has_any ("scanner", "monitoring", "healthcheck", "probe")
+    | extend src_ip = SourceIpAddress
+    | extend user_arn = UserIdentityArn
+    | extend resource_arn = tostring(parse_json(Resources)[0].ARN)
+    | summarize event_count = count(), src_ips = make_set(src_ip) by user_arn, EventName, resource_arn
+    | where event_count >= 1
+    | sort by event_count desc
+    | project TimeGenerated = now(), user_arn, EventName, resource_arn, event_count, src_ips
+  aql: "SELECT DATEFORMAT(eventtime, 'yyyy-MM-dd HH:mm:ss') AS event_time, \n       sourceip AS src_ip, \n       username, \n       \"userIdentity.arn\"\
+    \ AS user_arn, \n       \"eventName\" AS event_name, \n       \"resources{}.ARN\" AS resource_arn, \n       URL AS request_url, \n       COUNT(*)\
+    \ AS event_count\nFROM events\nWHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%aws%elb%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%cloudtrail%')\n\
+    \  AND (URL MATCHES '.*[\\\\\\/](cmd|powershell|psexec|wmic|mshta|rundll32|regsvr32|certutil|bitsadmin|mimikatz|procdump|net\\.exe|whoami|systeminfo|ipconfig|netstat).*'\n\
+    \       OR URL MATCHES '.*[\\?\\&](cmd|exec|shell|system|eval|passthru|query)=.*'\n       OR URL MATCHES '.*%5[Cc].*'\n       OR URL MATCHES\
+    \ '.*%252[Ee].*'\n       OR URL MATCHES '.*\\.\\.[\\\\\\/].*'\n       OR URL MATCHES '.*[Cc]:[\\\\\\/][Ww]indows.*'\n       OR URL MATCHES\
+    \ '.*[Cc]:[\\\\\\/][Pp]rogram.*'\n       OR URL MATCHES '.*\\.\\.%2[Ff].*'\n       OR \"eventName\" MATCHES '.*[\\\\\\/](cmd|powershell|wmic).*'\n\
+    \       OR \"eventName\" MATCHES '.*%5[Cc].*'\n       OR \"eventName\" MATCHES '.*\\.\\.[\\\\\\/].*')\n  AND sourceip NOT IN ('10.0.0.100',\
+    \ '192.168.1.50')\n  AND username NOT ILIKE '%scanner%'\n  AND username NOT ILIKE '%monitoring%'\nGROUP BY sourceip, username, \"userIdentity.arn\"\
+    , \"eventName\", \"resources{}.ARN\", URL, eventtime\nHAVING event_count >= 1\nORDER BY event_count DESC\nLAST 24 HOURS\n"
+  yara_l: |
+    rule aws_elb_suspicious_windows_string_in_url {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects suspicious Windows strings in URLs via AWS ELB indicating potential command and control activity"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1078"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Amazon ELB"
+        $e.metadata.product_event_type != /scanner|monitor|health_check/
+        (
+          re.regex($e.network.http.parsed_user_agent, `(?i)(cmd\.exe|powershell|\\windows\\|\.bat|\.ps1|wscript|cscript|mshta)`) or
+          re.regex($e.target.url, `(?i)(cmd\.exe|powershell|\\windows\\|\.bat|\.ps1|wscript|cscript|mshta|whoami|ipconfig|netstat|\.\.\\|\.\.%2f|%5c%5c)`) or
+          re.regex($e.network.http.referrer_url, `(?i)(cmd\.exe|powershell|\\windows\\|\.bat|\.ps1|wscript|cscript|mshta|\.\.\\|\.\.%2f|%5c%5c)`)
+        )
+        $e.principal.ip = $src_ip
+        $e.principal.user.userid = $user_arn
+        $e.target.resource.name = $resource_arn
+        $e.metadata.description = $event_name
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user_arn, $event_name, $resource_arn over 24h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = max(75)
+        $src_ips = array_distinct($src_ip)
+        $event_count = count_distinct($e.metadata.id)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-aws.elb_logs*,logs-aws.cloudtrail*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND (
+        url.original RLIKE ".*(\\.\\.\\/|%2e%2e%2f|%2e%2e\\\\|%5c%5c|cmd\\.exe|powershell|psexec|wmic\\.exe|net\\.exe|whoami|systeminfo|tasklist|\\\\windows\\\\|\\\\system32\\\\|%windir%|C:\\\\|D:\\\\).*"
+        OR http.request.body.content RLIKE ".*(\\.\\.\\/|%2e%2e%2f|%2e%2e\\\\|%5c%5c|cmd\\.exe|powershell|psexec|wmic\\.exe|net\\.exe|whoami|systeminfo|tasklist|\\\\windows\\\\|\\\\system32\\\\|%windir%|C:\\\\|D:\\\\).*"
+        OR cloud.account.id IS NOT NULL
+      )
+      AND source.ip NOT IN ("10.0.0.1", "192.168.1.100")
+      AND user_agent.original NOT LIKE "*Nessus*"
+      AND user_agent.original NOT LIKE "*OpenVAS*"
+      AND user_agent.original NOT LIKE "*Qualys*"
+    | EVAL resource_arn = COALESCE(aws.cloudtrail.resources.ARN, cloud.target.resource.id, "unknown")
+    | EVAL user_identity = COALESCE(aws.cloudtrail.user_identity.arn, user.id, source.ip)
+    | EVAL event_name = COALESCE(event.action, event.type, "unknown")
+    | STATS event_count = COUNT(*), src_ips = VALUES(source.ip) BY user_identity, event_name, resource_arn
+    | WHERE event_count >= 1
+    | SORT event_count DESC
+    | KEEP user_identity, event_name, resource_arn, event_count, src_ips
+  leql: |
+    where(log_source_name=/AWS.*ELB/ AND (url ICONTAINS "cmd.exe" OR url ICONTAINS "powershell" OR url ICONTAINS "..\\..\\..\\windows" OR url ICONTAINS "%5c%5c" OR url ICONTAINS "\\windows\\system32" OR url ICONTAINS ".ps1" OR url ICONTAINS "whoami" OR url ICONTAINS "net user" OR url ICONTAINS "net localgroup" OR url ICONTAINS "\\cmd" OR url ICONTAINS "%2e%2e%2f" OR url ICONTAINS "%2e%2e%5c")) groupby(source_json.userIdentity.arn, source_json.eventName, source_address) calculate(count)
+  crowdstrike: |
+    #repo=cloud #type=aws:cloudtrail
+    (eventName=*\\* OR eventName=*%5C* OR eventName=*.cmd* OR eventName=*.bat* OR eventName=*.ps1* OR eventName=*powershell* OR eventName=*..\\* OR eventName=*..%5C* OR eventName=*cmd.exe* OR eventName=*wscript* OR eventName=*cscript* OR eventName=*mshta* OR eventName=*regsvr32* OR eventName=*rundll32*)
+    | NOT (sourceIPAddress IN ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+    | groupBy([userIdentity.arn, eventName, resources{}.ARN, sourceIPAddress], function=count(as=event_count))
+    | event_count >= 1
+    | sort(event_count, order=desc)
+    | table([userIdentity.arn, eventName, resources{}.ARN, sourceIPAddress, event_count])
+  xql: "dataset = cloud_audit_logs\n| filter cloud_provider = \"AWS\" and event_type ~= \"(?i).*(\\\\\\\\|%5c|cmd\\\\.exe|powershell|/bin/|wget|curl|eval\\\
+    \\(|base64|\\\\$\\\\(|\\\\||&|;|<|>|passthru|exec\\\\(|system\\\\(|shell_exec).*\"\n| alter src_ip = json_extract_scalar(raw_log, \"$.sourceIPAddress\"\
+    ),\n        user_arn = json_extract_scalar(raw_log, \"$.userIdentity.arn\"),\n        event_name = json_extract_scalar(raw_log, \"$.eventName\"\
+    ),\n        resource_arn = json_extract_scalar(raw_log, \"$.resources[0].ARN\")\n| filter src_ip not in (\"10.0.0.0/8\", \"172.16.0.0/12\"\
+    , \"192.168.0.0/16\") \n| comp count() as event_count, values(src_ip) as src_ips by user_arn, event_name, resource_arn\n| filter event_count\
+    \ >= 1\n| sort desc event_count\n| fields user_arn, event_name, resource_arn, event_count, src_ips\n"
+  lucene: |
+    sourcetype:(aws\:cloudtrail OR azure\:auditlogs OR gcp\:audit) AND (eventName:(*\\* OR *cmd* OR *powershell* OR *../* OR *..\\* OR *.exe* OR *.bat* OR *.ps1* OR *%2e%2e* OR *%5c* OR *%252e* OR *C\:* OR *D\:* OR *eval* OR *exec*)) AND NOT sourceIPAddress:(10.* OR 172.16.* OR 192.168.* OR "scanner-agent" OR "monitoring-service")
+  sumo: |
+    _sourceCategory=*elb* OR _sourceCategory=*cloudtrail*
+    | json field=_raw "requestParameters.requestUri" as request_uri
+    | json field=_raw "url" as url
+    | json field=_raw "request" as request
+    | json field=_raw "userIdentity.arn" as user_arn
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "sourceIPAddress" as src_ip
+    | json field=_raw "resources[*].ARN" as resource_arn
+    | where (request_uri matches "*cmd.exe*" OR request_uri matches "*powershell*" OR request_uri matches "*..\\*" OR request_uri matches "*../*" OR request_uri matches "*%2e%2e*" OR request_uri matches "*%5c*" OR request_uri matches "*whoami*" OR request_uri matches "*net%20user*" OR request_uri matches "*&echo*" OR request_uri matches "*|echo*")
+       OR (url matches "*cmd.exe*" OR url matches "*powershell*" OR url matches "*..\\*" OR url matches "*../*" OR url matches "*%2e%2e*" OR url matches "*%5c*" OR url matches "*whoami*" OR url matches "*net%20user*" OR url matches "*&echo*" OR url matches "*|echo*")
+       OR (request matches "*cmd.exe*" OR request matches "*powershell*" OR request matches "*..\\*" OR request matches "*../*" OR request matches "*%2e%2e*" OR request matches "*%5c*" OR request matches "*whoami*" OR request matches "*net%20user*" OR request matches "*&echo*" OR request matches "*|echo*")
+       OR (event_name matches "*cmd.exe*" OR event_name matches "*powershell*" OR event_name matches "*..\\*" OR event_name matches "*../*" OR event_name matches "*%2e%2e*" OR event_name matches "*%5c*")
+    | where !(src_ip matches "10.*" OR src_ip matches "172.16.*" OR src_ip matches "192.168.*" OR src_ip matches "*scanner*" OR src_ip matches "*monitor*")
+    | count as event_count by user_arn, event_name, resource_arn, src_ip
+    | where event_count >= 1
+    | sort by event_count desc
+    | fields user_arn, event_name, resource_arn, src_ip, event_count
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -96,7 +160,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

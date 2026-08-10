@@ -26,68 +26,102 @@ queries:
     \ app IN (\"chrome\", \"firefox\", \"edge\", \"safari\", \"iexplore\", \"opera\", \"brave\"))\n| eval dest_domain=coalesce(query, dest_domain,\
     \ url)\n| stats count values(dest_domain) as domains values(process_name) as process values(src) as source_ip by host\n| where count > 0\n\
     | table _time, host, source_ip, process, domains, count\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    DnsEvents
+    | where TimeGenerated > ago(1h)
+    | where Name has_any ("pastebin.com", "raw.githubusercontent.com", "hastebin", "paste.ee", "api.telegram.org")
+    | join kind=inner (
+        CommonSecurityLog
+        | where TimeGenerated > ago(1h)
+        | where DestinationHostName has_any ("pastebin.com", "raw.githubusercontent.com", "hastebin", "paste.ee", "api.telegram.org")
+        | where ApplicationProtocol in~ ("HTTP", "HTTPS")
+        | extend ProcessName = coalesce(ProcessName, DeviceProcessName, ApplicationName)
+        | where ProcessName !has_any ("chrome.exe", "firefox.exe", "msedge.exe", "iexplore.exe", "safari.exe", "opera.exe", "brave.exe")
+        | where isnotempty(ProcessName)
+    ) on $left.Name == $right.DestinationHostName
+    | project TimeGenerated, SourceIP, DestinationIP, DestinationHostName, ProcessName, DeviceVendor, DeviceAction
+    | distinct TimeGenerated, SourceIP, DestinationIP, DestinationHostName, ProcessName
+  aql: |
+    SELECT sourceip, destinationip, QIDNAME(qid) AS event_name, "Process Name", LOGSOURCENAME(logsourceid) AS source, COUNT(*) AS connection_count
+    FROM events
+    WHERE (destinationip IN (SELECT destinationip FROM events WHERE (LOGSOURCENAME(logsourceid) ILIKE '%dns%' OR category IN (15,16,18)) AND (payload ILIKE '%pastebin.com%' OR payload ILIKE '%raw.githubusercontent.com%' OR payload ILIKE '%hastebin%' OR payload ILIKE '%paste.ee%' OR payload ILIKE '%api.telegram.org/bot%') LAST 1 HOURS)
+       OR (LOGSOURCENAME(logsourceid) ILIKE '%firewall%' AND (destinationip MATCHES '.*' AND (LOGSOURCENAME(logsourceid) ILIKE '%pastebin%' OR LOGSOURCENAME(logsourceid) ILIKE '%githubusercontent%' OR LOGSOURCENAME(logsourceid) ILIKE '%hastebin%' OR LOGSOURCENAME(logsourceid) ILIKE '%paste.ee%' OR LOGSOURCENAME(logsourceid) ILIKE '%telegram%'))))
+    AND ("Process Name" IS NOT NULL AND "Process Name" NOT ILIKE '%chrome%' AND "Process Name" NOT ILIKE '%firefox%' AND "Process Name" NOT ILIKE '%safari%' AND "Process Name" NOT ILIKE '%msedge%' AND "Process Name" NOT ILIKE '%iexplore%' AND "Process Name" NOT ILIKE '%opera%')
+    GROUP BY sourceip, destinationip, qid, "Process Name", logsourceid
+    LAST 1 HOURS
+  yara_l: |
+    rule web_service_c2_non_browser {
+      meta:
+        author = "TDL"
+        description = "Non-browser process connecting to common web services used for C2"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1102"
+        severity = "High"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        (
+          re.regex($e.target.hostname, `(?i)pastebin\.com`) or
+          re.regex($e.target.hostname, `(?i)raw\.githubusercontent\.com`) or
+          re.regex($e.target.hostname, `(?i)hastebin`) or
+          re.regex($e.target.hostname, `(?i)paste\.ee`) or
+          re.regex($e.target.hostname, `(?i)api\.telegram\.org/bot`)
+        )
+        not re.regex($e.principal.process.file.full_path, `(?i)(chrome\.exe|firefox\.exe|msedge\.exe|safari|iexplore\.exe|opera\.exe|brave\.exe)$`)
+        $e.principal.hostname = $host
+        $e.principal.process.file.full_path = $process
 
-    | where eventName matches regex ".+"
+      match:
+        $host, $process over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+      outcome:
+        $risk_score = 75
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000809 {\n  meta:\n    author = \"TDL\"\n    description = \"Programmatic Access to Public Paste/Drive Service\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1102\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network.dns*, logs-zeek.dns*, logs-suricata.dns*, packetbeat-*, logs-network.firewall*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        destination.domain LIKE "*pastebin.com" OR
+        destination.domain LIKE "*raw.githubusercontent.com" OR
+        destination.domain LIKE "*hastebin.com" OR
+        destination.domain LIKE "*paste.ee" OR
+        destination.domain LIKE "*api.telegram.org*" OR
+        dns.question.name LIKE "*pastebin.com" OR
+        dns.question.name LIKE "*raw.githubusercontent.com" OR
+        dns.question.name LIKE "*hastebin.com" OR
+        dns.question.name LIKE "*paste.ee" OR
+        dns.question.name LIKE "*api.telegram.org*"
+      )
+      AND process.name IS NOT NULL
+      AND NOT (
+        TO_LOWER(process.name) IN ("chrome.exe", "firefox.exe", "msedge.exe", "iexplore.exe", "safari", "opera.exe", "brave.exe", "chromium")
+      )
+    | EVAL domain = COALESCE(destination.domain, dns.question.name)
+    | STATS count = COUNT(*) BY host.name, process.name, process.executable, user.name, domain
+    | KEEP @timestamp, host.name, process.name, process.executable, user.name, domain, count
+  leql: |
+    where((destination_address ICONTAINS "pastebin.com" OR destination_address ICONTAINS "raw.githubusercontent.com" OR destination_address ICONTAINS "hastebin" OR destination_address ICONTAINS "paste.ee" OR destination_address ICONTAINS "api.telegram.org/bot") AND process_name NOT ICONTAINS "chrome" AND process_name NOT ICONTAINS "firefox" AND process_name NOT ICONTAINS "safari" AND process_name NOT ICONTAINS "edge" AND process_name NOT ICONTAINS "iexplore" AND process_name NOT ICONTAINS "opera" AND process_name NOT ICONTAINS "brave") groupby(process_name, destination_address, asset) calculate(count)
+  crowdstrike: |
+    (event_simpleName=NetworkConnectIP4 OR event_simpleName=DnsRequest)
+    (RemoteAddressIP4=*pastebin.com* OR RemoteAddressIP4=*raw.githubusercontent.com* OR RemoteAddressIP4=*hastebin* OR RemoteAddressIP4=*paste.ee* OR RemoteAddressIP4=*api.telegram.org/bot* OR DomainName=*pastebin.com* OR DomainName=*raw.githubusercontent.com* OR DomainName=*hastebin* OR DomainName=*paste.ee* OR DomainName=*api.telegram.org/bot*)
+    FileName!=*chrome.exe FileName!=*firefox.exe FileName!=*msedge.exe FileName!=*iexplore.exe FileName!=*safari.exe FileName!=*opera.exe FileName!=*brave.exe
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, RemoteAddressIP4, DomainName, RemotePort])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter dest_location != null and (dest_location contains \"pastebin.com\" or dest_location contains\
+    \ \"raw.githubusercontent.com\" or dest_location contains \"hastebin\" or dest_location contains \"paste.ee\" or dest_location contains \"\
+    api.telegram.org\")\n| filter app != \"web-browsing\" and app != \"ssl\" \n| fields _time, source_ip, dest_ip, dest_location, app, action,\
+    \ bytes_sent, bytes_received\n"
+  lucene: |
+    (destination.domain:(*pastebin.com OR *raw.githubusercontent.com OR *hastebin* OR *paste.ee OR *api.telegram.org*bot*) OR dns.question.name:(*pastebin.com OR *raw.githubusercontent.com OR *hastebin* OR *paste.ee OR *api.telegram.org*bot*)) AND NOT (process.name:(chrome.exe OR firefox.exe OR msedge.exe OR safari OR iexplore.exe OR opera.exe OR brave.exe) OR source.process.name:(chrome.exe OR firefox.exe OR msedge.exe OR safari OR iexplore.exe OR opera.exe OR brave.exe))
+  sumo: |
+    _sourceCategory=*DNS* OR _sourceCategory=*Firewall* (pastebin.com OR raw.githubusercontent.com OR hastebin OR paste.ee OR api.telegram.org)
+    | parse regex "(?<domain>pastebin\.com|raw\.githubusercontent\.com|hastebin\.[a-z]+|paste\.ee|api\.telegram\.org)" nodrop
+    | parse regex "(?<process_name>[^\s\\\/]+\.exe)" nodrop
+    | where !(process_name matches "*chrome*" OR process_name matches "*firefox*" OR process_name matches "*edge*" OR process_name matches "*iexplore*" OR process_name matches "*safari*" OR process_name matches "*opera*" OR process_name matches "*brave*")
+    | where isNotNull(domain) AND isNotNull(process_name)
+    | fields _messageTime, _sourceHost, process_name, domain
 pseudo_logic: Non-browser process connecting to pastebin.com, raw.githubusercontent.com, hastebin, paste.ee, or telegram-bot API. Web-service
   C2.
 false_positives:
@@ -106,7 +140,7 @@ references:
 - https://attack.mitre.org/techniques/T1102/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

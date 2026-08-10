@@ -16,73 +16,80 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=windows sourcetype="WinEventLog:Security" Operation="FolderDeleted"
+  spl: 'index=windows sourcetype="WinEventLog:Security" Operation="FolderDeleted"
+
     | bin _time span=5m
+
     | stats dc(FileName) as distinct_files values(FileName) as file_names by _time, SourceUserName
+
     | where distinct_files >= 20
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_000058 {\n  meta:\n    author = \"TDL\"\n    description = \"Mass Folder Deletion\"\n    severity = \"LOW\"\n    tactic\
-    \ = \"TA0040\"\n    technique = \"T1485\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n   \
-    \ $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    SharePointFileOperation
+    | where TimeGenerated > ago(1h)
+    | where Operation == "FolderDeleted"
+    | summarize DistinctFolders = dcount(ObjectId), FolderList = make_set(ObjectId) by bin(TimeGenerated, 5m), UserId
+    | where DistinctFolders >= 20
+    | project TimeGenerated, UserId, DistinctFolders, FolderList
+  aql: |
+    SELECT username AS "Source Username", COUNT(*) AS total_deletions, UNIQUECOUNT("File Name") AS distinct_files
+    FROM events
+    WHERE "Operation Name" = 'FolderDeleted'
+    GROUP BY username
+    HAVING total_deletions >= 20 AND distinct_files >= 20
+    LAST 5 MINUTES
+  yara_l: |
+    rule sharepoint_mass_folder_deletion {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects 20+ distinct folder deletions in SharePoint within 5 minutes by same user - T1485 Impact"
+        mitre_attack_technique = "T1485"
+        mitre_attack_tactic = "Impact"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Microsoft SharePoint"
+        $e.metadata.product_event_type = "FolderDeleted"
+        $e.principal.user.userid = $user
+        $e.target.file.full_path = $file
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #file >= 20
+    }
+  esql: "FROM logs-o365.audit*\n| WHERE @timestamp > NOW() - 5 minutes \n  AND event.action == \"FolderDeleted\"\n  AND event.provider == \"SharePoint\"\
+    \n| STATS distinct_files = COUNT_DISTINCT(file.name), total_ops = COUNT(*) BY user.name, bucket = BUCKET(@timestamp, 5 minutes)\n| WHERE distinct_files\
+    \ >= 20\n| KEEP user.name, distinct_files, total_ops, bucket\n"
+  leql: |
+    where(source_json.Operation="FolderDeleted") groupby(source_json.UserId) calculate(unique:source_json.ObjectId)
+  crowdstrike: |
+    #type=sharepoint Operation="FolderDeleted"
+    | bucket(@timestamp, span=5m, as=time_window)
+    | groupBy([time_window, UserName], function=[count(FileName, distinct=true, as=distinct_files)])
+    | distinct_files >= 20
+    | table([time_window, UserName, distinct_files])
+  xql: |
+    dataset = msft_365_raw
+    | filter vendor = "Microsoft" and product = "Office 365"
+    | filter outcome = "Success" and action_audit_operation = "FolderDeleted"
+    | bin _time span=5m
+    | comp count_distinct(action_audit_objectid) as distinct_files by _time, actor_user_upn
+    | filter distinct_files >= 20
+    | fields _time, actor_user_upn, distinct_files
+  lucene: |
+    event.code:"5177" AND Operation:"FolderDeleted"
+  sumo: |
+    _sourceCategory=*Windows*Security* OR _sourceCategory=*SharePoint* "FolderDeleted"
+    | json field=_raw "Operation" as operation
+    | json field=_raw "SourceUserName" as source_user
+    | json field=_raw "ObjectId" as file_name
+    | where operation = "FolderDeleted"
+    | timeslice 5m
+    | count_distinct(file_name) as distinct_files by _timeslice, source_user
+    | where distinct_files >= 20
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -92,7 +99,7 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '20 Sharepoint Events
 

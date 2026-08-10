@@ -17,76 +17,59 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security EventCode=4726
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security EventCode=4726
+
     | lookup authorized_user_modifiers.csv SubjectUserName OUTPUT authorized
+
     | where isnull(authorized) OR authorized!=1
+
     | table _time, ComputerName, SubjectUserName, TargetUserName
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4726")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4726')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_000116 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized User Deletion\"\n    severity = \"LOW\"\n\
-    \    tactic = \"TA0040\"\n    technique = \"T1531\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4726)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND event_id IN ("4726")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4726])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4726)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4726")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4726)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4726")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4726
+    | where SubjectUserName !in ("Administrator", "SYSTEM", "admin", "svc_admin")
+    | project TimeGenerated, Computer, SubjectUserName, SubjectDomainName, TargetUserName, TargetDomainName, Activity
+  aql: |
+    SELECT username AS source_username, "Target Account Name" AS deleted_account, LOGSOURCENAME(logsourceid) AS host, eventtime
+    FROM events
+    WHERE "EventID" = '4726'
+      AND username NOT IN ('svc_admin', 'domain_admin', 'helpdesk_admin', 'it_support')
+    LAST 24 HOURS
+  yara_l: "rule unauthorized_user_deletion_t1531 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects unauthorized user account deletion\
+    \ via Event ID 4726\"\n    mitre_attack_tactic = \"Impact\"\n    mitre_attack_technique = \"T1531\"\n    severity = \"High\"\n\n  events:\n\
+    \    $e.metadata.event_type = \"USER_DELETION\"\n    $e.metadata.product_event_type = \"4726\"\n    $e.principal.user.userid = $source_user\n\
+    \    $e.target.user.userid = $deleted_user\n    \n    // Exclude authorized administrators\n    not re.regex($e.principal.user.userid, `(?i)(^Administrator$|^Domain\
+    \ Admins$|^Enterprise Admins$|^Account Operators$)`)\n\n  match:\n    $source_user over 5m\n\n  outcome:\n    $risk_score = 85\n    $source_user_name\
+    \ = $source_user\n    $deleted_account = $deleted_user\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-system.security*
+    | WHERE @timestamp > NOW() - 24 hour AND event.code == "4726"
+    | WHERE NOT winlog.event_data.SubjectUserName IN ("admin", "Administrator", "svc_automation", "SYSTEM")
+    | KEEP @timestamp, host.name, winlog.event_data.SubjectUserName, winlog.event_data.TargetUserName, winlog.event_data.SubjectDomainName, winlog.event_data.TargetDomainName
+  leql: |
+    where(source_json.EventID=4726 AND source_json.SubjectUserName NOT IN ["authorized_user_1", "authorized_user_2", "authorized_user_3"])
+  crowdstrike: |
+    EventCode=4726
+    | !in(field=SubjectUserName, values=["Administrator", "SYSTEM", "DomainAdmin", "BackupOperator"])
+    | table([@timestamp, ComputerName, SubjectUserName, TargetUserName, SubjectDomainName, TargetDomainName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4726
+    | filter actor_effective_username not in ("AdminUser1", "AdminUser2", "ServiceAccount1")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_data_TargetUserName, action_evtlog_message
+  lucene: |
+    event.code:4726 AND NOT winlog.event_data.SubjectUserName:(authorized_user1 OR authorized_user2 OR authorized_user3)
+  sumo: |
+    _sourceCategory=*Windows*Security* "4726"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "SubjectUserName" as source_user
+    | json field=_raw "TargetUserName" as target_user
+    | where event_id = "4726"
+    | where !(source_user in ("Administrator", "DomainAdministrator", "ServiceAccount"))
+    | fields _messageTime, _sourceHost, source_user, target_user
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -96,7 +79,7 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows User Deletion Event \nWhere the Event ID is 4726\nWhere the Source Username is NOT on the Users Authorized to Modify\
   \ Users List"

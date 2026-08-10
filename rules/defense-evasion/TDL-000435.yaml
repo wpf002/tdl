@@ -15,73 +15,84 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit) eventName="*CobaltStrike*"
+  spl: 'index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit) eventName="*CobaltStrike*"
+
     | stats count values(src_ip) as source_ips by userIdentity.arn, eventName, resources{}.ARN
+
     | where count >= 1
+
     | sort - count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "CobaltStrike"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%CobaltStrike%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000435 {\n  meta:\n    author = \"TDL\"\n    description = \"CobaltStrike Malleable OneDrive Browsing Traffic Profile\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /CobaltStrike/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%CobaltStrike%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
+  kql: |
+    union AWSCloudTrail, AuditLogs, GCPAuditLogs
+    | where TimeGenerated > ago(90d)
+    | where (SourceSystem == "AWS" and EventName contains "CobaltStrike")
+        or (SourceSystem == "Azure" and OperationName contains "CobaltStrike")
+        or (SourceSystem == "GCP" and OperationName contains "CobaltStrike")
+    | extend UserArn = coalesce(UserIdentityArn, UserPrincipalName, Identity)
+    | extend Event = coalesce(EventName, OperationName)
+    | extend ResourceArn = coalesce(tostring(parse_json(RequestParameters).resourceARN), tostring(parse_json(TargetResources)[0].id), ResourceId)
+    | extend SourceIP = coalesce(SourceIpAddress, IPAddress, CallerIpAddress)
+    | summarize count(), SourceIPs = make_set(SourceIP) by UserArn, Event, ResourceArn
+    | where count_ >= 1
+    | sort by count_ desc
+    | project UserArn, Event, ResourceArn, count_, SourceIPs
+  aql: |
+    SELECT useridentity, eventname, sourceip, COUNT(*) AS event_count
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%cloudtrail%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%azure%audit%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%gcp%audit%')
+      AND eventname ILIKE '%CobaltStrike%'
+    GROUP BY useridentity, eventname, sourceip
+    HAVING event_count >= 1
+    ORDER BY event_count DESC
+    LAST 24 HOURS
+  yara_l: "rule cobaltstrike_cloud_audit_event {\n  meta:\n    author = \"TDL\"\n    description = \"Detects CobaltStrike-related cloud audit\
+    \ events - MITRE T1071 Defense Evasion\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1071\"\n    severity\
+    \ = \"HIGH\"\n\n  events:\n    $e.metadata.event_type = \"SYSTEM_AUDIT_LOG_UNCATEGORIZED\" or\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
+    \ or\n    $e.metadata.event_type = \"USER_RESOURCE_CREATION\" or\n    $e.metadata.event_type = \"USER_RESOURCE_DELETION\" or\n    $e.metadata.event_type\
+    \ = \"USER_RESOURCE_UPDATE_CONTENT\" or\n    $e.metadata.event_type = \"SETTING_MODIFICATION\"\n    \n    (\n      $e.metadata.product_name\
+    \ = \"AWS CloudTrail\" or\n      $e.metadata.product_name = \"Azure\" or\n      $e.metadata.product_name = \"GCP\"\n    )\n    \n    re.regex($e.metadata.product_event_type,\
+    \ `(?i).*CobaltStrike.*`) or\n    re.regex($e.security_result.summary, `(?i).*CobaltStrike.*`) or\n    re.regex($e.target.resource.name, `(?i).*CobaltStrike.*`)\
+    \ or\n    re.regex($e.metadata.description, `(?i).*CobaltStrike.*`)\n    \n    $e.principal.user.userid = $user_identity\n    $e.metadata.product_event_type\
+    \ = $event_name\n    $e.target.resource.name = $resource_arn\n    $e.principal.ip = $source_ip\n\n  match:\n    $user_identity, $event_name,\
+    \ $resource_arn over 24h\n\n  outcome:\n    $risk_score = 85\n    $source_ips = array_distinct($source_ip)\n    $event_count = count_distinct($e.metadata.id)\n\
+    \n  condition:\n    #e >= 1\n}\n"
+  esql: |
+    FROM logs-cloud*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (event.dataset IN ("aws.cloudtrail", "azure.auditlogs", "gcp.audit") OR log.logger IN ("aws.cloudtrail", "azure.auditlogs", "gcp.audit"))
+      AND event.action LIKE "*CobaltStrike*"
+    | STATS count = COUNT(*), source_ips = VALUES(source.ip) BY cloud.account.id, event.action, related.user
+    | WHERE count >= 1
     | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/CobaltStrike/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*CobaltStrike*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "CobaltStrike"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*CobaltStrike*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*CobaltStrike*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    | KEEP cloud.account.id, event.action, related.user, count, source_ips
+  leql: |
+    where(source_json.eventName ICONTAINS "CobaltStrike") groupby(source_json.userIdentity.arn, source_json.eventName, source_json.resources{}.ARN, source_address) calculate(count)
+  crowdstrike: |
+    #repo=cloud (sourcetype="aws:cloudtrail" OR sourcetype="azure:auditlogs" OR sourcetype="gcp:audit") eventName=*CobaltStrike*
+    | groupBy([userIdentity.arn, eventName, resources{}.ARN], function=[count(as=event_count), collect(sourceIPAddress)])
+    | event_count >= 1
+    | sort(event_count, order=desc)
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider in ("AWS", "Azure", "GCP") and operation_name ~= ".*CobaltStrike.*"
+    | comp count() as event_count by identity_name, operation_name, resource_id, caller_ip_address
+    | filter event_count >= 1
+    | sort desc event_count
+    | fields identity_name, operation_name, resource_id, caller_ip_address, event_count
+  lucene: |
+    (sourcetype:(aws\:cloudtrail OR azure\:auditlogs OR gcp\:audit)) AND eventName:*CobaltStrike*
+  sumo: |
+    _sourceCategory=*cloud* (aws:cloudtrail OR azure:auditlogs OR gcp:audit)
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "userIdentity.arn" as user_arn
+    | json field=_raw "resources[*].ARN" as resource_arn
+    | json field=_raw "sourceIPAddress" as src_ip
+    | where event_name matches "*CobaltStrike*"
+    | count as event_count by user_arn, event_name, resource_arn, src_ip
+    | where event_count >= 1
+    | sort by event_count desc
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -91,7 +102,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

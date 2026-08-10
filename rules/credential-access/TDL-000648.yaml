@@ -16,71 +16,79 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail eventSource="lambda.amazonaws.com" eventName="UpdateFunctionConfiguration" requestParameters.layers=*
-    | table _time, userIdentity.principalId, userIdentity.arn, awsRegion, requestParameters.functionName, requestParameters.layers, sourceIPAddress, userAgent
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: 'index=aws sourcetype=aws:cloudtrail eventSource="lambda.amazonaws.com" eventName="UpdateFunctionConfiguration" requestParameters.layers=*
 
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "UpdateFunctionConfiguration"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+    | table _time, userIdentity.principalId, userIdentity.arn, awsRegion, requestParameters.functionName, requestParameters.layers, sourceIPAddress,
+    userAgent
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%UpdateFunctionConfiguration%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000648 {\n  meta:\n    author = \"TDL\"\n    description = \"Potential Lambda Layer Injection Attempt\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /UpdateFunctionConfiguration/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(1h)
+    | where EventSource == "lambda.amazonaws.com"
+    | where EventName == "UpdateFunctionConfiguration"
+    | where isnotnull(RequestParameters) and RequestParameters has "layers"
+    | extend LayersData = parse_json(RequestParameters).layers
+    | where isnotnull(LayersData)
+    | project TimeGenerated, UserIdentityArn, EventName, EventSource, SourceIpAddress, UserAgent, RequestParameters, LayersData, AWSRegion, RecipientAccountId
+  aql: |
+    SELECT eventtime, username, sourceip, "eventName", "requestParameters", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%cloudtrail%'
+      AND "eventSource" = 'lambda.amazonaws.com'
+      AND "eventName" = 'UpdateFunctionConfiguration'
+      AND "requestParameters" IS NOT NULL
+      AND "requestParameters" ILIKE '%layers%'
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_lambda_layer_modification {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects AWS Lambda function layer updates which could indicate credential access via T1078"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_event_type = "UpdateFunctionConfiguration"
+        $e.metadata.vendor_name = "AMAZON"
+        $e.metadata.product_name = "AWS CloudTrail"
+        $e.target.resource.attribute.labels["eventSource"] = "lambda.amazonaws.com"
+        $e.target.resource.attribute.labels["requestParameters.layers"] != ""
+        $e.principal.user.userid = $user
+        $e.principal.ip = $ip
 
-    | WHERE eventName LIKE "%UpdateFunctionConfiguration%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/UpdateFunctionConfiguration/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*UpdateFunctionConfiguration*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "UpdateFunctionConfiguration"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*UpdateFunctionConfiguration*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*UpdateFunctionConfiguration*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-aws.cloudtrail*\n| WHERE event.provider == \"lambda.amazonaws.com\" \n  AND event.action == \"UpdateFunctionConfiguration\"\
+    \n  AND aws.cloudtrail.request_parameters LIKE \"*layers*\"\n| KEEP @timestamp, cloud.account.id, cloud.region, user.name, event.action, aws.cloudtrail.request_parameters,\
+    \ source.ip, user_agent.original\n"
+  leql: |
+    where(source_json.eventSource="lambda.amazonaws.com" AND source_json.eventName="UpdateFunctionConfiguration" AND source_json.requestParameters.layers!=null)
+  crowdstrike: |
+    #repo=* event.provider=lambda.amazonaws.com eventName=UpdateFunctionConfiguration requestParameters.layers=*
+    | table([@timestamp, userIdentity.principalId, userIdentity.arn, sourceIPAddress, requestParameters.functionName, requestParameters.layers, awsRegion])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and event_type = "AwsApiCall"
+    | filter action_resource_creation_sub_type = "UpdateFunctionConfiguration"
+    | filter json_extract_scalar(raw_log, "$.userIdentity.invokedBy") = "lambda.amazonaws.com"
+    | filter json_extract(raw_log, "$.requestParameters.layers") != null
+    | fields _time, actor_effective_username, action_resource_creation_sub_type, action_resource, raw_log
+  lucene: |
+    eventSource:"lambda.amazonaws.com" AND eventName:"UpdateFunctionConfiguration" AND _exists_:requestParameters.layers
+  sumo: |
+    _sourceCategory=*cloudtrail* "UpdateFunctionConfiguration"
+    | json field=_raw "eventSource" as event_source
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "requestParameters.layers" as layers
+    | where event_source = "lambda.amazonaws.com"
+    | where event_name = "UpdateFunctionConfiguration"
+    | where !isNull(layers)
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +98,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 AWS CloudTrail Event
 

@@ -22,68 +22,92 @@ queries:
     eks.privileged\" \nannotations.podsecuritypolicy.policy.k8s.io/validate-policy=\"eks.privileged\" \nrequestObject.spec.containers{}.securityContext.privileged=true)\n\
     | table _time, objectRef.namespace, objectRef.name, user.username, sourceIPs{}, annotations.podsecuritypolicy.policy.k8s.io/admit-policy,\
     \ annotations.podsecuritypolicy.policy.k8s.io/validate-policy, requestObject.spec.containers{}.securityContext.privileged\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    KubernetesEvents
+    | where TimeGenerated > ago(1h)
+    | where ObjectKind == "Pod"
+    | where Verb == "create"
+    | extend annotations = parse_json(Annotations)
+    | extend requestObject = parse_json(RequestObject)
+    | extend admitPolicy = tostring(annotations["podsecuritypolicy.policy.k8s.io/admit-policy"])
+    | extend validatePolicy = tostring(annotations["podsecuritypolicy.policy.k8s.io/validate-policy"])
+    | extend containers = requestObject.spec.containers
+    | mv-expand container = containers
+    | extend isPrivileged = tobool(container.securityContext.privileged)
+    | where admitPolicy == "eks.privileged" or validatePolicy == "eks.privileged" or isPrivileged == true
+    | project TimeGenerated, Namespace, Name, Verb, admitPolicy, validatePolicy, isPrivileged, RequestObject, SourceIPs, UserAgent
+  aql: "SELECT eventtime, sourceip, \"Resource\", \"Verb\", \"annotations.podsecuritypolicy.policy.k8s.io/admit-policy\", \"annotations.podsecuritypolicy.policy.k8s.io/validate-policy\"\
+    , \"requestObject.spec.containers.1.securityContext.privileged\", username, LOGSOURCENAME(logsourceid) AS log_source\nFROM events\nWHERE \"\
+    Resource\" = 'pods' \n  AND (\"Verb\" = 'create' \n       OR (\"annotations.podsecuritypolicy.policy.k8s.io/admit-policy\" = 'eks.privileged'\
+    \ \n           AND \"annotations.podsecuritypolicy.policy.k8s.io/validate-policy\" = 'eks.privileged' \n           AND \"requestObject.spec.containers.1.securityContext.privileged\"\
+    \ = 'true'))\nLAST 24 HOURS\n"
+  yara_l: |
+    rule kubernetes_privileged_pod_creation {
+      meta:
+        author = "TDL"
+        description = "Detects creation of privileged pods in Kubernetes (T1611)"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1611"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.product_name = "Kubernetes"
+        $e.target.resource.name = "pods"
+        $e.target.resource.attribute.labels.key = "verb"
+        $e.target.resource.attribute.labels.value = "create"
+        (
+          (
+            $e.target.resource.attribute.labels.key = "annotations.podsecuritypolicy.policy.k8s.io/admit-policy"
+            $e.target.resource.attribute.labels.value = "eks.privileged"
+          ) or
+          (
+            $e.target.resource.attribute.labels.key = "annotations.podsecuritypolicy.policy.k8s.io/validate-policy"
+            $e.target.resource.attribute.labels.value = "eks.privileged"
+          ) or
+          (
+            $e.target.resource.attribute.labels.key = "requestObject.spec.containers.1.securityContext.privileged"
+            $e.target.resource.attribute.labels.value = "true"
+          )
+        )
+        $e.principal.user.userid = $user
 
-    | where eventName matches regex ".+"
+      match:
+        $user over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000574 {\n  meta:\n    author = \"TDL\"\n    description = \"Privileged Kubernetes Pod Created\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1611\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-kubernetes.audit*
+    | WHERE kubernetes.audit.objectRef.resource == "pods"
+      AND kubernetes.audit.verb == "create"
+      AND (kubernetes.audit.annotations.podsecuritypolicy_policy_k8s_io_admit-policy == "eks.privileged"
+        OR kubernetes.audit.annotations.podsecuritypolicy_policy_k8s_io_validate-policy == "eks.privileged"
+        OR kubernetes.audit.requestObject.spec.containers.securityContext.privileged == true)
+    | KEEP @timestamp, host.name, user.name, kubernetes.audit.objectRef.namespace, kubernetes.audit.objectRef.name, kubernetes.audit.verb, kubernetes.audit.annotations.podsecuritypolicy_policy_k8s_io_admit-policy, kubernetes.audit.annotations.podsecuritypolicy_policy_k8s_io_validate-policy, kubernetes.audit.requestObject.spec.containers.securityContext.privileged
+  leql: |
+    where(source_json.objectRef.resource="pods" AND source_json.verb="create" AND (source_json.annotations.podsecuritypolicy.policy.k8s.io/admit-policy="eks.privileged" OR source_json.annotations.podsecuritypolicy.policy.k8s.io/validate-policy="eks.privileged" OR source_json.requestObject.spec.containers.1.securityContext.privileged="true"))
+  crowdstrike: "#type=kubernetes event.resource=\"pods\" event.verb=\"create\" \n(annotations.podsecuritypolicy.policy.k8s.io/admit-policy=\"\
+    eks.privileged\" OR annotations.podsecuritypolicy.policy.k8s.io/validate-policy=\"eks.privileged\" OR requestObject.spec.containers.*.securityContext.privileged=true)\n\
+    | table([@timestamp, event.resource, event.verb, annotations.podsecuritypolicy.policy.k8s.io/admit-policy, annotations.podsecuritypolicy.policy.k8s.io/validate-policy,\
+    \ requestObject.spec.containers.*.securityContext.privileged, objectRef.name, objectRef.namespace, user.username])\n"
+  xql: "dataset = cloud_audit_logs\n| filter cloud_provider = \"AZURE_KUBERNETES_SERVICE\" or cloud_provider = \"GCP_GKE\" or cloud_provider =\
+    \ \"AWS_EKS\"\n| filter resource_type = \"pods\"\n| filter (operation = \"create\" \n         or (operation_requested_data contains \"\\\"\
+    eks.privileged\\\"\"\n             and operation_requested_data contains \"\\\"podsecuritypolicy.policy.k8s.io/admit-policy\\\"\")\n     \
+    \    or (operation_requested_data contains \"\\\"eks.privileged\\\"\"\n             and operation_requested_data contains \"\\\"podsecuritypolicy.policy.k8s.io/validate-policy\\\
+    \"\")\n         or (operation_requested_data contains \"\\\"privileged\\\":true\"\n             and operation_requested_data contains \"\\\
+    \"securityContext\\\"\"))\n| fields _time, cloud_provider, resource_type, operation, caller_ip, identity_name, operation_requested_data\n"
+  lucene: |
+    kubernetes.resource:pods AND kubernetes.verb:create AND (kubernetes.annotations.podsecuritypolicy.policy.k8s.io\/admit-policy:eks.privileged OR kubernetes.annotations.podsecuritypolicy.policy.k8s.io\/validate-policy:eks.privileged OR kubernetes.requestObject.spec.containers.1.securityContext.privileged:true)
+  sumo: |
+    _sourceCategory=*Kubernetes* "pods" "create"
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "verb" as verb
+    | json field=_raw "annotations.podsecuritypolicy.policy.k8s.io/admit-policy" as admit_policy
+    | json field=_raw "annotations.podsecuritypolicy.policy.k8s.io/validate-policy" as validate_policy
+    | json field=_raw "requestObject.spec.containers[*].securityContext.privileged" as privileged
+    | where resource = "pods" and verb = "create" and (admit_policy = "eks.privileged" or validate_policy = "eks.privileged" or privileged = "true")
+    | fields _messageTime, _sourceHost, resource, verb, admit_policy, validate_policy, privileged
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +117,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere the Resource is \"pods\"\nWhere Verb is \"create\"\nOR\n    Where \"annotations.podsecuritypolicy.policy.k8s.io/admit-policy\"\
   \ is \"eks.privileged\"\n    Where \"annotations.podsecuritypolicy.policy.k8s.io/validate-policy\" is \"eks.privileged\"\n    Where \"requestObject.spec.containers.1.securityContext.privileged\"\

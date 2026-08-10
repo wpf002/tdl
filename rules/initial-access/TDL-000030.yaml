@@ -16,71 +16,64 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=o365 sourcetype="o365:management:activity" Operation=AlertTriggered Name="Activity from infrequent country"
+  spl: 'index=o365 sourcetype="o365:management:activity" Operation=AlertTriggered Name="Activity from infrequent country"
+
     | table _time, UserId, ClientIP, Name, Severity, Category, UserAgent
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "AlertTriggered"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%AlertTriggered%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000030 {\n  meta:\n    author = \"TDL\"\n    description = \"Activity from Infrequent Country\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /AlertTriggered/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    CloudAppEvents
+    | where TimeGenerated > ago(24h)
+    | where Application == "Microsoft Cloud App Security"
+    | where ActionType == "AlertTriggered"
+    | where RawEventData.Data.alert.title == "Activity from infrequent country"
+    | project TimeGenerated, AccountDisplayName, AccountObjectId, IPAddress, CountryCode, RawEventData
+  aql: "SELECT username, sourceip, destinationip, QIDNAME(qid), \"Alert Name\", \"Operation\", eventtime\nFROM events\nWHERE \"Operation\" = 'AlertTriggered'\
+    \ \n  AND \"Alert Name\" = 'Activity from infrequent country'\nLAST 24 HOURS\n"
+  yara_l: |
+    rule o365_atp_activity_from_infrequent_country {
+      meta:
+        author = "TDL"
+        description = "Detects O365 ATP alert for activity from infrequent country - T1078 Initial Access"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Microsoft Office 365"
+        $e.metadata.vendor_name = "Microsoft"
+        $e.metadata.event_type = "USER_UNCATEGORIZED"
+        $e.security_result.summary = "Activity from infrequent country"
+        $e.metadata.product_log_id = "AlertTriggered"
+        $e.target.user.userid = $user
+        $e.principal.ip = $ip
 
-    | WHERE eventName LIKE "%AlertTriggered%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/AlertTriggered/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*AlertTriggered*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "AlertTriggered"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*AlertTriggered*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*AlertTriggered*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-o365*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.action == \"AlertTriggered\" \n  AND o365.audit.Name == \"Activity\
+    \ from infrequent country\"\n| KEEP @timestamp, user.name, source.ip, source.geo.country_name, host.name, event.id, o365.audit.AlertEntityId,\
+    \ o365.audit.AlertLinks\n"
+  leql: |
+    where(source_json.Operation="AlertTriggered" AND source_json.alert_name="Activity from infrequent country")
+  crowdstrike: |
+    #dataSource=O365ATP Operation="AlertTriggered" Name="Activity from infrequent country"
+    | table([@timestamp, ComputerName, UserName, Operation, Name, RawActivityObject])
+  xql: |
+    dataset = msft_azure_raw
+    | filter event_platform = "Office 365 ATP" and operation = "AlertTriggered" and alert_name = "Activity from infrequent country"
+    | fields _time, user_name, alert_name, operation, event_data
+  lucene: |
+    Operation:"AlertTriggered" AND alert_name:"Activity from infrequent country"
+  sumo: |
+    _sourceCategory=*O365* OR _sourceCategory=*CloudAppSecurity* OR _sourceCategory=*MCAS*
+    | json field=_raw "Operation" as operation
+    | json field=_raw "AlertName" as alert_name
+    | where operation = "AlertTriggered" and alert_name = "Activity from infrequent country"
+    | fields _messageTime, _sourceHost, operation, alert_name
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +83,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Microsoft Cloud App Security Event
 

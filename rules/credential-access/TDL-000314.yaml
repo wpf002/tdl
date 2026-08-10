@@ -17,68 +17,70 @@ risk_score: 55
 queries:
   spl: "index=gcp sourcetype=gcp:cloudaudit methodName=\"storage.buckets.delete\" \n| search NOT (user=\"*@admin.google.com\" OR user=\"*gserviceaccount.com\"\
     ) \n| table _time, user, methodName, resource.labels.bucket_name, protoPayload.authenticationInfo.principalEmail, protoPayload.status.message\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    GCP_CloudAudit_CL
+    | where TimeGenerated > ago(1h)
+    | where message_data_protoPayload_methodName_s contains "storage.buckets.delete"
+    | where message_data_protoPayload_authenticationInfo_principalEmail_s !endswith "gserviceaccount.com"
+    | where message_data_protoPayload_authenticationInfo_principalEmail_s !has "admin"
+    | project TimeGenerated, principalEmail = message_data_protoPayload_authenticationInfo_principalEmail_s, methodName = message_data_protoPayload_methodName_s, resourceName = message_data_protoPayload_resourceName_s, callerIp = message_data_protoPayload_requestMetadata_callerIp_s, projectId = message_resource_labels_project_id_s
+  aql: |
+    SELECT eventtime, username, sourceip, "methodName", "resourceName", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "methodName" ILIKE '%storage.buckets.delete%'
+      AND username NOT ILIKE '%@gserviceaccount.com%'
+      AND username NOT ILIKE '%admin%'
+    LAST 24 HOURS
+  yara_l: |
+    rule gcp_bucket_deletion_non_admin {
+      meta:
+        author = "TDL"
+        description = "Detects GCP storage bucket deletion by non-admin or non-service account users - T1078 Credential Access"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.product_name = "GCP"
+        $e.metadata.vendor_name = "Google Cloud Platform"
+        $e.metadata.product_event_type = "storage.buckets.delete"
+        $e.principal.user.userid = $user
+        not re.regex($e.principal.user.userid, `(?i)gserviceaccount\.com$`)
+        not re.regex($e.principal.user.userid, `(?i)admin`)
 
-    | where eventName matches regex ".+"
+      match:
+        $user over 1h
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000314 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized Bucket Deletion - GCP\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-gcp*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.action == \"storage.buckets.delete\"\n  AND NOT (user.name LIKE \"\
+    *@gserviceaccount.com\" OR user.roles LIKE \"*admin*\" OR user.name LIKE \"*admin*\")\n| STATS delete_count = COUNT(*) BY user.name, user.email,\
+    \ gcp.audit.authentication_info.principal_email, cloud.project.id, host.name\n| KEEP @timestamp, user.name, user.email, gcp.audit.authentication_info.principal_email,\
+    \ cloud.project.id, host.name, event.action, delete_count\n"
+  leql: |
+    where(source_json.protoPayload.methodName ICONTAINS "storage.buckets.delete" AND NOT (source_user ICONTAINS "admin" OR source_user ICONTAINS "gserviceaccount")) groupby(source_user, source_json.resource.labels.bucket_name) calculate(count)
+  crowdstrike: |
+    #type=gcp_audit message.data.protoPayload.methodName=*storage.buckets.delete*
+    | regex("(?<sourceUser>[^@]+@[^@]+)", field=message.data.protoPayload.authenticationInfo.principalEmail)
+    | sourceUser!=*gserviceaccount.com
+    | regex("^(?!.*[Aa]dmin).*$", field=sourceUser)
+    | table([@timestamp, message.data.protoPayload.authenticationInfo.principalEmail, message.data.protoPayload.methodName, message.data.protoPayload.resourceName, message.data.protoPayload.request.bucket])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "GCP" and json_extract_scalar(raw_log, "$.protoPayload.methodName") contains "storage.buckets.delete"
+    | alter source_user = coalesce(json_extract_scalar(raw_log, "$.protoPayload.authenticationInfo.principalEmail"), json_extract_scalar(raw_log, "$.actor.user.email"))
+    | filter source_user != null and not (source_user contains "gserviceaccount.com" or source_user ~= ".*admin.*")
+    | fields _time, source_user, json_extract_scalar(raw_log, "$.protoPayload.methodName") as method_name, json_extract_scalar(raw_log, "$.protoPayload.resourceName") as resource_name, json_extract_scalar(raw_log, "$.protoPayload.status.message") as status_message
+  lucene: |
+    message.data.protoPayload.methodName:*storage.buckets.delete* AND NOT (message.data.protoPayload.authenticationInfo.principalEmail:*@gserviceaccount.com OR message.data.protoPayload.authenticationInfo.principalEmail:*admin*)
+  sumo: |
+    _sourceCategory=*GCP* OR _sourceCategory=*gcp* "storage.buckets.delete"
+    | json field=_raw "message.data.protoPayload.methodName" as method_name
+    | json field=_raw "message.data.protoPayload.authenticationInfo.principalEmail" as principal_email
+    | where method_name matches "*storage.buckets.delete*"
+    | where !(principal_email matches "*@gserviceaccount.iam*" OR principal_email matches "*admin*")
+    | fields _messageTime, _sourceHost, principal_email, method_name
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -88,7 +90,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Cloud Audit event
 

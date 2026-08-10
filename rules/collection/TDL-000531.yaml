@@ -15,74 +15,96 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=cloud sourcetype IN("aws:cloudtrail", "azure:auditlogs", "gcp:audit") eventName=* userAgent=*
+  spl: 'index=cloud sourcetype IN("aws:cloudtrail", "azure:auditlogs", "gcp:audit") eventName=* userAgent=*
+
     | regex userAgent="(?i)([0-9a-f]{2}){4,}"
+
     | stats count values(userAgent) as userAgent by userIdentity.arn, eventName, resources{}.ARN
+
     | where count >= 1
+
     | sort - count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000531 {\n  meta:\n    author = \"TDL\"\n    description = \"Hexadecimal User-Agent\"\n    severity = \"LOW\"\n  \
-    \  tactic = \"TA0009\"\n    technique = \"T1132\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n\
-    \    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(90d)
+    | where isnotempty(UserAgent)
+    | where UserAgent matches regex @"(?i)(%[0-9A-Fa-f]{2})+"
+    | where isnotempty(EventName)
+    | extend ResourceARN = tostring(parse_json(Resources)[0].ARN)
+    | summarize count() by UserIdentityArn, EventName, ResourceARN
+    | where count_ >= 1
+    | sort by count_ desc
+  aql: |
+    SELECT useridentity, eventname, useragent, COUNT(*) AS event_count
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%aws%'
+      AND eventname IS NOT NULL
+      AND eventname != ''
+      AND (useragent MATCHES '.*[0-9a-fA-F]{8,}.*' OR useragent MATCHES '.*\\x[0-9a-fA-F]{2}.*' OR useragent MATCHES '.*%[0-9a-fA-F]{2}.*')
+    GROUP BY useridentity, eventname, useragent
+    HAVING event_count >= 1
+    ORDER BY event_count DESC
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_elb_hex_encoded_user_agent {
+      meta:
+        author = "TDL"
+        description = "Detects hexadecimal-encoded User-Agent strings in AWS ELB logs - T1132 Collection"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1132"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "AWS ELB"
+        $e.metadata.vendor_name = "AMAZON"
+        re.regex($e.network.http.user_agent, `(?i)(\\x[0-9a-f]{2}|%[0-9a-f]{2}|0x[0-9a-f]{2})`)
+        $e.target.resource.name != ""
+        $e.principal.user.userid = $user_arn
+        $e.target.resource.name = $event_name
+        $e.target.resource.id = $resource_arn
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user_arn, $event_name, $resource_arn over 24h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 65
+        $event_count = count_distinct($e.metadata.id)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: "FROM logs-aws.cloudtrail*\n| WHERE @timestamp > NOW() - 24 hour \n  AND user_agent.original RLIKE \".*(%[0-9A-Fa-f]{2}).*\"\n  AND event.action\
+    \ IS NOT NULL\n  AND event.action != \"\"\n| STATS count = COUNT(*) BY user_agent.original, cloud.account.id, event.action, user.id\n| WHERE\
+    \ count >= 1\n| SORT count DESC\n| KEEP count, user.id, event.action, user_agent.original, cloud.account.id\n"
+  leql: |
+    where(log_source_name="AWS CloudTrail" AND userAgent=/[0-9a-fA-F]{8,}/ AND eventName!="") groupby(userIdentity.arn, eventName, resources{}.ARN) calculate(count)
+  crowdstrike: |
+    #type=aws:elb userAgent=/.*[0-9a-fA-F]{8,}.*/ eventName=*
+    | groupBy([userIdentity.arn, eventName, resources{}.ARN], function=count(as=cnt))
+    | cnt >= 1
+    | sort(cnt, order=desc)
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = ENUM.CLOUD_PROVIDER_AWS and action_type_name != null and action_type_name != ""
+    | filter user_agent ~= "\\x[0-9a-fA-F]{2}"
+    | comp count() as cnt by actor_effective_username, action_type_name, action_resource_name
+    | filter cnt >= 1
+    | sort desc cnt
+    | fields actor_effective_username, action_type_name, action_resource_name, cnt
+  lucene: |
+    sourcetype:"aws:elb" AND userAgent:/.*(%[0-9A-Fa-f]{2}){4,}.*/
+  sumo: |
+    _sourceCategory=*AWS* OR _sourceCategory=*ELB* OR _sourceCategory=*CloudTrail*
+    | json field=_raw "userAgent" as user_agent
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "userIdentity.arn" as user_arn
+    | json field=_raw "resources[0].ARN" as resource_arn
+    | where user_agent matches "*\\x[0-9a-fA-F][0-9a-fA-F]*" and event_name != ""
+    | count as cnt by user_arn, event_name, resource_arn
+    | where cnt >= 1
+    | sort by cnt desc
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -92,7 +114,7 @@ tags:
 - collection
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'

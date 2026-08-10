@@ -16,77 +16,81 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=628 OR EventCode=4724)
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=628 OR EventCode=4724)
+
     | lookup high_value_targets.csv username AS TargetUserName OUTPUT is_hvt
+
     | lookup authorized_account_modifiers.csv username AS SubjectUserName OUTPUT is_authorized
+
     | where is_hvt=1 AND (is_authorized!=1 OR isnull(is_authorized))
+
     | table _time, ComputerName, SubjectUserName, TargetUserName, EventCode
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4724")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4724')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000017 {\n  meta:\n    author = \"TDL\"\n    description = \"HVT Account Password Reset by Unauthorized User\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
-    \n    $e.event_id = /(4724)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (628, 4724)
+    | where TargetAccount in ("Administrator", "Domain Admin", "Enterprise Admin", "Schema Admin", "Backup Operators", "Account Operators", "Server Operators", "Print Operators", "Replicator")
+    | where SubjectUserName !in ("ADAdminUser", "PasswordResetService", "HelpDeskAdmin", "ITSecurityTeam")
+    | project TimeGenerated, Computer, EventID, SubjectUserName, SubjectDomainName, TargetAccount, TargetDomainName, Activity
+  aql: |
+    SELECT eventtime, sourceip, username AS source_user, "Target Username" AS destination_user, LOGSOURCENAME(logsourceid) AS host, qidname(qid)
+    FROM events
+    WHERE "EventID" IN ('628', '4724')
+      AND "Target Username" IN ('administrator', 'admin', 'domain admin', 'enterprise admin', 'schema admin', 'backup operator', 'server operator', 'account operator')
+      AND username NOT IN ('authorized_admin1', 'authorized_admin2', 'IT_Support', 'helpdesk')
+    LAST 24 HOURS
+  yara_l: "rule high_value_target_password_reset_by_unauthorized_user {\n  meta:\n    author = \"TDL\"\n    description = \"Detects password reset\
+    \ events on high value target accounts by unauthorized users\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique =\
+    \ \"T1078\"\n    severity = \"HIGH\"\n\n  events:\n    $e.metadata.event_type = \"USER_CHANGE_PERMISSIONS\"\n    $e.metadata.product_event_type\
+    \ = \"4724\"\n    $e.target.user.userid = $target_user\n    $e.principal.user.userid = $source_user\n    \n    // High Value Target Users\n\
+    \    (\n      $target_user = \"Administrator\" or\n      $target_user = \"Domain Admin\" or\n      $target_user = \"Enterprise Admin\" or\n\
+    \      re.regex($target_user, `(?i).*admin.*`) or\n      re.regex($target_user, `(?i).*svc.*`) or\n      re.regex($target_user, `(?i).*service.*`)\n\
+    \    )\n    \n    // Exclude authorized users\n    not (\n      $source_user = \"HelpDesk\" or\n      $source_user = \"IT-Admin\" or\n   \
+    \   $source_user = \"Password-Reset-Service\" or\n      re.regex($source_user, `(?i)^authorized_.*`)\n    )\n\n  match:\n    $target_user,\
+    \ $source_user over 5m\n\n  outcome:\n    $risk_score = max(85)\n    $target_account = $target_user\n    $reset_by_user = $source_user\n\n\
+    \  condition:\n    $e\n}\n"
+  esql: "FROM logs-system.security*, logs-windows.security*, winlogbeat-*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.code IN (\"628\"\
+    , \"4724\")\n  AND winlog.event_data.TargetUserName IN (\"Administrator\", \"Domain Admins\", \"Enterprise Admins\", \"krbtgt\", \"admin\"\
+    )\n  AND winlog.event_data.SubjectUserName NOT IN (\"SYSTEM\", \"LOCAL SERVICE\", \"NETWORK SERVICE\", \"helpdesk_admin\", \"IT_Support\"\
+    )\n| STATS reset_count = COUNT(*) BY host.name, winlog.event_data.SubjectUserName, winlog.event_data.TargetUserName, @timestamp\n| KEEP @timestamp,\
+    \ host.name, winlog.event_data.SubjectUserName, winlog.event_data.TargetUserName, reset_count\n"
+  leql: |
+    where(source_json.EventID IN [628, 4724] AND destination_user IN ["HighValueUser1", "HighValueUser2", "HighValueUser3"] AND source_user NOT IN ["AuthorizedAdmin1", "AuthorizedAdmin2", "AuthorizedAdmin3"])
+  crowdstrike: "EventCode=4724 \n| TargetUserName in [file=\"hvt_users.txt\"]\n| SubjectUserName not in [file=\"authorized_admins.txt\"]\n| table([@timestamp,\
+    \ ComputerName, SubjectUserName, TargetUserName, EventCode])\n"
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (628, 4724)
+    | filter action_evtlog_event_data_TargetUserName in ("Administrator", "Domain Admins", "Enterprise Admins", "Schema Admins", "Backup Operators")
+    | filter action_evtlog_event_data_SubjectUserName not in ("IT_AdminUser1", "IT_AdminUser2", "ServiceDesk")
+    | fields _time, agent_hostname, action_evtlog_event_data_SubjectUserName, action_evtlog_event_data_TargetUserName, action_evtlog_event_id
+  lucene: |
+    event.code:4724 AND _exists_:destination.user.name AND NOT _exists_:source.user.name
+    ```
 
-    | WHERE @timestamp > NOW() - 1 hour
+    However, if your field mappings use different conventions for the authorized users list filter, you may need:
 
-    | WHERE event.category == "process" AND event_id IN ("4724")
+    ```
+    event.code:4724
+    ```
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+    Note: The "High Value Target User List" and "Users Authorized to Modify User Accounts List" filters are typically implemented as lookup tables or enrichment lists in the SIEM platform (OpenSearch/Graylog/Exabeam) rather than within the Lucene query string itself. The query string filters to the event type, and the exclusion logic is applied via the platform's correlation rules or alert conditions referencing those lists.
 
-    | SORT count DESC
+    If you need the query to explicitly reference user fields as they appear in your logs:
 
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4724])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4724)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4724")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4724)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4724")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+    ```
+    event.code:4724 AND _exists_:winlog.event_data.TargetUserName
+  sumo: |
+    _sourceCategory=*Windows*Security* ("628" OR "4724")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetUserName" as target_user
+    | json field=_raw "SubjectUserName" as source_user
+    | where event_id in ("628", "4724")
+    | where target_user in ("Administrator", "Domain Admin", "Enterprise Admin", "krbtgt", "admin")
+    | where !(source_user in ("svc_admin", "helpdesk", "IT_Admin", "service_account"))
+    | fields _messageTime, _sourceHost, event_id, source_user, target_user
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -96,7 +100,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows Password Reset Event\nWhere the Event ID is in [628, 4724] \nWhere the Destination Username is in the High Value Target\
   \ User List\nWhere the Source Username is NOT in the Users Authorized to Modify User Accounts List"

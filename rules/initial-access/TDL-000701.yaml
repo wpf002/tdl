@@ -21,78 +21,185 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=cloud* OR index=saas* (sourcetype=aws:cloudtrail OR sourcetype=azure:aad:signin OR sourcetype=gcp:audit OR sourcetype=okta)
+  spl: 'index=cloud* OR index=saas* (sourcetype=aws:cloudtrail OR sourcetype=azure:aad:signin OR sourcetype=gcp:audit OR sourcetype=okta)
+
     (eventName=ConsoleLogin OR eventName="Sign-in activity" OR protoPayload.methodName="google.login.LoginService.loginSuccess" OR eventType="user.session.start")
+
     outcome=success OR responseElements.ConsoleLogin=Success OR status.errorCode=null OR outcome.result=SUCCESS
-    | eval identity_provider=coalesce(responseElements.SamlProviderArn, additionalDetails.federationProtocol, requestContext.identity.identityProvider, actor.alternateId, authentication_method)
+
+    | eval identity_provider=coalesce(responseElements.SamlProviderArn, additionalDetails.federationProtocol, requestContext.identity.identityProvider,
+    actor.alternateId, authentication_method)
+
     | eval partner_tenant=coalesce(userIdentity.principalOrgID, tenantId, actor.alternateId, client.userAgent)
+
     | search identity_provider=* OR partner_tenant=*
-    | search NOT (identity_provider IN ("arn:aws:iam::123456789012:saml-provider/ApprovedIdP", "https://approvedidp.okta.com", "ApprovedAzureADTenant", "approved-gcp-domain.com"))
+
+    | search NOT (identity_provider IN ("arn:aws:iam::123456789012:saml-provider/ApprovedIdP", "https://approvedidp.okta.com", "ApprovedAzureADTenant",
+    "approved-gcp-domain.com"))
+
     | search NOT (partner_tenant IN ("o-approved123", "00000000-0000-0000-0000-000000000000", "approved-partner-tenant"))
+
     | table _time, user, src, identity_provider, partner_tenant, eventName, sourceIPAddress, userAgent
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000701 {\n  meta:\n    author = \"TDL\"\n    description = \"Federated Trust Login from Third-Party Tenant\"\n  \
-    \  severity = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1199\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    let TrustedTenantIds = dynamic(["tenant-id-1", "tenant-id-2", "tenant-id-3"]);
+    let TrustedIssuers = dynamic(["https://sts.windows.net/trusted-tenant-1/", "https://sts.windows.net/trusted-tenant-2/"]);
+    let TrustedOktaDomains = dynamic(["company.okta.com", "partner1.okta.com"]);
+    union isfuzzy=true
+    (SigninLogs
+    | where TimeGenerated > ago(24h)
+    | where ResultType == 0
+    | where HomeTenantId != ResourceTenantId or isnotempty(CrossTenantAccessType)
+    | where HomeTenantId !in (TrustedTenantIds)
+    | extend ExternalTenantId = HomeTenantId
+    | extend TrustType = CrossTenantAccessType
+    | project TimeGenerated, UserPrincipalName, IPAddress, Location, AppDisplayName, ExternalTenantId, TrustType, ResourceDisplayName, ResourceTenantId),
+    (AADNonInteractiveUserSignInLogs
+    | where TimeGenerated > ago(24h)
+    | where ResultType == 0
+    | where HomeTenantId != ResourceTenantId or isnotempty(CrossTenantAccessType)
+    | where HomeTenantId !in (TrustedTenantIds)
+    | extend ExternalTenantId = HomeTenantId
+    | extend TrustType = CrossTenantAccessType
+    | project TimeGenerated, UserPrincipalName, IPAddress, Location, AppDisplayName, ExternalTenantId, TrustType, ResourceDisplayName, ResourceTenantId),
+    (AWSCloudTrail
+    | where TimeGenerated > ago(24h)
+    | where EventName in ("ConsoleLogin", "AssumeRole", "AssumeRoleWithSAML", "AssumeRoleWithWebIdentity")
+    | where ErrorCode == ""
+    | extend IdpArn = tostring(parse_json(RequestParameters).principalArn)
+    | extend SamlIssuer = tostring(parse_json(RequestParameters).issuer)
+    | where isnotempty(IdpArn) or isnotempty(SamlIssuer)
+    | where SamlIssuer !in (TrustedIssuers)
+    | project TimeGenerated, UserIdentityPrincipalid, SourceIpAddress, EventName, IdpArn, SamlIssuer, UserAgent),
+    (GCPAuditLogs
+    | where TimeGenerated > ago(24h)
+    | where ServiceName == "login.googleapis.com"
+    | where MethodName has_any ("Login", "google.login")
+    | extend IdpEntityId = tostring(parse_json(AuthenticationInfo).thirdPartyPrincipal.thirdPartyIdpEntityId)
+    | where isnotempty(IdpEntityId)
+    | where IdpEntityId !in (TrustedIssuers)
+    | project TimeGenerated, PrincipalEmail, CallerIp, MethodName, IdpEntityId),
+    (Okta_CL
+    | where TimeGenerated > ago(24h)
+    | where eventType_s == "user.session.start" and outcome_result_s == "SUCCESS"
+    | extend IdpDomain = tostring(parse_json(authenticationContext_s).externalIdp.domain)
+    | where isnotempty(IdpDomain)
+    | where IdpDomain !in (TrustedOktaDomains)
+    | project TimeGenerated, actor_alternateId_s, client_ipAddress_s, eventType_s, IdpDomain, client_userAgent_originalUserAgent_s)
+    | extend SourceIP = coalesce(IPAddress, SourceIpAddress, CallerIp, client_ipAddress_s)
+    | extend UserIdentity = coalesce(UserPrincipalName, UserIdentityPrincipalid, PrincipalEmail, actor_alternateId_s)
+    | extend ExternalIdentityProvider = coalesce(ExternalTenantId, SamlIssuer, IdpArn, IdpEntityId, IdpDomain)
+    | project TimeGenerated, UserIdentity, SourceIP, Location, ExternalIdentityProvider, TrustType, AppDisplayName, EventName, MethodName, ResourceDisplayName
+  aql: |
+    SELECT username, sourceip, "Identity Provider", "Tenant ID", "Login Type", LOGSOURCENAME(logsourceid) AS source, COUNT(*) AS login_count
+    FROM events
+    WHERE (categoryname(category) ILIKE '%authentication%' OR categoryname(category) ILIKE '%sign%in%' OR categoryname(category) ILIKE '%logon%')
+      AND ("Login Type" ILIKE '%federated%' OR "Login Type" ILIKE '%saml%' OR "Login Type" ILIKE '%external%' OR "Authentication Method" ILIKE '%federated%' OR "Identity Provider" IS NOT NULL)
+      AND ("Login Result" = 'success' OR "Event Outcome" = 'success' OR qidname(qid) ILIKE '%success%')
+      AND ("Identity Provider" NOT IN ('approved-idp-1.com', 'approved-idp-2.com', 'approved-partner.com') OR "Tenant ID" NOT IN ('approved-tenant-id-1', 'approved-tenant-id-2'))
+      AND "Identity Provider" IS NOT NULL
+    GROUP BY username, sourceip, "Identity Provider", "Tenant ID", "Login Type", LOGSOURCENAME(logsourceid)
+    LAST 1 HOURS
+  yara_l: |
+    rule trusted_relationship_abuse_t1199 {
+      meta:
+        author = "TDL"
+        description = "Detects successful logins from untrusted external IdP or partner tenants - T1199 Trusted Relationship"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1199"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.security_result.action = "ALLOW"
+        (
+          $e.metadata.product_name = "AWS CloudTrail" or
+          $e.metadata.product_name = "AZURE" or
+          $e.metadata.product_name = "GCP" or
+          $e.metadata.product_name = "Okta" or
+          re.regex($e.metadata.product_name, `(?i)saas`)
+        )
+        (
+          $e.security_result.summary != "" or
+          $e.target.user.attribute.labels.value != ""
+        )
+        not (
+          re.regex($e.security_result.summary, `(?i)(trusted|approved|authorized)`) or
+          re.regex($e.target.user.attribute.labels.value, `(?i)(internal|corp|trusted)`) or
+          re.regex($e.principal.ip, `^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)`)
+        )
+        (
+          re.regex($e.security_result.summary, `(?i)(external|partner|federated|idp|sso|saml)`) or
+          re.regex($e.target.user.attribute.labels.value, `(?i)(external|partner|federated|guest)`) or
+          $e.target.user.userid != $e.principal.user.userid
+        )
+        $e.target.user.userid = $user
+        $e.principal.ip = $ip
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user, $ip over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-okta*, logs-azure*, logs-gcp*, logs-aws*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND event.action IN ("user.session.start", "UserLoggedIn", "ConsoleLogin", "google.login.login")
+      AND event.outcome == "success"
+      AND (
+        okta.authentication_context.external_session_id IS NOT NULL
+        OR azure.signinlogs.properties.crossTenantAccessType == "b2bCollaboration"
+        OR azure.signinlogs.properties.crossTenantAccessType == "b2bDirectConnect"
+        OR event.provider == "signin.amazonaws.com" AND cloud.account.id != user.target.domain
+        OR gcp.audit.method_name LIKE "*google.accounts.Login*" AND user.domain NOT IN ("*")
+      )
+    | EVAL trusted_domains = ["trusted-partner1.com", "trusted-partner2.com", "approved-msp.com"]
+    | WHERE NOT (
+        user.domain IN (trusted_domains)
+        OR okta.authentication_context.issuer.domain IN (trusted_domains)
+        OR azure.signinlogs.properties.homeTenantId IN ("00000000-0000-0000-0000-000000000000")
+      )
+    | STATS login_count = COUNT(*) BY user.email, user.name, source.ip, user.domain, cloud.provider, event.action
+    | KEEP @timestamp, user.email, user.name, source.ip, user.domain, cloud.provider, event.action, login_count
+  leql: |
+    where(result=SUCCESS AND (source_json.eventName ICONTAINS "ConsoleLogin" OR source_json.eventName ICONTAINS "AssumeRole" OR source_json.eventName="UserAuthentication" OR source_json.eventType="user.session.start") AND (source_json.userIdentity.type="FederatedUser" OR source_json.userIdentity.type="AssumedRole" OR source_json.actor.alternateId ICONTAINS "saml" OR source_json.actor.alternateId ICONTAINS "oidc" OR source_json.authenticationDetails.authenticationProvider!="" OR source_json.idpEntityId!="" OR source_json.identityProviderType!="")) groupby(source_json.identityProviderType, source_json.idpEntityId, source_json.authenticationDetails.authenticationProvider, source_json.userIdentity.principalId, user, source_address) calculate(count)
+  crowdstrike: "(event_simpleName=UserLogon OR event_simpleName=SamlAssertion OR event.action=user.session.start OR event.action=user.authentication.sso\
+    \ OR eventName=ConsoleLogin OR event.action=Login OR event_simpleName=AzureActiveDirectorySignInLogs)\n(\n  (eventSource=signin.amazonaws.com\
+    \ responseElements.ConsoleLogin=Success) OR\n  (event.action=user.session.start event.outcome=success) OR\n  (event.action=user.authentication.sso\
+    \ event.outcome=success) OR\n  (event_simpleName=AzureActiveDirectorySignInLogs ResultType=0) OR\n  (event.action=Login LoginStatus=LOGIN_SUCCESS)\n\
+    )\n(\n  IdentityProviderArn=* OR \n  idp.name=* OR \n  idp_id=* OR \n  issuer=* OR \n  CrossTenantAccessType=b2bCollaboration OR\n  CrossTenantAccessType=b2bDirectConnect\
+    \ OR\n  externalId=* OR\n  partnerTenantId=*\n)\nNOT (\n  IdentityProviderArn=/^arn:aws:iam::(123456789012|987654321098):saml-provider\\/(ApprovedIDP|TrustedPartner)$/\
+    \ OR\n  idp.name IN [ApprovedOkta, TrustedPingFederate, CorporateAzureAD] OR\n  issuer IN [https://sts.windows.net/approved-tenant-id/, https://accounts.google.com/approved-workspace]\
+    \ OR\n  partnerTenantId IN [11111111-1111-1111-1111-111111111111, 22222222-2222-2222-2222-222222222222]\n)\n| groupBy([userIdentity.principalId,\
+    \ userName, user.email, idp.name, IdentityProviderArn, issuer, partnerTenantId, sourceIPAddress], function=count(as=logins))\n| table([@timestamp,\
+    \ userIdentity.principalId, userName, user.email, idp.name, IdentityProviderArn, issuer, partnerTenantId, sourceIPAddress, logins])\n"
+  xql: "dataset = cloud_audit_logs\n| filter outcome = \"success\" \n  and (event_type contains \"login\" or event_type contains \"signin\" or\
+    \ event_type contains \"authentication\" or event_type contains \"console\" or event_type contains \"api\")\n  and (identity_orig_identity_type\
+    \ contains \"federated\" or identity_orig_identity_type contains \"external\" or identity_orig_identity_type contains \"partner\" or actor_user_agent\
+    \ contains \"SAML\" or actor_user_agent contains \"federation\" or event_type contains \"federated\" or event_type contains \"saml\")\n| alter\
+    \ idp_domain = arrayindex(regextract(identity_name, \"@([^@]+)$\"), 0)\n| filter idp_domain not in (\"approved-partner1.com\", \"approved-partner2.com\"\
+    , \"trustedmsp.com\", \"internal-domain.com\")\n| fields _time, cloud_provider, identity_name, idp_domain, identity_orig_identity_type, source_ip_address,\
+    \ actor_user_agent, resource_type, operation, outcome\n"
+  lucene: |
+    (event.action:("user.session.start" OR "ConsoleLogin" OR "signin" OR "UserLoggedIn") OR event.category:"authentication" AND event.outcome:"success") AND (event.provider:("SAML" OR "OIDC" OR "Federation" OR "ExternalIdentityProvider") OR authentication.method:("federated" OR "saml" OR "oidc" OR "external")) AND NOT (source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) OR idp.name:("ApprovedPartner1" OR "ApprovedPartner2" OR "CorporateSSO") OR federation.issuer:("https://sts.windows.net/trusted-tenant-id/" OR "https://accounts.google.com/trusted-workspace"))
+  sumo: "_sourceCategory=*audit* OR _sourceCategory=*cloudtrail* OR _sourceCategory=*azure* OR _sourceCategory=*gcp* OR _sourceCategory=*okta*\n\
+    | json field=_raw \"eventName\" as event_name\n| json field=_raw \"userIdentity.type\" as user_type\n| json field=_raw \"userIdentity.principalId\"\
+    \ as principal_id\n| json field=_raw \"eventType\" as event_type\n| json field=_raw \"outcome.result\" as outcome\n| json field=_raw \"actor.alternateId\"\
+    \ as actor_email\n| json field=_raw \"authentication.externalSessionId\" as external_session\n| json field=_raw \"debugContext.debugData.requestUri\"\
+    \ as request_uri\n| json field=_raw \"authenticationContext.externalSessionId\" as okta_external_session\n| json field=_raw \"actor.displayName\"\
+    \ as actor_name\n| json field=_raw \"authenticationDetails.authenticationProvider\" as auth_provider\n| json field=_raw \"identity.providerType\"\
+    \ as provider_type\n| where (event_name = \"ConsoleLogin\" OR event_name = \"AssumeRoleWithSAML\" OR event_name = \"AssumeRoleWithWebIdentity\"\
+    \ OR event_type = \"user.session.start\" OR event_name = \"Interactive Login\" OR event_name matches \"*login*\" OR event_name matches \"\
+    *signin*\") \n| where (outcome = \"SUCCESS\" OR outcome = \"success\" OR event_name matches \"*Success*\" OR outcome is null)\n| where (external_session\
+    \ is not null OR okta_external_session is not null OR auth_provider is not null OR provider_type matches \"*Federated*\" OR provider_type\
+    \ matches \"*External*\" OR user_type = \"FederatedUser\" OR user_type = \"AssumedRole\")\n| where !(auth_provider matches \"*corporate.com*\"\
+    \ OR auth_provider matches \"*approved-idp.com*\" OR provider_type matches \"*AzureAD*\" OR principal_id matches \"*@trusted-partner.com*\"\
+    )\n| fields _messageTime, _sourceHost, event_name, principal_id, actor_email, actor_name, auth_provider, provider_type, user_type, external_session\n"
 pseudo_logic: Successful console/API login originates from an external IdP or partner tenant outside the approved trust list. Adversaries pivot
   through compromised MSPs and partners.
 false_positives:
@@ -111,7 +218,7 @@ references:
 - https://attack.mitre.org/techniques/T1199/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

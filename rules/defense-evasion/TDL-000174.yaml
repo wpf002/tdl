@@ -17,74 +17,117 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=windows EventCode=4688 NewProcessName="*.exe" (NewProcessName="*C:\\PerfLogs\\*" OR NewProcessName="*C:\\$Recycle.bin\\*" OR NewProcessName="*C:\\Intel\\Logs\\*" OR NewProcessName="*C:\\Users\\Default\\*" OR NewProcessName="*C:\\Users\\Public\\*" OR NewProcessName="*C:\\Users\\NetworkService\\*" OR NewProcessName="*C:\\Windows\\Fonts\\*" OR NewProcessName="*C:\\Windows\\Debug\\*" OR NewProcessName="*C:\\Windows\\Media\\*" OR NewProcessName="*C:\\Windows\\Help\\*" OR NewProcessName="*C:\\Windows\\addins\\*" OR NewProcessName="*C:\\Windows\\repair\\*" OR NewProcessName="*C:\\Windows\\security\\*" OR NewProcessName="*\\RSA\\MachineKeys\\*" OR NewProcessName="*C:\\Windows\\system32\\config\\systemprofile\\*")
+  spl: 'index=windows EventCode=4688 NewProcessName="*.exe" (NewProcessName="*C:\\PerfLogs\\*" OR NewProcessName="*C:\\$Recycle.bin\\*" OR NewProcessName="*C:\\Intel\\Logs\\*"
+    OR NewProcessName="*C:\\Users\\Default\\*" OR NewProcessName="*C:\\Users\\Public\\*" OR NewProcessName="*C:\\Users\\NetworkService\\*" OR
+    NewProcessName="*C:\\Windows\\Fonts\\*" OR NewProcessName="*C:\\Windows\\Debug\\*" OR NewProcessName="*C:\\Windows\\Media\\*" OR NewProcessName="*C:\\Windows\\Help\\*"
+    OR NewProcessName="*C:\\Windows\\addins\\*" OR NewProcessName="*C:\\Windows\\repair\\*" OR NewProcessName="*C:\\Windows\\security\\*" OR NewProcessName="*\\RSA\\MachineKeys\\*"
+    OR NewProcessName="*C:\\Windows\\system32\\config\\systemprofile\\*")
+
     | table _time, ComputerName, NewProcessName, CommandLine, SubjectUserName, ParentProcessName
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4688")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000174 {\n  meta:\n    author = \"TDL\"\n    description = \"Executables Started in Suspicious Folder\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1564\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id\
-    \ = /(4688)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where Process endswith ".exe"
+    | where NewProcessName has_any ("C:\\PerfLogs\\", "C:\\$Recycle.bin\\", "C:\\Intel\\Logs\\", "C:\\Users\\Default\\", "C:\\Users\\Public\\", "C:\\Users\\NetworkService\\", "C:\\Windows\\Fonts\\", "C:\\Windows\\Debug\\", "C:\\Windows\\Media\\", "C:\\Windows\\Help\\", "C:\\Windows\\addins\\", "C:\\Windows\\repair\\", "C:\\Windows\\security\\", "\\RSA\\MachineKeys\\", "C:\\Windows\\system32\\config\\systemprofile\\")
+    | project TimeGenerated, Computer, Account, Process, NewProcessName, CommandLine, ParentProcessName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Parent Process Name"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Process Name" ILIKE '%.exe'
+      AND ("Process Name" ILIKE '%C:\PerfLogs\%'
+           OR "Process Name" ILIKE '%C:\$Recycle.bin\%'
+           OR "Process Name" ILIKE '%C:\Intel\Logs\%'
+           OR "Process Name" ILIKE '%C:\Users\Default\%'
+           OR "Process Name" ILIKE '%C:\Users\Public\%'
+           OR "Process Name" ILIKE '%C:\Users\NetworkService\%'
+           OR "Process Name" ILIKE '%C:\Windows\Fonts\%'
+           OR "Process Name" ILIKE '%C:\Windows\Debug\%'
+           OR "Process Name" ILIKE '%C:\Windows\Media\%'
+           OR "Process Name" ILIKE '%C:\Windows\Help\%'
+           OR "Process Name" ILIKE '%C:\Windows\addins\%'
+           OR "Process Name" ILIKE '%C:\Windows\repair\%'
+           OR "Process Name" ILIKE '%C:\Windows\security\%'
+           OR "Process Name" ILIKE '%\RSA\MachineKeys\%'
+           OR "Process Name" ILIKE '%C:\Windows\system32\config\systemprofile\%')
+    LAST 24 HOURS
+  yara_l: |
+    rule process_execution_unusual_directories {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects process execution from unusual or hidden directories - T1564 Defense Evasion"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1564"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688"
+        )
+        re.regex($e.target.process.file.full_path, `(?i)\.exe$`)
+        (
+          re.regex($e.target.process.file.full_path, `(?i)C:\\PerfLogs\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\\$Recycle\.bin\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\Intel\\Logs\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\Users\\Default\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\Users\\Public\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\Users\\NetworkService\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\Windows\\Fonts\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\Windows\\Debug\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\Windows\\Media\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\Windows\\Help\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\Windows\\addins\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\Windows\\repair\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\Windows\\security\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)\\RSA\\MachineKeys\\`) or
+          re.regex($e.target.process.file.full_path, `(?i)C:\\Windows\\system32\\config\\systemprofile\\`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND event_id IN ("4688")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4688])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4688)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4688")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4688)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4688")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-system.security*, winlogbeat-*\n| WHERE event.code IN (\"592\", \"4688\") \n  AND process.name LIKE \"*.exe\"\n  AND (process.executable\
+    \ LIKE \"*C:\\\\PerfLogs\\\\*\" \n    OR process.executable LIKE \"*C:\\\\$Recycle.bin\\\\*\"\n    OR process.executable LIKE \"*C:\\\\Intel\\\
+    \\Logs\\\\*\"\n    OR process.executable LIKE \"*C:\\\\Users\\\\Default\\\\*\"\n    OR process.executable LIKE \"*C:\\\\Users\\\\Public\\\\\
+    *\"\n    OR process.executable LIKE \"*C:\\\\Users\\\\NetworkService\\\\*\"\n    OR process.executable LIKE \"*C:\\\\Windows\\\\Fonts\\\\\
+    *\"\n    OR process.executable LIKE \"*C:\\\\Windows\\\\Debug\\\\*\"\n    OR process.executable LIKE \"*C:\\\\Windows\\\\Media\\\\*\"\n  \
+    \  OR process.executable LIKE \"*C:\\\\Windows\\\\Help\\\\*\"\n    OR process.executable LIKE \"*C:\\\\Windows\\\\addins\\\\*\"\n    OR process.executable\
+    \ LIKE \"*C:\\\\Windows\\\\repair\\\\*\"\n    OR process.executable LIKE \"*C:\\\\Windows\\\\security\\\\*\"\n    OR process.executable LIKE\
+    \ \"*\\\\RSA\\\\MachineKeys\\\\*\"\n    OR process.executable LIKE \"*C:\\\\Windows\\\\system32\\\\config\\\\systemprofile\\\\*\")\n| KEEP\
+    \ @timestamp, host.name, user.name, process.name, process.executable, process.command_line, process.parent.name\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND process_name ENDS-WITH ".exe" AND (process_cmd_line ICONTAINS "C:\PerfLogs\" OR process_cmd_line ICONTAINS "C:\$Recycle.bin\" OR process_cmd_line ICONTAINS "C:\Intel\Logs\" OR process_cmd_line ICONTAINS "C:\Users\Default\" OR process_cmd_line ICONTAINS "C:\Users\Public\" OR process_cmd_line ICONTAINS "C:\Users\NetworkService\" OR process_cmd_line ICONTAINS "C:\Windows\Fonts\" OR process_cmd_line ICONTAINS "C:\Windows\Debug\" OR process_cmd_line ICONTAINS "C:\Windows\Media\" OR process_cmd_line ICONTAINS "C:\Windows\Help\" OR process_cmd_line ICONTAINS "C:\Windows\addins\" OR process_cmd_line ICONTAINS "C:\Windows\repair\" OR process_cmd_line ICONTAINS "C:\Windows\security\" OR process_cmd_line ICONTAINS "\RSA\MachineKeys\" OR process_cmd_line ICONTAINS "C:\Windows\system32\config\systemprofile\"))
+  crowdstrike: |
+    EventCode=4688 ImageFileName=*.exe (NewProcessName=*C:\PerfLogs\* OR NewProcessName=*C:\$Recycle.bin\* OR NewProcessName=*C:\Intel\Logs\* OR NewProcessName=*C:\Users\Default\* OR NewProcessName=*C:\Users\Public\* OR NewProcessName=*C:\Users\NetworkService\* OR NewProcessName=*C:\Windows\Fonts\* OR NewProcessName=*C:\Windows\Debug\* OR NewProcessName=*C:\Windows\Media\* OR NewProcessName=*C:\Windows\Help\* OR NewProcessName=*C:\Windows\addins\* OR NewProcessName=*C:\Windows\repair\* OR NewProcessName=*C:\Windows\security\* OR NewProcessName=*\RSA\MachineKeys\* OR NewProcessName=*C:\Windows\system32\config\systemprofile\*) | table([@timestamp, ComputerName, SubjectUserName, NewProcessName, CommandLine, ParentProcessName])
+  xql: "dataset = xdr_data\n| filter action_evtlog_event_id in (592, 4688)\n| filter action_process_image_name ~= \".*\\\\.exe$\"\n| filter action_process_image_path\
+    \ contains \"C:\\\\PerfLogs\\\\\" \n    or action_process_image_path contains \"C:\\\\$Recycle.bin\\\\\" \n    or action_process_image_path\
+    \ contains \"C:\\\\Intel\\\\Logs\\\\\" \n    or action_process_image_path contains \"C:\\\\Users\\\\Default\\\\\" \n    or action_process_image_path\
+    \ contains \"C:\\\\Users\\\\Public\\\\\" \n    or action_process_image_path contains \"C:\\\\Users\\\\NetworkService\\\\\" \n    or action_process_image_path\
+    \ contains \"C:\\\\Windows\\\\Fonts\\\\\" \n    or action_process_image_path contains \"C:\\\\Windows\\\\Debug\\\\\" \n    or action_process_image_path\
+    \ contains \"C:\\\\Windows\\\\Media\\\\\" \n    or action_process_image_path contains \"C:\\\\Windows\\\\Help\\\\\" \n    or action_process_image_path\
+    \ contains \"C:\\\\Windows\\\\addins\\\\\" \n    or action_process_image_path contains \"C:\\\\Windows\\\\repair\\\\\" \n    or action_process_image_path\
+    \ contains \"C:\\\\Windows\\\\security\\\\\" \n    or action_process_image_path contains \"\\\\RSA\\\\MachineKeys\\\\\" \n    or action_process_image_path\
+    \ contains \"C:\\\\Windows\\\\system32\\\\config\\\\systemprofile\\\\\"\n| fields _time, agent_hostname, actor_effective_username, action_process_image_name,\
+    \ action_process_image_path, action_process_image_command_line\n"
+  lucene: |
+    event.code:(592 OR 4688) AND process.name:*.exe AND process.executable:(*\\PerfLogs\\* OR *\\$Recycle.bin\\* OR *\\Intel\\Logs\\* OR *\\Users\\Default\\* OR *\\Users\\Public\\* OR *\\Users\\NetworkService\\* OR *\\Windows\\Fonts\\* OR *\\Windows\\Debug\\* OR *\\Windows\\Media\\* OR *\\Windows\\Help\\* OR *\\Windows\\addins\\* OR *\\Windows\\repair\\* OR *\\Windows\\security\\* OR *\\RSA\\MachineKeys\\* OR *\\Windows\\system32\\config\\systemprofile\\*)
+  sumo: |
+    _sourceCategory=*Windows* "4688"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_path
+    | where event_id in ("592", "4688")
+    | where process_path matches "*.exe"
+    | where process_path matches "*C:\\PerfLogs\\*" or process_path matches "*C:\\$Recycle.bin\\*" or process_path matches "*C:\\Intel\\Logs\\*" or process_path matches "*C:\\Users\\Default\\*" or process_path matches "*C:\\Users\\Public\\*" or process_path matches "*C:\\Users\\NetworkService\\*" or process_path matches "*C:\\Windows\\Fonts\\*" or process_path matches "*C:\\Windows\\Debug\\*" or process_path matches "*C:\\Windows\\Media\\*" or process_path matches "*C:\\Windows\\Help\\*" or process_path matches "*C:\\Windows\\addins\\*" or process_path matches "*C:\\Windows\\repair\\*" or process_path matches "*C:\\Windows\\security\\*" or process_path matches "*\\RSA\\MachineKeys\\*" or process_path matches "*C:\\Windows\\system32\\config\\systemprofile\\*"
+    | fields _messageTime, _sourceHost, event_id, process_path
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +137,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name ends with \".exe\"\nWhere the\
   \ Process Path contains: [C:\\PerfLogs\\, C:\\$Recycle.bin\\, C:\\Intel\\Logs\\, C:\\Users\\Default\\, C:\\Users\\Public\\, C:\\Users\\NetworkService\\\

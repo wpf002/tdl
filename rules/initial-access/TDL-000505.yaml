@@ -18,82 +18,173 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    (index=* (sourcetype=waf OR sourcetype="web_application_firewall" OR sourcetype=ids OR sourcetype=ips OR sourcetype=snort OR sourcetype=suricata) (action=allowed OR signature="*traversal*" OR signature="*lfi*"))
+  spl: '(index=* (sourcetype=waf OR sourcetype="web_application_firewall" OR sourcetype=ids OR sourcetype=ips OR sourcetype=snort OR sourcetype=suricata)
+    (action=allowed OR signature="*traversal*" OR signature="*lfi*"))
+
     OR
-    (index=* (sourcetype=access_combined OR sourcetype=access_* OR sourcetype=nginx:plus:access OR sourcetype=apache:access OR sourcetype=iis OR sourcetype="reverse_proxy") (uri="*../*" OR uri="*\\..\\..*" OR uri="*..../*" OR uri="*\"\"\"\"*" OR uri="*<<*" OR uri="*><*" OR uri="*./././*" OR uri="*\\\\*" OR uri="*\\\\.\\*" OR uri="*/%c0%ae%c0%ae/*" OR uri="*@fs/*" OR uri="*file:/*" OR uri="*file%3a/*") status!=4* status!=5*)
+
+    (index=* (sourcetype=access_combined OR sourcetype=access_* OR sourcetype=nginx:plus:access OR sourcetype=apache:access OR sourcetype=iis
+    OR sourcetype="reverse_proxy") (uri="*../*" OR uri="*\\..\\..*" OR uri="*..../*" OR uri="*\"\"\"\"*" OR uri="*<<*" OR uri="*><*" OR uri="*./././*"
+    OR uri="*\\\\*" OR uri="*\\\\.\\*" OR uri="*/%c0%ae%c0%ae/*" OR uri="*@fs/*" OR uri="*file:/*" OR uri="*file%3a/*") status!=4* status!=5*)
+
     | table _time, src_ip, dest_ip, uri, status, action, signature, sourcetype, host
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: "let WAFEvents = \n    AzureDiagnostics\n    | where TimeGenerated > ago(1h)\n    | where Category == \"ApplicationGatewayFirewallLog\"\
+    \ or ResourceType == \"APPLICATIONGATEWAYS\"\n    | where action_s == \"Allowed\" or Message has \"traversal\" or Message has \"lfi\"\n  \
+    \  | extend EventType = \"WAF\", SourceIP = clientIp_s, URI = requestUri_s, Action = action_s, Signature = Message\n    | project TimeGenerated,\
+    \ EventType, SourceIP, URI, Action, Signature, Computer = hostname_s;\nlet ProxyWebserverEvents =\n    union isfuzzy=true\n        (W3CIISLog\n\
+    \        | where TimeGenerated > ago(1h)\n        | extend csUriStem_lower = tolower(csUriStem), csUriQuery_lower = tolower(csUriQuery)\n\
+    \        | where (csUriStem_lower has \"../\" or csUriQuery_lower has \"../\")\n            or (csUriStem_lower has \"\\\\..\\\\\" or csUriQuery_lower\
+    \ has \"\\\\..\\\\\")\n            or (csUriStem_lower has \"..../\" or csUriQuery_lower has \"../..\")\n            or (csUriStem_lower has\
+    \ \"\\\"\\\"\\\"\\\"\" or csUriQuery_lower has \"\\\"\\\"\\\"\\\"\")\n            or (csUriStem_lower has \"<<\" or csUriQuery_lower has \"\
+    <<\")\n            or (csUriStem_lower has \"><\" or csUriQuery_lower has \"><\")\n            or (csUriStem_lower has \"./././\" or csUriQuery_lower\
+    \ has \"./././\")\n            or (csUriStem_lower has \"\\\\\\\\\" or csUriQuery_lower has \"\\\\\\\\\")\n            or (csUriStem_lower\
+    \ has \"\\\\\\\\.\\\\\" or csUriQuery_lower has \"\\\\\\\\.\\\\\")\n            or (csUriStem_lower has \"/%c0%ae%c0%ae/\" or csUriQuery_lower\
+    \ has \"/%c0%ae%c0%ae/\")\n            or (csUriStem_lower has \"@fs/\" or csUriQuery_lower has \"@fs/\")\n            or (csUriStem_lower\
+    \ has \"file:/\" or csUriQuery_lower has \"file:/\")\n            or (csUriStem_lower has \"file%3a/\" or csUriQuery_lower has \"file%3a/\"\
+    )\n        | where scStatus !startswith \"4\" and scStatus !startswith \"5\"\n        | extend EventType = \"IIS\", SourceIP = cIP, URI =\
+    \ strcat(csUriStem, csUriQuery), ResponseCode = scStatus\n        | project TimeGenerated, EventType, SourceIP, URI, ResponseCode, Computer\
+    \ = Computer),\n        (CommonSecurityLog\n        | where TimeGenerated > ago(1h)\n        | where DeviceVendor in (\"Palo Alto Networks\"\
+    ,\"Fortinet\",\"Cisco\",\"F5\") or DeviceProduct has_any (\"ASA\",\"Firepower\",\"FortiGate\",\"BIG-IP\")\n        | extend RequestURL_lower\
+    \ = tolower(RequestURL)\n        | where RequestURL_lower has \"../\"\n            or RequestURL_lower has \"\\\\..\\\\\"\n            or\
+    \ RequestURL_lower has \"..../\"\n            or RequestURL_lower has \"\\\"\\\"\\\"\\\"\"\n            or RequestURL_lower has \"<<\"\n \
+    \           or RequestURL_lower has \"><\"\n            or RequestURL_lower has \"./././\"\n            or RequestURL_lower has \"\\\\\\\\\
+    \"\n            or RequestURL_lower has \"\\\\\\\\.\\\\\"\n            or RequestURL_lower has \"/%c0%ae%c0%ae/\"\n            or RequestURL_lower\
+    \ has \"@fs/\"\n            or RequestURL_lower has \"file:/\"\n            or RequestURL_lower has \"file%3a/\"\n        | where toint(EventOutcome)\
+    \ !startswith \"4\" and toint(EventOutcome) !startswith \"5\"\n        | extend EventType = \"Proxy\", SourceIP = SourceIP, URI = RequestURL,\
+    \ ResponseCode = EventOutcome\n        | project TimeGenerated, EventType, SourceIP, URI, ResponseCode, Computer = Computer)\n    | project\
+    \ TimeGenerated, EventType, SourceIP, URI, ResponseCode, Computer;\nunion WAFEvents, ProxyWebserverEvents\n| project TimeGenerated, EventType,\
+    \ SourceIP, URI, Action, Signature, ResponseCode, Computer\n| sort by TimeGenerated desc\n"
+  aql: |
+    SELECT sourceip, destinationip, username, "URL" AS uri, "HTTP Response Code" AS response_code, qidname(qid) AS signature, CATEGORYNAME(category) AS event_category, LOGSOURCENAME(logsourceid) AS log_source, COUNT(*) AS event_count
+    FROM events
+    WHERE (
+        (CATEGORYNAME(category) ILIKE '%firewall%' AND CATEGORYNAME(category) ILIKE '%web%' AND "Action" = 'Allowed')
+        OR
+        (CATEGORYNAME(category) ILIKE '%firewall%' AND CATEGORYNAME(category) ILIKE '%web%' AND (qidname(qid) ILIKE '%traversal%' OR qidname(qid) ILIKE '%lfi%'))
+        OR
+        (
+            (CATEGORYNAME(category) ILIKE '%proxy%' OR CATEGORYNAME(category) ILIKE '%web%server%' OR CATEGORYNAME(category) ILIKE '%http%')
+            AND (
+                "URL" LIKE '%../%'
+                OR "URL" LIKE '%\\..\\%'
+                OR "URL" LIKE '%..../%'
+                OR "URL" LIKE '%\"\"\"\"%'
+                OR "URL" LIKE '%<<%'
+                OR "URL" LIKE '%><%'
+                OR "URL" LIKE '%./././%'
+                OR "URL" LIKE '%\\\\%'
+                OR "URL" LIKE '%\\\\.\\%'
+                OR "URL" ILIKE '%/%c0%ae%c0%ae/%'
+                OR "URL" LIKE '%@fs/%'
+                OR "URL" ILIKE '%file:/%'
+                OR "URL" ILIKE '%file%3a/%'
+            )
+            AND "HTTP Response Code" NOT LIKE '4%'
+            AND "HTTP Response Code" NOT LIKE '5%'
+        )
+    )
+    GROUP BY sourceip, destinationip, username, "URL", "HTTP Response Code", qidname(qid), CATEGORYNAME(category), LOGSOURCENAME(logsourceid)
     LAST 1 HOURS
+  yara_l: |
+    rule path_traversal_exploit_attempts {
+      meta:
+        author = "TDL"
+        description = "Detects path traversal and LFI attempts via WAF/IDS or web logs with successful responses"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1190"
+        severity = "HIGH"
 
-    '
-  yara_l: "rule tdl_tdl_auth_000505 {\n  meta:\n    author = \"TDL\"\n    description = \"Allowed Directory Traversal Traffic\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        // WAF/IDS events with allowed action and traversal/lfi signatures
+        (
+          $waf.metadata.event_type = "NETWORK_HTTP" and
+          $waf.security_result.action = "ALLOW" and
+          (
+            re.regex($waf.security_result.summary, `(?i)traversal`) or
+            re.regex($waf.security_result.summary, `(?i)lfi`)
+          ) and
+          $waf.target.ip = $ip
+        ) or
+        // Web/proxy events with path traversal patterns and non-error responses
+        (
+          $web.metadata.event_type = "NETWORK_HTTP" and
+          (
+            re.regex($web.target.url, `\.\./`) or
+            re.regex($web.target.url, `\\\\\.\./`) or
+            re.regex($web.target.url, `\.\.\.\./`) or
+            re.regex($web.target.url, `"""""`) or
+            re.regex($web.target.url, `<<`) or
+            re.regex($web.target.url, `><`) or
+            re.regex($web.target.url, `\./\./\./`) or
+            re.regex($web.target.url, `\\\\`) or
+            re.regex($web.target.url, `\\\\\.\\/`) or
+            re.regex($web.target.url, `(?i)/%c0%ae%c0%ae/`) or
+            re.regex($web.target.url, `(?i)@fs/`) or
+            re.regex($web.target.url, `(?i)file:/`) or
+            re.regex($web.target.url, `(?i)file%3a/`)
+          ) and
+          not re.regex($web.network.http.response_code, `^[45]`) and
+          $web.target.ip = $ip
+        )
 
-    | WHERE @timestamp > NOW() - 1 hour
+      match:
+        $ip over 5m
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $waf or $web
+    }
+  esql: |
+    FROM logs-network.*, logs-web.*, logs-waf.*, logs-nginx.*, logs-apache.*
+    | WHERE @timestamp > NOW() - 24 hours
+    | WHERE (
+        (event.category == "web" AND event.action == "allowed")
+        OR (event.category == "intrusion_detection" AND (event.action == "allowed" OR TO_LOWER(rule.name) LIKE "*traversal*" OR TO_LOWER(rule.name) LIKE "*lfi*"))
+        OR (TO_LOWER(url.path) LIKE "*../*" OR TO_LOWER(url.path) LIKE "*\\..\\..*" OR TO_LOWER(url.path) LIKE "*..../*" OR TO_LOWER(url.path) LIKE "*\"\"\"\"*" OR TO_LOWER(url.path) LIKE "*<<*" OR TO_LOWER(url.path) LIKE "*><*" OR TO_LOWER(url.path) LIKE "*./././*" OR TO_LOWER(url.path) LIKE "*\\\\\\\\*" OR TO_LOWER(url.path) LIKE "*\\\\\\\\.\\\\*" OR TO_LOWER(url.path) LIKE "*/%c0%ae%c0%ae/*" OR TO_LOWER(url.path) LIKE "*@fs/*" OR TO_LOWER(url.path) LIKE "*file:/*" OR TO_LOWER(url.path) LIKE "*file%3a/*")
+        OR (TO_LOWER(url.original) LIKE "*../*" OR TO_LOWER(url.original) LIKE "*\\..\\..*" OR TO_LOWER(url.original) LIKE "*..../*" OR TO_LOWER(url.original) LIKE "*\"\"\"\"*" OR TO_LOWER(url.original) LIKE "*<<*" OR TO_LOWER(url.original) LIKE "*><*" OR TO_LOWER(url.original) LIKE "*./././*" OR TO_LOWER(url.original) LIKE "*\\\\\\\\*" OR TO_LOWER(url.original) LIKE "*\\\\\\\\.\\\\*" OR TO_LOWER(url.original) LIKE "*/%c0%ae%c0%ae/*" OR TO_LOWER(url.original) LIKE "*@fs/*" OR TO_LOWER(url.original) LIKE "*file:/*" OR TO_LOWER(url.original) LIKE "*file%3a/*")
+        OR (TO_LOWER(http.request.body.content) LIKE "*../*" OR TO_LOWER(http.request.body.content) LIKE "*\\..\\..*" OR TO_LOWER(http.request.body.content) LIKE "*..../*" OR TO_LOWER(http.request.body.content) LIKE "*\"\"\"\"*" OR TO_LOWER(http.request.body.content) LIKE "*<<*" OR TO_LOWER(http.request.body.content) LIKE "*><*" OR TO_LOWER(http.request.body.content) LIKE "*./././*" OR TO_LOWER(http.request.body.content) LIKE "*\\\\\\\\*" OR TO_LOWER(http.request.body.content) LIKE "*\\\\\\\\.\\\\*" OR TO_LOWER(http.request.body.content) LIKE "*/%c0%ae%c0%ae/*" OR TO_LOWER(http.request.body.content) LIKE "*@fs/*" OR TO_LOWER(http.request.body.content) LIKE "*file:/*" OR TO_LOWER(http.request.body.content) LIKE "*file%3a/*")
+      )
+    | WHERE NOT STARTS_WITH(TO_STRING(http.response.status_code), "4") AND NOT STARTS_WITH(TO_STRING(http.response.status_code), "5")
+    | KEEP @timestamp, host.name, source.ip, destination.ip, url.path, url.original, http.request.method, http.response.status_code, user_agent.original, event.action, rule.name
+  leql: |
+    where((log_source_category=WAF AND (action=allowed OR signature ICONTAINS "traversal" OR signature ICONTAINS "lfi")) OR (log_source_category IN [reverse_proxy, webserver] AND (url ICONTAINS "../" OR url ICONTAINS "\\..\\" OR url ICONTAINS "..../" OR url ICONTAINS "\"\"\"\"" OR url ICONTAINS "<<" OR url ICONTAINS "><" OR url ICONTAINS "./././" OR url ICONTAINS "\\\\" OR url ICONTAINS "\\\\.\\" OR url ICONTAINS "/%c0%ae%c0%ae/" OR url ICONTAINS "@fs/" OR url ICONTAINS "file:/" OR url ICONTAINS "file%3a/") AND NOT response_code STARTS-WITH "4" AND NOT response_code STARTS-WITH "5"))
+  crowdstrike: "(#type=waf (action=allowed OR signature=*traversal* OR signature=*lfi*))\nOR\n(#type IN [reverse_proxy, webserver] \n  (uri=*../*\
+    \ OR uri=*\\\\..\\\\* OR uri=*..../* OR uri=*\\\"\\\"\\\"\\\"* OR uri=*<<* OR uri=*><* OR uri=*./././* OR uri=*\\\\\\\\* OR uri=*\\\\\\\\\
+    .\\\\* OR uri=*/%c0%ae%c0%ae/* OR uri=*@fs/* OR uri=*file:/* OR uri=*file%3a/*)\n  NOT (status_code=4* OR status_code=5*)\n)\n| table([@timestamp,\
+    \ #type, action, signature, uri, status_code, src_ip, dest_ip, ComputerName])\n"
+  xql: "dataset = panw_ngfw_threat_raw\n| filter (action_firewall_action = \"allow\" or lowercase(threat_name) contains \"traversal\" or lowercase(threat_name)\
+    \ contains \"lfi\")\n   or (\n       (url_path contains \"../\" \n        or url_path contains \"\\\\..\\\\\" \n        or url_path contains\
+    \ \"..../\" \n        or url_path contains \"\\\"\\\"\\\"\\\"\" \n        or url_path contains \"<<\" \n        or url_path contains \"><\"\
+    \ \n        or url_path contains \"./././\" \n        or url_path contains \"\\\\\\\\\" \n        or url_path contains \"\\\\\\\\.\\\\\" \n\
+    \        or url_path contains \"/%c0%ae%c0%ae/\" \n        or url_path contains \"@fs/\" \n        or url_path contains \"file:/\" \n    \
+    \    or url_path contains \"file%3a/\")\n       and http_response_code != null\n       and to_string(http_response_code) !~= \"^4\"\n    \
+    \   and to_string(http_response_code) !~= \"^5\"\n   )\n| fields _time, action_source_translated_ip, dst_host_name, url_path, http_response_code,\
+    \ threat_name, action_firewall_action, src_user_name\n"
+  lucene: |
+    (event_type:"waf" AND action:"Allowed" AND (signature:*traversal* OR signature:*lfi*)) OR (event_type:("reverse_proxy" OR "webserver") AND (uri:*../* OR uri:*\\..\\* OR uri:*..../* OR uri:*\"\"\"\"* OR uri:*<<* OR uri:*><* OR uri:*./././* OR uri:*\\\\* OR uri:*\\\\.\\* OR uri:*/%c0%ae%c0%ae/* OR uri:*@fs/* OR uri:*file:/* OR uri:*file%3a/*) AND NOT response_code:4* AND NOT response_code:5*)
+  sumo: |
+    (_sourceCategory=*WAF* OR _sourceCategory=*IDS* OR _sourceCategory=*IPS* OR _sourceCategory=*web* OR _sourceCategory=*proxy* OR _sourceCategory=*nginx* OR _sourceCategory=*apache* OR _sourceCategory=*iis*)
+    | json field=_raw "action" as action
+    | json field=_raw "signature" as signature
+    | json field=_raw "uri" as uri
+    | json field=_raw "url" as url
+    | json field=_raw "request_uri" as request_uri
+    | json field=_raw "cs-uri-stem" as cs_uri_stem
+    | json field=_raw "status" as status
+    | json field=_raw "sc-status" as sc_status
+    | json field=_raw "response_code" as response_code
+    | json field=_raw "http_status" as http_status
+    | if(isNull(uri), if(isNull(url), if(isNull(request_uri), cs_uri_stem, request_uri), url), uri) as uri_field
+    | if(isNull(status), if(isNull(sc_status), if(isNull(response_code), http_status, response_code), sc_status), status) as status_code
+    | where (
+        (action matches "*allow*" OR action matches "*permitted*") OR
+        (signature matches "*traversal*") OR
+        (signature matches "*lfi*") OR
+        (uri_field matches "*../*" OR uri_field matches "*\\..\\"OR uri_field matches "*...../*" OR uri_field matches "*\"\"\"\"*" OR uri_field matches "*<<*" OR uri_field matches "*><*" OR uri_field matches "*./././*" OR uri_field matches "*\\\\*" OR uri_field matches "*\\\\.\\*" OR uri_field matches "*/%c0%ae%c0%ae/*" OR uri_field matches "*@fs/*" OR uri_field matches "*file:/*" OR uri_field matches "*file%3a/*")
+    )
+    | where !(status_code matches "4*") AND !(status_code matches "5*")
+    | fields _messageTime, _sourceHost, _sourceCategory, action, signature, uri_field, status_code
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -103,7 +194,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Web Application Firewall Event\nWhere Action is Allowed\nOR\n    Where the Signature contains \"traversal\"\n\n    Where the\
   \ Signature contains \"lfi\"\n\n--------------------------------------------------\n\n1 Reverse Proxy/Webserver Event\nOR\n    Where the URI\

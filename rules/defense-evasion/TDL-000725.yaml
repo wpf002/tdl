@@ -17,77 +17,80 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1) OR (sourcetype=edr action=token_grant OR action=privilege_grant)
-    (PrivilegeList="*SeAssignPrimaryTokenPrivilege*" OR PrivilegeList="*SeImpersonatePrivilege*" OR privilege_name="SeAssignPrimaryTokenPrivilege" OR privilege_name="SeImpersonatePrivilege")
-    NOT (Image="*\\services.exe" OR Image="*\\svchost.exe" OR Image="*\\dllhost.exe" OR Image="*\\wmiprvse.exe" OR process_name="services.exe" OR process_name="svchost.exe" OR process_name="dllhost.exe" OR process_name="wmiprvse.exe")
+  spl: 'index=wineventlog (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1) OR (sourcetype=edr action=token_grant OR
+    action=privilege_grant)
+
+    (PrivilegeList="*SeAssignPrimaryTokenPrivilege*" OR PrivilegeList="*SeImpersonatePrivilege*" OR privilege_name="SeAssignPrimaryTokenPrivilege"
+    OR privilege_name="SeImpersonatePrivilege")
+
+    NOT (Image="*\\services.exe" OR Image="*\\svchost.exe" OR Image="*\\dllhost.exe" OR Image="*\\wmiprvse.exe" OR process_name="services.exe"
+    OR process_name="svchost.exe" OR process_name="dllhost.exe" OR process_name="wmiprvse.exe")
+
     | eval process=coalesce(Image, process_name)
+
     | table _time, ComputerName, host, process, User, user, CommandLine, command_line, PrivilegeList, privilege_name, ParentImage, parent_process
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000725 {\n  meta:\n    author = \"TDL\"\n    description = \"Process Acquired SeImpersonate-Style Privileged Token\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1134\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4703
+    | where PrivilegeList has_any ("SeAssignPrimaryTokenPrivilege", "SeImpersonatePrivilege")
+    | where ProcessName !endswith "services.exe"
+    | where ProcessName !endswith "lsass.exe"
+    | where ProcessName !endswith "svchost.exe"
+    | project TimeGenerated, Computer, Account, ProcessName, ProcessId, PrivilegeList, EnabledPrivileges
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process Name", "Process CommandLine", "Parent Process Name", "Privileges"
+    FROM events
+    WHERE ("EventID" = '1' OR "EventID" ILIKE '%token%')
+      AND ("Privileges" ILIKE '%SeAssignPrimaryTokenPrivilege%' OR "Privileges" ILIKE '%SeImpersonatePrivilege%')
+      AND "Process Name" NOT ILIKE '%services.exe%'
+      AND "Process Name" NOT ILIKE '%svchost.exe%'
+      AND "Process Name" NOT ILIKE '%wmiprvse.exe%'
+    LAST 1 HOURS
+  yara_l: "rule token_privilege_escalation_t1134 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects non-service processes acquiring\
+    \ SeAssignPrimaryTokenPrivilege or SeImpersonatePrivilege for token manipulation (T1134)\"\n    severity = \"HIGH\"\n    mitre_tactic = \"\
+    Defense Evasion\"\n    mitre_technique = \"T1134\"\n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\" or\n    $e.metadata.event_type\
+    \ = \"GENERIC_EVENT\"\n    \n    (\n      $e.metadata.product_event_type = \"1\" or\n      re.regex($e.metadata.product_event_type, `(?i)token.*grant`)\
+    \ or\n      re.regex($e.metadata.description, `(?i)privilege.*enabled`)\n    )\n    \n    (\n      re.regex($e.security_result.summary, `(?i)SeAssignPrimaryTokenPrivilege`)\
+    \ or\n      re.regex($e.security_result.summary, `(?i)SeImpersonatePrivilege`) or\n      re.regex($e.additional.fields.value.string_value,\
+    \ `(?i)SeAssignPrimaryTokenPrivilege`) or\n      re.regex($e.additional.fields.value.string_value, `(?i)SeImpersonatePrivilege`) or\n    \
+    \  re.regex($e.target.process.command_line, `(?i)SeAssignPrimaryTokenPrivilege`) or\n      re.regex($e.target.process.command_line, `(?i)SeImpersonatePrivilege`)\n\
+    \    )\n    \n    not re.regex($e.principal.process.file.full_path, `(?i)\\\\windows\\\\system32\\\\services\\.exe$`)\n    not re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\windows\\\\system32\\\\svchost\\.exe$`)\n    not re.regex($e.principal.process.file.full_path, `(?i)\\\\windows\\\\system32\\\\\
+    lsass\\.exe$`)\n    \n    $e.principal.hostname = $host\n    $e.principal.process.file.full_path = $process\n    \n  match:\n    $host, $process\
+    \ over 5m\n    \n  outcome:\n    $risk_score = max(75)\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-windows.sysmon_operational*, logs-endpoint.events.process*\n| WHERE (winlog.event_id == \"1\" OR event.action == \"token_manipulation\"\
+    )\n  AND (\n    process.args LIKE \"*SeAssignPrimaryTokenPrivilege*\" \n    OR process.args LIKE \"*SeImpersonatePrivilege*\"\n    OR winlog.event_data.GrantedPrivileges\
+    \ LIKE \"*SeAssignPrimaryTokenPrivilege*\"\n    OR winlog.event_data.GrantedPrivileges LIKE \"*SeImpersonatePrivilege*\"\n  )\n  AND NOT (\n\
+    \    process.executable LIKE \"*\\\\services.exe\"\n    OR process.executable LIKE \"*\\\\svchost.exe\"\n    OR process.executable LIKE \"\
+    *\\\\System32\\\\*\"\n    OR process.executable LIKE \"*\\\\SysWOW64\\\\*\"\n  )\n| KEEP @timestamp, host.name, user.name, process.name, process.executable,\
+    \ process.command_line, process.parent.name, winlog.event_data.GrantedPrivileges\n"
+  leql: |
+    where(source_json.EventID=1 AND (source_json.PrivilegeList ICONTAINS "SeAssignPrimaryTokenPrivilege" OR source_json.PrivilegeList ICONTAINS "SeImpersonatePrivilege") AND source_json.ParentImage NOT ICONTAINS "services.exe") groupby(asset, process_name, user) calculate(count)
+  crowdstrike: |
+    (EventCode=1 OR event_simpleName=ProcessRollup2) (CommandLine=*SeAssignPrimaryTokenPrivilege* OR CommandLine=*SeImpersonatePrivilege*) NOT (ParentBaseFileName=services.exe OR FileName=*svchost.exe OR FileName=*dllhost.exe OR FileName=*wmiprvse.exe)
+    | table([@timestamp, ComputerName, UserName, FileName, ParentBaseFileName, CommandLine])
+  xql: "dataset = xdr_data\n| filter (action_evtlog_event_id = 1 or event_type = ENUM.EVENT_TYPE_PROCESS)\n  and (action_evtlog_message contains\
+    \ \"SeAssignPrimaryTokenPrivilege\" \n       or action_evtlog_message contains \"SeImpersonatePrivilege\"\n       or action_process_image_command_line\
+    \ contains \"SeAssignPrimaryTokenPrivilege\"\n       or action_process_image_command_line contains \"SeImpersonatePrivilege\")\n  and actor_process_image_name\
+    \ not in (\"services.exe\", \"svchost.exe\", \"WmiPrvSE.exe\", \"dllhost.exe\", \"msiexec.exe\")\n| fields _time, agent_hostname, actor_effective_username,\
+    \ actor_process_image_name, action_process_image_name, action_process_image_command_line, action_evtlog_message\n"
+  lucene: |
+    (event.code:1 OR event.action:"token-grant") AND (winlog.event_data.PrivilegeList:(*SeAssignPrimaryTokenPrivilege* OR *SeImpersonatePrivilege*) OR privileges:(*SeAssignPrimaryTokenPrivilege* OR *SeImpersonatePrivilege*)) AND NOT process.name:(services.exe OR svchost.exe OR wmiprvse.exe OR dllhost.exe OR MsMpEng.exe)
+  sumo: |
+    _sourceCategory=*Sysmon* OR _sourceCategory=*EDR*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Image" as image
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "User" as user
+    | json field=_raw "PrivilegeList" as privilege_list
+    | json field=_raw "ProcessName" as process_name
+    | where (event_id = "1" OR event_id matches "*token*" OR event_id matches "*privilege*")
+      AND (privilege_list matches "*SeAssignPrimaryTokenPrivilege*" OR privilege_list matches "*SeImpersonatePrivilege*" OR command_line matches "*SeAssignPrimaryTokenPrivilege*" OR command_line matches "*SeImpersonatePrivilege*")
+      AND !(image matches "*services.exe" OR image matches "*svchost.exe" OR image matches "*wmiprvse.exe" OR image matches "*dllhost.exe" OR process_name matches "*services.exe" OR process_name matches "*svchost.exe" OR process_name matches "*wmiprvse.exe" OR process_name matches "*dllhost.exe")
+    | fields _messageTime, _sourceHost, event_id, image, process_name, command_line, privilege_list, user
 pseudo_logic: Sysmon EID 1 or EDR token-grant event showing a non-service process acquiring SeAssignPrimaryTokenPrivilege or SeImpersonatePrivilege.
   Token-theft / Potato-style abuse.
 false_positives:
@@ -106,7 +109,7 @@ references:
 - https://attack.mitre.org/techniques/T1134/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

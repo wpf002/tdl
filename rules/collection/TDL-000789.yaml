@@ -20,70 +20,71 @@ queries:
   spl: "index=wineventlog sourcetype=WinEventLog:Security EventCode=5145 (Share_Name=\"*HR*\" OR Share_Name=\"*Finance*\" OR Share_Name=\"*Legal*\"\
     ) \n| bin _time span=10m \n| stats dc(Relative_Target_Name) as unique_files by _time, Account_Name, Share_Name, IpAddress \n| where unique_files\
     \ >= 500\n"
-  kql: 'SecurityEvent
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 5145
+    | where ShareName has_any ("HR", "Finance", "Legal")
+    | summarize UniqueFiles = dcount(RelativeTargetName) by bin(TimeGenerated, 10m), SubjectUserName, Computer, ShareName
+    | where UniqueFiles >= 500
+    | project TimeGenerated, SubjectUserName, Computer, ShareName, UniqueFiles
+  aql: |
+    SELECT username, sourceip, "Share Name", UNIQUECOUNT("Relative Target Name") AS unique_files, COUNT(*) AS total_accesses
+    FROM events
+    WHERE "EventID" = '5145'
+      AND ("Share Name" ILIKE '%HR%' OR "Share Name" ILIKE '%Finance%' OR "Share Name" ILIKE '%Legal%')
+    GROUP BY username, sourceip, "Share Name"
+    HAVING unique_files >= 500
+    LAST 10 MINUTES
+  yara_l: |
+    rule data_from_network_share_mass_access {
+      meta:
+        author = "TDL"
+        description = "Detects mass file access on sensitive shares (HR/Finance/Legal) - T1039"
+        mitre_attack_technique = "T1039"
+        mitre_attack_tactic = "Collection"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.metadata.product_event_type = "5145"
+        $e.principal.user.userid = $user
+        re.regex($e.target.file.full_path, `(?i)(\\\\[^\\]+\\(HR|Finance|Legal|Human.?Resources|Accounting|Payroll))`)
+        $e.target.file.full_path = $file
 
-    | where event_id in ("5145")
+      match:
+        $user over 10m
 
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('5145')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000789 {\n  meta:\n    author = \"TDL\"\n    description = \"Burst Reads from Departmental Share by Single User\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0009\"\n    technique = \"T1039\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n \
-    \   $e.event_id = /(5145)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("5145")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [5145])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (5145)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("5145")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(5145)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("5145")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+      condition:
+        #file >= 500
+    }
+  esql: |
+    FROM logs-system.security*
+    | WHERE @timestamp > NOW() - 10 minute AND event.code == "5145" AND (winlog.event_data.ShareName LIKE "*HR*" OR winlog.event_data.ShareName LIKE "*Finance*" OR winlog.event_data.ShareName LIKE "*Legal*")
+    | STATS unique_files = COUNT_DISTINCT(winlog.event_data.RelativeTargetName) BY user.name, winlog.event_data.ShareName, host.name
+    | WHERE unique_files >= 500
+    | KEEP user.name, winlog.event_data.ShareName, host.name, unique_files
+  leql: |
+    where(source_json.EventID=5145 AND (source_json.ShareName ICONTAINS "HR" OR source_json.ShareName ICONTAINS "Finance" OR source_json.ShareName ICONTAINS "Legal")) groupby(source_json.SubjectUserName, source_json.ShareName) calculate(unique:source_json.RelativeTargetName)
+  crowdstrike: |
+    EventCode=5145 ShareName IN [*HR*, *Finance*, *Legal*, *FINANCE*, *LEGAL*, *hr*, *finance*, *legal*]
+    | bucket(span=10m, function=[count(RelativeTargetName, distinct=true, as=uniqueFiles)], limit=max)
+    | uniqueFiles >= 500
+    | table([@timestamp, ComputerName, SubjectUserName, ShareName, uniqueFiles])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 5145
+    | filter action_evtlog_event_data_ShareName ~= ".*(?i)(hr|human.?resource|finance|financ|legal|law).*"
+    | bin _time span=10m
+    | comp count_distinct(action_evtlog_event_data_RelativeTargetName) as unique_files by _time, action_evtlog_event_data_SubjectUserName, action_evtlog_event_data_ShareName, agent_hostname
+    | filter unique_files >= 500
+    | fields _time, agent_hostname, action_evtlog_event_data_SubjectUserName, action_evtlog_event_data_ShareName, unique_files
+  lucene: |
+    event.code:5145 AND winlog.event_data.ShareName:(*HR* OR *Finance* OR *Legal* OR *Payroll* OR *Accounting*)
+  sumo: "_sourceCategory=*Windows* \"5145\"\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"SubjectUserName\" as user\n| json\
+    \ field=_raw \"ShareName\" as share\n| json field=_raw \"RelativeTargetName\" as file_path\n| where event_id = \"5145\" \n| where share matches\
+    \ \"*HR*\" or share matches \"*Finance*\" or share matches \"*Legal*\"\n| timeslice 10m\n| count_distinct(file_path) as unique_files by _timeslice,\
+    \ user, share\n| where unique_files >= 500\n| fields _timeslice, user, share, unique_files\n"
 pseudo_logic: EID 5145 share access ≥500 unique files within 10m from one user against HR/Finance/Legal share.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -100,7 +101,7 @@ references:
 - https://attack.mitre.org/techniques/T1039/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'

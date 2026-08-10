@@ -17,92 +17,142 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog (EventCode=5156 OR EventCode=4663 OR EventCode=5145)
-    | eval event_type=case(
-        EventCode=5156 AND Application="\\device\\harddiskvolume*\\windows\\system32\\svchost.exe" AND DestAddress!="0.0.0.0" AND DestPort=445, "smb_connection",
-        EventCode=4663 AND (ObjectName="*.scf" OR ObjectName="*.url" OR ObjectName="*.htm" OR ObjectName="*.html"), "file_access",
-        EventCode=5145 AND (ShareName="\\\\*\\*.scf" OR ShareName="\\\\*\\*.url"), "share_access",
-        1=1, "other"
-    )
-    | where event_type IN ("smb_connection", "file_access", "share_access")
-    | eval smb_dest=if(event_type="smb_connection" AND match(DestAddress, "^(?!10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)"), DestAddress, null())
-    | where isnotnull(smb_dest) OR event_type IN ("file_access", "share_access")
-    | bin _time span=2s
-    | stats values(event_type) as events, values(smb_dest) as external_ips, values(ObjectName) as files, values(ShareName) as shares by _time, ComputerName, Account_Name
-    | where mvcount(events) > 1 AND isnotnull(external_ips)
-    | table _time, ComputerName, Account_Name, events, external_ips, files, shares
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  spl: "index=wineventlog (EventCode=5156 OR EventCode=4663 OR EventCode=5145)\n| eval event_type=case(\n    EventCode=5156 AND Application=\"\
+    \\\\device\\\\harddiskvolume*\\\\windows\\\\system32\\\\svchost.exe\" AND DestAddress!=\"0.0.0.0\" AND DestPort=445, \"smb_connection\",\n\
+    \    EventCode=4663 AND (ObjectName=\"*.scf\" OR ObjectName=\"*.url\" OR ObjectName=\"*.htm\" OR ObjectName=\"*.html\"), \"file_access\",\n\
+    \    EventCode=5145 AND (ShareName=\"\\\\\\\\*\\\\*.scf\" OR ShareName=\"\\\\\\\\*\\\\*.url\"), \"share_access\",\n    1=1, \"other\"\n)\n\
+    | where event_type IN (\"smb_connection\", \"file_access\", \"share_access\")\n| eval smb_dest=if(event_type=\"smb_connection\" AND match(DestAddress,\
+    \ \"^(?!10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)\"), DestAddress, null())\n| where isnotnull(smb_dest) OR event_type IN (\"file_access\"\
+    , \"share_access\")\n| bin _time span=2s\n| stats values(event_type) as events, values(smb_dest) as external_ips, values(ObjectName) as files,\
+    \ values(ShareName) as shares by _time, ComputerName, Account_Name\n| where mvcount(events) > 1 AND isnotnull(external_ips)\n| table _time,\
+    \ ComputerName, Account_Name, events, external_ips, files, shares\n"
+  kql: |
+    let TimeWindow = 2s;
+    let SuspiciousFileTypes = dynamic([".scf", ".url", ".htm", ".html", ".xml", ".lnk"]);
+    let ExternalIPPattern = @"^(?!10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.)(\d{1,3}\.){3}\d{1,3}$";
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (5140, 5145)
+    | extend FileName = tostring(split(ObjectName, '\\')[-1])
+    | extend FileExtension = tolower(strcat(".", split(FileName, '.')[-1]))
+    | where FileExtension in (SuspiciousFileTypes) or ObjectName has_any ("\\\\", "file://\\\\")
+    | extend FileAccessTime = TimeGenerated
+    | extend SourceIP = IpAddress
+    | extend TargetIP = DestAddress
+    | project FileAccessTime, Computer, Account, ObjectName, FileName, FileExtension, SourceIP, TargetIP
+    | join kind=inner (
+        SecurityEvent
+        | where TimeGenerated > ago(24h)
+        | where EventID == 5156
+        | where Direction == "%%14593"
+        | where Application has "\\System32\\svchost.exe" or Application has "smb" or SourcePort == 445 or DestPort == 445
+        | extend RemoteIP = iff(Direction == "%%14593", DestAddress, SourceAddress)
+        | where RemoteIP matches regex ExternalIPPattern
+        | extend SMBConnectionTime = TimeGenerated
+        | project SMBConnectionTime, Computer, Account, RemoteIP, SourcePort, DestPort, Application
+    ) on Computer, Account
+    | where (SMBConnectionTime - FileAccessTime) between (0s .. TimeWindow)
+    | project TimeGenerated = FileAccessTime, Computer, Account, SuspiciousFile = ObjectName, FileName, FileExtension, ExternalIP = RemoteIP, SMBConnectionTime, TimeDifference = (SMBConnectionTime - FileAccessTime), SourcePort, DestPort
+    | extend ThreatIndicator = "Potential Forced Authentication Attempt"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, username, LOGSOURCENAME(logsourceid) AS host, COUNT(*) AS connection_count
+    FROM events
+    WHERE (categoryname(category) ILIKE '%file%' OR categoryname(category) ILIKE '%filesystem%' OR "EventID" IN ('5140','5145','4663'))
+      AND (destinationport = 445 OR destinationport = 139)
+      AND destinationip NOT IN (SELECT sourceip FROM events WHERE sourceip LIKE '10.%' OR sourceip LIKE '172.%' OR sourceip LIKE '192.168.%' LAST 2 SECONDS)
+      AND destinationip NOT LIKE '10.%'
+      AND destinationip NOT LIKE '172.%'
+      AND destinationip NOT LIKE '192.168.%'
+    GROUP BY sourceip, destinationip, destinationport, username, logsourceid
+    LAST 2 SECONDS
+  yara_l: |
+    rule forced_authentication_attempt {
+      meta:
+        author = "TDL"
+        description = "Detects T1187 forced authentication via file open followed by external SMB connection"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1187"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $file.metadata.event_type = "FILE_OPEN"
+        (
+          re.regex($file.target.file.full_path, `(?i)\.(scf|url|htm|html)$`) or
+          re.regex($file.target.file.full_path, `(?i)\\\\[^\\]+\\`)
+        )
+        $file.principal.hostname = $host
+        $file.principal.user.userid = $user
 
-    | where network.protocol matches regex "smb"
+        $smb.metadata.event_type = "NETWORK_CONNECTION"
+        $smb.target.port = 445
+        not net.ip_in_range_cidr($smb.target.ip, "10.0.0.0/8")
+        not net.ip_in_range_cidr($smb.target.ip, "172.16.0.0/12")
+        not net.ip_in_range_cidr($smb.target.ip, "192.168.0.0/16")
+        not net.ip_in_range_cidr($smb.target.ip, "127.0.0.0/8")
+        not net.ip_in_range_cidr($smb.target.ip, "169.254.0.0/16")
+        $smb.principal.hostname = $host
+        $smb.principal.user.userid = $user
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+        $file.metadata.event_timestamp.seconds <= $smb.metadata.event_timestamp.seconds
+        $smb.metadata.event_timestamp.seconds - $file.metadata.event_timestamp.seconds <= 2
 
-    | order by Bytes desc
+      match:
+        $host, $user over 5m
 
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+      outcome:
+        $risk_score = 75
+        $external_ip = $smb.target.ip
+        $suspicious_file = $file.target.file.full_path
 
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%smb%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_ca_000747 {\n  meta:\n    author = \"TDL\"\n    description = \"SMB Connection Following SCF/HTML UNC Trigger\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0006\"\n    technique = \"T1187\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /smb/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%smb%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/smb/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*smb*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "smb"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*smb*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*smb*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $file and $smb
+    }
+  esql: |
+    FROM logs-network*, logs-windows.sysmon_operational*, logs-endpoint.events.network*
+    | WHERE @timestamp > NOW() - 5 minutes
+      AND (
+        (event.category == "network" AND network.protocol == "smb" AND destination.ip NOT LIKE "10.*" AND destination.ip NOT LIKE "172.16.*" AND destination.ip NOT LIKE "172.17.*" AND destination.ip NOT LIKE "172.18.*" AND destination.ip NOT LIKE "172.19.*" AND destination.ip NOT LIKE "172.20.*" AND destination.ip NOT LIKE "172.21.*" AND destination.ip NOT LIKE "172.22.*" AND destination.ip NOT LIKE "172.23.*" AND destination.ip NOT LIKE "172.24.*" AND destination.ip NOT LIKE "172.25.*" AND destination.ip NOT LIKE "172.26.*" AND destination.ip NOT LIKE "172.27.*" AND destination.ip NOT LIKE "172.28.*" AND destination.ip NOT LIKE "172.29.*" AND destination.ip NOT LIKE "172.30.*" AND destination.ip NOT LIKE "172.31.*" AND destination.ip NOT LIKE "192.168.*" AND destination.ip NOT LIKE "127.*")
+        OR (winlog.event_id == 3 AND destination.port == 445 AND destination.ip NOT LIKE "10.*" AND destination.ip NOT LIKE "172.16.*" AND destination.ip NOT LIKE "172.17.*" AND destination.ip NOT LIKE "172.18.*" AND destination.ip NOT LIKE "172.19.*" AND destination.ip NOT LIKE "172.20.*" AND destination.ip NOT LIKE "172.21.*" AND destination.ip NOT LIKE "172.22.*" AND destination.ip NOT LIKE "172.23.*" AND destination.ip NOT LIKE "172.24.*" AND destination.ip NOT LIKE "172.25.*" AND destination.ip NOT LIKE "172.26.*" AND destination.ip NOT LIKE "172.27.*" AND destination.ip NOT LIKE "172.28.*" AND destination.ip NOT LIKE "172.29.*" AND destination.ip NOT LIKE "172.30.*" AND destination.ip NOT LIKE "172.31.*" AND destination.ip NOT LIKE "192.168.*" AND destination.ip NOT LIKE "127.*")
+      )
+    | EVAL time_bucket = BUCKET(@timestamp, 2 seconds)
+    | STATS conn_count = COUNT(*) BY host.name, user.name, destination.ip, time_bucket
+    | WHERE conn_count >= 1
+    | KEEP @timestamp, host.name, user.name, destination.ip, conn_count
+  leql: |
+    where(source_json.EventID IN [5140, 5145] AND destination_address NOT IN [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8] AND (source_json.RelativeTargetName ICONTAINS ".scf" OR source_json.RelativeTargetName ICONTAINS ".url" OR source_json.RelativeTargetName ICONTAINS ".htm" OR source_json.RelativeTargetName ICONTAINS ".html")) groupby(asset, destination_address, source_json.RelativeTargetName) calculate(count)
+  crowdstrike: "(event_simpleName=NetworkConnectIP4 OR EventCode=5156) RemotePort=445 \n| RemoteAddressIP4!=/^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\\
+    .|192\\.168\\.)/ \n| timestamp_ns:=@timestamp.nanos\n| groupBy([ComputerName, UserName], function=[collect([timestamp_ns, RemoteAddressIP4,\
+    \ FileName, event_simpleName])])\n| array:explode(_collect)\n| timestamp_ns:=_collect[0] | remote:=_collect[1] | file:=_collect[2] | evt:=_collect[3]\n\
+    | sort(timestamp_ns, order=asc)\n| prev_ts:=lag(timestamp_ns)\n| time_diff:=(timestamp_ns - prev_ts)/1000000000\n| time_diff <= 2\n| file=~/.*(\\\
+    .scf|\\.url|\\.htm|\\.html)$/i OR file=*\\\\\\\\*\n| table([ComputerName, UserName, file, remote, time_diff, @timestamp])\n"
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_NETWORK and action_network_protocol = "SMB" and not incidr(action_remote_ip, "10.0.0.0/8") and not incidr(action_remote_ip, "172.16.0.0/12") and not incidr(action_remote_ip, "192.168.0.0/16")
+    | alter external_smb_time = _time, smb_host = agent_hostname, smb_user = actor_effective_username, smb_remote_ip = action_remote_ip
+    | join type=inner (dataset = xdr_data | filter event_type = ENUM.EVENT_TYPE_FILE and (action_file_extension in ("scf", "url", "html", "htm") or action_file_path ~= ".*\\\\[^\\\\]+\\\\.*") | alter file_time = _time, file_host = agent_hostname, file_user = actor_effective_username, file_path = action_file_path, file_name = action_file_name) as file_events file_events.file_host = smb_host and file_events.file_user = smb_user
+    | filter external_smb_time >= file_time and external_smb_time <= timestamp_add(file_time, 2, "SECONDS")
+    | fields external_smb_time, smb_host, smb_user, smb_remote_ip, file_time, file_path, file_name
+  lucene: |
+    (event.code:(4663 OR 5145) OR network.protocol:smb OR source.port:445 OR destination.port:445) AND (_exists_:destination.ip AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16 OR 127.0.0.0/8 OR 169.254.0.0/16)) AND (file.extension:(scf OR url OR lnk) OR file.name:(*.scf OR *.url OR *.lnk) OR file.content:(*\\\\* OR *img*src*\\\\*) OR process.command_line:*\\\\*)
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Network*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Computer" as computer
+    | json field=_raw "TargetUserName" as user
+    | json field=_raw "ShareName" as share_name
+    | json field=_raw "IpAddress" as ip_address
+    | json field=_raw "SourceAddress" as source_address
+    | json field=_raw "DestinationAddress" as dest_address
+    | json field=_raw "DestinationPort" as dest_port
+    | json field=_raw "ObjectName" as object_name
+    | where (event_id = "5140" or event_id = "5145" or dest_port = "445" or dest_port = "139")
+    | where !(ip_address matches "10.*" or ip_address matches "172.16.*" or ip_address matches "172.17.*" or ip_address matches "172.18.*" or ip_address matches "172.19.*" or ip_address matches "172.20.*" or ip_address matches "172.21.*" or ip_address matches "172.22.*" or ip_address matches "172.23.*" or ip_address matches "172.24.*" or ip_address matches "172.25.*" or ip_address matches "172.26.*" or ip_address matches "172.27.*" or ip_address matches "172.28.*" or ip_address matches "172.29.*" or ip_address matches "172.30.*" or ip_address matches "172.31.*" or ip_address matches "192.168.*" or ip_address matches "127.*" or ip_address matches "169.254.*")
+    | where !(dest_address matches "10.*" or dest_address matches "172.16.*" or dest_address matches "172.17.*" or dest_address matches "172.18.*" or dest_address matches "172.19.*" or dest_address matches "172.20.*" or dest_address matches "172.21.*" or dest_address matches "172.22.*" or dest_address matches "172.23.*" or dest_address matches "172.24.*" or dest_address matches "172.25.*" or dest_address matches "172.26.*" or dest_address matches "172.27.*" or dest_address matches "172.28.*" or dest_address matches "172.29.*" or dest_address matches "172.30.*" or dest_address matches "172.31.*" or dest_address matches "192.168.*" or dest_address matches "127.*" or dest_address matches "169.254.*")
+    | where object_name matches "*.scf" or object_name matches "*.url" or object_name matches "*.htm*" or share_name matches "*$"
+    | timeslice 2s
+    | count by _timeslice, computer, user, ip_address, dest_address, object_name
+    | where _count >= 1
+    | fields _timeslice, computer, user, ip_address, dest_address, object_name
 pseudo_logic: Client SMB connection to external IP within 2s of opening a file or browsing a path. Forced-auth via SCF / .url / HTML img src=\\evil.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -120,7 +170,7 @@ references:
 - https://attack.mitre.org/techniques/T1187/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'

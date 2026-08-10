@@ -23,71 +23,74 @@ queries:
     \ IN (\"System\", \"vmmem\", \"vmwp.exe\", \"MsMpEng.exe\", \"SgrmBroker.exe\", \"svchost.exe\"))\n| stats count values(TargetImage) as target_device\
     \ values(GrantedAccess) as granted_access values(SourceImage) as source_image by ComputerName, SourceUser, process_name\n| table _time, ComputerName,\
     \ SourceUser, process_name, source_image, target_device, granted_access, count\n"
-  kql: 'DeviceRegistryEvents
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 10
+    | where TargetObject has_any (@"\\.\C:", @"\\.\PhysicalDrive0")
+    | where GrantedAccess has "0x1"
+    | where SourceImage !has_any ("System", "smss.exe", "csrss.exe", "wininit.exe", "services.exe", "lsass.exe", "svchost.exe", "MsMpEng.exe", "SgrmBroker.exe", "TrustedInstaller.exe")
+    | project TimeGenerated, Computer, SourceImage, TargetObject, GrantedAccess, SourceProcessId, SourceUser
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Image", "TargetFilename", "GrantedAccess", COUNT(*) AS access_count
+    FROM events
+    WHERE ("EventID" = '12' OR "EventID" = '13' OR "EventID" = '15')
+      AND ("TargetFilename" ILIKE '%\\\\.\\C:%' OR "TargetFilename" ILIKE '%\\\\.\\PhysicalDrive0%')
+    GROUP BY eventtime, LOGSOURCENAME(logsourceid), username, "Process Name", "Image", "TargetFilename", "GrantedAccess"
+    LAST 1 HOURS
+  yara_l: |
+    rule raw_disk_access_defense_evasion {
+      meta:
+        author = "TDL"
+        description = "Detects direct raw disk access bypassing NTFS ACLs (T1006 Defense Evasion)"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1006"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_OPEN"
+        (
+          re.regex($e.target.file.full_path, `(?i)^\\\\\.\\\C:$`) or
+          re.regex($e.target.file.full_path, `(?i)^\\\\\.\\\PhysicalDrive\d+$`)
+        )
+        $e.principal.process.file.full_path = $process
+        $e.principal.hostname = $host
 
-    | where registry_key matches regex ".+"
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
+      outcome:
+        $risk_score = 85
+        $process_name = $process
+        $target_path = $e.target.file.full_path
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Registry Key\", \"Registry Value Name\", \"Registry Value Data\", \"Process Name\"\nFROM events\nWHERE\
-    \ LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n  AND \"EventID\" IN ('12','13','14')\n  AND \"registry_key\" LIKE '%.+%'\n\
-    LAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000728 {\n  meta:\n    author = \"TDL\"\n    description = \"Raw Volume Open via \\\\\\\\.\\\\C: Handle\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1006\"\n  events:\n    $e.metadata.event_type = \"REGISTRY_MODIFICATION\"\n    $e.registry_key\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "registry" AND registry_key LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/.+/)
-
-    groupby(asset, registry_key, registry_value)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*.+*
-
-    | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
-
-    | sort -changes
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.REGISTRY AND registry_key ~= ".+"
-
-    | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
-
-    | sort desc changes
-
-    '
-  lucene: 'event.category:"registry" AND registry_key:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id IN ("12","13","14") AND registry_key matches "*.+*"
-
-    | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.file*
+    | WHERE winlog.event_id == 9 OR (event.category == "file" AND event.action == "open")
+    | WHERE (file.path LIKE "*\\\\.\\C:*" OR file.path LIKE "*\\\\.\\PhysicalDrive*")
+      AND (winlog.event_data.GrantedAccess RLIKE ".*READ_DATA.*" OR file.access == "read")
+    | STATS access_count = COUNT(*) BY process.name, process.executable, process.command_line, host.name, user.name, file.path
+    | WHERE access_count >= 1
+    | KEEP @timestamp, host.name, user.name, process.name, process.executable, process.command_line, file.path, access_count
+  leql: |
+    where(source_json.EventID=10 AND (source_json.TargetImage ICONTAINS "\\.\C:" OR source_json.TargetImage ICONTAINS "\\.\PhysicalDrive")) groupby(source_json.SourceImage, asset, source_json.TargetImage) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 (CommandLine=*"\\\\.\\C:"* OR CommandLine=*"\\\\.\\PhysicalDrive0"*)
+    | table([@timestamp, ComputerName, UserName, FileName, ParentBaseFileName, CommandLine, SHA256HashData])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_FILE_EVENT
+      and (action_file_path ~= "(?i)\\\\\\\\\.\\\\[Cc]:" or action_file_path ~= "(?i)\\\\\\\\\.\\\\PhysicalDrive[0-9]+")
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, actor_process_image_command_line, action_file_path, action_file_name
+  lucene: |
+    event.id:11 AND file.path:(\\.\C\: OR \\.\PhysicalDrive* OR \\\\.\\C\: OR \\\\.\\PhysicalDrive*)
+  sumo: "_sourceCategory=*Sysmon* \"10\"\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"SourceImage\" as source_image\n| json\
+    \ field=_raw \"TargetImage\" as target_image\n| json field=_raw \"GrantedAccess\" as granted_access\n| where event_id = \"10\" \n  and (target_image\
+    \ matches \"*\\\\\\\\.\\\\C:*\" or target_image matches \"*\\\\\\\\.\\\\PhysicalDrive0*\")\n  and granted_access matches \"*0x1*\"\n| fields\
+    \ _messageTime, _sourceHost, source_image, target_image, granted_access\n"
 pseudo_logic: 'Process opens \\.\C: or \\.\PhysicalDrive0 with FILE_READ_DATA — bypasses NTFS ACLs to read NTDS.dit, registry hives, locked files.'
 false_positives:
 - Sanctioned admin or engineering activity
@@ -105,7 +108,7 @@ references:
 - https://attack.mitre.org/techniques/T1006/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

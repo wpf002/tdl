@@ -18,74 +18,85 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=windows sourcetype=WinEventLog:Security EventCode=4657 Object_Name="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\DsrmAdminLogonBehavior" (New_Value=1 OR New_Value=2 OR Old_Value=1 OR Old_Value=2)
+  spl: 'index=windows sourcetype=WinEventLog:Security EventCode=4657 Object_Name="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\DsrmAdminLogonBehavior"
+    (New_Value=1 OR New_Value=2 OR Old_Value=1 OR Old_Value=2)
+
     | table _time, ComputerName, SubjectUserName, Object_Name, Old_Value, New_Value, Process_Name
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4657")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4657')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000695 {\n  meta:\n    author = \"TDL\"\n    description = \"DSRM Persistence Usage\"\n    severity = \"HIGH\"\n  \
-    \  tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4657)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4657
+    | where ObjectName has "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\DsrmAdminLogonBehavior"
+    | extend NewValue = tostring(parse_json(EventData).NewValue)
+    | extend OldValue = tostring(parse_json(EventData).OldValue)
+    | where NewValue in ("1", "2") or OldValue in ("1", "2")
+    | project TimeGenerated, Computer, Account, ObjectName, OldValue, NewValue, ProcessName, SubjectUserName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Object Name" AS registry_key, "New Value", "Old Value"
+    FROM events
+    WHERE "EventID" = '4657'
+      AND "Object Name" ILIKE '%HKLM\\System\\CurrentControlSet\\Control\\Lsa\\DsrmAdminLogonBehavior%'
+      AND ("New Value" IN ('1', '2') OR "Old Value" IN ('1', '2'))
+    LAST 24 HOURS
+  yara_l: |
+    rule dsrm_admin_logon_behavior_modified {
+      meta:
+        author = "TDL"
+        description = "Detects modification of DSRM admin logon behavior registry key (T1078)"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "REGISTRY_MODIFICATION"
+        $e.metadata.product_event_type = "4657"
+        re.regex($e.target.registry.registry_key, `(?i)HKLM\\System\\CurrentControlSet\\Control\\Lsa\\DsrmAdminLogonBehavior`)
+        (
+          re.regex($e.target.registry.registry_value_data, `(?i)1`) or
+          re.regex($e.target.registry.registry_value_data, `(?i)2`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND event_id IN ("4657")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4657])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4657)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4657")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4657)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4657")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*, logs-windows.security*, winlogbeat-*
+    | WHERE event.code == "4657"
+      AND winlog.event_data.ObjectName LIKE "*HKLM\\System\\CurrentControlSet\\Control\\Lsa\\DsrmAdminLogonBehavior*"
+      AND (winlog.event_data.NewValue IN ("1", "2") OR winlog.event_data.OldValue IN ("1", "2"))
+    | KEEP @timestamp, host.name, user.name, winlog.event_data.ObjectName, winlog.event_data.OldValue, winlog.event_data.NewValue, winlog.event_data.ProcessName
+  leql: |
+    where(source_json.EventID=4657 AND source_json.ObjectName ICONTAINS "HKLM\System\CurrentControlSet\Control\Lsa\DsrmAdminLogonBehavior" AND (source_json.NewValue IN [1, 2] OR source_json.OldValue IN [1, 2]))
+  crowdstrike: |
+    EventCode=4657 ObjectName=*HKLM\System\CurrentControlSet\Control\Lsa\DsrmAdminLogonBehavior* (NewValue=1 OR NewValue=2 OR OldValue=1 OR OldValue=2)
+    | table([@timestamp, ComputerName, SubjectUserName, ObjectName, OperationType, OldValue, NewValue])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4657
+    | filter action_evtlog_message ~= "(?i)HKLM\\\\System\\\\CurrentControlSet\\\\Control\\\\Lsa\\\\DsrmAdminLogonBehavior"
+    | filter action_evtlog_message ~= "(?:New Value|Old Value).*[12]"
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_message, action_evtlog_event_data_ObjectName
+  lucene: |
+    event.code:4657 AND winlog.event_data.ObjectName:*\\System\\CurrentControlSet\\Control\\Lsa\\DsrmAdminLogonBehavior AND (winlog.event_data.NewValue:(1 OR 2) OR winlog.event_data.OldValue:(1 OR 2))
+  sumo: |
+    _sourceCategory=*Windows*Security* "4657"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ObjectName" as object_name
+    | json field=_raw "NewValue" as new_value
+    | json field=_raw "OldValue" as old_value
+    | where event_id = "4657"
+    | where object_name matches "*HKLM\\System\\CurrentControlSet\\Control\\Lsa\\DsrmAdminLogonBehavior*"
+    | where new_value in ("1", "2") or old_value in ("1", "2")
+    | fields _messageTime, _sourceHost, object_name, old_value, new_value
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -95,7 +106,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Security Event
 

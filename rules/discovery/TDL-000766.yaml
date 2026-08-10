@@ -25,71 +25,119 @@ queries:
     *-ef*\")) \n| eval security_tool_search=case(\n    match(CommandLine, \"(?i)(sentinel|csagent|MsMpEng|falcon|defender|carbonblack)\"), 1,\n\
     \    match(CommandLine, \"(?i)grep.*(sentinel|csagent|MsMpEng|falcon|defender|carbonblack)\"), 1,\n    match(CommandLine, \"(?i)findstr.*(sentinel|csagent|MsMpEng|falcon|defender|carbonblack)\"\
     ), 1,\n    1=1, 0)\n| where security_tool_search=1\n| table _time, host, ComputerName, User, Image, CommandLine, ParentImage\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    union
+    (SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where CommandLine has_any ("tasklist", "ps -ef", "ps aux")
+    | where CommandLine has_any ("sentinel", "csagent", "MsMpEng", "falcon", "defender", "carbonblack", "crowdstrike", "cylance", "sophos", "symantec", "mcafee", "kaspersky", "trendmicro", "bitdefender")
+    | project TimeGenerated, Computer, Account, Process = NewProcessName, CommandLine, ParentProcessName),
+    (Event
+    | where TimeGenerated > ago(1h)
+    | where Source == "Microsoft-Windows-Sysmon" and EventID == 1
+    | extend CommandLine = tostring(EventData.CommandLine)
+    | extend Process = tostring(EventData.Image)
+    | extend ParentProcessName = tostring(EventData.ParentImage)
+    | extend User = tostring(EventData.User)
+    | where CommandLine has_any ("tasklist", "ps -ef", "ps aux")
+    | where CommandLine has_any ("sentinel", "csagent", "MsMpEng", "falcon", "defender", "carbonblack", "crowdstrike", "cylance", "sophos", "symantec", "mcafee", "kaspersky", "trendmicro", "bitdefender")
+    | project TimeGenerated, Computer, Account = User, Process, CommandLine, ParentProcessName),
+    (Syslog
+    | where TimeGenerated > ago(1h)
+    | where ProcessName in~ ("bash", "sh", "zsh", "dash", "csh", "tcsh", "ksh")
+    | where SyslogMessage has_any ("ps -ef", "ps aux")
+    | where SyslogMessage has_any ("sentinel", "csagent", "MsMpEng", "falcon", "defender", "carbonblack", "crowdstrike", "cylance", "sophos", "symantec", "mcafee", "kaspersky", "trendmicro", "bitdefender")
+    | project TimeGenerated, Computer, Account = ProcessName, Process = ProcessName, CommandLine = SyslogMessage, ParentProcessName = "")
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName
+  aql: |
+    SELECT username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process CommandLine", "Process Name", "Parent Process Name", COUNT(*) AS executions
+    FROM events
+    WHERE (
+      ("Process CommandLine" ILIKE '%tasklist%' AND ("Process CommandLine" ILIKE '%sentinel%' OR "Process CommandLine" ILIKE '%csagent%' OR "Process CommandLine" ILIKE '%MsMpEng%' OR "Process CommandLine" ILIKE '%falcon%' OR "Process CommandLine" ILIKE '%defender%' OR "Process CommandLine" ILIKE '%carbonblack%'))
+      OR
+      ("Process CommandLine" ILIKE '%ps -ef%' AND ("Process CommandLine" ILIKE '%grep%' AND ("Process CommandLine" ILIKE '%sentinel%' OR "Process CommandLine" ILIKE '%csagent%' OR "Process CommandLine" ILIKE '%MsMpEng%' OR "Process CommandLine" ILIKE '%falcon%' OR "Process CommandLine" ILIKE '%defender%' OR "Process CommandLine" ILIKE '%carbonblack%')))
+    )
+    AND ("EventID" = '1' OR "EventID" = '4688' OR "EventID" = 'EXECVE')
+    GROUP BY username, sourceip, LOGSOURCENAME(logsourceid), "Process CommandLine", "Process Name", "Parent Process Name"
+    LAST 1 HOURS
+  yara_l: |
+    rule process_discovery_security_tools {
+      meta:
+        author = "TDL"
+        description = "T1057 Process Discovery - Survey for security tools via tasklist or ps commands"
+        mitre_attack_tactic = "Discovery"
+        mitre_attack_technique = "T1057"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          (
+            re.regex($e.principal.process.file.full_path, `(?i)\\tasklist\.exe$`) and
+            re.regex($e.principal.process.command_line, `(?i)/v`)
+          ) or
+          (
+            re.regex($e.principal.process.file.full_path, `(?i)/bin/(ps|grep)$`) and
+            re.regex($e.principal.process.command_line, `(?i)(ps\s+(-)?ef|grep)`)
+          )
+        )
+        re.regex($e.principal.process.command_line, `(?i)(sentinel|csagent|msmpeng|falcon|defender|carbonblack)`)
+        $e.principal.hostname = $host
 
-    | where process_name matches regex ".+"
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      outcome:
+        $risk_score = 45
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000766 {\n  meta:\n    author = \"TDL\"\n    description = \"tasklist / ps Enumerating EDR & AV Processes\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1057\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint.events.process*, logs-windows.sysmon_operational*, logs-system.auth*
+    | WHERE event.category == "process" AND event.type == "start"
+      AND (
+        (process.name IN ("tasklist.exe", "tasklist") AND process.command_line LIKE "*/v*")
+        OR (process.name IN ("ps", "grep") AND (process.command_line LIKE "*ps -ef*" OR process.command_line LIKE "*ps aux*"))
+      )
+      AND (
+        process.command_line LIKE "*sentinel*"
+        OR process.command_line LIKE "*csagent*"
+        OR process.command_line LIKE "*MsMpEng*"
+        OR process.command_line LIKE "*falcon*"
+        OR process.command_line LIKE "*defender*"
+        OR process.command_line LIKE "*carbonblack*"
+      )
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.parent.command_line
+  leql: |
+    where((process_name ICONTAINS "tasklist" AND process_cmd_line ICONTAINS "/v") OR (process_name ICONTAINS "ps" AND process_cmd_line=/grep.*(sentinel|csagent|MsMpEng|falcon|defender|carbonblack)/i)) groupby(asset, user, process_cmd_line) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 (CommandLine=*tasklist* OR CommandLine=*ps\ -ef* OR CommandLine=*ps\ aux*) (CommandLine=*sentinel* OR CommandLine=*csagent* OR CommandLine=*MsMpEng* OR CommandLine=*falcon* OR CommandLine=*defender* OR CommandLine=*carbonblack* OR CommandLine=*grep*)
+    | table([@timestamp, ComputerName, UserName, FileName, ParentBaseFileName, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter (
+        (action_process_image_name = "tasklist.exe" and action_process_image_command_line ~= ".*\\s+/v.*") or
+        (action_process_image_name in ("ps", "grep") and action_process_image_command_line ~= ".*(ps\\s+-ef|ps\\s+aux).*") or
+        (action_process_image_command_line ~= ".*(sentinel|csagent|MsMpEng|falcon|defender|carbonblack).*" and action_process_image_name in ("tasklist.exe", "ps", "grep"))
+      )
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, actor_process_image_name
+  lucene: |
+    (process.name:(tasklist.exe OR ps) AND process.command_line:(*sentinel* OR *csagent* OR *MsMpEng* OR *falcon* OR *defender* OR *carbonblack*)) OR (process.name:grep AND process.command_line:(*sentinel* OR *csagent* OR *MsMpEng* OR *falcon* OR *defender* OR *carbonblack*))
+  sumo: |
+    _sourceCategory=*Sysmon* OR _sourceCategory=*Auditd* OR _sourceCategory=*Windows* OR _sourceCategory=*Linux*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as cmd
+    | json field=_raw "Image" as image
+    | json field=_raw "COMMAND" as auditd_cmd
+    | where (event_id = "1" OR event_id = "4688" OR isBlank(event_id))
+    | where (cmd matches "*tasklist*" AND (cmd matches "*sentinel*" OR cmd matches "*csagent*" OR cmd matches "*MsMpEng*" OR cmd matches "*falcon*" OR cmd matches "*defender*" OR cmd matches "*carbonblack*"))
+       OR (cmd matches "*ps -ef*" AND (cmd matches "*grep*" AND (cmd matches "*sentinel*" OR cmd matches "*csagent*" OR cmd matches "*MsMpEng*" OR cmd matches "*falcon*" OR cmd matches "*defender*" OR cmd matches "*carbonblack*")))
+       OR (auditd_cmd matches "*tasklist*" AND (auditd_cmd matches "*sentinel*" OR auditd_cmd matches "*csagent*" OR auditd_cmd matches "*MsMpEng*" OR auditd_cmd matches "*falcon*" OR auditd_cmd matches "*defender*" OR auditd_cmd matches "*carbonblack*"))
+       OR (auditd_cmd matches "*ps -ef*" AND (auditd_cmd matches "*grep*" AND (auditd_cmd matches "*sentinel*" OR auditd_cmd matches "*csagent*" OR auditd_cmd matches "*MsMpEng*" OR auditd_cmd matches "*falcon*" OR auditd_cmd matches "*defender*" OR auditd_cmd matches "*carbonblack*")))
+    | fields _messageTime, _sourceHost, image, cmd, auditd_cmd
 pseudo_logic: tasklist /v or ps -ef | grep with patterns for sentinel*, csagent, MsMpEng, falcon, defender, carbonblack — survey for security
   tools.
 false_positives:
@@ -107,7 +155,7 @@ references:
 - https://attack.mitre.org/techniques/T1057/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

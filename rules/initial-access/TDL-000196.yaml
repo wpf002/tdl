@@ -17,73 +17,81 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=okta eventType="system.push.send_factor_verify_push"
+  spl: 'index=okta eventType="system.push.send_factor_verify_push"
+
     | bin _time span=5m
+
     | stats dc(user) as unique_users values(user) as users by _time, src_ip
+
     | where unique_users >= 5
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000196 {\n  meta:\n    author = \"TDL\"\n    description = \"MFA Push Sent Spraying\"\n    severity = \"LOW\"\n \
-    \   tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n\
-    \    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    Okta_CL
+    | where TimeGenerated > ago(5m)
+    | where eventType_s == "system.push.send_factor_verify_push"
+    | summarize UniqueUsers = dcount(actor_alternateId_s), Users = make_set(actor_alternateId_s), EventCount = count() by bin(TimeGenerated, 5m), client_ipAddress_s
+    | where UniqueUsers >= 5 and EventCount >= 5
+    | project TimeGenerated, SourceIP = client_ipAddress_s, UniqueUserCount = UniqueUsers, UserList = Users, TotalEvents = EventCount
+  aql: |
+    SELECT sourceip, UNIQUECOUNT(username) AS unique_users, COUNT(*) AS push_events
+    FROM events
+    WHERE "Event Type" = 'system.push.send_factor_verify_push'
+    GROUP BY sourceip
+    HAVING unique_users >= 5 AND push_events >= 5
+    LAST 5 MINUTES
+  yara_l: |
+    rule okta_push_mfa_spray {
+      meta:
+        author = "TDL"
+        description = "Detects potential MFA push notification spray from single IP to multiple users"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_event_type = "system.push.send_factor_verify_push"
+        $e.principal.ip = $source_ip
+        $e.target.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $source_ip over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 5 and #user >= 5
+    }
+  esql: |
+    FROM logs-okta*
+    | WHERE @timestamp > NOW() - 5 minutes AND event.action == "system.push.send_factor_verify_push"
+    | STATS unique_users = COUNT_DISTINCT(user.name), event_count = COUNT(*) BY source.ip, time_window = BUCKET(@timestamp, 5 minutes)
+    | WHERE unique_users >= 5 AND event_count >= 5
+    | KEEP time_window, source.ip, unique_users, event_count
+  leql: |
+    where(source_json.eventType="system.push.send_factor_verify_push") groupby(source_address) calculate(unique:user)
+  crowdstrike: |
+    #type=okta eventType="system.push.send_factor_verify_push"
+    | groupBy([client.ipAddress], function=[count(actor.alternateId, distinct=true, as=uniqueUsers), count(as=totalEvents)], limit=max)
+    | uniqueUsers >= 5 AND totalEvents >= 5
+    | table([client.ipAddress, uniqueUsers, totalEvents])
+  xql: |
+    dataset = okta_logs
+    | filter event_type = "system.push.send_factor_verify_push"
+    | bin _time span=5m
+    | comp count() as push_count, count_distinct(actor_alternate_id) as unique_users by _time, client_ip_address
+    | filter push_count >= 5 and unique_users >= 5
+    | fields _time, client_ip_address, push_count, unique_users
+  lucene: |
+    eventType:"system.push.send_factor_verify_push"
+  sumo: |
+    _sourceCategory=*Okta* "system.push.send_factor_verify_push"
+    | json field=_raw "eventType" as event_type
+    | json field=_raw "client.ipAddress" as src_ip
+    | json field=_raw "actor.alternateId" as username
+    | where event_type = "system.push.send_factor_verify_push"
+    | timeslice 5m
+    | count_distinct(username) as unique_users, count as total_events by _timeslice, src_ip
+    | where unique_users >= 5 and total_events >= 5
+    | fields _timeslice, src_ip, unique_users, total_events
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -93,7 +101,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "5 Okta Event\nWhere the Event Type is \"system.push.send_factor_verify_push\"\nFrom the same source IP \nWith at least 5 unique\
   \ source usernames\nWithin 5 minutes"

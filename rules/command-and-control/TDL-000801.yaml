@@ -16,100 +16,111 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=dns OR index=network sourcetype IN (stream:dns, stream:http, bro:dns, bro:http, zeek:dns, zeek:http)
-    | eval is_tls_sni=if(isnotnull(ssl_server_name) OR isnotnull(server_name) OR isnotnull(tls_sni), 1, 0)
-    | eval is_http_host=if(isnotnull(host) OR isnotnull(http_host) OR isnotnull(Host), 1, 0)
-    | eval tls_sni_field=coalesce(ssl_server_name, server_name, tls_sni)
-    | eval http_host_field=coalesce(host, http_host, Host)
-    | where is_tls_sni=1 AND is_http_host=1
-    | eval cdn_match=case(
-        match(tls_sni_field, "(?i)cloudfront\.net"), "cloudfront",
-        match(tls_sni_field, "(?i)akamai\.net"), "akamai",
-        match(tls_sni_field, "(?i)akamaiedge\.net"), "akamai",
-        match(tls_sni_field, "(?i)akamaitechnologies\.com"), "akamai",
-        match(tls_sni_field, "(?i)edgesuite\.net"), "akamai",
-        match(tls_sni_field, "(?i)edgekey\.net"), "akamai",
-        match(tls_sni_field, "(?i)cloudflare\.net"), "cloudflare",
-        match(tls_sni_field, "(?i)fastly\.net"), "fastly",
-        1=1, null())
-    | where isnotnull(cdn_match)
-    | eval tls_domain=lower(replace(tls_sni_field, "^.*\.([^.]+\.[^.]+)$", "\1"))
-    | eval http_domain=lower(replace(http_host_field, "^.*\.([^.]+\.[^.]+)$", "\1"))
-    | where tls_domain!=http_domain
-    | stats count values(tls_sni_field) as tls_sni values(http_host_field) as http_host by src_ip, dest_ip, cdn_match
-    | table _time, src_ip, dest_ip, cdn_match, tls_sni, http_host, count
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tls"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tls%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  spl: "index=dns OR index=network sourcetype IN (stream:dns, stream:http, bro:dns, bro:http, zeek:dns, zeek:http)\n| eval is_tls_sni=if(isnotnull(ssl_server_name)\
+    \ OR isnotnull(server_name) OR isnotnull(tls_sni), 1, 0)\n| eval is_http_host=if(isnotnull(host) OR isnotnull(http_host) OR isnotnull(Host),\
+    \ 1, 0)\n| eval tls_sni_field=coalesce(ssl_server_name, server_name, tls_sni)\n| eval http_host_field=coalesce(host, http_host, Host)\n| where\
+    \ is_tls_sni=1 AND is_http_host=1\n| eval cdn_match=case(\n    match(tls_sni_field, \"(?i)cloudfront\\.net\"), \"cloudfront\",\n    match(tls_sni_field,\
+    \ \"(?i)akamai\\.net\"), \"akamai\",\n    match(tls_sni_field, \"(?i)akamaiedge\\.net\"), \"akamai\",\n    match(tls_sni_field, \"(?i)akamaitechnologies\\\
+    .com\"), \"akamai\",\n    match(tls_sni_field, \"(?i)edgesuite\\.net\"), \"akamai\",\n    match(tls_sni_field, \"(?i)edgekey\\.net\"), \"\
+    akamai\",\n    match(tls_sni_field, \"(?i)cloudflare\\.net\"), \"cloudflare\",\n    match(tls_sni_field, \"(?i)fastly\\.net\"), \"fastly\"\
+    ,\n    1=1, null())\n| where isnotnull(cdn_match)\n| eval tls_domain=lower(replace(tls_sni_field, \"^.*\\.([^.]+\\.[^.]+)$\", \"\\1\"))\n\
+    | eval http_domain=lower(replace(http_host_field, \"^.*\\.([^.]+\\.[^.]+)$\", \"\\1\"))\n| where tls_domain!=http_domain\n| stats count values(tls_sni_field)\
+    \ as tls_sni values(http_host_field) as http_host by src_ip, dest_ip, cdn_match\n| table _time, src_ip, dest_ip, cdn_match, tls_sni, http_host,\
+    \ count\n"
+  kql: |
+    let TimeFrame = 1h;
+    let PopularCDNs = dynamic(["cloudfront.net", "akamai.net", "akamaiedge.net", "edgekey.net", "edgesuite.net", "azureedge.net", "azurefd.net"]);
+    DnsEvents
+    | where TimeGenerated > ago(TimeFrame)
+    | where isnotempty(AdditionalFields)
+    | extend SNI = tostring(parse_json(AdditionalFields).SNI)
+    | extend HTTPHost = tostring(parse_json(AdditionalFields).HTTPHost)
+    | where isnotempty(SNI) and isnotempty(HTTPHost)
+    | where SNI has_any (PopularCDNs)
+    | extend SNIDomain = extract(@"([^\.]+\.[^\.]+)$", 1, tolower(SNI))
+    | extend HostDomain = extract(@"([^\.]+\.[^\.]+)$", 1, tolower(HTTPHost))
+    | where SNIDomain != HostDomain
+    | project TimeGenerated, ClientIP, SNI, HTTPHost, SNIDomain, HostDomain, Name, Type, Result
+  aql: |
+    SELECT sourceip, destinationip, "HTTP Host Header" AS http_host, "TLS SNI" AS tls_sni, COUNT(*) AS occurrences
+    FROM events
+    WHERE (categoryname(category) ILIKE '%web%' OR categoryname(category) ILIKE '%http%' OR categoryname(category) ILIKE '%proxy%')
+      AND ("TLS SNI" ILIKE '%cloudfront.net%' OR "TLS SNI" ILIKE '%akamai%' OR "TLS SNI" ILIKE '%fastly%' OR "TLS SNI" ILIKE '%azureedge.net%' OR "TLS SNI" ILIKE '%cloudflare%')
+      AND "HTTP Host Header" IS NOT NULL
+      AND "TLS SNI" IS NOT NULL
+      AND "HTTP Host Header" NOT ILIKE CONCAT('%', DOMAINNAME("TLS SNI"), '%')
+    GROUP BY sourceip, destinationip, "HTTP Host Header", "TLS SNI"
+    HAVING occurrences >= 1
     LAST 1 HOURS
+  yara_l: |
+    rule domain_fronting_cdn_mismatch {
+      meta:
+        author = "TDL"
+        description = "Detects domain fronting via TLS SNI/HTTP Host mismatch on popular CDNs"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1665"
+        severity = "HIGH"
 
-    '
-  yara_l: "rule tdl_tdl_c2_000801 {\n  meta:\n    author = \"TDL\"\n    description = \"TLS SNI Disagrees With HTTP Host Header\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1665\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tls/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        (
+          re.regex($e.network.tls.client.server_name, `(?i)(cloudfront\.net|akamai\.net|akamaiedge\.net|akamaihd\.net)$`) or
+          re.regex($e.target.hostname, `(?i)(cloudfront\.net|akamai\.net|akamaiedge\.net|akamaihd\.net)$`)
+        )
+        $e.network.http.parsed_user_agent != ""
+        $e.network.application_protocol = "HTTPS"
+        $sni = $e.network.tls.client.server_name
+        $host = $e.network.http.host_header
+        $sni != $host
+        not re.regex($host, `(?i)(cloudfront\.net|akamai\.net|akamaiedge\.net|akamaihd\.net)$`)
+        $e.principal.ip = $src_ip
 
+      match:
+        $src_ip over 5m
+
+      outcome:
+        $risk_score = 75
+        $cdn_domain = $sni
+        $fronted_domain = $host
+
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network.dns-*, packetbeat-*, logs-zeek.dns-*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tls%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tls/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tls*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tls"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tls*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tls*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      AND (
+        (tls.client.server_name LIKE "*cloudfront.net" OR tls.client.server_name LIKE "*akamai*" OR tls.client.server_name LIKE "*fastly*" OR tls.client.server_name LIKE "*cloudflare*")
+        AND NOT (http.request.headers.host == tls.client.server_name OR http.request.headers.host LIKE CONCAT("*", SUBSTRING(tls.client.server_name, 0, 20), "*"))
+      )
+      AND tls.client.server_name IS NOT NULL
+      AND http.request.headers.host IS NOT NULL
+    | STATS occurrences = COUNT(*) BY source.ip, destination.ip, tls.client.server_name, http.request.headers.host
+    | WHERE occurrences >= 1
+    | KEEP @timestamp, source.ip, destination.ip, tls.client.server_name, http.request.headers.host, occurrences
+  leql: |
+    where(source_json.tls_sni IN ["cloudfront.net", "akamaihd.net", "akamaiedge.net", "cloudflare.net"] AND source_json.http_host != source_json.tls_sni AND source_json.http_host NOT IN ["cloudfront.net", "akamaihd.net", "akamaiedge.net", "cloudflare.net"]) groupby(source_address, destination_address, source_json.tls_sni, source_json.http_host) calculate(count)
+  crowdstrike: "(#type=dns OR event_simpleName=DnsRequest) \n| regex(\"(?i)(cloudfront\\\\.net|akamai\\\\.net|akamaiedge\\\\.net|fastly\\\\.net|cloudflare\\\
+    \\.net)\", field=query, as=cdn_match)\n| cdn_match=*\n| groupBy([query, answer], function=count(as=requests))\n| table([@timestamp, query,\
+    \ answer, requests])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter app_category = "web-based" and (dest_port = 443 or dest_port = 80)
+    | filter (http_hostname != null and tls_sni != null) and (lowercase(tls_sni) contains "cloudfront" or lowercase(tls_sni) contains "akamai" or lowercase(tls_sni) contains "fastly" or lowercase(tls_sni) contains "cloudflare")
+    | alter sni_normalized = lowercase(tls_sni), host_normalized = lowercase(http_hostname)
+    | filter sni_normalized != host_normalized and host_normalized !~= ".*cloudfront.*|.*akamai.*|.*fastly.*|.*cloudflare.*"
+    | comp count() as fronting_attempts by src_ip, http_hostname, tls_sni
+    | filter fronting_attempts >= 1
+    | fields src_ip, http_hostname, tls_sni, fronting_attempts
+  lucene: |
+    (tls.client.server_name:(*cloudfront.net OR *akamai.net OR *akamaiedge.net OR *akamaihd.net OR *fastly.net OR *cloudflare.net) AND http.request.header.host:* AND NOT http.request.header.host:(*cloudfront.net OR *akamai.net OR *akamaiedge.net OR *akamaihd.net OR *fastly.net OR *cloudflare.net OR *amazonaws.com OR *azureedge.net OR *msecnd.net))
+  sumo: "_sourceCategory=*DNS* OR _sourceCategory=*Network* OR _sourceCategory=*Proxy*\n| parse regex \"(?<sni_field>sni[=:\\s]+(?<sni>[^\\s,;]+))\"\
+    \ nodrop\n| parse regex \"(?<host_field>host[=:\\s]+(?<host_header>[^\\s,;]+))\" nodrop\n| parse regex \"\\\"(?<http_host>Host:\\s*[^\\s\\\
+    \"]+)\\\"\" nodrop\n| parse \"Host: *\" as host_parsed nodrop\n| where (sni matches \"*cloudfront.net*\" or sni matches \"*akamai*\" or sni\
+    \ matches \"*fastly*\" or sni matches \"*cloudflare*\") \n| where isNotEmpty(host_header) or isNotEmpty(http_host) or isNotEmpty(host_parsed)\n\
+    | if(isNotEmpty(host_header), host_header, if(isNotEmpty(http_host), http_host, host_parsed)) as extracted_host\n| where !(extracted_host\
+    \ matches \"*cloudfront*\" or extracted_host matches \"*akamai*\" or extracted_host matches \"*fastly*\" or extracted_host matches \"*cloudflare*\"\
+    )\n| where sni != extracted_host\n| fields _messageTime, _sourceHost, sni, extracted_host, _raw\n"
 pseudo_logic: TLS SNI = popular CDN (cloudfront, akamai), HTTP Host header = unrelated domain. Domain-fronting indicator.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -126,7 +137,7 @@ references:
 - https://attack.mitre.org/techniques/T1665/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

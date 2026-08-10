@@ -17,77 +17,106 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=windows (EventCode=4688 OR EventCode=592 OR EventCode=4104)
-    ((EventCode=4688 OR EventCode=592) (Image="*\\powershell.exe" OR NewProcessName="*\\powershell.exe") (CommandLine="*invoke-dllinjection*" OR CommandLine="*invoke-shellcode*" OR CommandLine="*invoke-wmicommand*" OR CommandLine="*get-gpppassword*" OR CommandLine="*get-keystrokes*" OR CommandLine="*get-timedscreenshot*" OR CommandLine="*get-vaultcredential*" OR CommandLine="*invoke-credentialinjection*" OR CommandLine="*invoke-ninjacopy*" OR CommandLine="*invoke-tokenmanipulation*" OR CommandLine="*out-minidump*" OR CommandLine="*volumeshadowcopytools*" OR CommandLine="*invoke-reflectivepeinjection*"))
+  spl: 'index=windows (EventCode=4688 OR EventCode=592 OR EventCode=4104)
+
+    ((EventCode=4688 OR EventCode=592) (Image="*\\powershell.exe" OR NewProcessName="*\\powershell.exe") (CommandLine="*invoke-dllinjection*"
+    OR CommandLine="*invoke-shellcode*" OR CommandLine="*invoke-wmicommand*" OR CommandLine="*get-gpppassword*" OR CommandLine="*get-keystrokes*"
+    OR CommandLine="*get-timedscreenshot*" OR CommandLine="*get-vaultcredential*" OR CommandLine="*invoke-credentialinjection*" OR CommandLine="*invoke-ninjacopy*"
+    OR CommandLine="*invoke-tokenmanipulation*" OR CommandLine="*out-minidump*" OR CommandLine="*volumeshadowcopytools*" OR CommandLine="*invoke-reflectivepeinjection*"))
+
     OR
-    (EventCode=4104 (ScriptBlockText="*invoke-dllinjection*" OR ScriptBlockText="*invoke-shellcode*" OR ScriptBlockText="*invoke-wmicommand*" OR ScriptBlockText="*get-gpppassword*" OR ScriptBlockText="*get-keystrokes*" OR ScriptBlockText="*get-timedscreenshot*" OR ScriptBlockText="*get-vaultcredential*" OR ScriptBlockText="*invoke-credentialinjection*" OR ScriptBlockText="*invoke-ninjacopy*" OR ScriptBlockText="*invoke-tokenmanipulation*" OR ScriptBlockText="*out-minidump*" OR ScriptBlockText="*volumeshadowcopytools*" OR ScriptBlockText="*invoke-reflectivepeinjection*"))
+
+    (EventCode=4104 (ScriptBlockText="*invoke-dllinjection*" OR ScriptBlockText="*invoke-shellcode*" OR ScriptBlockText="*invoke-wmicommand*"
+    OR ScriptBlockText="*get-gpppassword*" OR ScriptBlockText="*get-keystrokes*" OR ScriptBlockText="*get-timedscreenshot*" OR ScriptBlockText="*get-vaultcredential*"
+    OR ScriptBlockText="*invoke-credentialinjection*" OR ScriptBlockText="*invoke-ninjacopy*" OR ScriptBlockText="*invoke-tokenmanipulation*"
+    OR ScriptBlockText="*out-minidump*" OR ScriptBlockText="*volumeshadowcopytools*" OR ScriptBlockText="*invoke-reflectivepeinjection*"))
+
     | table _time, ComputerName, EventCode, User, Image, NewProcessName, CommandLine, ScriptBlockText
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("powershell.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('powershell.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000509 {\n  meta:\n    author = \"TDL\"\n    description = \"PowerSploit Commandlet Activity\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(powershell.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    union
+    (
+    SecurityEvent
+    | where EventID == 4688
+    | where Process has "powershell.exe"
+    | where CommandLine matches regex @"(?i).*\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\b.*"
+    | extend EventType = "ProcessExecution"
+    | project TimeGenerated, Computer, Account, Process, CommandLine, EventID, EventType
+    ),
+    (
+    Event
+    | where EventID == 4104
+    | where EventLog == "Microsoft-Windows-PowerShell/Operational"
+    | extend ScriptBlockText = tostring(EventData.ScriptBlockText)
+    | where ScriptBlockText matches regex @"(?i).*\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\b.*"
+    | extend EventType = "ScriptBlockLogging"
+    | project TimeGenerated, Computer, Account = UserName, Process = "powershell.exe", CommandLine = ScriptBlockText, EventID, EventType
+    )
+    | sort by TimeGenerated desc
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, \"EventID\", \"Process Name\", \"Process CommandLine\", \"ScriptBlockText\"\
+    , sourceip\nFROM events\nWHERE (\n    (\"EventID\" IN ('592', '4688') \n     AND \"Process Name\" ILIKE '%powershell.exe%' \n     AND \"Process\
+    \ CommandLine\" MATCHES '.*\\b(invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\\\
+    b.*')\n    OR\n    (\"EventID\" = '4104' \n     AND \"ScriptBlockText\" MATCHES '.*\\b(invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\\\
+    b.*')\n)\nLAST 1 HOURS\n"
+  yara_l: |
+    rule powershell_malicious_cmdlets {
+      meta:
+        author = "TDL"
+        description = "Detects execution of malicious PowerShell cmdlets associated with PowerSploit and other offensive frameworks"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        (
+          $process.metadata.event_type = "PROCESS_LAUNCH" and
+          (
+            $process.metadata.product_event_type = "592" or
+            $process.metadata.product_event_type = "4688"
+          ) and
+          re.regex($process.principal.process.file.full_path, `(?i)powershell\.exe$`) and
+          re.regex($process.principal.process.command_line, `(?i)\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\b`)
+        ) or
+        (
+          $process.metadata.event_type = "SCRIPT_EXECUTE" and
+          $process.metadata.product_event_type = "4104" and
+          re.regex($process.security_result.detection_fields["ScriptBlockText"], `(?i)\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\b`)
+        )
+        $process.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name IN ("powershell.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 85
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [powershell.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $process
+    }
+  esql: |
+    FROM logs-system.security*, logs-endpoint.events.process*, winlogbeat-*, logs-windows.powershell*
+    | WHERE (
+        (event.code IN ("592", "4688") AND process.name == "powershell.exe" AND process.command_line RLIKE ".*\\b(?i)(invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\\b.*")
+        OR
+        (event.code == "4104" AND powershell.file.script_block_text RLIKE ".*\\b(?i)(invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\\b.*")
+      )
+    | KEEP @timestamp, host.name, user.name, event.code, process.name, process.command_line, process.parent.name, powershell.file.script_block_text
+  leql: |
+    where((source_json.EventID=4688 AND process_name ICONTAINS "powershell.exe" AND process_cmd_line=/.*\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\b.*/i) OR (source_json.EventID=4104 AND source_json.ScriptBlockText=/.*\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\b.*/i))
+  crowdstrike: |
+    (EventCode=4688 FileName=*powershell.exe CommandLine=/.*\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\b.*/i) OR (EventCode=4104 ScriptBlockText=/.*\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\b.*/i)
+    | table([@timestamp, EventCode, ComputerName, UserName, FileName, CommandLine, ScriptBlockText])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) and lowercase(actor_process_image_name) contains "powershell.exe" and action_process_image_command_line ~= ".*\\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\\b.*") or (action_evtlog_event_id = 4104 and action_evtlog_message ~= ".*\\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\\b.*")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_id, actor_process_image_name, action_process_image_command_line, action_evtlog_message
+  lucene: |
+    (event.code:(592 OR 4688) AND process.name:powershell.exe AND process.command_line:/(invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)/i) OR (event.code:4104 AND ScriptBlockText:/(invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)/i)
+  sumo: "_sourceCategory=*Windows* ((\"4688\" powershell.exe) OR \"4104\")\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"NewProcessName\"\
+    \ as process_name\n| json field=_raw \"CommandLine\" as command_line\n| json field=_raw \"ScriptBlockText\" as script_block\n| where (event_id\
+    \ in (\"592\", \"4688\") and process_name matches \"*powershell.exe\" and command_line matches /.*\\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\\\
+    b.*/i) \n       OR (event_id = \"4104\" and script_block matches /.*\\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\\\
+    b.*/i)\n| fields _messageTime, _sourceHost, event_id, process_name, command_line, script_block\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -97,7 +126,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe\nWhere Command\
   \ matches the regex \".*\\b(?:invoke-dllinjection|invoke-shellcode|invoke-wmicommand|get-gpppassword|get-keystrokes|get-timedscreenshot|get-vaultcredential|invoke-credentialinjection|invoke-ninjacopy|invoke-tokenmanipulation|out-minidump|volumeshadowcopytools|invoke-reflectivepeinjection)\\\

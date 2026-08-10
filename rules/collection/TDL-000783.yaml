@@ -17,74 +17,84 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=edr (EventType=AudioDeviceAccess OR EventType=DeviceAccess OR EventType=ProcessAccess OR event_type=audio_access OR event_type=device_access) (action=opened OR action=open OR action=access) (device_type=audio OR device_type=microphone OR device_name=*WASAPI* OR device_name=*CoreAudio* OR api_name=*WASAPI* OR api_name=*CoreAudio*)
-    NOT (process_name IN ("Teams.exe", "Zoom.exe", "obs64.exe", "obs32.exe", "obs.exe", "audacity.exe", "Skype.exe", "Discord.exe", "slack.exe", "webexmta.exe", "CiscoCollabHost.exe", "Microsoft.Teams.exe", "ms-teams.exe") OR process_path IN ("*\\Microsoft Teams\\*", "*\\Zoom\\*", "*\\OBS Studio\\*", "*\\Audacity\\*", "*\\Skype\\*", "*\\Discord\\*", "*\\Slack\\*"))
-    | stats count values(device_name) as devices values(device_type) as device_types values(action) as actions by _time, host, process_name, process_path, user
+  spl: 'index=edr (EventType=AudioDeviceAccess OR EventType=DeviceAccess OR EventType=ProcessAccess OR event_type=audio_access OR event_type=device_access)
+    (action=opened OR action=open OR action=access) (device_type=audio OR device_type=microphone OR device_name=*WASAPI* OR device_name=*CoreAudio*
+    OR api_name=*WASAPI* OR api_name=*CoreAudio*)
+
+    NOT (process_name IN ("Teams.exe", "Zoom.exe", "obs64.exe", "obs32.exe", "obs.exe", "audacity.exe", "Skype.exe", "Discord.exe", "slack.exe",
+    "webexmta.exe", "CiscoCollabHost.exe", "Microsoft.Teams.exe", "ms-teams.exe") OR process_path IN ("*\\Microsoft Teams\\*", "*\\Zoom\\*", "*\\OBS
+    Studio\\*", "*\\Audacity\\*", "*\\Skype\\*", "*\\Discord\\*", "*\\Slack\\*"))
+
+    | stats count values(device_name) as devices values(device_type) as device_types values(action) as actions by _time, host, process_name, process_path,
+    user
+
     | where count > 0
+
     | table _time, host, user, process_name, process_path, devices, device_types, actions, count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000783 {\n  meta:\n    author = \"TDL\"\n    description = \"Non-Conferencing Process Activating Microphone\"\n  \
-    \  severity = \"HIGH\"\n    tactic = \"TA0009\"\n    technique = \"T1123\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceEvents
+    | where TimeGenerated > ago(1h)
+    | where ActionType in ("AudioCaptureStarted", "AudioRecordingEvent")
+    | where InitiatingProcessFileName !in~ ("Teams.exe", "Zoom.exe", "obs64.exe", "obs32.exe", "obs.exe", "audacity.exe", "chrome.exe", "msedge.exe", "firefox.exe", "safari", "Skype.exe", "Webex.exe", "slack.exe", "discord.exe")
+    | project TimeGenerated, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessFolderPath, ActionType
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Audio Device", COUNT(*) AS access_count
+    FROM events
+    WHERE ("EventID" IN ('800', '801', '1124', '1125') OR "Event Name" ILIKE '%audio%device%' OR "Event Name" ILIKE '%WASAPI%' OR "Event Name" ILIKE '%CoreAudio%')
+      AND "Process Name" NOT ILIKE '%teams.exe%'
+      AND "Process Name" NOT ILIKE '%zoom.exe%'
+      AND "Process Name" NOT ILIKE '%obs%'
+      AND "Process Name" NOT ILIKE '%audacity%'
+      AND "Process Name" NOT ILIKE '%skype%'
+      AND "Process Name" NOT ILIKE '%discord%'
+      AND "Process Name" NOT ILIKE '%webex%'
+    GROUP BY eventtime, LOGSOURCENAME(logsourceid), username, "Process Name", "Process CommandLine", "Audio Device"
+    LAST 1 HOURS
+  yara_l: "rule audio_device_access_suspicious_process {\n  meta:\n    author = \"TDL\"\n    description = \"Detects audio device access via WASAPI/CoreAudio\
+    \ by non-whitelisted processes - T1123 Audio Capture\"\n    mitre_attack_tactic = \"Collection\"\n    mitre_attack_technique = \"T1123\"\n\
+    \    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"RESOURCE_READ\" or\n    $e.metadata.event_type = \"RESOURCE_PERMISSIONS_CHANGE\"\
+    \ or\n    $e.metadata.event_type = \"PROCESS_OPEN\"\n    \n    (\n      re.regex($e.target.resource.name, `(?i)(wasapi|coreaudio|mmdevapi\\\
+    .dll|audioses\\.dll|CoreAudio\\.framework)`) or\n      re.regex($e.target.file.full_path, `(?i)(wasapi|coreaudio|mmdevapi\\.dll|audioses\\\
+    .dll|CoreAudio\\.framework)`) or\n      re.regex($e.principal.process.command_line, `(?i)(wasapi|coreaudio|AVCaptureDevice|AVAudioSession)`)\n\
+    \    )\n    \n    not re.regex($e.principal.process.file.full_path, `(?i)(teams\\.exe|zoom\\.exe|obs64\\.exe|obs\\.exe|audacity\\.exe|skype\\\
+    .exe|discord\\.exe|slack\\.exe|webex\\.exe|chrome\\.exe|firefox\\.exe|safari|edge\\.exe|msedge\\.exe)$`)\n    \n    $e.principal.hostname\
+    \ = $host\n    $e.principal.process.file.full_path = $process\n    \n  match:\n    $host, $process over 5m\n    \n  outcome:\n    $risk_score\
+    \ = 65\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-endpoint.events.api* \n| WHERE @timestamp > NOW() - 1 hour \n  AND (\n    (event.category == \"api\" AND event.dataset LIKE\
+    \ \"*windows*\" AND winlog.event_data.InterfaceName LIKE \"*IAudioClient*\")\n    OR \n    (event.category == \"api\" AND event.dataset LIKE\
+    \ \"*macos*\" AND process.Ext.api.name IN (\"AudioDeviceCreateIOProcID\", \"AudioUnitInitialize\", \"AudioQueueNewInput\"))\n  )\n| EVAL proc_lower\
+    \ = TO_LOWER(process.name)\n| WHERE NOT (\n    proc_lower LIKE \"*teams*\" \n    OR proc_lower LIKE \"*zoom*\" \n    OR proc_lower LIKE \"\
+    *obs*\" \n    OR proc_lower LIKE \"*audacity*\"\n    OR proc_lower LIKE \"*skype*\"\n    OR proc_lower LIKE \"*webex*\"\n    OR proc_lower\
+    \ LIKE \"*slack*\"\n  )\n| STATS event_count = COUNT(*) BY host.name, process.name, process.executable, user.name, process.parent.name\n|\
+    \ WHERE event_count > 0\n| KEEP @timestamp, host.name, user.name, process.name, process.executable, process.parent.name, event_count\n"
+  leql: |
+    where(source_json.EventID=255 OR source_json.api ICONTAINS "wasapi" OR source_json.api ICONTAINS "coreaudio" OR source_json.event_type ICONTAINS "audio" OR source_json.device_type ICONTAINS "audio") AND NOT (process_name ICONTAINS "teams.exe" OR process_name ICONTAINS "zoom.exe" OR process_name ICONTAINS "obs" OR process_name ICONTAINS "audacity.exe" OR process_name ICONTAINS "skype.exe" OR process_name ICONTAINS "slack.exe" OR process_name ICONTAINS "webex" OR process_name ICONTAINS "discord") groupby(asset, process_name, user) calculate(count)
+  crowdstrike: |
+    event_simpleName=AudioCaptureStarted
+    | !match(file=["*teams.exe", "*zoom.exe", "*obs*.exe", "*audacity.exe", "*skype.exe", "*discord.exe", "*slack.exe", "*webex*.exe", "*chrome.exe", "*firefox.exe", "*msedge.exe"], field=FileName, ignoreCase=true)
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, SHA256HashData])
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_LOAD_IMAGE \n  and (action_module_path ~= \".*audioses\\.dll$\" \n       or\
+    \ action_module_path ~= \".*mmdevapi\\.dll$\"\n       or action_module_path ~= \".*CoreAudio\\.framework.*\")\n| filter actor_process_image_name\
+    \ not in (\"teams.exe\", \"zoom.exe\", \"obs64.exe\", \"obs32.exe\", \"audacity.exe\", \"Teams.exe\", \"Zoom.exe\", \"OBS.exe\", \"Audacity.exe\"\
+    , \"Microsoft Teams.exe\")\n  and actor_process_image_path not contains \"Microsoft Teams\"\n  and actor_process_image_path not contains \"\
+    zoom.us\"\n  and actor_process_image_path not contains \"OBS Studio\"\n  and actor_process_image_path not contains \"Audacity\"\n| fields\
+    \ _time, agent_hostname, actor_effective_username, actor_process_image_name, actor_process_image_path, actor_process_image_command_line, action_module_path\n"
+  lucene: |
+    (event.action:"audio_device_access" OR event.type:"audio_capture" OR process.command_line:(*WASAPI* OR *CoreAudio* OR *IAudioClient* OR *AudioComponentInstance*)) AND NOT (process.name:(Teams.exe OR Zoom.exe OR obs64.exe OR obs32.exe OR obs.exe OR audacity.exe OR Skype.exe OR slack.exe OR discord.exe OR chrome.exe OR firefox.exe OR safari.exe OR "Microsoft Teams.app" OR "zoom.us.app" OR "OBS.app" OR "Audacity.app" OR "Skype.app" OR "Slack.app" OR "Discord.app"))
+  sumo: |
+    _sourceCategory=*EDR* OR _sourceCategory=*Windows* OR _sourceCategory=*macOS*
+    | json field=_raw "EventType" as event_type
+    | json field=_raw "ProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "ImagePath" as image_path
+    | json field=_raw "DeviceType" as device_type
+    | json field=_raw "APICall" as api_call
+    | json field=_raw "TargetObject" as target_object
+    | where (api_call matches "*WASAPI*" or api_call matches "*CoreAudio*" or api_call matches "*IAudioClient*" or api_call matches "*AudioObjectGetPropertyData*" or target_object matches "*audio*" or device_type matches "*audio*" or event_type matches "*AudioDevice*" or event_type matches "*AudioCapture*")
+    | where NOT (process_name matches "*teams.exe*" or process_name matches "*Zoom*" or process_name matches "*obs*" or process_name matches "*audacity*" or process_name matches "*Skype*" or process_name matches "*Discord*" or process_name matches "*Slack*" or process_name matches "*WebEx*" or image_path matches "*Microsoft Teams*" or image_path matches "*Zoom*" or image_path matches "*OBS*" or image_path matches "*Audacity*")
+    | fields _messageTime, _sourceHost, process_name, image_path, command_line, api_call, device_type, event_type
 pseudo_logic: Audio device opened via WASAPI / CoreAudio by a process not in the conferencing/recording allowlist (Teams, Zoom, OBS, Audacity).
 false_positives:
 - Sanctioned admin or engineering activity
@@ -101,7 +111,7 @@ references:
 - https://attack.mitre.org/techniques/T1123/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'

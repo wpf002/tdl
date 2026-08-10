@@ -19,77 +19,57 @@ queries:
     \ \n    ((dest_port=20 OR dest_port=21) OR (app=\"*ftp*\"))\n| lookup threat_intel_list dest_ip OUTPUT threat_indicator\n| where isnotnull(threat_indicator)\n\
     | stats dc(dest_ip) as unique_destinations values(dest_ip) as destinations values(dest_port) as ports values(app) as applications by src_ip\n\
     | where unique_destinations > 1\n| table src_ip, unique_destinations, destinations, ports, applications\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where destination_port in ("20", "21")
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "destination_port" IN (''20'', ''21'')
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(1h)\n| where DeviceAction !in (\"deny\", \"drop\", \"block\")\n| where DeviceDirection\
+    \ =~ \"outbound\"\n| where (DestinationPort in (20, 21) or ApplicationProtocol =~ \"ftp\")\n| join kind=inner (\n    ThreatIntelligenceIndicator\n\
+    \    | where isnotempty(NetworkIP) or isnotempty(NetworkDestinationIP) or isnotempty(NetworkSourceIP)\n    | extend TI_IP = coalesce(NetworkIP,\
+    \ NetworkDestinationIP, NetworkSourceIP)\n    | where isnotempty(TI_IP)\n    | project TI_IP, ThreatType, Description\n) on $left.DestinationIP\
+    \ == $right.TI_IP\n| summarize \n    DestinationCount = dcount(DestinationIP),\n    Destinations = make_set(DestinationIP),\n    Ports = make_set(DestinationPort),\n\
+    \    ThreatTypes = make_set(ThreatType)\n    by SourceIP, DeviceName, ApplicationProtocol\n| where DestinationCount >= 5\n| project SourceIP,\
+    \ DeviceName, DestinationCount, Destinations, Ports, ApplicationProtocol, ThreatTypes\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, application, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_destinations
+    FROM events
+    WHERE (destinationport IN (20, 21) OR application ILIKE '%ftp%')
+      AND sourceip IN (SELECT sourceip FROM events WHERE INOFFENSE(destinationip) GROUP BY sourceip HAVING UNIQUECOUNT(destinationip) > 5 LAST 1 HOURS)
+      AND INOFFENSE(destinationip)
+    GROUP BY sourceip, destinationip, destinationport, application
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exf_000103 {\n  meta:\n    author = \"TDL\"\n    description = \"Malicious FTP Traffic - Outbound\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0010\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.destination_port\
-    \ = /(20|21)/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND destination_port IN ("20", "21")
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND destination_port IN [20, 21])
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND destination_port IN (20, 21)
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND destination_port in ("20", "21")
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND destination_port:(20 OR 21)
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where destination_port IN ("20", "21")
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  yara_l: "rule exfil_ftp_to_threat_intel_destination {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects outbound FTP\
+    \ traffic to threat intel listed IPs\"\n    mitre_attack_tactic = \"Exfiltration\"\n    mitre_attack_technique = \"T1071\"\n    \n  events:\n\
+    \    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.direction = \"OUTBOUND\"\n    (\n      $e.target.port = 20 or\n     \
+    \ $e.target.port = 21 or\n      re.regex($e.network.application_protocol, `(?i)ftp`)\n    )\n    $e.principal.ip = $src_ip\n    $e.target.ip\
+    \ = $dst_ip\n    net.ip_in_range_cidr($dst_ip, \"0.0.0.0/0\")\n    \n  match:\n    $src_ip over 1h\n    \n  outcome:\n    $risk_score = 85\n\
+    \    $unique_destinations = count_distinct($dst_ip)\n    \n  condition:\n    $e and $dst_ip in %threat_intel_list\n}\n"
+  esql: "FROM logs-network.firewall*\n| WHERE @timestamp > NOW() - 24 hours\n  AND (network.direction == \"outbound\" OR network.direction ==\
+    \ \"egress\")\n  AND (\n    destination.port IN (20, 21)\n    OR TO_LOWER(network.application) == \"ftp\"\n  )\n  AND threat.indicator.ip\
+    \ == destination.ip\n| STATS \n    dest_count = COUNT_DISTINCT(destination.ip),\n    total_events = COUNT(*)\n  BY source.ip, host.name, bucket\
+    \ = BUCKET(@timestamp, 1 hour)\n| WHERE dest_count > 1 OR total_events > 0\n| KEEP bucket, source.ip, host.name, dest_count, total_events\n"
+  leql: |
+    where(source_json.direction=outbound AND (destination_port IN [20, 21] OR source_json.application ICONTAINS "ftp") AND destination_asset.threat_list=true)
+  crowdstrike: |
+    #type=firewall action=allowed
+    (DestinationIP=* AND SourceIP IN CIDR("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+    (DestinationPort IN [20, 21] OR Application=/(?i)ftp/)
+    | match(file="threat_intel.csv", field=DestinationIP, include=[DestinationIP], ignoreCase=true, strict=false)
+    | groupBy([SourceIP], function=count(DestinationIP, distinct=true, as=unique_destinations))
+    | table([SourceIP, unique_destinations, DestinationIP, DestinationPort, Application])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_source_translated_ip != null and action_destination_translated_ip != null
+    | filter (dest_port in (20, 21) or lowercase(app) = "ftp")
+    | filter dest_location = "ExternalNetwork" or not incidr(action_destination_ip, "10.0.0.0/8") and not incidr(action_destination_ip, "172.16.0.0/12") and not incidr(action_destination_ip, "192.168.0.0/16")
+    | alter is_threat_ip = if(action_destination_nat_ip != null and action_destination_nat_ip in ("*"), "yes", "no")
+    | filter is_threat_ip = "yes" or action_destination_reputation in ("malware", "phishing", "command_and_control")
+    | comp count_distinct(action_destination_ip) as unique_destinations by action_source_ip
+    | filter unique_destinations >= 5
+    | fields action_source_ip, unique_destinations
+  lucene: |
+    (destination.ip:* AND _exists_:threat.indicator.ip) AND (source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)) AND (destination.port:(20 OR 21) OR application:/[Ff][Tt][Pp]/)
+  sumo: "_sourceCategory=*Firewall* \n| json field=_raw \"src_ip\" as src_ip\n| json field=_raw \"dest_ip\" as dest_ip\n| json field=_raw \"dest_port\"\
+    \ as dest_port\n| json field=_raw \"application\" as application\n| json field=_raw \"direction\" as direction\n| json field=_raw \"threat_match\"\
+    \ as threat_match\n| where direction = \"outbound\" or direction = \"Outbound\"\n| where (dest_port in (\"20\", \"21\") or toLowerCase(application)\
+    \ matches \"*ftp*\")\n| where threat_match = \"true\" or threat_match = \"True\" or threat_match = \"1\"\n| count_distinct(dest_ip) as unique_destinations\
+    \ by src_ip\n| where unique_destinations >= 5\n| fields src_ip, unique_destinations\n"
 false_positives:
 - Authorized pen testing
 - Security research
@@ -99,7 +79,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Firewall Event \nFrom one internal source to many external destinations (Outbound)\nOR\n\tWhere the Destination Port is in [20,\
   \ 21]\n\t\n\tWhere the Application is case insensitive \"ftp\"\n\t\nWhere the Destination IP is on a Threat Intelligence List"

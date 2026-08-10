@@ -16,77 +16,138 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=kubernetes sourcetype=kube:apiserver:audit verb=list (objectRef.resource=pods OR objectRef.resource=services OR objectRef.resource=deployments OR objectRef.resource=replicasets OR objectRef.resource=statefulsets OR objectRef.resource=daemonsets) user.username=system:serviceaccount:*
+  spl: 'index=kubernetes sourcetype=kube:apiserver:audit verb=list (objectRef.resource=pods OR objectRef.resource=services OR objectRef.resource=deployments
+    OR objectRef.resource=replicasets OR objectRef.resource=statefulsets OR objectRef.resource=daemonsets) user.username=system:serviceaccount:*
+
     | rex field=user.username "system:serviceaccount:(?<namespace>[^:]+):(?<serviceaccount>.+)"
+
     | bin _time span=1h
-    | stats dc(objectRef.resource) as resource_types, values(objectRef.resource) as resources, values(objectRef.namespace) as namespaces_accessed, count by _time, namespace, serviceaccount, sourceIPs{}
+
+    | stats dc(objectRef.resource) as resource_types, values(objectRef.resource) as resources, values(objectRef.namespace) as namespaces_accessed,
+    count by _time, namespace, serviceaccount, sourceIPs{}
+
     | where resource_types >= 2 OR "pods" IN(resources)
+
     | eventstats dc(_time) as historical_count by namespace, serviceaccount
+
     | where historical_count <= 3
+
     | table _time, namespace, serviceaccount, sourceIPs{}, resource_types, resources, namespaces_accessed, count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000758 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubectl get all from Inside a Pod\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0007\"\n    technique = \"T1613\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: "AzureDiagnostics\n| where TimeGenerated > ago(1h)\n| where Category == \"kube-audit\"\n| extend requestURI = column_ifexists(\"requestURI_s\"\
+    , \"\")\n| extend verb = column_ifexists(\"verb_s\", \"\")\n| extend user = parse_json(column_ifexists(\"user_s\", \"{}\"))\n| extend username\
+    \ = tostring(user.username)\n| where verb == \"list\"\n| where requestURI has_any (\"/api/v1/pods\", \"/api/v1/namespaces\", \"/apis/apps/v1/deployments\"\
+    , \"/apis/apps/v1/replicasets\", \"/apis/apps/v1/daemonsets\", \"/apis/apps/v1/statefulsets\", \"/api/v1/services\")\n| where username startswith\
+    \ \"system:serviceaccount:\"\n| summarize \n    requestCount = count(),\n    namespacesAccessed = dcount(requestURI),\n    distinctURIs =\
+    \ make_set(requestURI, 10)\n    by bin(TimeGenerated, 5m), username, sourceIPs = column_ifexists(\"sourceIPs_s\", \"\")\n| join kind=leftanti\
+    \ (\n    AzureDiagnostics\n    | where TimeGenerated between (ago(7d) .. ago(1h))\n    | where Category == \"kube-audit\"\n    | extend requestURI\
+    \ = column_ifexists(\"requestURI_s\", \"\")\n    | extend verb = column_ifexists(\"verb_s\", \"\")\n    | extend user = parse_json(column_ifexists(\"\
+    user_s\", \"{}\"))\n    | extend username = tostring(user.username)\n    | where verb == \"list\"\n    | where requestURI has_any (\"/api/v1/pods\"\
+    , \"/api/v1/namespaces\", \"/apis/apps/v1/deployments\", \"/apis/apps/v1/replicasets\", \"/apis/apps/v1/daemonsets\", \"/apis/apps/v1/statefulsets\"\
+    , \"/api/v1/services\")\n    | where username startswith \"system:serviceaccount:\"\n    | distinct username\n) on username\n| where requestCount\
+    \ >= 3\n| project TimeGenerated, username, sourceIPs, requestCount, namespacesAccessed, distinctURIs\n"
+  aql: |
+    SELECT username AS service_account, sourceip, "objectRef.namespace" AS namespace, "verb" AS action, COUNT(*) AS enum_attempts
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%kubernetes%'
+      AND "verb" IN ('list', 'get')
+      AND ("objectRef.resource" = 'pods' OR "objectRef.resource" = 'services' OR "objectRef.resource" = 'deployments' OR "objectRef.resource" = 'replicasets' OR "objectRef.resource" = 'daemonsets' OR "objectRef.resource" = 'statefulsets')
+      AND username ILIKE '%system:serviceaccount:%'
+      AND username NOT IN ('system:serviceaccount:kube-system:default', 'system:serviceaccount:kube-system:kube-proxy', 'system:serviceaccount:kube-system:kube-controller-manager')
+    GROUP BY username, sourceip, "objectRef.namespace", "verb"
+    HAVING enum_attempts >= 1
+    LAST 1 HOURS
+  yara_l: |
+    rule kubernetes_container_enumeration_t1613 {
+      meta:
+        author = "TDL"
+        description = "Detects kubectl get all or get pods --all-namespaces from in-cluster service accounts (T1613 - Container and Resource Discovery)"
+        mitre_attack_tactic = "Discovery"
+        mitre_attack_technique = "T1613"
+        severity = "Medium"
 
+      events:
+        $e.metadata.product_log_id = "k8s_audit"
+        $e.metadata.event_type = "SYSTEM_AUDIT_LOG_UNCATEGORIZED"
+        re.regex($e.security_result.summary, `(?i)(verb|action).*list`)
+        (
+          re.regex($e.target.resource.name, `(?i)pods`) or
+          re.regex($e.target.resource.name, `(?i)services`) or
+          re.regex($e.target.resource.name, `(?i)deployments`) or
+          re.regex($e.target.resource.name, `(?i)replicasets`) or
+          re.regex($e.target.resource.name, `(?i)daemonsets`) or
+          re.regex($e.target.resource.name, `(?i)statefulsets`)
+        )
+        (
+          re.regex($e.principal.user.userid, `^system:serviceaccount:`) or
+          re.regex($e.principal.user.userid, `^system:node:`)
+        )
+        not re.regex($e.principal.user.userid, `(?i)(kube-system|monitoring|logging|ingress|prometheus|grafana|datadog|falco|istio)`)
+        $e.principal.user.userid = $service_account
+        $e.target.resource.attribute.labels["namespace"] = $namespace
+
+      match:
+        $service_account over 5m
+
+      outcome:
+        $risk_score = 55
+
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-kubernetes.audit*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      AND kubernetes.audit.verb == "list"
+      AND (
+        (kubernetes.audit.objectRef.resource == "pods" AND kubernetes.audit.requestURI LIKE "*namespaces*")
+        OR kubernetes.audit.requestURI LIKE "*api/v1*"
+        OR kubernetes.audit.requestURI LIKE "*apis*"
+      )
+      AND kubernetes.audit.user.username LIKE "system:serviceaccount:*"
+    | STATS request_count = COUNT(*), namespaces = COUNT_DISTINCT(kubernetes.audit.objectRef.namespace), resources = COUNT_DISTINCT(kubernetes.audit.objectRef.resource) BY kubernetes.audit.user.username, kubernetes.audit.sourceIPs, time_window = BUCKET(@timestamp, 5 minute)
+    | WHERE request_count >= 3 OR namespaces >= 3
+    | KEEP time_window, kubernetes.audit.user.username, kubernetes.audit.sourceIPs, request_count, namespaces, resources
+  leql: |
+    where(source_json.verb="list" AND (source_json.objectRef.resource="pods" OR source_json.objectRef.resource="*") AND source_json.user.username STARTS-WITH "system:serviceaccount:" AND source_json.requestURI ICONTAINS "namespaces") groupby(source_json.user.username, source_json.sourceIPs) calculate(count)
+  crowdstrike: |
+    #type=kubernetes-audit verb=list (objectRef.resource=pods OR objectRef.resource=services OR objectRef.resource=deployments OR objectRef.resource=replicasets OR objectRef.resource=daemonsets OR objectRef.resource=statefulsets) user.username=system:serviceaccount:*
+    | regex("system:serviceaccount:(?<namespace>[^:]+):(?<serviceaccount>.+)", field=user.username)
+    | groupBy([namespace, serviceaccount, sourceIPs], function=count(as=enum_count))
+    | enum_count >= 1
+    | table([@timestamp, namespace, serviceaccount, sourceIPs, objectRef.resource, objectRef.namespace, enum_count, user.username, userAgent])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "GCP" and resource_type = "k8s_cluster"
+    | filter json_extract_scalar(audit_log_json, "$.requestMetadata.callerSuppliedUserAgent") ~= "kubectl"
+    | filter (json_extract_scalar(audit_log_json, "$.methodName") contains "list" and json_extract_scalar(audit_log_json, "$.methodName") contains "pods")
+         or (json_extract_scalar(audit_log_json, "$.resourceName") ~= ".*namespaces/.*/pods.*" and json_extract_scalar(audit_log_json, "$.methodName") contains "list")
+    | alter service_account = json_extract_scalar(audit_log_json, "$.authenticationInfo.principalEmail")
+    | filter service_account ~= ".*system:serviceaccount:.*"
+    | alter namespace = arrayindex(regextract(service_account, "system:serviceaccount:([^:]+):"), 0)
+    | alter sa_name = arrayindex(regextract(service_account, "system:serviceaccount:[^:]+:(.+)"), 0)
+    | filter sa_name != "kubernetes-dashboard" and sa_name != "kube-state-metrics" and namespace != "kube-system"
+    | comp count() as enum_count by service_account, namespace, sa_name
+    | filter enum_count >= 1
+    | fields _time, service_account, namespace, sa_name, enum_count
+  lucene: |
+    objectRef.resource:(pods OR services OR deployments OR replicasets OR daemonsets OR statefulsets OR jobs OR cronjobs) AND verb:list AND (objectRef.namespace:* OR requestObject.allNamespaces:true OR user.username:system\:serviceaccount\:*) AND NOT user.username:(system\:serviceaccount\:kube-system\:* OR system\:serviceaccount\:kube-public\:* OR system\:serviceaccount\:kube-node-lease\:*)
+  sumo: |
+    _sourceCategory=*Kubernetes*Audit* "get" ("pods" OR "all")
+    | json field=_raw "verb" as verb
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "user.username" as username
+    | json field=_raw "sourceIPs[0]" as source_ip
+    | json field=_raw "requestURI" as request_uri
+    | where verb = "get" and (resource = "pods" or request_uri matches "*get all*")
+    | where username matches "system:serviceaccount:*"
+    | timeslice 1h
+    | count as enum_count by _timeslice, username, source_ip
+    | where enum_count >= 1
+    | count as total_windows by username
+    | where total_windows = 1
+    | fields username, source_ip, enum_count
 pseudo_logic: kubectl get all / kubectl get pods --all-namespaces issued from an in-cluster service account that does not normally enumerate.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -104,7 +165,7 @@ references:
 - https://attack.mitre.org/techniques/T1613/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

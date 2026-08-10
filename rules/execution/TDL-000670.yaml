@@ -15,71 +15,61 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudwatchlogs:guardduty type IN ("Execution:Runtime/SuspiciousShellCreated")
+  spl: 'index=aws sourcetype=aws:cloudwatchlogs:guardduty type IN ("Execution:Runtime/SuspiciousShellCreated")
+
     | table _time, accountId, region, type, resource.instanceDetails.instanceId, severity, title, description
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000670 {\n  meta:\n    author = \"TDL\"\n    description = \"Potentially Malicious Shell Created - GuardDuty\"\n \
-    \   severity = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where ActivityType == "Execution:Runtime/SuspiciousShellCreated"
+    | project TimeGenerated, ActivityType, AccountId, Region, ResourceType, Severity, Title, Description, Resource = tostring(Resource)
+  aql: "SELECT QIDNAME(qid) AS event_name, sourceip, destinationip, username, LOGSOURCENAME(logsourceid) AS log_source, \"finding.type\" AS finding_type,\
+    \ eventtime\nFROM events\nWHERE LOGSOURCENAME(logsourceid) ILIKE '%GuardDuty%' \n  AND \"finding.type\" = 'Execution:Runtime/SuspiciousShellCreated'\n\
+    LAST 24 HOURS\n"
+  yara_l: |
+    rule aws_guardduty_suspicious_shell_created {
+      meta:
+        author = "TDL"
+        description = "Detects AWS GuardDuty Execution:Runtime/SuspiciousShellCreated finding"
+        mitre_tactic = "Execution"
+        mitre_technique = "T1204"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Amazon AWS"
+        $e.metadata.product_name = "GuardDuty"
+        $e.metadata.product_event_type = "Execution:Runtime/SuspiciousShellCreated"
+        $e.principal.cloud.environment = $account_id
 
-    | WHERE eventName LIKE "%GuardDuty%"
+      match:
+        $account_id over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type == "Execution:Runtime/SuspiciousShellCreated"
+    | KEEP @timestamp, cloud.account.id, cloud.region, aws.guardduty.finding.id, aws.guardduty.finding.type, aws.guardduty.severity, aws.guardduty.resource.instance_details.instance_id, user.name, event.action
+  leql: |
+    where(source_json.type IN ["Execution:Runtime/SuspiciousShellCreated"])
+  crowdstrike: |
+    #type=guardduty findingType="Execution:Runtime/SuspiciousShellCreated"
+    | table([@timestamp, accountId, region, resource.instanceDetails.instanceId, resource.instanceDetails.imageId, title, description, severity])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and logtype = "guardduty"
+    | filter json_extract_scalar(raw_log, "$.detail.type") in ("Execution:Runtime/SuspiciousShellCreated")
+    | fields _time, cloud_provider_account, json_extract_scalar(raw_log, "$.detail.type") as finding_type, json_extract_scalar(raw_log, "$.detail.severity") as severity, json_extract_scalar(raw_log, "$.detail.resource.instanceDetails.instanceId") as instance_id, json_extract_scalar(raw_log, "$.detail.description") as description
+  lucene: |
+    event_type:"Execution:Runtime/SuspiciousShellCreated"
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty* OR _source=*guardduty*
+    | json field=_raw "type" as event_type
+    | where event_type = "Execution:Runtime/SuspiciousShellCreated"
+    | fields _messageTime, event_type, _sourceHost
 false_positives:
 - Security software
 - Authorized admin tools
@@ -89,7 +79,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Execution:Runtime/SuspiciousShellCreated\"]"
 triage_steps:

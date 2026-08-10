@@ -13,74 +13,81 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 80
 queries:
-  spl: |
-    index=windows sourcetype="WinEventLog:Security" EventCode=7045
+  spl: 'index=windows sourcetype="WinEventLog:Security" EventCode=7045
+
     | stats count values(ComputerName) as affected_systems by Account_Name, IpAddress, Logon_Type, EventCode
+
     | where count >= 1
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("7045")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('7045')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_002 {\n  meta:\n    author = \"TDL\"\n    description = \"New Service Created with Suspicious Executable Path\"\n\
-    \    severity = \"HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1543.003\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n\
-    \    $e.event_id = /(7045)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
+  kql: "SecurityEvent\n| where EventID == 7045\n| extend User = coalesce(SubjectUserName, Account)\n| extend IpAddress = coalesce(IpAddress, \"\
+    \")\n| extend LogonType = coalesce(LogonType, \"\")\n| extend EventCode = EventID\n| summarize \n    FirstSeen = min(TimeGenerated),\n   \
+    \ LastSeen = max(TimeGenerated),\n    AffectedHosts = make_set(Computer),\n    ServiceNames = make_set(Service),\n    EventCount = count()\n\
+    \    by User, IpAddress\n| where EventCount >= 1\n| project FirstSeen, LastSeen, User, IpAddress, EventCount, AffectedHosts, ServiceNames\n"
+  aql: |
+    SELECT username AS user, sourceip AS IpAddress, "Logon Type" AS LogonType, "EventID" AS EventCode, LOGSOURCENAME(logsourceid) AS host, eventtime, "Service Name", "Service File Name"
+    FROM events
+    WHERE "EventID" = '7045'
+    GROUP BY username, sourceip, "Logon Type", "EventID", LOGSOURCENAME(logsourceid), eventtime, "Service Name", "Service File Name"
+    LAST 30 DAYS
+  yara_l: |
+    rule windows_new_service_installed_7045 {
+      meta:
+        author = "TDL"
+        description = "Detects Windows Security Event ID 7045 - A new service was installed"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1543.003"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 day
+      events:
+        $e.metadata.event_type = "SERVICE_CREATION"
+        $e.metadata.product_event_type = "7045"
+        $e.target.user.userid = $user
+        $e.principal.ip = $ipaddress
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "authentication" AND event_id IN ("7045")
+      match:
+        $user, $ipaddress over 1h
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [7045])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (7045)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("7045")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(7045)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("7045")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code == "7045" OR winlog.event_id == 7045
+    | STATS hosts = VALUES(host.name), event_count = COUNT(*) BY user.name, source.ip
+    | WHERE event_count >= 1
+    | KEEP user.name, source.ip, hosts, event_count
+  leql: |
+    where(source_json.EventID=7045) groupby(source_json.SubjectUserName, source_json.IpAddress, asset) calculate(count)
+  crowdstrike: |
+    EventCode=7045
+    | groupBy([user, IpAddress], function=[count(as=event_count), collect([ComputerName, ServiceName, ImagePath])])
+    | event_count >= 1
+    | table([user, IpAddress, event_count, ComputerName, ServiceName, ImagePath])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 7045
+    | alter user = coalesce(action_evtlog_event_data_SubjectUserName, actor_effective_username),
+            IpAddress = coalesce(action_remote_ip, action_evtlog_event_data_IpAddress),
+            LogonType = action_evtlog_event_data_LogonType,
+            EventCode = action_evtlog_event_id
+    | comp count() as event_count by user, IpAddress, LogonType, EventCode, agent_hostname
+    | filter event_count >= 1
+    | fields user, IpAddress, LogonType, EventCode, agent_hostname, event_count
+  lucene: |
+    event.code:7045 OR EventID:7045 OR winlog.event_id:7045
+  sumo: |
+    _sourceCategory=*Windows*Security* "7045"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "SubjectUserName" as user
+    | json field=_raw "IpAddress" as IpAddress
+    | json field=_raw "LogonType" as LogonType
+    | json field=_raw "ServiceName" as service_name
+    | json field=_raw "ServiceFileName" as service_path
+    | json field=_raw "Computer" as host
+    | where event_id = "7045"
+    | fields _messageTime, host, user, IpAddress, LogonType, event_id, service_name, service_path
 false_positives:
 - Some legitimate software in non-standard paths
 tags:
@@ -89,7 +96,7 @@ tags:
 author: TDL
 created: '2024-01-20'
 test_method: purple_team
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'
 - Inspect the parent → child process tree, command line arguments, and code-signing status — verify the persistence target points to an unusual

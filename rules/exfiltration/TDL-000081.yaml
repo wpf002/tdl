@@ -18,77 +18,102 @@ queries:
   spl: "index=firewall (action=allowed OR action=accept OR action=permitted) src_zone=internal dest_zone=external \n(\n    [| inputlookup botnet_ips.csv\
     \ | fields dest_ip | rename dest_ip as dest]\n    OR \n    (sourcetype=fgt_traffic signature=\"*botnet*\")\n)\n| stats count by _time, src_ip,\
     \ dest_ip, dest_port, action\n| where count > 0\n| table _time, src_ip, dest_ip, dest_port, action\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(1h)
+    | where DeviceVendor in~ ("Fortinet", "Fortigate") or DeviceProduct has "fortigate"
+    | where DeviceAction !in~ ("blocked", "deny", "dropped")
+    | where (
+        (ThreatIndicatorType has "botnet" or ThreatDescription has "botnet" or AdditionalExtensions has "botnet" or Message has "botnet")
+        or
+        (IndicatorThreatType has "botnet" or ThreatConfidence > 0)
+      )
+    | where SourceIP matches regex @"^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)"
+    | where DestinationIP !matches regex @"^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)"
+    | project TimeGenerated, DeviceVendor, DeviceProduct, SourceIP, DestinationIP, DestinationPort, Protocol, DeviceAction, ThreatIndicatorType, ThreatDescription, AdditionalExtensions, Message, Activity
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count, LOGSOURCENAME(logsourceid) AS firewall
+    FROM events
+    WHERE (INOFFENSE(destinationip) OR destinationip IN (SELECT ip FROM reference_set WHERE name = 'BotnetIPs'))
+      AND sourceip IN (SELECT ip FROM reference_set WHERE name = 'RFC1918_IPs')
+      AND (categoryname(category) ILIKE '%botnet%' OR categoryname(category) ILIKE '%IPS%' OR categoryname(category) ILIKE '%IDS%')
+    GROUP BY sourceip, destinationip, destinationport, logsourceid
     LAST 1 HOURS
+  yara_l: |
+    rule botnet_exfiltration_detection {
+      meta:
+        author = "TDL"
+        description = "Detects outbound connections to known botnet IPs or Fortinet botnet-labeled traffic"
+        mitre_attack_tactic = "Exfiltration"
+        mitre_attack_technique = "T1071"
+        severity = "HIGH"
 
-    '
-  yara_l: "rule tdl_tdl_exf_000081 {\n  meta:\n    author = \"TDL\"\n    description = \"Known Botnet Communication - Outbound\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0010\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        // Firewall event to known botnet IP
+        $fw.metadata.event_type = "NETWORK_CONNECTION"
+        $fw.network.direction = "OUTBOUND"
+        $fw.principal.ip != ""
+        net.ip_in_range_cidr($fw.principal.ip, "10.0.0.0/8") or
+        net.ip_in_range_cidr($fw.principal.ip, "172.16.0.0/12") or
+        net.ip_in_range_cidr($fw.principal.ip, "192.168.0.0/16")
+        $fw.target.ip != ""
+        not net.ip_in_range_cidr($fw.target.ip, "10.0.0.0/8")
+        not net.ip_in_range_cidr($fw.target.ip, "172.16.0.0/12")
+        not net.ip_in_range_cidr($fw.target.ip, "192.168.0.0/16")
+        $fw.network.threat.category = "BOTNET"
+        $fw.principal.ip = $src_ip
+        $fw.target.ip = $dst_ip
 
-    | WHERE @timestamp > NOW() - 1 hour
+        // Fortinet IDS/IPS botnet event
+        $ids.metadata.product_name = "Fortigate" or $ids.metadata.product_name = "Fortinet"
+        $ids.network.direction = "OUTBOUND"
+        $ids.principal.ip != ""
+        net.ip_in_range_cidr($ids.principal.ip, "10.0.0.0/8") or
+        net.ip_in_range_cidr($ids.principal.ip, "172.16.0.0/12") or
+        net.ip_in_range_cidr($ids.principal.ip, "192.168.0.0/16")
+        $ids.target.ip != ""
+        not net.ip_in_range_cidr($ids.target.ip, "10.0.0.0/8")
+        not net.ip_in_range_cidr($ids.target.ip, "172.16.0.0/12")
+        not net.ip_in_range_cidr($ids.target.ip, "192.168.0.0/16")
+        re.regex($ids.security_result.summary, `(?i)botnet`)
+        $ids.principal.ip = $src_ip2
+        $ids.target.ip = $dst_ip2
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+      match:
+        $src_ip, $dst_ip over 5m
 
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+      outcome:
+        $risk_score = 85
 
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $fw or $ids
+    }
+  esql: "FROM logs-fortinet.firewall*, logs-firewall*, logs-network.firewall*\n| WHERE @timestamp > NOW() - 24 hours\n  AND (\n    (network.direction\
+    \ == \"outbound\" OR network.direction == \"external\")\n    AND (\n      threat.indicator.ip != null \n      OR threat.feed.name LIKE \"\
+    *botnet*\"\n      OR threat.feed.name LIKE \"*Botnet*\"\n      OR event.category == \"intrusion_detection\"\n      OR (observer.vendor ==\
+    \ \"Fortinet\" AND (event.dataset LIKE \"*ips*\" OR event.dataset LIKE \"*ids*\") AND (threat.indicator.type == \"botnet\" OR TO_LOWER(threat.indicator.description)\
+    \ LIKE \"*botnet*\"))\n    )\n  )\n| KEEP @timestamp, source.ip, destination.ip, source.port, destination.port, network.protocol, network.bytes,\
+    \ observer.name, threat.indicator.ip, threat.feed.name, threat.indicator.type, event.action, event.outcome, network.direction\n"
+  leql: |
+    where(log_set=/firewall/i AND direction=outbound AND threat_feed CONTAINS "botnet")
+  crowdstrike: "(#type=firewall OR event_simpleName=FortigateEvent OR event_simpleName=FirewallEvent) \n(direction=outbound OR direction=out OR\
+    \ traffic_direction=outbound OR action=*outbound*)\n(threat_category=*botnet* OR category=*botnet* OR signature_category=*botnet* OR threat_type=*botnet*\
+    \ OR attack_type=*botnet* OR ips_signature=*botnet* OR ids_signature=*botnet*)\n| table([@timestamp, ComputerName, source_ip, destination_ip,\
+    \ direction, threat_category, category, signature_category, threat_type, attack_type, ips_signature, ids_signature])\n"
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter action_source_translated_ip != null \n  and action_destination_translated_ip != null\n  and\
+    \ action_destination_location = ENUM.EXTERNAL\n  and (threat_name contains \"botnet\" or threat_category = \"botnet\" or action_external_hostname_list\
+    \ ~= \".*botnet.*\")\n| fields _time, action_source_ip, action_destination_ip, action_destination_translated_ip, threat_name, threat_category,\
+    \ action_bytes_sent, action_destination_port, agent_hostname\n"
+  lucene: |
+    (event_type:"firewall" AND direction:outbound AND source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND threat.indicator.type:"botnet") OR (vendor:"Fortinet" AND product:"Fortigate" AND event_type:"ids" AND direction:outbound AND source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND (category:"Botnet" OR threat.category:"Botnet" OR attack:"Botnet"))
+  sumo: |
+    _sourceCategory=*Firewall* OR _sourceCategory=*Fortigate* OR _sourceCategory=*Fortinet*
+    | where _raw matches "*outbound*" OR _raw matches "*out*" OR direction = "outbound" OR direction = "out"
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | where (isPrivateIP(src_ip) and !isPrivateIP(dest_ip)) OR _raw matches "*botnet*" OR _raw matches "*Botnet*"
+    | where _raw matches "*botnet*" OR _raw matches "*Botnet*" OR dest_ip in ("known_botnet_list")
+    | fields _messageTime, _sourceHost, src_ip, dest_ip, _raw
 false_positives:
 - Authorized pen testing
 - Security research
@@ -98,7 +123,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Firewall Event
 

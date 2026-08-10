@@ -16,71 +16,103 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=google_workspace sourcetype=google:gworkspace:admin (events.name="CHANGE_APPLICATION_SETTING" OR events.name="CREATE_APPLICATION_SETTING") (SETTING_NAME="password management - enforce strong password" OR SETTING_NAME="password management - password reset frequency" OR SETTING_NAME="password management - enable password reuse" OR SETTING_NAME="password management - enforce password policy at next login" OR SETTING_NAME="password management - minimum password length" OR SETTING_NAME="password management - maximum password length")
+  spl: 'index=google_workspace sourcetype=google:gworkspace:admin (events.name="CHANGE_APPLICATION_SETTING" OR events.name="CREATE_APPLICATION_SETTING")
+    (SETTING_NAME="password management - enforce strong password" OR SETTING_NAME="password management - password reset frequency" OR SETTING_NAME="password
+    management - enable password reuse" OR SETTING_NAME="password management - enforce password policy at next login" OR SETTING_NAME="password
+    management - minimum password length" OR SETTING_NAME="password management - maximum password length")
+
     | table _time, events.name, SETTING_NAME, user, NEW_VALUE, OLD_VALUE
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000304 {\n  meta:\n    author = \"TDL\"\n    description = \"Google Workspace Password Policy Modified\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0005\"\n    technique = \"T1484\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    GWorkspaceActivityReports
+    | where TimeGenerated > ago(90d)
+    | where RecordType == "admin"
+    | extend EventName = tostring(parse_json(tostring(EventData)).events[0].name)
+    | extend Parameters = parse_json(tostring(EventData)).events[0].parameters
+    | mv-expand Parameters
+    | extend SettingName = tostring(Parameters.name)
+    | where EventName in ("CHANGE_APPLICATION_SETTING", "CREATE_APPLICATION_SETTING")
+    | where SettingName in (
+        "password management - enforce strong password",
+        "password management - password reset frequency",
+        "password management - enable password reuse",
+        "password management - enforce password policy at next login",
+        "password management - minimum password length",
+        "password management - maximum password length"
+    )
+    | project TimeGenerated, ActorIpAddress, UserId, EventName, SettingName, Parameters
+  aql: "SELECT eventtime, username, \"Event Name\", \"Setting Name\", LOGSOURCENAME(logsourceid) AS source\nFROM events\nWHERE (\"Event Name\"\
+    \ = 'CHANGE_APPLICATION_SETTING' OR \"Event Name\" = 'CREATE_APPLICATION_SETTING')\n  AND (\"Setting Name\" = 'password management - enforce\
+    \ strong password' \n       OR \"Setting Name\" = 'password management - password reset frequency'\n       OR \"Setting Name\" = 'password\
+    \ management - enable password reuse'\n       OR \"Setting Name\" = 'password management - enforce password policy at next login'\n      \
+    \ OR \"Setting Name\" = 'password management - minimum password length'\n       OR \"Setting Name\" = 'password management - maximum password\
+    \ length')\nLAST 24 HOURS\n"
+  yara_l: |
+    rule gws_password_policy_modification {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects modifications to Google Workspace password policy settings - MITRE T1484 Defense Evasion"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1484"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Google Workspace"
+        (
+          $e.metadata.product_event_type = "CHANGE_APPLICATION_SETTING" or
+          $e.metadata.product_event_type = "CREATE_APPLICATION_SETTING"
+        )
+        (
+          $e.target.resource.attribute.labels["SETTING_NAME"] = "password management - enforce strong password" or
+          $e.target.resource.attribute.labels["SETTING_NAME"] = "password management - password reset frequency" or
+          $e.target.resource.attribute.labels["SETTING_NAME"] = "password management - enable password reuse" or
+          $e.target.resource.attribute.labels["SETTING_NAME"] = "password management - enforce password policy at next login" or
+          $e.target.resource.attribute.labels["SETTING_NAME"] = "password management - minimum password length" or
+          $e.target.resource.attribute.labels["SETTING_NAME"] = "password management - maximum password length"
+        )
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-google_workspace*
+    | WHERE event.action IN ("CHANGE_APPLICATION_SETTING", "CREATE_APPLICATION_SETTING")
+      AND TO_LOWER(google_workspace.admin.setting.name) IN (
+        "password management - enforce strong password",
+        "password management - password reset frequency",
+        "password management - enable password reuse",
+        "password management - enforce password policy at next login",
+        "password management - minimum password length",
+        "password management - maximum password length"
+      )
+    | KEEP @timestamp, event.action, google_workspace.admin.setting.name, google_workspace.actor.email, google_workspace.organization.domain, google_workspace.admin.new_value, google_workspace.admin.old_value
+  leql: |
+    where(source_json.events.name IN ["CHANGE_APPLICATION_SETTING", "CREATE_APPLICATION_SETTING"] AND source_json.SETTING_NAME IN ["password management - enforce strong password", "password management - password reset frequency", "password management - enable password reuse", "password management - enforce password policy at next login", "password management - minimum password length", "password management - maximum password length"])
+  crowdstrike: |
+    #type=gsuite (events.name="CHANGE_APPLICATION_SETTING" OR events.name="CREATE_APPLICATION_SETTING") (SETTING_NAME="password management - enforce strong password" OR SETTING_NAME="password management - password reset frequency" OR SETTING_NAME="password management - enable password reuse" OR SETTING_NAME="password management - enforce password policy at next login" OR SETTING_NAME="password management - minimum password length" OR SETTING_NAME="password management - maximum password length")
+    | table([@timestamp, events.name, SETTING_NAME, actor.email, events.parameters.SETTING_VALUE, events.parameters.NEW_VALUE, events.parameters.OLD_VALUE, org_unit_name])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Google" and logtype = "workspace"
+    | filter json_extract_scalar(action_app_response_details, "$.events[*].name") in ("CHANGE_APPLICATION_SETTING", "CREATE_APPLICATION_SETTING")
+    | alter setting_name = json_extract_scalar(action_app_response_details, "$.events[*].parameters[?(@.name=='SETTING_NAME')].value")
+    | filter setting_name in ("password management - enforce strong password", "password management - password reset frequency", "password management - enable password reuse", "password management - enforce password policy at next login", "password management - minimum password length", "password management - maximum password length")
+    | fields _time, actor_user, setting_name, action_app_response_details
+  lucene: |
+    events.name:(CHANGE_APPLICATION_SETTING OR CREATE_APPLICATION_SETTING) AND SETTING_NAME:("password management - enforce strong password" OR "password management - password reset frequency" OR "password management - enable password reuse" OR "password management - enforce password policy at next login" OR "password management - minimum password length" OR "password management - maximum password length")
+  sumo: |
+    _sourceCategory=*Google*Workspace*
+    | json field=_raw "events[*].name" as event_name
+    | json field=_raw "events[*].parameters[*].name" as param_name
+    | json field=_raw "events[*].parameters[*].value" as param_value
+    | where event_name in ("CHANGE_APPLICATION_SETTING", "CREATE_APPLICATION_SETTING")
+    | where param_name = "SETTING_NAME" and param_value in ("password management - enforce strong password", "password management - password reset frequency", "password management - enable password reuse", "password management - enforce password policy at next login", "password management - minimum password length", "password management - maximum password length")
+    | fields _messageTime, _sourceHost, event_name, param_value
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +122,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Google Workspace Event
 

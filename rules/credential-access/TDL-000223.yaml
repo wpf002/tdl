@@ -18,78 +18,140 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=5140 OR EventCode=5145)
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=5140 OR EventCode=5145)
+
     | eval is_5140=if(EventCode=5140 AND like(Share_Name, "\\\\*\\SYSVOL"), 1, 0)
-    | eval is_5145=if(EventCode=5145 AND like(Share_Name, "\\\\*\\SYSVOL") AND match(Relative_Target_Name, "(?i)^.*\\\\policies\\\\.*\\\\Machine\\\\.*$"), 1, 0)
+
+    | eval is_5145=if(EventCode=5145 AND like(Share_Name, "\\\\*\\SYSVOL") AND match(Relative_Target_Name, "(?i)^.*\\\\policies\\\\.*\\\\Machine\\\\.*$"),
+    1, 0)
+
     | bin _time span=2m
-    | stats dc(ComputerName) as unique_destinations, sum(is_5140) as count_5140, sum(is_5145) as count_5145, values(ComputerName) as destinations, values(Share_Name) as shares, values(Relative_Target_Name) as files by _time, Source_Network_Address
+
+    | stats dc(ComputerName) as unique_destinations, sum(is_5140) as count_5140, sum(is_5145) as count_5145, values(ComputerName) as destinations,
+    values(Share_Name) as shares, values(Relative_Target_Name) as files by _time, Source_Network_Address
+
     | where (count_5140 >= 10) OR (count_5145 >= 3)
+
     | table _time, Source_Network_Address, unique_destinations, count_5140, count_5145, destinations, shares, files
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("5140", "5145")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('5140', '5145')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000223 {\n  meta:\n    author = \"TDL\"\n    description = \"SYSVOL Share Sweep\"\n    severity = \"MEDIUM\"\n    tactic\
-    \ = \"TA0006\"\n    technique = \"T1552\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(5140|5145)/\n    $user\
-    \ = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
+  kql: |
+    let timeWindow = 2m;
+    let threshold1 = 10;
+    let threshold2 = 3;
+    let event5140 = SecurityEvent
+    | where TimeGenerated > ago(timeWindow)
+    | where EventID == 5140
+    | where ShareName has "\\SYSVOL"
+    | summarize DestinationCount = dcount(Computer) by bin(TimeGenerated, timeWindow), IpAddress
+    | where DestinationCount >= threshold1
+    | project TimeGenerated, IpAddress, EventType = "5140", DestinationCount;
+    let event5145 = SecurityEvent
+    | where TimeGenerated > ago(timeWindow)
+    | where EventID == 5145
+    | where ShareName has "\\SYSVOL"
+    | where RelativeTargetName matches regex @"^.*\\policies\\.*\\Machine\\.*$"
+    | summarize DestinationCount = dcount(Computer) by bin(TimeGenerated, timeWindow), IpAddress
+    | where DestinationCount >= threshold2
+    | project TimeGenerated, IpAddress, EventType = "5145", DestinationCount;
+    union event5140, event5145
+    | project TimeGenerated, IpAddress, EventType, DestinationCount
+  aql: |
+    SELECT sourceip, UNIQUECOUNT(destinationip) AS unique_dests, COUNT(*) AS event_count
+    FROM events
+    WHERE "EventID" IN ('5140', '5145')
+      AND "Share Name" ILIKE '%\\SYSVOL%'
+      AND (
+        ("EventID" = '5140')
+        OR
+        ("EventID" = '5145' AND "Relative Target Name" MATCHES '.*\\policies\\.*\\Machine\\.*')
+      )
+    GROUP BY sourceip
+    HAVING (SUM(CASE WHEN "EventID" = '5140' THEN 1 ELSE 0 END) >= 10 AND UNIQUECOUNT(destinationip) >= 1)
+       OR (SUM(CASE WHEN "EventID" = '5145' THEN 1 ELSE 0 END) >= 3 AND UNIQUECOUNT(destinationip) >= 1)
+    LAST 2 MINUTES
+  yara_l: |
+    rule credential_access_sysvol_enumeration {
+      meta:
+        author = "TDL"
+        description = "Detects potential Group Policy Preferences credential access via SYSVOL enumeration"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1552"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 day
+      events:
+        $share_access.metadata.event_type = "NETWORK_CONNECTION"
+        $share_access.metadata.product_event_type = "5140"
+        re.regex($share_access.target.resource.name, `(?i)^\\\\.+\\SYSVOL$`)
+        $share_access.principal.ip = $source_ip
+        $share_access.target.hostname = $dest_host_5140
 
-    | WHERE event.category == "authentication" AND event_id IN ("5140", "5145")
+        $file_access.metadata.event_type = "NETWORK_CONNECTION"
+        $file_access.metadata.product_event_type = "5145"
+        re.regex($file_access.target.resource.name, `(?i)^\\\\.+\\SYSVOL$`)
+        re.regex($file_access.target.file.full_path, `(?i)^.*\\policies\\.*\\Machine\\.*$`)
+        $file_access.principal.ip = $source_ip
+        $file_access.target.hostname = $dest_host_5145
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+      match:
+        $source_ip over 2m
 
-    | SORT count DESC
+      outcome:
+        $risk_score = 85
+        $accessed_shares = count_distinct($dest_host_5140)
+        $accessed_files = count_distinct($dest_host_5145)
 
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [5140, 5145])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (5140, 5145)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("5140", "5145")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(5140 OR 5145)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("5140", "5145")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+      condition:
+        #share_access >= 10 and
+        #dest_host_5140 >= 10 and
+        #file_access >= 3 and
+        #dest_host_5145 >= 3
+    }
+  esql: |
+    FROM logs-system.security*
+    | WHERE @timestamp > NOW() - 2 minutes
+      AND event.code IN ("5140", "5145")
+      AND winlog.event_data.ShareName LIKE "*\\SYSVOL"
+    | EVAL is_5140 = CASE(event.code == "5140", 1, 0),
+           is_5145 = CASE(
+             event.code == "5145" AND RLIKE(winlog.event_data.RelativeTargetName, "^.*\\\\policies\\\\.*\\\\Machine\\\\.*$"),
+             1,
+             0
+           )
+    | STATS count_5140 = SUM(is_5140),
+            count_5145 = SUM(is_5145),
+            unique_dests = COUNT_DISTINCT(destination.ip)
+      BY source.ip, bucket = BUCKET(@timestamp, 2 minutes)
+    | WHERE (count_5140 >= 10 AND unique_dests >= 10) OR (count_5145 >= 3 AND unique_dests >= 3)
+    | KEEP bucket, source.ip, count_5140, count_5145, unique_dests
+  leql: |
+    where(source_json.EventID=5140 AND source_json.ShareName ICONTAINS "\\SYSVOL") groupby(source_json.IpAddress, destination_user) calculate(count)
+  crowdstrike: |
+    EventCode=5140 ShareName="\\*\SYSVOL"
+    | groupBy([IpAddress], function=[count(ComputerName, distinct=true, as=unique_dests), selectLast([ShareName, IpAddress, ComputerName], as=sample)])
+    | unique_dests >= 10
+    | bucket(limit=1, span=2m, function=[max(unique_dests, as=max_dests)])
+    | max_dests >= 10
+    | table([IpAddress, max_dests, sample.*])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (5140, 5145)
+    | filter action_evtlog_event_data_ShareName ~= "\\\\.*\\\\SYSVOL"
+    | alter share_file_path = coalesce(action_evtlog_event_data_RelativeTargetName, "")
+    | filter (action_evtlog_event_id = 5140) or (action_evtlog_event_id = 5145 and share_file_path ~= ".*\\\\policies\\\\.*\\\\Machine\\\\.*")
+    | alter source_ip = coalesce(action_evtlog_event_data_IpAddress, action_remote_ip)
+    | bin _time span = 2m
+    | comp count() as event_count, count_distinct(agent_hostname) as unique_destinations by _time, source_ip, action_evtlog_event_id
+    | filter (action_evtlog_event_id = 5140 and event_count >= 10 and unique_destinations >= 10) or (action_evtlog_event_id = 5145 and event_count >= 3 and unique_destinations >= 3)
+    | fields _time, source_ip, action_evtlog_event_id, event_count, unique_destinations
+  lucene: |
+    (event.code:5140 AND winlog.event_data.ShareName:\\*\\SYSVOL) OR (event.code:5145 AND winlog.event_data.ShareName:\\*\\SYSVOL AND winlog.event_data.RelativeTargetName:/.*\\policies\\.*\\Machine\\.*/i)
+  sumo: "_sourceCategory=*Windows* (EventID=5140 OR EventID=5145)\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"ShareName\"\
+    \ as share_name\n| json field=_raw \"IpAddress\" as src_ip\n| json field=_raw \"Computer\" as destination\n| json field=_raw \"RelativeTargetName\"\
+    \ as relative_target\n| where (event_id = \"5140\" and share_name matches \"*\\\\\\\\*\\\\SYSVOL\") \n   or (event_id = \"5145\" and share_name\
+    \ matches \"*\\\\\\\\*\\\\SYSVOL\" and relative_target matches regex \"^.*\\\\\\\\policies\\\\\\\\.*\\\\\\\\Machine\\\\\\\\.*$\")\n| timeslice\
+    \ 2m\n| count_distinct(destination) as unique_dests, count as event_count by _timeslice, src_ip, event_id\n| where (event_id = \"5140\" and\
+    \ event_count >= 10) or (event_id = \"5145\" and event_count >= 3)\n| fields _timeslice, src_ip, event_id, unique_dests, event_count\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -99,7 +161,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "10 Windows Network Share Object Accessed Events\nWhere the Event ID is in [5140]\nWhere the Share Name is \"\\\\*\\SYSVOL\"\nWith\
   \ the same Source IP\nWith unique Destinations\nWithin 2 minutes\n\n--------------------------------------------------------------------\n\n\

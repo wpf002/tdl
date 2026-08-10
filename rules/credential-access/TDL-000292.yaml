@@ -15,71 +15,48 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=azure sourcetype=azure:eventhub EventType="Add group"
+  spl: 'index=azure sourcetype=azure:eventhub EventType="Add group"
+
     | table _time, user, EventType, TargetUserName, Group, Category, ResourceGroup
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000292 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized Domain Group Creation\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AuditLogs
+    | where TimeGenerated > ago(1h)
+    | where OperationName == "Add member to group"
+    | project TimeGenerated, Identity, TargetResources, OperationName, Result, InitiatedBy, AADTenantId, CorrelationId
+  aql: |
+    SELECT sourceip, username, "Activity", "Target", eventtime, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCETYPE(devicetype) ILIKE '%Azure%' AND ("Activity" ILIKE '%Add group%' OR "Activity" ILIKE '%group add%' OR "Activity" = 'Add group' OR CATEGORYNAME(category) ILIKE '%Add group%')
+    LAST 24 HOURS
+  yara_l: "rule azure_add_group_event {\n  meta:\n    author = \"Chronicle Detection\"\n    description = \"Detects Azure 'Add group' events -\
+    \ MITRE T1078 Credential Access\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique = \"T1078\"\n    severity =\
+    \ \"Medium\"\n    \n  events:\n    $e.metadata.product_name = \"Azure\"\n    $e.metadata.product_event_type = \"Add group\"\n    $e.principal.user.userid\
+    \ = $user\n    \n  match:\n    $user over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-azure*
+    | WHERE event.action == "Add group" OR event.action == "Group.Add" OR azure.activitylogs.operation_name == "Add group" OR azure.auditlogs.operation_name == "Add group"
+    | KEEP @timestamp, host.name, user.name, azure.activitylogs.operation_name, azure.auditlogs.operation_name, event.action, azure.activitylogs.properties.target_resources, azure.auditlogs.properties.target_resources, source.ip
+  leql: |
+    where(source_json.operationName="Add group" OR source_json.operation="Add group" OR source_json.eventName="Add group")
+  crowdstrike: |
+    event_simpleName=UserActivityAuditEvent event_platform=Win OperationName="Add group"
+    | table([@timestamp, ComputerName, UserName, OperationName, TargetResources])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "Azure" and operation_name = "Add group"
+    | fields _time, cloud_provider, operation_name, identity_name, resource_name, caller_ip_address, project_name
+  lucene: |
+    event.type:"Add group" OR (azure.activitylogs.operation_name:"Add group" OR azure.auditlogs.operation_name:"Add group" OR operation_name:"Add group")
+  sumo: |
+    _sourceCategory=*Azure* "Add group"
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "properties.targetResources[0].displayName" as group_name
+    | json field=_raw "identity.claims.http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn" as user
+    | json field=_raw "callerIpAddress" as ip_address
+    | where operation_name matches "*Add group*" OR operation_name matches "*Create group*"
+    | fields _messageTime, user, group_name, ip_address, operation_name
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +66,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: 1 Azure Event Where Event Type is "Add group"
 tuning_period: 7 days

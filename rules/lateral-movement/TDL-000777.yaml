@@ -23,77 +23,92 @@ queries:
     \\*\\\\C$\\\\Windows\\\\*.exe\" OR TargetFilename=\"\\\\\\\\*\\\\C$\\\\Windows\\\\*.dll\" OR TargetFilename=\"\\\\\\\\*\\\\C$\\\\Windows\\\
     \\*.bin\")\n| rex field=TargetFilename \"\\\\\\\\\\\\\\\\(?<remote_host>[^\\\\\\\\]+)\\\\\\\\\"\n| table _time, ComputerName, User, Image,\
     \ TargetFilename, remote_host\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "smb"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%smb%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    Event
+    | where TimeGenerated > ago(1h)
+    | where Source == "Microsoft-Windows-Sysmon" and EventID == 11
+    | extend EventData = parse_xml(EventData)
+    | extend TargetFilename = tostring(EventData.DataItem.EventData.Data.[5].["#text"])
+    | extend Image = tostring(EventData.DataItem.EventData.Data.[4].["#text"])
+    | extend User = tostring(EventData.DataItem.EventData.Data.[2].["#text"])
+    | where TargetFilename matches regex @"^\\\\[^\\]+\\(ADMIN\$|C\$\\Windows)\\.*\.(exe|dll|bin)$"
+    | join kind=inner (
+        SecurityEvent
+        | where TimeGenerated > ago(1h)
+        | where EventID == 4624
+        | where LogonType in (3, 10)
+        | project LogonTime = TimeGenerated, TargetLogonId, TargetUserName, IpAddress, Computer
+    ) on $left.Computer == $right.Computer
+    | where TimeGenerated >= LogonTime and TimeGenerated <= LogonTime + 5m
+    | project TimeGenerated, Computer, User, TargetFilename, Image, TargetUserName, IpAddress, TargetLogonId
+  aql: |
+    SELECT eventtime, username, sourceip, destinationip, "TargetFilename" AS dropped_file, "Process Name" AS dropper_process, LOGSOURCENAME(logsourceid) AS host
+    FROM events
+    WHERE ("EventID" = '11' OR "EventID" = '23')
+      AND ("TargetFilename" ILIKE '%\\\\%\\ADMIN$\\%' OR "TargetFilename" ILIKE '%\\\\%\\C$\\Windows\\%')
+      AND ("TargetFilename" ILIKE '%.exe' OR "TargetFilename" ILIKE '%.dll' OR "TargetFilename" ILIKE '%.bin')
+      AND "Logon Type" IN ('3', '10')
     LAST 1 HOURS
+  yara_l: |
+    rule lateral_payload_drop {
+      meta:
+        author = "TDL"
+        description = "Detects file creation of executables in administrative shares indicating lateral movement"
+        mitre_attack_tactic = "Lateral Movement"
+        mitre_attack_technique = "T1570"
+        severity = "HIGH"
 
-    '
-  yara_l: "rule tdl_tdl_lm_000777 {\n  meta:\n    author = \"TDL\"\n    description = \"Executable Written via SMB to Admin$ Share\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0008\"\n    technique = \"T1570\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /smb/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        $e.metadata.event_type = "FILE_CREATION"
+        (
+          re.regex($e.target.file.full_path, `(?i)\\\\[^\\]+\\ADMIN\$\\.*\.(exe|dll|bin)$`) or
+          re.regex($e.target.file.full_path, `(?i)\\\\[^\\]+\\C\$\\Windows\\.*\.(exe|dll|bin)$`)
+        )
+        $e.principal.hostname = $source_host
+        $e.target.hostname = $target_host
+        $source_host != $target_host
 
-    | WHERE @timestamp > NOW() - 1 hour
+      match:
+        $source_host, $target_host over 5m
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%smb%"
+      outcome:
+        $risk_score = 75
 
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/smb/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*smb*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "smb"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*smb*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*smb*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*
+    | WHERE winlog.event_id == "11"
+      AND (
+        file.path RLIKE "\\\\\\\\[^\\\\]+\\\\ADMIN\\$\\\\.*\\.(exe|dll|bin)"
+        OR file.path RLIKE "\\\\\\\\[^\\\\]+\\\\C\\$\\\\Windows\\\\.*\\.(exe|dll|bin)"
+      )
+      AND winlog.event_data.User NOT LIKE "*$"
+    | KEEP @timestamp, host.name, user.name, file.path, process.name, process.executable, winlog.event_data.TargetFilename
+  leql: |
+    where(source_json.EventID=11 AND (source_json.TargetFilename CONTAINS "\\ADMIN$\\" OR source_json.TargetFilename CONTAINS "\\C$\\Windows\\") AND (source_json.TargetFilename ENDS-WITH ".exe" OR source_json.TargetFilename ENDS-WITH ".dll" OR source_json.TargetFilename ENDS-WITH ".bin")) groupby(asset, source_json.TargetFilename, source_json.Image) calculate(count)
+  crowdstrike: |
+    (event_simpleName=FileCreateEvent OR EventCode=11) (TargetFilename=*\\\\*\\ADMIN$\\* OR TargetFilename=*\\\\*\\C$\\Windows\\*) (TargetFilename=*.exe OR TargetFilename=*.dll OR TargetFilename=*.bin)
+    | regex("\\\\\\\\(?<RemoteHost>[^\\\\]+)\\\\", field=TargetFilename)
+    | groupBy([ComputerName, UserName, RemoteHost, TargetFilename], function=count(as=drops))
+    | table([@timestamp, ComputerName, UserName, RemoteHost, TargetFilename, drops])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_FILE and action_file_path ~= "\\\\[^\\]+\\(ADMIN\\$|C\\$\\\\Windows).*\\.(exe|dll|bin)$" and action_remote_ip != null and action_remote_ip != ""
+    | fields _time, agent_hostname, actor_effective_username, action_file_path, action_file_name, action_remote_ip, actor_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:11 AND file.path:(*\\ADMIN$\\*.exe OR *\\ADMIN$\\*.dll OR *\\ADMIN$\\*.bin OR *\\C$\\Windows\\*.exe OR *\\C$\\Windows\\*.dll OR *\\C$\\Windows\\*.bin) AND (winlog.event_data.User:*$ OR user.name:*$)
+  sumo: |
+    _sourceCategory=*Sysmon* "11"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetFilename" as target_file
+    | json field=_raw "Image" as process_name
+    | json field=_raw "User" as user
+    | where event_id = "11"
+    | where (target_file matches "*\\\\*\\ADMIN$\\*" OR target_file matches "*\\\\*\\C$\\Windows\\*")
+    | where (target_file matches "*.exe" OR target_file matches "*.dll" OR target_file matches "*.bin")
+    | fields _messageTime, _sourceHost, user, process_name, target_file
 pseudo_logic: FileCreate of .exe/.dll/.bin under \\<host>\ADMIN$ or \\<host>\C$\Windows\* by a remote logon session. Classic lateral payload drop.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -111,7 +126,7 @@ references:
 - https://attack.mitre.org/techniques/T1570/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, target host, and the protocol / credential used.'

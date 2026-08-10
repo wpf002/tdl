@@ -16,73 +16,62 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=gcp sourcetype="google:gcp:pubsub:message" code=7 NOT src_user="*gserviceaccount*"
+  spl: 'index=gcp sourcetype="google:gcp:pubsub:message" code=7 NOT src_user="*gserviceaccount*"
+
     | bin _time span=5m
+
     | stats count by _time, src_user
+
     | where count >= 10
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000325 {\n  meta:\n    author = \"TDL\"\n    description = \"Excessive Failures by User - GCP\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    GCPAuditLogs
+    | where TimeGenerated > ago(5m)
+    | where StatusCode == 7
+    | where IdentityName !endswith "gserviceaccount.com"
+    | summarize event_count = count() by bin(TimeGenerated, 5m), IdentityName, ProjectId
+    | where event_count >= 10
+  aql: |
+    SELECT src_user, sourceip, COUNT(*) AS event_count
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%gcp%'
+      AND "Code" = '7'
+      AND src_user NOT ILIKE '%gserviceaccount%'
+    GROUP BY src_user, sourceip
+    HAVING event_count >= 10
+    LAST 5 MINUTES
+  yara_l: "rule gcp_multiple_permission_denied_events {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects 10+ GCP permission\
+    \ denied events (code 7) within 5 minutes from non-service accounts\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique\
+    \ = \"T1078\"\n    severity = \"Medium\"\n  \n  events:\n    $e.metadata.vendor_name = \"Google Cloud Platform\"\n    $e.metadata.product_name\
+    \ = \"GCP\"\n    $e.metadata.log_type = \"GCP_CLOUDAUDIT\"\n    $e.security_result.action = \"BLOCK\"\n    $e.security_result.detection_fields[\"\
+    code\"] = \"7\"\n    not re.regex($e.principal.user.userid, `.*gserviceaccount\\.com$`)\n    $e.principal.user.userid = $user\n    \n  match:\n\
+    \    $user over 5m\n    \n  condition:\n    #e >= 10\n}\n"
+  esql: "FROM logs-gcp.audit*\n| WHERE @timestamp > NOW() - 5 minutes \n  AND event.code == \"7\" \n  AND NOT user.name LIKE \"*gserviceaccount*\"\
+    \n| STATS event_count = COUNT(*) BY user.name, source.ip, bucket = BUCKET(@timestamp, 5 minutes)\n| WHERE event_count >= 10\n| KEEP bucket,\
+    \ user.name, source.ip, event_count\n"
+  leql: |
+    where(source_json.protoPayload.status.code=7 AND source_user NOT ICONTAINS "gserviceaccount") groupby(source_user) calculate(count)
+  crowdstrike: "#type=gcp_audit protoPayload.status.code=7 \n| protoPayload.authenticationInfo.principalEmail != \"*gserviceaccount.com\"\n| bucket(span=5m,\
+    \ function=[count(as=event_count), collect([protoPayload.authenticationInfo.principalEmail, protoPayload.resource.labels.project_id])])\n\
+    | event_count >= 10\n| table([@timestamp, protoPayload.authenticationInfo.principalEmail, protoPayload.resource.labels.project_id, event_count])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "GCP" and operation_status_code = 7 and actor_user !~= ".*gserviceaccount.*"
+    | bin _time span=5m
+    | comp count() as event_count by _time, actor_user, project_id
+    | filter event_count >= 10
+    | fields _time, actor_user, project_id, event_count
+  lucene: |
+    event.code:7 AND NOT src_user:*gserviceaccount*
+  sumo: |
+    _sourceCategory=*GCP* OR _sourceCategory=*Cloud*Audit*
+    | json field=_raw "protoPayload.status.code" as code
+    | json field=_raw "protoPayload.authenticationInfo.principalEmail" as src_user
+    | where code = "7" and !(src_user matches "*gserviceaccount*")
+    | timeslice 5m
+    | count as event_count by _timeslice, src_user
+    | where event_count >= 10
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -92,7 +81,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '10 Cloud Audit event within 5 minutes
 

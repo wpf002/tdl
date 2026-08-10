@@ -16,71 +16,47 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=github sourcetype=github:audit action="business.remove_organization"
+  spl: 'index=github sourcetype=github:audit action="business.remove_organization"
+
     | table _time, actor, org, action, actor_location.country_code, created_at
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000547 {\n  meta:\n    author = \"TDL\"\n    description = \"Organization Removed from Enterprise\"\n    severity =\
-    \ \"HIGH\"\n    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    GitHubAudit
+    | where TimeGenerated > ago(90d)
+    | where OperationType == "business.remove_organization"
+    | project TimeGenerated, Actor, ActorLocation, Organization, OperationType, UserAgent, IpAddress
+  aql: |
+    SELECT eventtime, username, sourceip, "action", QIDNAME(qid), LOGSOURCENAME(logsourceid)
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%github%'
+      AND "action" = 'business.remove_organization'
+    LAST 24 HOURS
+  yara_l: "rule github_business_remove_organization {\n  meta:\n    author = \"TDL\"\n    description = \"Detects removal of organization from\
+    \ GitHub business account - T1078 Command and Control\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique = \"\
+    T1078\"\n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.vendor_name = \"GITHUB\"\n    $e.metadata.product_name = \"GITHUB\"\n \
+    \   $e.security_result.action = \"business.remove_organization\"\n    $e.principal.user.userid = $user\n    \n  match:\n    $user over 1h\n\
+    \    \n  outcome:\n    $risk_score = 75\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-github.audit-*
+    | WHERE event.action == "business.remove_organization"
+    | KEEP @timestamp, github.actor, github.org, github.business, event.action, source.ip, user.name
+  leql: |
+    where(source_json.action="business.remove_organization")
+  crowdstrike: |
+    #repo=github action=business.remove_organization
+    | table([@timestamp, actor, org, action, business])
+  xql: |
+    dataset = github_audit_log_raw
+    | filter action = "business.remove_organization"
+    | fields _time, actor, action, org, user, repo
+  lucene: |
+    event.action:"business.remove_organization"
+  sumo: |
+    _sourceCategory=*Github*
+    | json field=_raw "action" as action
+    | where action = "business.remove_organization"
+    | fields _messageTime, _sourceHost, action
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -90,7 +66,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Github event\n   where actions is \"business.remove_organization\""
 triage_steps:

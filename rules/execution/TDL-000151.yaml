@@ -18,77 +18,96 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=601 OR EventCode=4697)
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=601 OR EventCode=4697)
+
     NOT Account_Name="*$"
+
     | lookup hvt_hosts.csv ComputerName OUTPUT is_hvt
+
     | where is_hvt="true"
+
     | table _time, ComputerName, Account_Name, Service_Name, Service_File_Name, EventCode
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4697")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4697')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000151 {\n  meta:\n    author = \"TDL\"\n    description = \"Service Installation - HVT\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1569\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4697)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (601, 4697)
+    | where AccountType != "Machine"
+    | extend SourceUser = coalesce(SubjectUserName, Account)
+    | where SourceUser !endswith "$"
+    | where Computer in (_GetWatchlist('HighValueAssets') | project SearchKey)
+    | project TimeGenerated, Computer, EventID, SourceUser, ServiceName = tostring(split(EventData, '<Data Name="ServiceName">')[1]), ServiceFileName = tostring(split(EventData, '<Data Name="ServiceFileName">')[1]), AccountDomain, Activity
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS destination_hostname, username AS source_username, "Service Name", "Service File Name", qidname(qid)
+    FROM events
+    WHERE "EventID" IN ('601', '4697')
+      AND username NOT LIKE '%$'
+      AND LOGSOURCENAME(logsourceid) IN (REFERENCESET('high_value_target_hosts'))
+    LAST 24 HOURS
+  yara_l: |
+    rule windows_service_installed_on_hvt {
+      meta:
+        author = "TDL"
+        description = "Detects Windows service installation on high value targets (T1569)"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1569"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "SERVICE_INSTALLATION"
+        (
+          $e.metadata.product_event_type = "601" or
+          $e.metadata.product_event_type = "4697"
+        )
+        not re.regex($e.principal.user.userid, `\$$`)
+        $e.target.hostname = $host
+        $e.target.asset.asset_id = $asset_id
 
-    | WHERE event.category == "process" AND event_id IN ("4697")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
+        $service_name = array_distinct($e.target.resource.name)
+        $user = array_distinct($e.principal.user.userid)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4697])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4697)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4697")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4697)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4697")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e and $e.target.asset.category = "HIGH_VALUE_TARGET"
+    }
+  esql: |
+    FROM logs-system.security*, logs-windows.system*, winlogbeat-*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.code IN ("601", "4697")
+      AND NOT user.name LIKE "*$"
+      AND host.name IN ("DC01", "DC02", "FS01", "EXCH01", "SQL01", "ADMIN01")
+    | STATS service_installs = COUNT(*) BY host.name, user.name, winlog.event_data.ServiceName, winlog.event_data.ImagePath, @timestamp
+    | KEEP @timestamp, host.name, user.name, winlog.event_data.ServiceName, winlog.event_data.ImagePath, service_installs
+  leql: |
+    where(source_json.EventID IN [601, 4697] AND source_user NOT ENDS-WITH "$" AND asset IN high_value_assets)
+  crowdstrike: |
+    EventCode IN [601, 4697]
+    | SubjectUserName != "*$"
+    | DestinationHostname IN file("high_value_targets.txt")
+    | table([@timestamp, ComputerName, EventCode, SubjectUserName, ServiceName, ServiceFileName, DestinationHostname])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (601, 4697)
+    | filter actor_effective_username != null and not actor_effective_username ~= "\$$"
+    | filter agent_hostname in ("HVA-DC01", "HVA-DC02", "HVA-EXCH01", "HVA-SQL01", "HVA-FILE01", "HVA-WEB01")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_data_ServiceName, action_evtlog_event_data_ServiceFileName, action_evtlog_event_id
+  lucene: |
+    event.code:(601 OR 4697) AND NOT user.name:*$ AND tags:"high_value_target"
+  sumo: |
+    _sourceCategory=*Windows* (EventID="601" OR EventID="4697")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Computer" as dest_host
+    | json field=_raw "SubjectUserName" as source_user
+    | where event_id in ("601", "4697")
+    | where !isEmpty(source_user) AND !(source_user matches "*$")
+    | lookup type, threat_level from shared/high_value_targets on dest_host=hostname
+    | where !isEmpty(type)
+    | fields _messageTime, dest_host, source_user, event_id, type, threat_level
 false_positives:
 - Security software
 - Authorized admin tools
@@ -98,7 +117,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Windows Service Installed Event
 

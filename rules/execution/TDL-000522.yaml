@@ -18,78 +18,136 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    (index=wineventlog sourcetype=WinEventLog:Security EventCode=4688 Image="*\\powershell.exe" CommandLine="*-verison*")
+  spl: '(index=wineventlog sourcetype=WinEventLog:Security EventCode=4688 Image="*\\powershell.exe" CommandLine="*-verison*")
+
     OR (index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-PowerShell/Operational" EventCode=4104 ScriptBlockText="*-verison*")
+
     OR (index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-PowerShell/Operational" EventCode=4103 EngineVersion!="5*")
-    | eval matches_version_regex=if((match(CommandLine, "-verison\s*[1-4]") OR match(ScriptBlockText, "-verison\s*[1-4]") OR (EventCode=4103 AND NOT match(EngineVersion, "^5"))), 1, 0)
+
+    | eval matches_version_regex=if((match(CommandLine, "-verison\s*[1-4]") OR match(ScriptBlockText, "-verison\s*[1-4]") OR (EventCode=4103 AND
+    NOT match(EngineVersion, "^5"))), 1, 0)
+
     | where matches_version_regex=1
+
     | table _time, ComputerName, EventCode, Image, CommandLine, ScriptBlockText, EngineVersion, User
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("powershell.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('powershell.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000522 {\n  meta:\n    author = \"TDL\"\n    description = \"PowerShell Version Downgrade Activity\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(powershell.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    union
+    (
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4688
+    | where Process has "powershell.exe"
+    | where CommandLine matches regex @".*\-verison\s*[1-4].*"
+    | project TimeGenerated, Computer, Account, Process, CommandLine, EventID
+    ),
+    (
+    Event
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4104
+    | where RenderedDescription matches regex @".*\-verison\s*[1-4].*" or ParameterBinding matches regex @".*\-verison\s*[1-4].*"
+    | extend ScriptBlockText = tostring(EventData.ScriptBlockText)
+    | where ScriptBlockText matches regex @".*\-verison\s*[1-4].*"
+    | project TimeGenerated, Computer, UserName, ScriptBlockText, EventID
+    ),
+    (
+    Event
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4103
+    | extend EngineVersion = tostring(EventData.EngineVersion)
+    | where EngineVersion !startswith "5"
+    | project TimeGenerated, Computer, UserName, EngineVersion, EventID
+    )
+  aql: |
+    SELECT eventtime, sourceip, username, "Process Name", "Process CommandLine", "EventID", "ScriptBlockText", "EngineVersion", LOGSOURCENAME(logsourceid) AS host
+    FROM events
+    WHERE (
+      ("EventID" IN ('592', '4688') AND "Process Name" ILIKE '%powershell.exe%' AND "Process CommandLine" MATCHES '.*\-verison\s*[1-4].*')
+      OR
+      ("EventID" = '4104' AND "ScriptBlockText" MATCHES '.*\-verison\s*[1-4].*')
+      OR
+      ("EventID" = '4103' AND "EngineVersion" != '5')
+    )
+    LAST 1 HOURS
+  yara_l: |
+    rule mitre_t1204_powershell_downgrade {
+      meta:
+        author = "TDL"
+        description = "Detects PowerShell downgrade attacks via version flag or engine version"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        // Process execution with -verison flag typo (version 1-4)
+        ($e1.metadata.event_type = "PROCESS_LAUNCH" and
+         ($e1.metadata.product_event_type = "592" or $e1.metadata.product_event_type = "4688") and
+         re.regex($e1.principal.process.file.full_path, `(?i)powershell\.exe$`) and
+         re.regex($e1.principal.process.command_line, `(?i)-verison\s*[1-4]`)) or
 
-    | WHERE event.category == "process" AND process_name IN ("powershell.exe")
+        // Script block logging with -verison flag
+        ($e1.metadata.event_type = "SCRIPT_EXECUTE" and
+         $e1.metadata.product_event_type = "4104" and
+         re.regex($e1.target.process.command_line, `(?i)-verison\s*[1-4]`)) or
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+        // Module logging with engine version NOT 5
+        ($e1.metadata.event_type = "SCRIPT_EXECUTE" and
+         $e1.metadata.product_event_type = "4103" and
+         not re.regex($e1.about.labels.value, `^5`) and
+         $e1.about.labels.key = "EngineVersion")
 
-    | SORT count DESC
+        $e1.principal.hostname = $host
 
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [powershell.exe])
+      match:
+        $host over 5m
 
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e1
+    }
+  esql: |
+    FROM logs-windows.powershell*, logs-system.security*, logs-endpoint.events.process*, winlogbeat-*
+    | WHERE (
+        (event.code IN ("592", "4688") AND process.name == "powershell.exe" AND process.command_line RLIKE ".*-verison\\s*[1-4].*")
+        OR
+        (event.code == "4104" AND powershell.file.script_block_text RLIKE ".*-verison\\s*[1-4].*")
+        OR
+        (event.code == "4103" AND powershell.engine.version NOT LIKE "5*")
+      )
+    | KEEP @timestamp, host.name, user.name, event.code, process.name, process.command_line, powershell.file.script_block_text, powershell.engine.version
+  leql: |
+    where((source_json.EventID IN [592, 4688] AND process_name ICONTAINS "powershell.exe" AND process_cmd_line=/.*\-verison\s*[1-4].*/) OR (source_json.EventID=4104 AND source_json.ScriptBlockText=/.*\-verison\s*[1-4].*/) OR (source_json.EventID=4103 AND source_json.EngineVersion!=5))
+  crowdstrike: |
+    (EventCode=4688 OR EventCode=592 OR EventCode=4104 OR EventCode=4103)
+    | case {
+        EventCode=4688 OR EventCode=592 | /powershell\.exe/i | CommandLine=/.*\-verison\s*[1-4].*/i;
+        EventCode=4104 | ScriptBlockText=/.*\-verison\s*[1-4].*/i;
+        EventCode=4103 | EngineVersion!="5";
+        * | drop();
+      }
+    | table([@timestamp, ComputerName, EventCode, CommandLine, ScriptBlockText, EngineVersion])
+  xql: "dataset = xdr_data\n| filter (\n    (action_evtlog_event_id in (592, 4688) \n     and lowercase(action_process_image_name) contains \"\
+    powershell.exe\" \n     and action_process_image_command_line ~= \".*\\\\-verison\\\\s*[1-4].*\")\n    or\n    (action_evtlog_event_id = 4104\
+    \ \n     and action_evtlog_message ~= \".*\\\\-verison\\\\s*[1-4].*\")\n    or\n    (action_evtlog_event_id = 4103 \n     and action_evtlog_event_data_EngineVersion\
+    \ != \"5\")\n)\n| fields _time, agent_hostname, actor_effective_username, action_evtlog_event_id, action_process_image_name, action_process_image_command_line,\
+    \ action_evtlog_message, action_evtlog_event_data_EngineVersion\n"
+  lucene: |
+    (event.code:(592 OR 4688) AND process.name:powershell.exe AND process.command_line:/.*\-verison\s*[1-4].*/) OR (event.code:4104 AND powershell.file.script_block_text:/.*\-verison\s*[1-4].*/) OR (event.code:4103 AND NOT winlog.event_data.EngineVersion:5)
+  sumo: |
+    _sourceCategory=*Windows* (("4688" OR "592") OR "4104" OR "4103")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "ProcessName" as alt_process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "ScriptBlockText" as script_block
+    | json field=_raw "Payload" as payload
+    | json field=_raw "EngineVersion" as engine_version
+    | where (
+        (event_id in ("4688", "592") and (process_name matches "*powershell.exe" or alt_process_name matches "*powershell.exe") and command_line matches regex ".*-verison\s*[1-4].*")
+        or (event_id = "4104" and script_block matches regex ".*-verison\s*[1-4].*")
+        or (event_id = "4103" and !(engine_version matches "5*"))
+      )
+    | fields _messageTime, _sourceHost, event_id, process_name, command_line, script_block, engine_version
 false_positives:
 - Security software
 - Authorized admin tools
@@ -99,7 +157,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe\nWhere Command\
   \ matches the regex \".*\\-verison\\s*[1-4].*\"\n\n---------------------------------------------------------------------------------------------------------------\n\

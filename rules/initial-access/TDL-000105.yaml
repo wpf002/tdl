@@ -19,77 +19,73 @@ queries:
     .(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)\") \n| lookup threat_intel_list dest_ip OUTPUT threat_score \n| where isnotnull(threat_score) \n|\
     \ stats dc(dest_ip) as unique_destinations values(dest_ip) as dest_ips values(dest_port) as ports values(Application) as applications by src_ip\
     \ \n| where unique_destinations > 1 \n| table src_ip, unique_destinations, dest_ips, ports, applications\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where destination_port in ("22")
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "destination_port" IN (''22'')
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: "let ThreatIPs = \n    ThreatIntelligenceIndicator\n    | where TimeGenerated > ago(24h)\n    | where isnotempty(NetworkIP)\n    | distinct\
+    \ NetworkIP;\nCommonSecurityLog\n| where TimeGenerated > ago(1h)\n| where DeviceAction !in (\"Deny\", \"Drop\", \"Reject\")\n| where (DeviceDirection\
+    \ =~ \"Outbound\" or CommunicationDirection =~ \"Outbound\")\n| where (DestinationPort == 22 or ApplicationProtocol =~ \"SSH\")\n| where DestinationIP\
+    \ in (ThreatIPs)\n| project TimeGenerated, SourceIP, DestinationIP, DestinationPort, ApplicationProtocol, DeviceVendor, DeviceProduct, DeviceAction,\
+    \ Message\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, QIDNAME(qid) AS event_name, CATEGORYNAME(category) AS category_name, COUNT(*) AS event_count
+    FROM events
+    WHERE (destinationport = 22 OR LOWER(QIDNAME(qid)) LIKE '%ssh%')
+      AND sourceip IN (SELECT sourceip FROM events WHERE sourceip NOT IN (SELECT destinationip FROM events WHERE destinationip INCIDR '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'))
+      AND destinationip NOT INCIDR '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
+      AND destinationip IN (SELECT ip FROM referencedata.reference_sets WHERE name = 'Threat_Intelligence')
+    GROUP BY sourceip, destinationip, destinationport, qid, category
     LAST 1 HOURS
+  yara_l: |
+    rule t1133_ssh_external_access_threat_intel {
+      meta:
+        author = "TDL"
+        description = "Detects outbound SSH connections to external IPs on threat intelligence lists"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1133"
+        severity = "HIGH"
 
-    '
-  yara_l: "rule tdl_tdl_auth_000105 {\n  meta:\n    author = \"TDL\"\n    description = \"Malicious SSH Traffic - Outbound\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1133\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.destination_port\
-    \ = /(22)/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.direction = "OUTBOUND"
+        (
+          $e.target.port = 22 or
+          re.regex($e.network.application_protocol, `(?i)ssh`)
+        )
+        $e.target.ip = $dest_ip
+        $e.principal.ip = $src_ip
+        $e.security_result.threat_intel_feeds.category_details != ""
 
-    | WHERE @timestamp > NOW() - 1 hour
+      match:
+        $src_ip over 5m
 
-    | WHERE event.category == "network" AND destination_port IN ("22")
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND destination_port IN [22])
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND destination_port IN (22)
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND destination_port in ("22")
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND destination_port:(22)
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where destination_port IN ("22")
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-network.firewall*\n| WHERE @timestamp > NOW() - 24 hours\n  AND (\n    (network.direction == \"outbound\" OR network.direction\
+    \ == \"egress\")\n    OR destination.port == 22\n    OR TO_LOWER(network.application) == \"ssh\"\n  )\n  AND threat.indicator.ip == destination.ip\n\
+    | STATS \n    dest_count = COUNT_DISTINCT(destination.ip),\n    event_count = COUNT(*)\n  BY source.ip, dest_port = destination.port, app\
+    \ = network.application, threat_ip = destination.ip\n| WHERE dest_count >= 1\n| KEEP source.ip, dest_count, event_count, dest_port, app, threat_ip\n"
+  leql: |
+    where(destination_address!=null AND destination_address IN threatlist() AND (destination_port=22 OR application ICONTAINS "ssh"))
+  crowdstrike: |
+    (#type=firewall OR event_simpleName=*Firewall* OR event_simpleName=*Network*)
+    (action=allowed OR action=accept OR disposition=allowed)
+    (direction=outbound OR direction=egress OR traffic_direction=outbound)
+    (DestinationPort=22 OR RemotePort=22 OR dst_port=22 OR destination_port=22)
+    (Application=/(?i)ssh/ OR app=/(?i)ssh/ OR ApplicationProtocol=/(?i)ssh/)
+    (threat_score>0 OR ioc_type=* OR threat_category=* OR threat_intel_match=true OR reputation=malicious OR is_malicious=true)
+    | table([@timestamp, ComputerName, SourceIP, src_ip, DestinationIP, RemoteAddressIP4, dst_ip, DestinationPort, RemotePort, Application, threat_category, ioc_type, threat_score])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter dest_port = 22 or lowercase(app) = "ssh"
+    | filter action_external_hostname != null or dest_ip in threat_intel_list
+    | filter direction = "outbound"
+    | fields _time, src_ip, dest_ip, dest_port, app, action_country_name, threat_name
+  lucene: |
+    (source.ip:10.0.0.0/8 OR source.ip:172.16.0.0/12 OR source.ip:192.168.0.0/16) AND NOT (destination.ip:10.0.0.0/8 OR destination.ip:172.16.0.0/12 OR destination.ip:192.168.0.0/16) AND (destination.port:22 OR application:/ssh/i) AND threat.indicator.ip:* AND action:(allowed OR accept OR permit)
+  sumo: "_sourceCategory=*Firewall* \n| json field=_raw \"src_ip\" as src_ip\n| json field=_raw \"dest_ip\" as dest_ip\n| json field=_raw \"dest_port\"\
+    \ as dest_port\n| json field=_raw \"application\" as application\n| json field=_raw \"action\" as action\n| where (dest_port = \"22\" OR toLowerCase(application)\
+    \ matches \"*ssh*\")\n| where !isPrivateIP(dest_ip)\n| lookup type, malicious_confidence, threat_intel from sumo://threat/cs on threat=dest_ip\n\
+    | where !isNull(malicious_confidence)\n| count_distinct(dest_ip) as unique_destinations by src_ip\n| where unique_destinations >= 1\n| fields\
+    \ src_ip, unique_destinations\n"
 false_positives:
 - Authorized pen testing
 - Security research
@@ -99,7 +95,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Firewall Event \nFrom one internal source to many external destinations (Outbound)\nOR\n\tWhere the Destination Port is 22\n\t\
   \n\tWhere the Application is case insensitive \"SSH\"\n\t\nWhere the Destination IP is on a Threat Intelligence List"

@@ -18,77 +18,73 @@ queries:
   spl: "index=network sourcetype IN (firewall, ids) protocol=tcp \n| lookup typosquatting_domains dest_ip OUTPUT is_typosquat \n| where is_typosquat=1\
     \ \n| search NOT (src_ip IN (\"10.50.1.100\", \"10.50.1.101\", \"172.16.5.50\")) \n| stats count dc(dest_ip) as unique_dests sum(bytes_out)\
     \ as total_bytes_out by src_ip, dest_ip, dest_port \n| where count >= 1 \n| sort - total_bytes_out\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_de_000463 {\n  meta:\n    author = \"TDL\"\n    description = \"Web Request to Typosquatting Domain\"\n    severity =\
-    \ \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1583\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
+  kql: |
+    CommonSecurityLog
+    | where DeviceVendor has_any ("Proxy", "Firewall", "IDS") or DeviceProduct has_any ("Proxy", "Firewall", "IDS")
+    | where Protocol =~ "tcp"
+    | where DestinationHostName has_any ("microsft.com", "gooogle.com", "amaz0n.com", "paypa1.com", "app1e.com", "facebo0k.com", "twittter.com", "linkedln.com", "netfl1x.com", "micros0ft.com", "g00gle.com", "amazom.com", "paypai.com", "appie.com")
+    | where SourceIP !in ("10.0.0.100", "10.0.0.101", "192.168.1.50")
+    | summarize count_ = count(), unique_dests = dcount(DestinationIP), bytes_out = sum(SentBytes) by SourceIP, DestinationIP, DestinationPort
+    | where count_ >= 1
     | sort by bytes_out desc
-
-    '
+    | project SourceIP, DestinationIP, DestinationPort, count_, unique_dests, bytes_out
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS conn_count, UNIQUECOUNT(destinationip) AS unique_dests, SUM(bytesout) AS total_bytes_out, LOGSOURCENAME(logsourceid) AS log_source
+    FROM flows
+    WHERE INCIDR(destinationip, '0.0.0.0/0')
+      AND sourceip NOT IN ('10.0.0.100', '10.0.0.101', '192.168.1.50')
+    GROUP BY sourceip, destinationip, destinationport
+    HAVING conn_count >= 1
+    ORDER BY total_bytes_out DESC
+    LAST 24 HOURS
+  yara_l: "rule typosquatting_domain_connection {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects connections to known\
+    \ typosquatting domains via Forward Proxy - MITRE T1583\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"\
+    T1583\"\n    severity = \"High\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.network.ip_protocol = \"TCP\"\n \
+    \   $e.target.hostname = $dest_domain\n    $e.target.ip = $dest_ip\n    $e.target.port = $dest_port\n    $e.principal.ip = $src_ip\n    $e.network.sent_bytes\
+    \ > 0\n    \n    // Known typosquatting domains - expand this list based on company domains\n    (\n      re.regex($dest_domain, `(?i)(g00gle|gooogle|micros0ft|amazom|paypa1|app1e|facebok|linkedln|slak|dropb0x|twiter|git-hub|stack0verflow)\\\
+    .`) or\n      re.regex($dest_domain, `(?i)(corp-internal|company-portal|enterprise-login|secure-auth|sso-login|vpn-access)\\.`) or\n     \
+    \ re.regex($dest_domain, `(?i)\\.(cm|co\\.uk|net|org|info|biz)$`)\n    )\n    \n    // Exclude authorized scanners and monitoring agents\n\
+    \    not (\n      $src_ip = \"10.0.0.100\" or\n      $src_ip = \"10.0.0.101\" or\n      $src_ip = \"192.168.1.50\" or\n      re.regex($e.principal.hostname,\
+    \ `(?i)scanner|nessus|qualys|monitoring|splunk|siem`)\n    )\n    \n  match:\n    $src_ip, $dest_ip, $dest_port over 24h\n    \n  outcome:\n\
+    \    $risk_score = max(75)\n    $total_bytes_out = sum($e.network.sent_bytes)\n    $connection_count = count_distinct($e.metadata.id)\n  \
+    \  $unique_dests = count_distinct($dest_ip)\n    $domains_contacted = array_distinct($dest_domain)\n    \n  condition:\n    #e >= 1\n}\n"
+  esql: |
+    FROM logs-network.firewall*, logs-network.ids*
+    | WHERE network.protocol == "tcp"
+    | WHERE destination.domain RLIKE ".*typo.*|.*squatt.*"
+    | EVAL connection_key = CONCAT(source.ip, "-", destination.ip, "-", TO_STRING(destination.port))
+    | STATS count = COUNT(*), unique_dests = COUNT_DISTINCT(destination.ip), bytes_out = SUM(network.bytes) BY source.ip, destination.ip, destination.port
+    | WHERE count >= 1
+    | WHERE NOT (source.ip IN ("10.0.0.100", "10.0.0.101") OR source.ip LIKE "192.168.1.*")
+    | SORT bytes_out DESC
+    | KEEP source.ip, destination.ip, destination.port, count, unique_dests, bytes_out
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp" AND source_json.dest_ip IN ["typosquat1.com", "typosquat2.com", "typosquat3.com"] AND source_json.src_ip NOT IN ["scanner1_ip", "scanner2_ip", "monitoring_agent_ip"]) groupby(source_json.src_ip, source_json.dest_ip, source_json.dest_port) calculate(count), calculate(unique:source_json.dest_ip), calculate(sum:source_json.bytes_out)
+  crowdstrike: "#type=firewall OR #type=ids network.protocol=*tcp* \n| !in(field=src_ip, values=[\"10.0.0.50\", \"10.0.0.51\", \"172.16.1.100\"\
+    ])\n| regex(\"(?<typosquat_match>micros0ft|g00gle|amaz0n|linkedln|paypa1)\", field=dest_domain, strict=false)\n| groupBy([src_ip, dest_ip,\
+    \ dest_port], function=[count(as=count), count(dest_ip, distinct=true, as=unique_dests), sum(bytes_out, as=total_bytes)])\n| count >= 1\n\
+    | sort(field=total_bytes, order=desc, limit=1000)\n| table([src_ip, dest_ip, dest_port, count, unique_dests, total_bytes])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter proto = "tcp"
+    | filter dest_fqdn ~= ".*(?:goog1e|g00gle|microsfot|micros0ft|amaz0n|ammazon|applé|app1e|netfIix|netf1ix|adobe-update|windowsupdate|microsoftupdate|office365-update)\.(?:com|net|org|info|biz).*"
+    | filter src_ip not in ("10.50.100.10", "10.50.100.11", "192.168.254.50")
+    | comp count() as count, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | filter count >= 1
+    | sort desc total_bytes_out
+    | fields src_ip, dest_ip, dest_port, count, unique_dests, total_bytes_out
+  lucene: |
+    network.protocol:tcp AND dest_ip:(*company-typo-domain1.com OR *company-typo-domain2.com OR *company-typo-domain3.com) AND NOT src_ip:(authorized_scanner_ip1 OR authorized_scanner_ip2 OR monitoring_agent_ip)
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*ids*
+    | where protocol matches "*tcp*" OR protocol="tcp"
+    | lookup type=csv suspicious_domains domain as dest_domain output is_typosquat
+    | where is_typosquat="true" OR dest_domain matches "*typosquat*"
+    | where !(src_ip in ("10.10.10.50", "10.10.10.51") OR src_ip matches "*scanner*")
+    | count as conn_count, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | where conn_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, conn_count, unique_dests, total_bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -98,7 +94,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

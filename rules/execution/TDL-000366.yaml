@@ -19,68 +19,45 @@ queries:
     \ OR \n     type=\"CredentialAccess:RDS/MaliciousIPCaller.FailedLogin\" OR \n     type=\"CredentialAccess:RDS/TorIPCaller.FailedLogin\")\n\
     | table _time, type, severity, accountId, region, resource.resourceType, service.action.rdsLoginAttemptAction.remoteIpDetails.ipAddressV4,\
     \ title, description\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000366 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS RDS Login Attempt from Malicious IP - GuardDuty\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSGuardDuty
+    | where ActivityType in ("CredentialAccess:RDS/AnomalousBehavior.FailedLogin", "CredentialAccess:RDS/MaliciousIPCaller.FailedLogin", "CredentialAccess:RDS/TorIPCaller.FailedLogin")
+    | project TimeGenerated, ActivityType, AwsAccountId, Title, Description, Severity, SourceIpAddress, ResourceType, ResourceId
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS log_source, sourceip, destinationip, username, "Event Type", "Finding Type", qidname(qid)
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%GuardDuty%'
+      AND ("Event Type" IN ('CredentialAccess:RDS/AnomalousBehavior.FailedLogin', 'CredentialAccess:RDS/MaliciousIPCaller.FailedLogin', 'CredentialAccess:RDS/TorIPCaller.FailedLogin')
+           OR "Finding Type" IN ('CredentialAccess:RDS/AnomalousBehavior.FailedLogin', 'CredentialAccess:RDS/MaliciousIPCaller.FailedLogin', 'CredentialAccess:RDS/TorIPCaller.FailedLogin'))
+    LAST 24 HOURS
+  yara_l: "rule aws_guardduty_rds_suspicious_failed_login {\n  meta:\n    author = \"Chronicle Detection Engineering\"\n    description = \"Detects\
+    \ GuardDuty findings indicating suspicious RDS failed login attempts from anomalous, malicious, or Tor IP addresses\"\n    mitre_attack_tactic\
+    \ = \"Execution\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"High\"\n    \n  events:\n    $e.metadata.vendor_name = \"Amazon\
+    \ AWS\"\n    $e.metadata.product_name = \"GuardDuty\"\n    (\n      $e.metadata.product_event_type = \"CredentialAccess:RDS/AnomalousBehavior.FailedLogin\"\
+    \ or\n      $e.metadata.product_event_type = \"CredentialAccess:RDS/MaliciousIPCaller.FailedLogin\" or\n      $e.metadata.product_event_type\
+    \ = \"CredentialAccess:RDS/TorIPCaller.FailedLogin\"\n    )\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n\
+    \  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("CredentialAccess:RDS/AnomalousBehavior.FailedLogin", "CredentialAccess:RDS/MaliciousIPCaller.FailedLogin", "CredentialAccess:RDS/TorIPCaller.FailedLogin")
+    | KEEP @timestamp, cloud.account.id, cloud.region, event.type, source.ip, aws.guardduty.severity, aws.guardduty.resource.rds_db_instance.name
+  leql: |
+    where(source_json.type IN ["CredentialAccess:RDS/AnomalousBehavior.FailedLogin", "CredentialAccess:RDS/MaliciousIPCaller.FailedLogin", "CredentialAccess:RDS/TorIPCaller.FailedLogin"])
+  crowdstrike: |
+    #repo=guardduty type IN ["CredentialAccess:RDS/AnomalousBehavior.FailedLogin", "CredentialAccess:RDS/MaliciousIPCaller.FailedLogin", "CredentialAccess:RDS/TorIPCaller.FailedLogin"]
+    | table([@timestamp, type, accountId, region, resource.resourceType, resource.instanceDetails.instanceId, service.additionalInfo, severity])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = XDR_CLOUD_PROVIDER_AWS and vendor = XDR_CLOUD_VENDOR_AWS_GUARDDUTY
+    | filter log_name in ("CredentialAccess:RDS/AnomalousBehavior.FailedLogin", "CredentialAccess:RDS/MaliciousIPCaller.FailedLogin", "CredentialAccess:RDS/TorIPCaller.FailedLogin")
+    | fields _time, cloud_provider, vendor, log_name, resource_name, resource_type, identity_name, identity_type, src_ipv4, severity
+  lucene: |
+    event.type:"GuardDuty" AND (finding.type:"CredentialAccess:RDS/AnomalousBehavior.FailedLogin" OR finding.type:"CredentialAccess:RDS/MaliciousIPCaller.FailedLogin" OR finding.type:"CredentialAccess:RDS/TorIPCaller.FailedLogin")
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty* OR _source=*guardduty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("CredentialAccess:RDS/AnomalousBehavior.FailedLogin", "CredentialAccess:RDS/MaliciousIPCaller.FailedLogin", "CredentialAccess:RDS/TorIPCaller.FailedLogin")
+    | fields _messageTime, _sourceHost, event_type
 false_positives:
 - Authorized pen testing
 - Security research
@@ -90,7 +67,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '"1 Guard Duty Event
 

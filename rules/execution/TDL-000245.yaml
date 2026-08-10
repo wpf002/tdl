@@ -18,76 +18,88 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=windows EventCode=4688 (CommandLine="*whoami*" OR CommandLine="*ipconfig*" OR CommandLine="*nestat*" OR CommandLine="*tasklist*" OR CommandLine="*ver*" OR CommandLine="*systeminfo*" OR CommandLine="*net time*" OR CommandLine="*net start*" OR CommandLine="*qprocess*" OR CommandLine="*query*" OR CommandLine="*dir*" OR CommandLine="*net view*" OR CommandLine="*ping*" OR CommandLine="*net use*" OR CommandLine="*type*" OR CommandLine="*net user*" OR CommandLine="*net localgroup*" OR CommandLine="*net group*" OR CommandLine="*net config*" OR CommandLine="*net share*")
+  spl: 'index=windows EventCode=4688 (CommandLine="*whoami*" OR CommandLine="*ipconfig*" OR CommandLine="*nestat*" OR CommandLine="*tasklist*"
+    OR CommandLine="*ver*" OR CommandLine="*systeminfo*" OR CommandLine="*net time*" OR CommandLine="*net start*" OR CommandLine="*qprocess*"
+    OR CommandLine="*query*" OR CommandLine="*dir*" OR CommandLine="*net view*" OR CommandLine="*ping*" OR CommandLine="*net use*" OR CommandLine="*type*"
+    OR CommandLine="*net user*" OR CommandLine="*net localgroup*" OR CommandLine="*net group*" OR CommandLine="*net config*" OR CommandLine="*net
+    share*")
+
     | stats count by ComputerName, Account_Name
+
     | where count >= 2
+
     | table ComputerName, Account_Name, count
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4688")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000245 {\n  meta:\n    author = \"TDL\"\n    description = \"Recon Commands\"\n    severity = \"LOW\"\n    tactic\
-    \ = \"TA0002\"\n    technique = \"T1005\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4688)/\n    $host\
-    \ = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND event_id IN ("4688")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4688])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4688)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4688")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4688)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4688")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where CommandLine has_any ("whoami", "ipconfig", "netstat", "tasklist", "ver", "systeminfo", "net time", "net start", "qprocess", "query", "dir", "net view", "ping", "net use", "type", "net user", "net localgroup", "net group", "net config", "net share")
+    | summarize CommandCount = dcount(CommandLine), Commands = make_set(CommandLine) by bin(TimeGenerated, 5m), Computer, Account
+    | where CommandCount >= 2
+    | project TimeGenerated, Computer, Account, CommandCount, Commands
+  aql: "SELECT username, sourceip, \"Process CommandLine\", COUNT(*) AS execution_count\nFROM events\nWHERE \"EventID\" IN ('592', '4688')\n \
+    \ AND (\"Process CommandLine\" ILIKE '%whoami%' \n    OR \"Process CommandLine\" ILIKE '%ipconfig%' \n    OR \"Process CommandLine\" ILIKE\
+    \ '%netstat%' \n    OR \"Process CommandLine\" ILIKE '%tasklist%' \n    OR \"Process CommandLine\" ILIKE '%ver %' \n    OR \"Process CommandLine\"\
+    \ ILIKE '%systeminfo%' \n    OR \"Process CommandLine\" ILIKE '%net time%' \n    OR \"Process CommandLine\" ILIKE '%net start%' \n    OR \"\
+    Process CommandLine\" ILIKE '%qprocess%' \n    OR \"Process CommandLine\" ILIKE '%query %' \n    OR \"Process CommandLine\" ILIKE '%dir %'\
+    \ \n    OR \"Process CommandLine\" ILIKE '%net view%' \n    OR \"Process CommandLine\" ILIKE '%ping %' \n    OR \"Process CommandLine\" ILIKE\
+    \ '%net use%' \n    OR \"Process CommandLine\" ILIKE '%type %' \n    OR \"Process CommandLine\" ILIKE '%net user%' \n    OR \"Process CommandLine\"\
+    \ ILIKE '%net localgroup%' \n    OR \"Process CommandLine\" ILIKE '%net group%' \n    OR \"Process CommandLine\" ILIKE '%net config%' \n \
+    \   OR \"Process CommandLine\" ILIKE '%net share%')\nGROUP BY username, sourceip, \"Process CommandLine\"\nHAVING execution_count >= 2\nLAST\
+    \ 1 HOURS\n"
+  yara_l: "rule execution_recon_commands {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects multiple Windows reconnaissance\
+    \ command executions - MITRE T1005\"\n    mitre_attack_technique = \"T1005\"\n    mitre_attack_tactic = \"Execution\"\n    \n  events:\n \
+    \   $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      $e.metadata.product_event_type = \"592\" or\n      $e.metadata.product_event_type\
+    \ = \"4688\"\n    )\n    (\n      re.regex($e.principal.process.command_line, `(?i)whoami`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)ipconfig`) or\n      re.regex($e.principal.process.command_line, `(?i)netstat`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)tasklist`) or\n      re.regex($e.principal.process.command_line, `(?i)\\bver\\b`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)systeminfo`) or\n      re.regex($e.principal.process.command_line, `(?i)net\\s+time`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)net\\s+start`) or\n      re.regex($e.principal.process.command_line, `(?i)qprocess`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)\\bquery\\b`) or\n      re.regex($e.principal.process.command_line, `(?i)\\bdir\\b`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)net\\s+view`) or\n      re.regex($e.principal.process.command_line, `(?i)ping`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)net\\s+use`) or\n      re.regex($e.principal.process.command_line, `(?i)\\btype\\b`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)net\\s+user`) or\n      re.regex($e.principal.process.command_line, `(?i)net\\s+localgroup`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)net\\s+group`) or\n      re.regex($e.principal.process.command_line, `(?i)net\\s+config`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)net\\s+share`)\n    )\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 10m\n    \n  condition:\n    #e >= 2\n}\n"
+  esql: "FROM logs-windows.security*, winlogbeat-*\n| WHERE @timestamp > NOW() - 24 hours \n  AND (event.code == \"4688\" OR event.code == \"\
+    592\")\n  AND (\n    process.command_line LIKE \"*whoami*\" OR\n    process.command_line LIKE \"*ipconfig*\" OR\n    process.command_line\
+    \ LIKE \"*netstat*\" OR\n    process.command_line LIKE \"*tasklist*\" OR\n    process.command_line LIKE \"*ver *\" OR\n    process.command_line\
+    \ LIKE \"* ver\" OR\n    process.command_line LIKE \"*systeminfo*\" OR\n    process.command_line LIKE \"*net time*\" OR\n    process.command_line\
+    \ LIKE \"*net start*\" OR\n    process.command_line LIKE \"*qprocess*\" OR\n    process.command_line LIKE \"*query *\" OR\n    process.command_line\
+    \ LIKE \"* query\" OR\n    process.command_line LIKE \"*dir *\" OR\n    process.command_line LIKE \"* dir\" OR\n    process.command_line LIKE\
+    \ \"*net view*\" OR\n    process.command_line LIKE \"*ping *\" OR\n    process.command_line LIKE \"* ping\" OR\n    process.command_line LIKE\
+    \ \"*net use*\" OR\n    process.command_line LIKE \"*type *\" OR\n    process.command_line LIKE \"* type\" OR\n    process.command_line LIKE\
+    \ \"*net user*\" OR\n    process.command_line LIKE \"*net localgroup*\" OR\n    process.command_line LIKE \"*net group*\" OR\n    process.command_line\
+    \ LIKE \"*net config*\" OR\n    process.command_line LIKE \"*net share*\"\n  )\n| STATS exec_count = COUNT(*) BY host.name, user.name\n| WHERE\
+    \ exec_count >= 2\n| KEEP host.name, user.name, exec_count\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND (process_cmd_line ICONTAINS "whoami" OR process_cmd_line ICONTAINS "ipconfig" OR process_cmd_line ICONTAINS "netstat" OR process_cmd_line ICONTAINS "tasklist" OR process_cmd_line ICONTAINS "ver" OR process_cmd_line ICONTAINS "systeminfo" OR process_cmd_line ICONTAINS "net time" OR process_cmd_line ICONTAINS "net start" OR process_cmd_line ICONTAINS "qprocess" OR process_cmd_line ICONTAINS "query" OR process_cmd_line ICONTAINS "dir" OR process_cmd_line ICONTAINS "net view" OR process_cmd_line ICONTAINS "ping" OR process_cmd_line ICONTAINS "net use" OR process_cmd_line ICONTAINS "type" OR process_cmd_line ICONTAINS "net user" OR process_cmd_line ICONTAINS "net localgroup" OR process_cmd_line ICONTAINS "net group" OR process_cmd_line ICONTAINS "net config" OR process_cmd_line ICONTAINS "net share")) groupby(asset, user) calculate(count)
+  crowdstrike: |
+    EventCode=4688 (CommandLine=*whoami* OR CommandLine=*ipconfig* OR CommandLine=*netstat* OR CommandLine=*tasklist* OR CommandLine=*ver* OR CommandLine=*systeminfo* OR CommandLine="*net time*" OR CommandLine="*net start*" OR CommandLine=*qprocess* OR CommandLine=*query* OR CommandLine=*dir* OR CommandLine="*net view*" OR CommandLine=*ping* OR CommandLine="*net use*" OR CommandLine=*type* OR CommandLine="*net user*" OR CommandLine="*net localgroup*" OR CommandLine="*net group*" OR CommandLine="*net config*" OR CommandLine="*net share*")
+    | groupBy([ComputerName], function=count(as=exec_count))
+    | exec_count >= 2
+    | table([ComputerName, exec_count])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter action_process_image_command_line ~= "(?i)(whoami|ipconfig|nestat|tasklist|ver|systeminfo|net time|net start|qprocess|query|dir|net view|ping|net use|type|net user|net localgroup|net group|net config|net share)"
+    | comp count() as exec_count by agent_hostname, actor_effective_username
+    | filter exec_count >= 2
+    | fields agent_hostname, actor_effective_username, exec_count
+  lucene: |
+    event.code:(592 OR 4688) AND (CommandLine:(*whoami* OR *ipconfig* OR *nestat* OR *tasklist* OR *ver* OR *systeminfo* OR "net time" OR "net start" OR *qprocess* OR *query* OR *dir* OR "net view" OR *ping* OR "net use" OR *type* OR "net user" OR "net localgroup" OR "net group" OR "net config" OR "net share") OR process.command_line:(*whoami* OR *ipconfig* OR *nestat* OR *tasklist* OR *ver* OR *systeminfo* OR "net time" OR "net start" OR *qprocess* OR *query* OR *dir* OR "net view" OR *ping* OR "net use" OR *type* OR "net user" OR "net localgroup" OR "net group" OR "net config" OR "net share"))
+  sumo: |
+    _sourceCategory=*Windows* ("4688" OR "592")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "NewProcessName" as process_name
+    | where event_id in ("4688", "592")
+    | where command_line matches "*whoami*" or command_line matches "*ipconfig*" or command_line matches "*netstat*" or command_line matches "*tasklist*" or command_line matches "*ver*" or command_line matches "*systeminfo*" or command_line matches "*net time*" or command_line matches "*net start*" or command_line matches "*qprocess*" or command_line matches "*query*" or command_line matches "*dir*" or command_line matches "*net view*" or command_line matches "*ping*" or command_line matches "*net use*" or command_line matches "*type*" or command_line matches "*net user*" or command_line matches "*net localgroup*" or command_line matches "*net group*" or command_line matches "*net config*" or command_line matches "*net share*"
+    | count as exec_count by _sourceHost, command_line
+    | where exec_count >= 2
+    | fields _sourceHost, command_line, exec_count
 false_positives:
 - Security software
 - Authorized admin tools
@@ -97,7 +109,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '2 or more Windows Process Executions
 

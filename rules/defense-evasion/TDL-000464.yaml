@@ -15,82 +15,76 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) network.protocol=tcp dest_port=443 (url="*/pswa/*" OR url="*/PowerShellWebAccess/*" OR http_referrer="*/pswa/*" OR http_user_agent="*PowerShell*")
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) network.protocol=tcp dest_port=443 (url="*/pswa/*" OR url="*/PowerShellWebAccess/*"
+    OR http_referrer="*/pswa/*" OR http_user_agent="*PowerShell*")
+
     | stats count as event_count, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
+
     | where event_count >= 1
+
     | sort - bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_de_000464 {\n  meta:\n    author = \"TDL\"\n    description = \"Windows PowerShell User Agent\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0005\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceVendor has_any ("Palo Alto", "Fortinet", "Cisco", "Checkpoint", "Zscaler", "Sophos") or DeviceProduct has_any ("Firewall", "Proxy", "IDS", "IPS")
+    | where Protocol =~ "TCP"
+    | where DestinationPort in (13990, 13991, 443) and (RequestURL has "pswa" or RequestURL has "PowerShell" or DestinationHostName has "pswa")
+    | summarize event_count = count(), unique_dests = dcount(DestinationIP), bytes_out = sum(SentBytes) by SourceIP, DestinationIP, DestinationPort
+    | where event_count >= 1
     | sort by bytes_out desc
-
-    '
+    | project SourceIP, DestinationIP, DestinationPort, event_count, unique_dests, bytes_out
+  aql: |
+    SELECT sourceip AS src_ip, destinationip AS dest_ip, destinationport AS dest_port, COUNT(*) AS count, UNIQUECOUNT(destinationip) AS unique_dests, SUM(destinationbytes) AS bytes_out FROM flows WHERE protocol = 6 AND (destinationport = 443 OR destinationport = 5986) GROUP BY sourceip, destinationip, destinationport HAVING count >= 1 ORDER BY bytes_out DESC LAST 24 HOURS
+  yara_l: "rule powershell_web_access_activity {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects Windows PowerShell\
+    \ Web Access network activity (T1071 - Application Layer Protocol)\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique\
+    \ = \"T1071\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.ip_protocol\
+    \ = \"TCP\"\n    re.regex($e.metadata.product_name, `(?i)(firewall|proxy|ids)`) or\n    re.regex($e.metadata.product_event_type, `(?i)(firewall|proxy|ids)`)\n\
+    \    \n    // PowerShell Web Access typically uses specific ports and user agents\n    (\n      $e.target.port = 443 or\n      $e.target.port\
+    \ = 8531 or\n      $e.target.port = 30091\n    )\n    \n    // Match PowerShell Web Access patterns in network metadata\n    (\n      re.regex($e.network.http.user_agent,\
+    \ `(?i)PowerShell`) or\n      re.regex($e.network.http.parsed_user_agent.browser, `(?i)PowerShell`) or\n      re.regex($e.about.url, `(?i)pswa`)\
+    \ or\n      re.regex($e.target.url, `(?i)pswa`)\n    )\n    \n    $e.principal.ip = $src_ip\n    $e.target.ip = $dest_ip\n    $e.target.port\
+    \ = $dest_port\n    \n  match:\n    $src_ip, $dest_ip, $dest_port over 1h\n    \n  outcome:\n    $risk_score = max(35)\n    $total_bytes_out\
+    \ = sum($e.network.sent_bytes)\n    $event_count = count_distinct($e.metadata.id)\n    $unique_dests = count_distinct($dest_ip)\n    \n  condition:\n\
+    \    #e >= 1\n}\n"
+  esql: |
+    FROM logs-network.traffic*, logs-proxy*, logs-firewall*
+    | WHERE network.transport == "tcp"
+    | STATS count = COUNT(*), unique_dests = COUNT_DISTINCT(destination.ip), bytes_out = SUM(network.bytes) BY source.ip, destination.ip, destination.port
+    | WHERE count >= 1
+    | SORT bytes_out DESC
+    | KEEP source.ip, destination.ip, destination.port, count, unique_dests, bytes_out
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp" AND (source_json.url ICONTAINS "/pswa" OR source_json.uri ICONTAINS "/pswa" OR destination_port=443)) groupby(source_address, destination_address, destination_port) calculate(count), calculate(unique:destination_address), calculate(sum:bytes_out)
+  crowdstrike: |
+    #type=firewall OR #type=ids
+    | protocol=tcp
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=event_count), count(dest_ip, distinct=true, as=unique_dests), sum(bytes_out, as=bytes_out)])
+    | event_count >= 1
+    | sort(bytes_out, order=desc, limit=10000)
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter proto = "tcp" and dest_port in (5986, 5985)
+    | comp count() as event_count, count_distinct(dest_ip) as unique_dests, sum(bytes_sent) as bytes_out by src_ip, dest_ip, dest_port
+    | filter event_count >= 1
+    | sort desc bytes_out
+    | fields src_ip, dest_ip, dest_port, event_count, unique_dests, bytes_out
+  lucene: |
+    network.protocol:tcp AND (dest_port:5986 OR dest_port:5985 OR (dest_port:443 AND (http.url:*pswa* OR http.host:*pswa* OR url.path:*/pswa/* OR destination.domain:*pswa*)))
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*network*
+    | where protocol="tcp" OR protocol="TCP" OR protocol matches "*tcp*"
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dest[ination]*[_:\s]+(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dest[ination]*[_\s]*port[:\s]*(?<dest_port>\d+)" nodrop
+    | parse regex "bytes[_\s]*out[:\s]*(?<bytes_out>\d+)" nodrop
+    | parse regex "powershell|pswa|Windows\s+PowerShell\s+Web\s+Access" as pswa_indicator nodrop
+    | where !isNull(pswa_indicator) OR dest_port="5986" OR dest_port="5985"
+    | count as event_count, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | where event_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, event_count, unique_dests, total_bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -100,7 +94,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

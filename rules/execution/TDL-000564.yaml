@@ -15,71 +15,50 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=kubernetes (verb=create resource=cronjob subresource="") OR (verb=create resource=cronjob NOT subresource=*)
+  spl: 'index=kubernetes (verb=create resource=cronjob subresource="") OR (verb=create resource=cronjob NOT subresource=*)
+
     | table _time, user, verb, resource, subresource, name, namespace, host
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000564 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubernetes Cronjob Created\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1053\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "KubernetesAuditLogs\n| where TimeGenerated > ago(24h)\n| where Verb =~ \"create\"\n| where (ObjectRef.resource =~ \"cronjobs\" and ObjectRef.subresource\
+    \ == \"\") \n     or (ObjectRef.resource =~ \"jobs\" and ObjectRef.subresource =~ \"cronjobs\")\n| project TimeGenerated, User.username, User.groups,\
+    \ ObjectRef.namespace, ObjectRef.name, ObjectRef.resource, ObjectRef.subresource, Verb, SourceIPs, UserAgent, RequestURI\n"
+  aql: |
+    SELECT objectRef.name AS resource_name, verb, objectRef.resource, objectRef.subresource, user.username, sourceIPs, userAgent, requestReceivedTimestamp
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%kubernetes%'
+      AND verb = 'create'
+      AND objectRef.resource = 'cronjobs'
+      AND objectRef.subresource IS NULL
+    LAST 1 HOURS
+  yara_l: "rule kubernetes_cronjob_creation {\n  meta:\n    author = \"Chronicle Detection\"\n    description = \"Detects creation of Kubernetes\
+    \ cronjobs - MITRE T1053 Execution via Scheduled Task/Job\"\n    mitre_attack_technique = \"T1053\"\n    mitre_attack_tactic = \"Execution\"\
+    \n    severity = \"Medium\"\n    \n  events:\n    $k.metadata.event_type = \"RESOURCE_CREATION\"\n    $k.metadata.product_name = \"Kubernetes\"\
+    \n    $k.target.resource.attribute.labels[\"verb\"] = \"create\"\n    (\n      ($k.target.resource.name = \"cronjob\" and $k.target.resource.attribute.labels[\"\
+    subresource\"] = \"\") or\n      ($k.target.resource.attribute.labels[\"resource\"] = \"cronjob\" and $k.target.resource.attribute.labels[\"\
+    subresource\"] = \"\")\n    )\n    $k.principal.user.userid = $user\n    $k.target.resource.attribute.labels[\"namespace\"] = $namespace\n\
+    \    \n  match:\n    $user, $namespace over 5m\n    \n  condition:\n    $k\n}\n"
+  esql: "FROM logs-kubernetes.audit*\n| WHERE @timestamp > NOW() - 24 hours \n  AND kubernetes.audit.verb == \"create\" \n  AND kubernetes.audit.objectRef.resource\
+    \ == \"cronjobs\" \n  AND kubernetes.audit.objectRef.subresource IS NULL\n| KEEP @timestamp, kubernetes.audit.user.username, kubernetes.audit.objectRef.namespace,\
+    \ kubernetes.audit.objectRef.name, kubernetes.audit.sourceIPs, kubernetes.audit.verb, kubernetes.audit.objectRef.resource\n"
+  leql: |
+    where(source_json.verb="create" AND (source_json.objectRef.resource="cronjob" OR source_json.objectRef.resource="cronjobs") AND (source_json.objectRef.subresource=null OR NOT(source_json.objectRef.subresource)))
+  crowdstrike: |
+    #type=kubernetes event.verb=create (event.resource=cronjob OR event.resource=cronjobs) (NOT event.subresource=* OR event.subresource="")
+    | table([@timestamp, event.verb, event.resource, event.subresource, event.user.username, event.objectRef.name, event.objectRef.namespace])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter lowercase(cloud_provider) = "kubernetes" and (verb = "create" and resource = "cronjob" and subresource = null) or (resource = "cronjob" and subresource = "cronjob")
+    | fields _time, user, verb, resource, subresource, object_name, namespace, cloud_provider
+  lucene: |
+    verb:"create" AND resource:"cronjob" AND NOT _exists_:subresource
+  sumo: |
+    _sourceCategory=*Kubernetes* OR _sourceCategory=*k8s*
+    | json field=_raw "verb" as verb
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "objectRef.subresource" as subresource
+    | where verb = "create" and (resource = "cronjob" or subresource = "cronjob") and (subresource = "" or isNull(subresource) or subresource = "cronjob")
+    | fields _messageTime, _sourceHost, verb, resource, subresource
 false_positives:
 - Security software
 - Authorized admin tools
@@ -89,7 +68,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere Verb is \"create\"\nOR\n             Where Resource is \"cronjob\"\n             Where Subresource is\
   \ NULL\n\n             Where Subresource is \"cronjob\""

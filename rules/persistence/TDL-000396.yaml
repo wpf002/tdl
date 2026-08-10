@@ -15,71 +15,62 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudwatchlogs:guardduty eventType IN ("Execution:Runtime/NewLibraryLoaded")
+  spl: 'index=aws sourcetype=aws:cloudwatchlogs:guardduty eventType IN ("Execution:Runtime/NewLibraryLoaded")
+
     | table _time, accountId, region, service.action.actionType, resource.instanceDetails.instanceId, service.additionalInfo.threatName, severity
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000396 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS New or Recently Modified Library Loaded - GuardDuty\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0003\"\n    technique = \"T1543\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(24h)
+    | where ActivityType in ("Execution:Runtime/NewLibraryLoaded")
+    | project TimeGenerated, ActivityType, AccountId, Region, ResourceType, Title, Description, Severity, ThreatName, ThreatFamilyName, ResourceId, ServiceName
+  aql: |
+    SELECT eventtime, sourceip, destinationip, qidname(qid), LOGSOURCENAME(logsourceid), "finding.type" AS finding_type, "finding.id" AS finding_id, "resource.instanceDetails.instanceId" AS instance_id, "service.additionalInfo.loadedLibraryName" AS library_name
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%GuardDuty%'
+      AND "finding.type" = 'Execution:Runtime/NewLibraryLoaded'
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_new_library_loaded {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects AWS GuardDuty findings for new library loaded at runtime indicating potential persistence"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1543"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Amazon GuardDuty"
+        $e.metadata.product_event_type = "Execution:Runtime/NewLibraryLoaded"
+        $e.principal.cloud.environment = "AMAZON_WEB_SERVICES"
 
-    | WHERE eventName LIKE "%GuardDuty%"
+      match:
+        $e.principal.resource.name over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type == "Execution:Runtime/NewLibraryLoaded"
+    | KEEP @timestamp, cloud.account.id, cloud.region, aws.guardduty.finding_id, aws.guardduty.severity, aws.guardduty.resource.instance_details.instance_id, event.original
+  leql: |
+    where(source_json.type IN ["Execution:Runtime/NewLibraryLoaded"])
+  crowdstrike: |
+    #type=guardduty "detail.type"="Execution:Runtime/NewLibraryLoaded"
+    | table([@timestamp, "detail.resource.instanceDetails.instanceId", "detail.resource.resourceType", "detail.service.additionalInfo.newLibraryLoadedDetails.name", "detail.severity"])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and logtype = "guardduty"
+    | filter json_extract_scalar(raw_log, "$.type") in ("Execution:Runtime/NewLibraryLoaded")
+    | fields _time, cloud_provider_account, cloud_provider_region, json_extract_scalar(raw_log, "$.type") as finding_type, json_extract_scalar(raw_log, "$.severity") as severity, json_extract_scalar(raw_log, "$.resource.instanceDetails.instanceId") as instance_id, json_extract_scalar(raw_log, "$.title") as title, json_extract_scalar(raw_log, "$.description") as description
+  lucene: |
+    event.type:"Execution:Runtime/NewLibraryLoaded"
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty* OR _source=*guardduty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("Execution:Runtime/NewLibraryLoaded")
 false_positives:
 - Security software
 - Authorized admin tools
@@ -89,7 +80,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Execution:Runtime/NewLibraryLoaded\"]"
 tuning_period: 7 days

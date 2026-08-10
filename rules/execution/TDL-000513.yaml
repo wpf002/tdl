@@ -18,78 +18,75 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    (index=wineventlog (EventCode=4688 OR EventCode=592) Image="*\\powershell.exe") OR (index=wineventlog EventCode=4104)
+  spl: '(index=wineventlog (EventCode=4688 OR EventCode=592) Image="*\\powershell.exe") OR (index=wineventlog EventCode=4104)
+
     | eval is_process_exec=if(EventCode=4688 OR EventCode=592, 1, 0)
+
     | eval is_script_exec=if(EventCode=4104, 1, 0)
-    | stats max(is_process_exec) as has_process max(is_script_exec) as has_script values(CommandLine) as cmdline values(ScriptBlockText) as script by ComputerName, User, _time span=1s
+
+    | stats max(is_process_exec) as has_process max(is_script_exec) as has_script values(CommandLine) as cmdline values(ScriptBlockText) as script
+    by ComputerName, User, _time span=1s
+
     | where has_process=1 OR has_script=1
+
     | table _time, ComputerName, User, EventCode, cmdline, script
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("powershell.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('powershell.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000513 {\n  meta:\n    author = \"TDL\"\n    description = \"Accessing Browser Login Data\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1555\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(powershell.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("powershell.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [powershell.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: "union \n(SecurityEvent\n| where TimeGenerated > ago(1h)\n| where EventID == 4688\n| where Process has \"powershell.exe\"\n| where CommandLine\
+    \ matches regex @\"(Get-UnattendedInstallFile|Get-Webconfig|Get-ApplicationHost|Get-SiteListPassword|Get-CachedGPPPassword|Get-RegistryAutoLogon)\"\
+    \n| project TimeGenerated, Computer, Account, Process, CommandLine, EventID),\n(Event\n| where TimeGenerated > ago(1h)\n| where EventID ==\
+    \ 4104\n| where RenderedDescription matches regex @\"(Get-UnattendedInstallFile|Get-Webconfig|Get-ApplicationHost|Get-SiteListPassword|Get-CachedGPPPassword|Get-RegistryAutoLogon)\"\
+    \n| project TimeGenerated, Computer, UserName, RenderedDescription, EventID)\n"
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process Name", "Process CommandLine", "ScriptBlockText"
+    FROM events
+    WHERE (
+      ("EventID" IN ('592', '4688') AND "Process Name" ILIKE '%powershell.exe%' AND "Process CommandLine" MATCHES '(password|credential|vault|cred|pass|pwd|PSCredential|Get-Credential|SecureString|NetworkCredential|ConvertFrom-SecureString|PasswordVault|Windows\.Security\.Credentials)')
+      OR
+      ("EventID" = '4104' AND "ScriptBlockText" MATCHES '(password|credential|vault|cred|pass|pwd|PSCredential|Get-Credential|SecureString|NetworkCredential|ConvertFrom-SecureString|PasswordVault|Windows\.Security\.Credentials)')
+    )
+    LAST 1 HOURS
+  yara_l: "rule mitre_t1555_credential_access_powershell {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects credential\
+    \ access attempts via PowerShell (T1555)\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1555\"\n    severity\
+    \ = \"High\"\n    \n  events:\n    $proc.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      $proc.metadata.product_event_type = \"592\"\
+    \ or\n      $proc.metadata.product_event_type = \"4688\"\n    )\n    re.regex($proc.principal.process.file.full_path, `(?i)powershell\\.exe$`)\n\
+    \    re.regex($proc.principal.process.command_line, `(Get-Credential|ConvertFrom-SecureString|CredentialManager|Windows\\.Security\\.Credentials|Vault|PasswordVault|Get-StoredCredential|Credential.*Manager|SecurePassword|PSCredential|NetworkCredential|System\\\
+    .Net\\.CredentialCache|IEX.*password|Invoke.*credential|mimikatz|kerberoast|lazagne|dump.*cred|export.*password|VaultCmd|cmdkey|rundll32.*keymgr)`)\n\
+    \    $proc.principal.hostname = $host\n    \n    $script.metadata.event_type = \"SCRIPT_EXECUTE\"\n    $script.metadata.product_event_type\
+    \ = \"4104\"\n    re.regex($script.target.process.command_line, `(Get-Credential|ConvertFrom-SecureString|CredentialManager|Windows\\.Security\\\
+    .Credentials|Vault|PasswordVault|Get-StoredCredential|Credential.*Manager|SecurePassword|PSCredential|NetworkCredential|System\\.Net\\.CredentialCache|IEX.*password|Invoke.*credential|mimikatz|kerberoast|lazagne|dump.*cred|export.*password|VaultCmd|cmdkey|rundll32.*keymgr)`)\n\
+    \    $script.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n  outcome:\n    $risk_score = max(75)\n    \n  condition:\n\
+    \    $proc or $script\n}\n"
+  esql: "FROM logs-windows.powershell*, logs-system.security*, logs-endpoint.events.process*, winlogbeat-*\n| WHERE (\n    (event.code IN (\"\
+    592\", \"4688\") AND process.name == \"powershell.exe\" AND process.command_line RLIKE \".*\") \n    OR \n    (event.code == \"4104\" AND\
+    \ powershell.file.script_block_text RLIKE \".*\")\n  )\n| KEEP @timestamp, host.name, user.name, event.code, process.name, process.command_line,\
+    \ powershell.file.script_block_text, process.parent.name\n"
+  leql: |
+    where((source_json.EventID IN [592, 4688] AND process_name ICONTAINS "powershell.exe") OR (source_json.EventID=4104))
+  crowdstrike: |
+    (EventCode=4688 OR EventCode=592 OR EventCode=4104)
+    AND (
+      (EventCode IN [592, 4688] AND (FileName=*powershell.exe OR Image=*powershell.exe OR NewProcessName=*powershell.exe) AND (CommandLine=/Get-ChildItem|gci|dir|ls|Get-Content|gc|cat|type|Select-String|sls|findstr/i OR Command=/Get-ChildItem|gci|dir|ls|Get-Content|gc|cat|type|Select-String|sls|findstr/i))
+      OR
+      (EventCode=4104 AND ScriptBlockText=/Get-ChildItem|gci|dir|ls|Get-Content|gc|cat|type|Select-String|sls|findstr/i)
+    )
+    AND (CommandLine=*/Credential|password|pwd|securestring|PSCredential|NetworkCredential|SecurePassword/i OR ScriptBlockText=*/Credential|password|pwd|securestring|PSCredential|NetworkCredential|SecurePassword/i)
+    | table([@timestamp, ComputerName, EventCode, FileName, Image, NewProcessName, CommandLine, Command, ScriptBlockText, UserName])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) and lowercase(actor_process_image_name) contains "powershell.exe")
+       or action_evtlog_event_id = 4104
+    | fields _time, agent_hostname, action_evtlog_event_id, actor_process_image_name, action_process_image_command_line, action_evtlog_message, actor_effective_username
+  lucene: |
+    (event.code:(592 OR 4688) AND process.name:powershell.exe AND process.command_line:/.*(Get-UnattendedInstallFile|Get-Keystrokes|Get-TimedScreenshot|Get-VaultCredential|Get-VaultElementValue|Invoke-CredentialInjection|Invoke-Mimikatz|Invoke-NinjaCopy|Invoke-TokenManipulation|Out-Minidump|VolumeShadowCopyTools|Invoke-ReflectivePEInjection|Invoke-UserHunter|Invoke-WMICommand|Get-LSASecret|Get-PassHashes|Show-TargetScreen|Port-Scan|Invoke-PsExec|Invoke-SSHCommand|Get-SecurityPackages|Install-SSP|Invoke-BackdoorLNK|PowerUp|PowerView|Get-GPPPassword|Get-GPPAutologon|Get-UnattendedInstallFile|Get-ApplicationHost|Get-RegAlwaysInstallElevated|Get-RegAutoLogon|Get-VaultCredential|Find-PathDLLHijack|Write-HijackDll|Find-ProcessDLLHijack|Find-AVSignature|Invoke-Mimikatz|Get-Keystrokes|Get-TimedScreenshot|New-ElevatedPersistenceOption|Invoke-CredentialInjection|Invoke-NinjaCopy|Invoke-TokenManipulation|Out-Minidump).*/) OR (event.code:4104 AND powershell.file.script_block_text:/.*(Get-UnattendedInstallFile|Get-Keystrokes|Get-TimedScreenshot|Get-VaultCredential|Get-VaultElementValue|Invoke-CredentialInjection|Invoke-Mimikatz|Invoke-NinjaCopy|Invoke-TokenManipulation|Out-Minidump|VolumeShadowCopyTools|Invoke-ReflectivePEInjection|Invoke-UserHunter|Invoke-WMICommand|Get-LSASecret|Get-PassHashes|Show-TargetScreen|Port-Scan|Invoke-PsExec|Invoke-SSHCommand|Get-SecurityPackages|Install-SSP|Invoke-BackdoorLNK|PowerUp|PowerView|Get-GPPPassword|Get-GPPAutologon|Get-UnattendedInstallFile|Get-ApplicationHost|Get-RegAlwaysInstallElevated|Get-RegAutoLogon|Get-VaultCredential|Find-PathDLLHijack|Write-HijackDll|Find-ProcessDLLHijack|Find-AVSignature|Invoke-Mimikatz|Get-Keystrokes|Get-TimedScreenshot|New-ElevatedPersistenceOption|Invoke-CredentialInjection|Invoke-NinjaCopy|Invoke-TokenManipulation|Out-Minidump).*/)
+  sumo: |
+    _sourceCategory=*Windows* (EventID=4688 OR EventID=592 OR EventID=4104)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "ScriptBlockText" as script_block
+    | where (event_id in ("4688", "592") and process_name matches "*powershell.exe" and (command_line matches "*Get-ItemProperty*" and command_line matches "*HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\*" or command_line matches "*vaultcmd*" or command_line matches "*VaultCmd.exe*" or command_line matches "*Get-Credential*" or command_line matches "*HKLM:\\SAM\\SAM*" or command_line matches "*HKLM:\\Security*" or command_line matches "*HKLM:\\SYSTEM*" or command_line matches "*mimikatz*" or command_line matches "*lsadump*" or command_line matches "*sekurlsa*" or command_line matches "*PSSQLite*" or command_line matches "*Select-String*" and command_line matches "*password*" or command_line matches "*AppData\\Local*" or command_line matches "*AppData\\Roaming*" or command_line matches "*Credentials*")) or (event_id = "4104" and (script_block matches "*Get-ItemProperty*" and script_block matches "*HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\*" or script_block matches "*vaultcmd*" or script_block matches "*VaultCmd.exe*" or script_block matches "*Get-Credential*" or script_block matches "*HKLM:\\SAM\\SAM*" or script_block matches "*HKLM:\\Security*" or script_block matches "*HKLM:\\SYSTEM*" or script_block matches "*mimikatz*" or script_block matches "*lsadump*" or script_block matches "*sekurlsa*" or script_block matches "*PSSQLite*" or script_block matches "*Select-String*" and script_block matches "*password*" or script_block matches "*AppData\\Local*" or script_block matches "*AppData\\Roaming*" or script_block matches "*Credentials*"))
+    | fields _messageTime, _sourceHost, event_id, process_name, command_line, script_block
 false_positives:
 - Security software
 - Authorized admin tools
@@ -99,7 +96,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe\nWhere Command\
   \ matches the regex \"\"\n\n---------------------------------------------------------------------------------------------------------------\n\

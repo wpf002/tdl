@@ -16,79 +16,93 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=proxy sourcetype=proxy* (url="*wp-*" OR (file_ext IN ("exe","dll","bat","cmd","ps1","vbs","js","jar","msi","scr","com","pif") AND content_type IN ("application/x-msdownload","application/x-msdos-program","application/x-dosexec","application/octet-stream","application/x-executable","application/x-java-archive"))) | table _time, src_ip, user, url, file_ext, content_type, bytes_in, bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  spl: 'index=proxy sourcetype=proxy* (url="*wp-*" OR (file_ext IN ("exe","dll","bat","cmd","ps1","vbs","js","jar","msi","scr","com","pif") AND
+    content_type IN ("application/x-msdownload","application/x-msdos-program","application/x-dosexec","application/octet-stream","application/x-executable","application/x-java-archive")))
+    | table _time, src_ip, user, url, file_ext, content_type, bytes_in, bytes_out
 
+    '
+  kql: |
+    CommonSecurityLog
     | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+    | where DeviceVendor has "Proxy" or DeviceProduct has "Proxy" or DeviceEventClassID has "proxy"
+    | where RequestURL contains "wp-"
+        or FileExtension in~ ("exe", "dll", "scr", "com", "bat", "cmd", "vbs", "js", "jar", "ps1", "msi", "hta", "application")
+        or RequestContext in~ ("application/x-msdownload", "application/x-msdos-program", "application/x-executable", "application/octet-stream", "application/exe", "application/x-exe", "application/dos-exe", "application/x-winexe", "application/msdos-windows", "application/x-msi", "application/x-ms-installer")
+    | project TimeGenerated, SourceIP, DestinationIP, RequestURL, FileExtension, RequestContext, DeviceAction, SourceUserName
+  aql: |
+    SELECT sourceip, destinationip, username, url, "File Extension", "Content Type", COUNT(*) AS event_count
+    FROM events
+    WHERE (url ILIKE '%wp-%' OR "File Extension" IN ('exe','dll','bat','cmd','ps1','vbs','js','jar','msi','scr','com','pif') OR "Content Type" IN ('application/x-msdownload','application/x-msdos-program','application/x-executable','application/octet-stream','application/exe','application/x-exe','application/dos-exe','application/x-winexe'))
+    AND categoryname(category) ILIKE '%proxy%'
+    GROUP BY sourceip, destinationip, username, url, "File Extension", "Content Type"
     LAST 1 HOURS
+  yara_l: |
+    rule user_execution_malicious_file_t1204 {
+      meta:
+        author = "TDL"
+        description = "Detects potential user execution of malicious files via forward proxy (T1204)"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "Medium"
 
-    '
-  yara_l: "rule tdl_tdl_exe_000159 {\n  meta:\n    author = \"TDL\"\n    description = \"Executable File Downloaded from WordPress Site\"\n  \
-    \  severity = \"LOW\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n\
-    \    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.metadata.product_name = "Forward Proxy"
+        (
+          re.regex($e.target.url, `wp-`) or
+          (
+            (
+              re.regex($e.target.file.mime_type, `(?i)(application/x-msdownload|application/x-dosexec|application/x-executable|application/x-msdos-program|application/octet-stream|application/exe|application/x-exe|application/dos-exe|application/x-winexe|application/msdos-windows|application/x-msi|application/x-ms-installer)`) or
+              re.regex($e.network.http.response_headers, `(?i)content-type:\s*(application/x-msdownload|application/x-dosexec|application/x-executable|application/x-msdos-program|application/octet-stream|application/exe|application/x-exe|application/dos-exe|application/x-winexe|application/msdos-windows|application/x-msi|application/x-ms-installer)`)
+            ) and
+            re.regex($e.target.url, `(?i)\.(exe|dll|scr|com|bat|cmd|vbs|js|jar|msi|ps1|hta|vbe|wsf|gadget|application|pif|cpl)(\?|$)`)
+          )
+        )
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $user
 
-    | WHERE @timestamp > NOW() - 1 hour
+      match:
+        $host, $user over 5m
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+      outcome:
+        $risk_score = 50
+        $url = array_distinct($e.target.url)
+        $file_type = array_distinct($e.target.file.mime_type)
 
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network.proxy*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        url.original LIKE "*wp-*"
+        OR (
+          url.extension IN ("exe", "dll", "bat", "cmd", "ps1", "vbs", "js", "jar", "msi", "scr", "com", "pif", "cpl")
+          AND http.response.mime_type IN ("application/x-msdownload", "application/x-msdos-program", "application/x-executable", "application/octet-stream", "application/exe", "application/x-exe", "application/dos-exe", "application/x-winexe", "application/msdos-windows", "application/x-msi", "application/x-ms-installer")
+        )
+      )
+    | KEEP @timestamp, source.ip, user.name, url.original, url.extension, http.response.mime_type, destination.ip
+  leql: |
+    where((url ICONTAINS "wp-") OR (file_extension IN ["exe", "dll", "bat", "cmd", "ps1", "vbs", "js", "jar", "msi", "scr", "com", "pif", "hta", "cpl", "wsf", "gadget", "application", "msp"]) OR (content_type IN ["application/x-msdownload", "application/x-msdos-program", "application/x-executable", "application/octet-stream", "application/x-dosexec", "application/exe", "application/x-exe", "application/dos-exe", "application/x-winexe", "application/msdos-windows", "application/x-msi", "application/x-ms-dos-executable"]))
+  crowdstrike: |
+    #type=proxy (url=*wp-* OR (file_extension IN (exe, dll, bat, cmd, ps1, vbs, js, jar, msi, scr, com, pif) AND content_type IN ("application/x-msdownload", "application/x-msdos-program", "application/octet-stream", "application/exe", "application/x-exe", "application/dos-exe", "application/x-winexe", "application/msdos-windows", "application/x-zip-compressed", "application/java-archive")))
+    | table([@timestamp, url, file_extension, content_type, src_ip, dst_ip, ComputerName])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter app_category = \"web-browsing\" or app_category = \"general-internet\"\n| filter url_category_list\
+    \ != null\n| filter (url contains \"wp-\" \n    or file_extension in (\"exe\", \"dll\", \"scr\", \"bat\", \"cmd\", \"vbs\", \"vbe\", \"js\"\
+    , \"jse\", \"wsf\", \"wsh\", \"msi\", \"msp\", \"com\", \"pif\", \"cpl\", \"hta\", \"jar\", \"ps1\", \"psm1\")\n    or content_type in (\"\
+    application/x-msdownload\", \"application/x-msdos-program\", \"application/x-executable\", \"application/octet-stream\", \"application/exe\"\
+    , \"application/x-exe\", \"application/dos-exe\", \"application/x-winexe\", \"application/msdos-windows\", \"application/x-msi\"))\n| filter\
+    \ file_extension in (\"exe\", \"dll\", \"scr\", \"bat\", \"cmd\", \"vbs\", \"vbe\", \"js\", \"jse\", \"wsf\", \"wsh\", \"msi\", \"msp\", \"\
+    com\", \"pif\", \"cpl\", \"hta\", \"jar\", \"ps1\", \"psm1\")\n    and content_type in (\"application/x-msdownload\", \"application/x-msdos-program\"\
+    , \"application/x-executable\", \"application/octet-stream\", \"application/exe\", \"application/x-exe\", \"application/dos-exe\", \"application/x-winexe\"\
+    , \"application/msdos-windows\", \"application/x-msi\")\n| fields _time, src_ip, dst_ip, url, file_extension, content_type, action\n"
+  lucene: |
+    (url:*wp-* OR (file_extension:(exe OR dll OR bat OR cmd OR ps1 OR vbs OR js OR jar OR msi OR scr OR com OR pif OR hta OR cpl OR wsf OR vbe OR jse) AND content_type:("application/x-msdownload" OR "application/x-msdos-program" OR "application/x-executable" OR "application/octet-stream" OR "application/x-dosexec" OR "application/exe" OR "application/x-exe" OR "application/dos-exe" OR "application/x-winexe" OR "application/msdos-windows")))
+  sumo: |
+    _sourceCategory=*Proxy* OR _sourceCategory=*Forward*Proxy*
+    | where url matches "*wp-*" OR file_extension in ("exe","dll","msi","bat","cmd","ps1","vbs","js","jar","scr","com","pif") OR content_type in ("application/x-msdownload","application/x-msdos-program","application/x-executable","application/x-dosexec","application/octet-stream","application/exe","application/x-exe","application/dos-exe","application/x-winexe","application/msdos-windows","application/x-msi","application/x-ms-installer")
+    | fields _messageTime, _sourceHost, url, file_extension, content_type, user, src_ip
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -98,7 +112,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Forward Proxy Event\nWhere the URL contains \"wp-\"\nOR\n\tWhere the File Extension is in the Executable File Extensions List\n\
   \t\n\tWhere Content Type is in the Executable Content Types List"

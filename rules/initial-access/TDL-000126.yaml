@@ -16,74 +16,111 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail eventName=CreateUser
+  spl: 'index=aws sourcetype=aws:cloudtrail eventName=CreateUser
+
     | lookup admin_users.csv user_name AS requestParameters.userName OUTPUT is_admin
+
     | lookup authorized_modifiers.csv user_name AS userIdentity.userName OUTPUT is_authorized
+
     | where is_admin="true" AND is_authorized!="true"
+
     | table _time, userIdentity.userName, requestParameters.userName, userIdentity.arn, sourceIPAddress, requestParameters.userName
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000126 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Admin Account Created by Unauthorized User\"\n \
-    \   severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(24h)
+    | where EventName in ("CreateUser", "PutUserPolicy", "AttachUserPolicy", "AddUserToGroup")
+    | where isnotempty(ResponseElements)
+    | extend DestinationUser = tostring(parse_json(ResponseElements).user.userName)
+    | extend SourceUser = tostring(UserIdentityPrincipalid)
+    | where SourceUser !in ("authorized-admin-1", "authorized-admin-2", "terraform-service-account")
+    | join kind=inner (
+        AWSCloudTrail
+        | where TimeGenerated > ago(24h)
+        | where EventName in ("AttachUserPolicy", "PutUserPolicy", "AddUserToGroup")
+        | extend DestinationUser = tostring(coalesce(
+            parse_json(RequestParameters).userName,
+            parse_json(ResponseElements).user.userName
+        ))
+        | extend PolicyArn = tostring(parse_json(RequestParameters).policyArn)
+        | extend GroupName = tostring(parse_json(RequestParameters).groupName)
+        | where PolicyArn has_any ("AdministratorAccess", "iam:*", "*:*") or GroupName has_any ("Admin", "Administrator")
+        | distinct DestinationUser
+    ) on DestinationUser
+    | project TimeGenerated, EventName, SourceUser, DestinationUser, SourceIpAddress, UserAgent, RequestParameters, ResponseElements
+  aql: |
+    SELECT sourceip, username AS source_user, "userIdentity.principalId" AS principal_id, "requestParameters.userName" AS created_user, "responseElements.user.arn" AS user_arn, eventtime, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%CloudTrail%'
+      AND ("eventName" = 'CreateUser' OR "eventName" = 'PutUserPolicy' OR "eventName" = 'AttachUserPolicy' OR "eventName" = 'AddUserToGroup')
+      AND ("responseElements.user.arn" ILIKE '%admin%' OR "requestParameters.policyArn" ILIKE '%Administrator%' OR "requestParameters.groupName" ILIKE '%admin%')
+      AND username NOT IN ('authorized_user1', 'authorized_user2', 'automation_account')
+    LAST 24 HOURS
+  yara_l: "rule aws_unauthorized_admin_user_creation {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects unauthorized\
+    \ creation of admin users in AWS - T1098\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1098\"\n    severity\
+    \ = \"HIGH\"\n\n  events:\n    $e.metadata.vendor_name = \"AMAZON\"\n    $e.metadata.product_name = \"AWS CloudTrail\"\n    $e.metadata.product_event_type\
+    \ = \"CreateUser\"\n    $e.principal.user.userid = $source_user\n    $e.target.user.userid = $target_user\n    $e.principal.cloud.environment\
+    \ = \"PRODUCTION\"\n    \n    $admin.metadata.vendor_name = \"AMAZON\"\n    $admin.metadata.product_name = \"AWS CloudTrail\"\n    ($admin.metadata.product_event_type\
+    \ = \"AttachUserPolicy\" or $admin.metadata.product_event_type = \"AddUserToGroup\")\n    $admin.target.user.userid = $target_user\n    (re.regex($admin.target.resource.attribute.labels.value,\
+    \ `(?i)(admin|administrator|poweruser)`) or \n     re.regex($admin.security_result.summary, `(?i)(admin|administrator|poweruser)`))\n    \n\
+    \    $e.principal.hostname = $admin.principal.hostname\n\n  match:\n    $source_user, $target_user over 15m\n\n  outcome:\n    $risk_score\
+    \ = max(75)\n    $source_user_name = array_distinct($source_user)\n    $target_user_name = array_distinct($target_user)\n\n  condition:\n\
+    \    $e and $admin and \n    not re.regex($source_user, `(?i)(authorized-automation-user|terraform-service|cloudformation-service|approved-admin-.*|security-team-.*)`)\n\
+    }\n"
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.dataset == "aws.cloudtrail"
+      AND event.action IN ("CreateUser", "CreateAccessKey", "CreateLoginProfile")
+      AND aws.cloudtrail.user_identity.type != "AssumedRole"
+    | EVAL source_user = COALESCE(user.name, aws.cloudtrail.user_identity.principal_id)
+    | EVAL destination_user = COALESCE(aws.cloudtrail.request_parameters, "")
+    | WHERE destination_user LIKE "*Admin*" OR destination_user LIKE "*admin*"
+    | WHERE source_user NOT IN ("authorized_admin_1", "authorized_admin_2", "terraform_service_account", "cloudformation_role")
+    | STATS event_count = COUNT(*) BY source_user, event.action, aws.cloudtrail.user_identity.arn, cloud.account.id, @timestamp
+    | KEEP @timestamp, cloud.account.id, source_user, aws.cloudtrail.user_identity.arn, event.action, event_count
+  leql: |
+    where(source_json.eventName="CreateUser" AND source_json.userIdentity.type IN ["IAMUser", "AssumedRole"] AND source_json.requestParameters.userName ICONTAINS "admin") groupby(source_json.userIdentity.userName, source_json.requestParameters.userName) calculate(count)
+  crowdstrike: |
+    #repo=cloudtrail (eventName=CreateUser OR eventName=PutUserPolicy OR eventName=AttachUserPolicy OR eventName=AddUserToGroup)
+    | case {
+        eventName=CreateUser | newUserName := requestParameters.userName;
+        eventName=PutUserPolicy | newUserName := requestParameters.userName;
+        eventName=AttachUserPolicy | newUserName := requestParameters.userName;
+        eventName=AddUserToGroup | newUserName := requestParameters.userName;
+        * | newUserName := "";
+      }
+    | case {
+        eventName=AddUserToGroup | groupName := requestParameters.groupName;
+        * | groupName := "";
+      }
+    | (groupName=/.*[Aa]dmin.*/ OR eventName=PutUserPolicy OR eventName=AttachUserPolicy)
+    | userIdentity.principalId != /^AIDA.*authorized.*/i
+    | not(userIdentity.principalId in ["AIDAAUTHORIZEDUSER1", "AIDAAUTHORIZEDUSER2"])
+    | table([@timestamp, eventName, userIdentity.principalId, userIdentity.userName, newUserName, groupName, sourceIPAddress, userAgent])
+  xql: "dataset = cloud_audit_logs\n| filter cloud_provider = \"AWS\" and operation_name in (\"CreateUser\", \"PutUserPolicy\", \"AttachUserPolicy\"\
+    , \"AddUserToGroup\")\n| filter json_extract_scalar(vendor_event_raw_data, \"$.userIdentity.type\") != \"Root\"\n| filter json_extract_scalar(vendor_event_raw_data,\
+    \ \"$.responseElements.user.arn\") ~= \".*admin.*\" \n    or json_extract_scalar(vendor_event_raw_data, \"$.requestParameters.policyArn\"\
+    ) ~= \".*AdministratorAccess.*\"\n    or json_extract_scalar(vendor_event_raw_data, \"$.requestParameters.groupName\") ~= \".*[Aa]dmin.*\"\
+    \n| alter source_user = coalesce(json_extract_scalar(vendor_event_raw_data, \"$.userIdentity.userName\"), json_extract_scalar(vendor_event_raw_data,\
+    \ \"$.userIdentity.principalId\"))\n| filter source_user not in (\"authorized_admin1\", \"authorized_admin2\", \"terraform_service_account\"\
+    )\n| fields _time, cloud_provider, operation_name, source_user, json_extract_scalar(vendor_event_raw_data, \"$.responseElements.user.userName\"\
+    ) as created_user, json_extract_scalar(vendor_event_raw_data, \"$.sourceIPAddress\") as source_ip\n"
+  lucene: |
+    eventName:"CreateUser" AND userIdentity.principalId:* AND NOT userIdentity.principalId:(authorized_user_1 OR authorized_user_2 OR authorized_user_3) AND responseElements.user.userName:(*admin* OR *root* OR *privileged*)
+  sumo: |
+    _sourceCategory=*cloudtrail* eventName=CreateUser
+    | json field=_raw "userIdentity.userName" as source_user
+    | json field=_raw "requestParameters.userName" as dest_user
+    | json field=_raw "responseElements.user.userName" as created_user
+    | json field=_raw "responseElements.user.arn" as user_arn
+    | json field=_raw "errorCode" as error_code
+    | where isNull(error_code) or error_code = ""
+    | where !(source_user matches "*authorized_user_1*" or source_user matches "*authorized_user_2*" or source_user matches "*authorized_user_3*")
+    | lookup type, user, reason from https://raw.githubusercontent.com/SumoLogic/cloud-siem-content-catalog/main/lookups/AdminUsers.csv on dest_user = user
+    | where type = "Admin"
+    | fields _messageTime, source_user, dest_user, user_arn, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -93,7 +130,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 AWS CloudTrail User Created
 

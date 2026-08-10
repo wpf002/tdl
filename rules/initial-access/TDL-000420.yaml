@@ -16,73 +16,87 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=salesforce EventType IN ("PermSetFlsChanged","PermSetEnableUserPerm","PermSetEntityPermChanged","PermSetRecordTypeAdded","SetupEntityAccessAudit_PermissionSet_ApexClass_Enabled","SetupEntityAccessAudit_PermissionSet_ApexPage_Enabled","SetupEntityAccessAudit_PermissionSet_CustomEntityDefinition_Enabled","SetupEntityAccessAudit_PermissionSet_CustomPermission_Enabled")
+  spl: 'index=salesforce EventType IN ("PermSetFlsChanged","PermSetEnableUserPerm","PermSetEntityPermChanged","PermSetRecordTypeAdded","SetupEntityAccessAudit_PermissionSet_ApexClass_Enabled","SetupEntityAccessAudit_PermissionSet_ApexPage_Enabled","SetupEntityAccessAudit_PermissionSet_CustomEntityDefinition_Enabled","SetupEntityAccessAudit_PermissionSet_CustomPermission_Enabled")
+
     | lookup salesforce_admins.csv username AS CreatedBy OUTPUT is_admin
+
     | where isnull(is_admin) OR is_admin!="true"
+
     | table _time, CreatedBy, EventType, PermissionSet, Action, host
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000420 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized Permission Set Modification - Salesforce\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    SalesforceServiceCloud
+    | where TimeGenerated > ago(1h)
+    | where EventType in ('PermSetFlsChanged','PermSetEnableUserPerm','PermSetEntityPermChanged','PermSetRecordTypeAdded','SetupEntityAccessAudit_PermissionSet_ApexClass_Enabled','SetupEntityAccessAudit_PermissionSet_ApexPage_Enabled','SetupEntityAccessAudit_PermissionSet_CustomEntityDefinition_Enabled','SetupEntityAccessAudit_PermissionSet_CustomPermission_Enabled')
+    | join kind=leftanti (
+        _GetWatchlist('SalesforceAdmins')
+        | project AdminUsername = SearchKey
+    ) on $left.UserId == $right.AdminUsername
+    | project TimeGenerated, UserId, EventType, SourceIp, UserAgent
+  aql: |
+    SELECT username AS "Source Username", "Event Type", LOGSOURCENAME(logsourceid) AS "Log Source", eventtime, sourceip
+    FROM events
+    WHERE LOGSOURCETYPE(devicetype) ILIKE '%salesforce%'
+      AND "Event Type" IN ('PermSetFlsChanged', 'PermSetEnableUserPerm', 'PermSetEntityPermChanged', 'PermSetRecordTypeAdded', 'SetupEntityAccessAudit_PermissionSet_ApexClass_Enabled', 'SetupEntityAccessAudit_PermissionSet_ApexPage_Enabled', 'SetupEntityAccessAudit_PermissionSet_CustomEntityDefinition_Enabled', 'SetupEntityAccessAudit_PermissionSet_CustomPermission_Enabled')
+      AND username NOT IN (SELECT username FROM referencedata WHERE setname='Salesforce_Admins_List')
+    LAST 24 HOURS
+  yara_l: |
+    rule salesforce_suspicious_permset_changes {
+      meta:
+        author = "TDL"
+        description = "Detects suspicious Salesforce permission set changes by non-admin users"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Salesforce"
+        (
+          $e.metadata.product_event_type = "PermSetFlsChanged" or
+          $e.metadata.product_event_type = "PermSetEnableUserPerm" or
+          $e.metadata.product_event_type = "PermSetEntityPermChanged" or
+          $e.metadata.product_event_type = "PermSetRecordTypeAdded" or
+          $e.metadata.product_event_type = "SetupEntityAccessAudit_PermissionSet_ApexClass_Enabled" or
+          $e.metadata.product_event_type = "SetupEntityAccessAudit_PermissionSet_ApexPage_Enabled" or
+          $e.metadata.product_event_type = "SetupEntityAccessAudit_PermissionSet_CustomEntityDefinition_Enabled" or
+          $e.metadata.product_event_type = "SetupEntityAccessAudit_PermissionSet_CustomPermission_Enabled"
+        )
+        $e.principal.user.userid = $user
+        not $e.principal.user.attribute.labels.value = "salesforce_admin"
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-salesforce*
+    | WHERE event.action IN ("PermSetFlsChanged", "PermSetEnableUserPerm", "PermSetEntityPermChanged", "PermSetRecordTypeAdded", "SetupEntityAccessAudit_PermissionSet_ApexClass_Enabled", "SetupEntityAccessAudit_PermissionSet_ApexPage_Enabled", "SetupEntityAccessAudit_PermissionSet_CustomEntityDefinition_Enabled", "SetupEntityAccessAudit_PermissionSet_CustomPermission_Enabled")
+    | WHERE NOT user.name IN ("admin1@example.com", "admin2@example.com", "salesforce.admin@company.com")
+    | KEEP @timestamp, user.name, event.action, source.ip, salesforce.event_type, salesforce.organization_id
+  leql: |
+    where(source_json.EVENT_TYPE IN ['PermSetFlsChanged', 'PermSetEnableUserPerm', 'PermSetEntityPermChanged', 'PermSetRecordTypeAdded', 'SetupEntityAccessAudit_PermissionSet_ApexClass_Enabled', 'SetupEntityAccessAudit_PermissionSet_ApexPage_Enabled', 'SetupEntityAccessAudit_PermissionSet_CustomEntityDefinition_Enabled', 'SetupEntityAccessAudit_PermissionSet_CustomPermission_Enabled'] AND NOT(source_json.USER_NAME IN ['admin1@company.com', 'admin2@company.com', 'sfdc-admin@company.com']))
+  crowdstrike: |
+    #type=salesforce EventType IN [PermSetFlsChanged, PermSetEnableUserPerm, PermSetEntityPermChanged, PermSetRecordTypeAdded, SetupEntityAccessAudit_PermissionSet_ApexClass_Enabled, SetupEntityAccessAudit_PermissionSet_ApexPage_Enabled, SetupEntityAccessAudit_PermissionSet_CustomEntityDefinition_Enabled, SetupEntityAccessAudit_PermissionSet_CustomPermission_Enabled]
+    | not (SourceUsername IN [salesforce_admin1, salesforce_admin2, salesforce_admin3])
+    | table([@timestamp, EventType, SourceUsername, ComputerName])
+  xql: |
+    dataset = salesforce_audit_logs
+    | filter event_type in ("PermSetFlsChanged", "PermSetEnableUserPerm", "PermSetEntityPermChanged", "PermSetRecordTypeAdded", "SetupEntityAccessAudit_PermissionSet_ApexClass_Enabled", "SetupEntityAccessAudit_PermissionSet_ApexPage_Enabled", "SetupEntityAccessAudit_PermissionSet_CustomEntityDefinition_Enabled", "SetupEntityAccessAudit_PermissionSet_CustomPermission_Enabled")
+    | alter is_admin = arrayindex(regextract(actor_effective_username, "(?i)(admin|administrator)"), 0)
+    | filter is_admin = null
+    | fields _time, actor_effective_username, event_type, event_id, event_description
+  lucene: |
+    event_type:(PermSetFlsChanged OR PermSetEnableUserPerm OR PermSetEntityPermChanged OR PermSetRecordTypeAdded OR SetupEntityAccessAudit_PermissionSet_ApexClass_Enabled OR SetupEntityAccessAudit_PermissionSet_ApexPage_Enabled OR SetupEntityAccessAudit_PermissionSet_CustomEntityDefinition_Enabled OR SetupEntityAccessAudit_PermissionSet_CustomPermission_Enabled) AND NOT user.name:(admin1 OR admin2 OR admin3)
+  sumo: |
+    _sourceCategory=*Salesforce*
+    | json field=_raw "EVENT_TYPE" as event_type
+    | json field=_raw "USER_NAME" as source_username
+    | where event_type in ("PermSetFlsChanged", "PermSetEnableUserPerm", "PermSetEntityPermChanged", "PermSetRecordTypeAdded", "SetupEntityAccessAudit_PermissionSet_ApexClass_Enabled", "SetupEntityAccessAudit_PermissionSet_ApexPage_Enabled", "SetupEntityAccessAudit_PermissionSet_CustomEntityDefinition_Enabled", "SetupEntityAccessAudit_PermissionSet_CustomPermission_Enabled")
+    | where !(source_username in ("admin1@company.com", "admin2@company.com", "sfadmin@company.com"))
+    | fields _messageTime, source_username, event_type, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -92,7 +106,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Salseforce Event  \nWhere the Event Type IN ('PermSetFlsChanged',\n    'PermSetEnableUserPerm','PermSetEntityPermChanged',\n\
   \    'PermSetRecordTypeAdded','SetupEntityAccessAudit_PermissionSet_ApexClass_Enabled',\n    'SetupEntityAccessAudit_PermissionSet_ApexPage_Enabled',\n\

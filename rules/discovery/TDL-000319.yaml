@@ -16,71 +16,65 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=gcp sourcetype=google:gcp:pubsub:message methodName="storage.buckets.list"
+  spl: 'index=gcp sourcetype=google:gcp:pubsub:message methodName="storage.buckets.list"
+
     | table _time, principalEmail, callerIp, methodName, resource.labels.project_id, severity
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000319 {\n  meta:\n    author = \"TDL\"\n    description = \"Calls for List Buckets Potential Enumeration - GCP\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0007\"\n    technique = \"T1083\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    GCPAuditLogs
+    | where TimeGenerated > ago(1h)
+    | where MethodName has "storage.buckets.list"
+    | project TimeGenerated, CallerIpAddress, PrincipalEmail, MethodName, ResourceName, ServiceName, RequestMetadata
+  aql: |
+    SELECT eventtime, username, sourceip, "message.data.protoPayload.methodName", "message.data.protoPayload.serviceName", "message.data.protoPayload.resourceName", COUNT(*) AS event_count
+    FROM events
+    WHERE "message.data.protoPayload.methodName" ILIKE '%storage.buckets.list%'
+    GROUP BY eventtime, username, sourceip, "message.data.protoPayload.methodName", "message.data.protoPayload.serviceName", "message.data.protoPayload.resourceName"
+    LAST 24 HOURS
+  yara_l: |
+    rule gcp_storage_bucket_enumeration {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects GCP Storage bucket enumeration via storage.buckets.list API calls (MITRE T1083)"
+        mitre_attack_tactic = "Discovery"
+        mitre_attack_technique = "T1083"
+        severity = "Low"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Google Cloud Platform"
+        $e.metadata.product_name = "GCP"
+        $e.metadata.log_type = "GCP_CLOUDAUDIT_ACTIVITY"
+        re.regex($e.target.resource.attribute.labels["method_name"], `storage\.buckets\.list`)
+        $e.principal.user.userid = $user
+        $e.principal.ip = $ip
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-gcp.audit*
+    | WHERE message.data.protoPayload.methodName LIKE "*storage.buckets.list*"
+    | KEEP @timestamp, cloud.account.id, cloud.project.id, user.name, source.ip, message.data.protoPayload.methodName, message.data.protoPayload.resourceName
+  leql: |
+    where(source_json.protoPayload.methodName ICONTAINS "storage.buckets.list")
+  crowdstrike: |
+    #type=gcp:audit message.data.protoPayload.methodName=*storage.buckets.list*
+    | table([@timestamp, message.data.protoPayload.authenticationInfo.principalEmail, message.data.protoPayload.methodName, message.data.protoPayload.requestMetadata.callerIp, message.data.resource.labels.project_id])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = GCP and raw_log.protoPayload.methodName contains "storage.buckets.list"
+    | fields _time, cloud_provider, raw_log.protoPayload.authenticationInfo.principalEmail, raw_log.protoPayload.methodName, raw_log.protoPayload.requestMetadata.callerIp, raw_log.resource.labels.project_id
+  lucene: |
+    message.data.protoPayload.methodName:*storage.buckets.list*
+  sumo: |
+    _sourceCategory=*GCP* *storage.buckets.list*
+    | json field=_raw "message.data.protoPayload.methodName" as method_name
+    | where method_name matches "*storage.buckets.list*"
+    | fields _messageTime, _sourceHost, method_name
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +84,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Cloud Audit event
 

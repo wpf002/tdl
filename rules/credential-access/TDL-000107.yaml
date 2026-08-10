@@ -21,81 +21,144 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=529 OR EventCode=4625 OR EventCode=4776 OR EventCode=680 OR EventCode=681) Failure_Code="0xC0000064"
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=529 OR EventCode=4625 OR EventCode=4776 OR EventCode=680 OR EventCode=681)
+    Failure_Code="0xC0000064"
+
     | where NOT match(TargetUserName, "\$$")
+
     | lookup domain_controllers.csv hostname AS dest_host OUTPUT is_dc
+
     | lookup mail_servers.csv hostname AS src_host OUTPUT is_mail
+
     | lookup auth_servers.csv hostname AS src_host OUTPUT is_auth
+
     | where isnull(is_dc) AND isnull(is_mail) AND isnull(is_auth)
+
     | bin _time span=3m
-    | stats dc(dest_host) as unique_dest_hosts values(dest_host) as dest_hosts values(EventCode) as event_codes values(TargetUserName) as target_users by _time, src_host, EventCode, TargetUserName
+
+    | stats dc(dest_host) as unique_dest_hosts values(dest_host) as dest_hosts values(EventCode) as event_codes values(TargetUserName) as target_users
+    by _time, src_host, EventCode, TargetUserName
+
     | where unique_dest_hosts >= 5
+
     | table _time, src_host, EventCode, TargetUserName, unique_dest_hosts, dest_hosts
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4625", "4776")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4625', '4776')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000107 {\n  meta:\n    author = \"TDL\"\n    description = \"Distributed Account Guessing\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0006\"\n    technique = \"T1110\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(4625|4776)/\n\
-    \    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(3m)
+    | where EventID in (529, 4625, 4776, 680, 681)
+    | where Status == "0xC0000064" or SubStatus == "0xC0000064"
+    | where TargetUserName !endswith "$"
+    | where Computer !in ("DC01", "DC02", "DC03")
+    | where SourceComputerName !in ("MAILSERVER01", "MAILSERVER02")
+    | where SourceComputerName !in ("AUTHSERVER01", "AUTHSERVER02")
+    | summarize DestinationHostnames = dcount(Computer), EventIDs = make_set(EventID), TargetUsers = make_set(TargetUserName), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by SourceComputerName, EventID, TargetUserName, bin(TimeGenerated, 3m)
+    | where DestinationHostnames >= 5
+    | project TimeGenerated, SourceComputerName, EventID, TargetUserName, DestinationHostnames, EventIDs, TargetUsers, FirstSeen, LastSeen
+  aql: |
+    SELECT sourceip, username AS destination_username, "EventID", UNIQUECOUNT(destinationip) AS unique_destinations, COUNT(*) AS failure_count
+    FROM events
+    WHERE "EventID" IN ('529', '4625', '4776', '680', '681')
+      AND ("Status" = '0xC0000064' OR "Failure Code" = '0xC0000064' OR "Sub Status" = '0xC0000064')
+      AND username NOT LIKE '%$'
+      AND logsourceid NOT IN (SELECT logsourceid FROM assets WHERE "Asset Type" = 'Domain Controller')
+      AND sourceip NOT IN (SELECT sourceip FROM assets WHERE "Asset Type" IN ('Mail Server', 'Authentication Server'))
+    GROUP BY sourceip, username, "EventID"
+    HAVING unique_destinations >= 2 AND failure_count >= 5
+    LAST 3 MINUTES
+  yara_l: |
+    rule windows_auth_failure_lateral_movement {
+      meta:
+        author = "TDL"
+        description = "Detects brute force attempts from internal source to multiple destinations"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1110"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 day
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.security_result.action = "BLOCK"
+        (
+          $e.metadata.product_event_type = "529" or
+          $e.metadata.product_event_type = "4625" or
+          $e.metadata.product_event_type = "4776" or
+          $e.metadata.product_event_type = "680" or
+          $e.metadata.product_event_type = "681"
+        )
+        $e.security_result.summary = "0xC0000064"
+        not re.regex($e.target.user.userid, `\$$`)
+        not re.regex($e.target.hostname, `(?i)(dc|domaincontroller|domain-controller)`)
+        not re.regex($e.principal.hostname, `(?i)(mail|smtp|exchange)`)
+        not re.regex($e.principal.hostname, `(?i)(auth|authentication|ldap|radius|sso)`)
+        $e.principal.hostname = $source_host
+        $e.target.hostname = $dest_host
+        $e.target.user.userid = $dest_user
+        $e.metadata.product_event_type = $event_id
 
-    | WHERE event.category == "authentication" AND event_id IN ("4625", "4776")
+      match:
+        $source_host, $dest_user, $event_id over 3m
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+      outcome:
+        $risk_score = max(75)
+        $unique_dest_hostnames = count_distinct($dest_host)
+        $total_failures = count_distinct($e.metadata.id)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4625, 4776])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4625, 4776)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4625", "4776")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4625 OR 4776)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4625", "4776")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 5 and $unique_dest_hostnames > 1
+    }
+  esql: "FROM logs-system.security*, winlogbeat-*\n| WHERE @timestamp > NOW() - 3 minutes\n  AND event.code IN (\"529\", \"4625\", \"4776\", \"\
+    680\", \"681\")\n  AND winlog.event_data.Status == \"0xC0000064\"\n  AND NOT user.name LIKE \"*$\"\n  AND NOT destination.ip IN (\"10.0.1.10\"\
+    , \"10.0.1.11\")\n  AND NOT host.name LIKE \"*dc*\"\n  AND NOT source.ip IN (\"192.168.1.50\", \"192.168.1.51\")\n  AND NOT host.name LIKE\
+    \ \"*mail*\"\n  AND NOT source.ip IN (\"172.16.0.100\", \"172.16.0.101\")\n  AND NOT host.name LIKE \"*auth*\"\n| STATS \n    failure_count\
+    \ = COUNT(*),\n    unique_destinations = COUNT_DISTINCT(destination.ip),\n    unique_dest_hosts = COUNT_DISTINCT(host.name)\n  BY source.ip,\
+    \ event.code, user.name, window = BUCKET(@timestamp, 3 minutes)\n| WHERE failure_count >= 5 AND unique_destinations >= 2\n| KEEP source.ip,\
+    \ user.name, event.code, failure_count, unique_destinations, unique_dest_hosts, window\n"
+  leql: |
+    where(source_json.EventID IN [529, 4625, 4776, 680, 681] AND source_json.FailureCode="0xC0000064" AND destination_user=/^(?!.*\$$).*$/ AND destination_asset NOT IN [domain_controller_list] AND source_asset NOT IN [mail_server_list, central_auth_server_list]) groupby(source_asset, source_json.EventID, destination_user) calculate(unique:destination_asset)
+  crowdstrike: |
+    EventCode IN [529, 4625, 4776, 680, 681] FailureCode="0xC0000064"
+    | TargetUserName != /.*\$$/
+    | NOT (TargetDomainName IN ["DC1", "DC2", "DomainController"] OR DestinationHostname IN ["DC1", "DC2", "DomainController"])
+    | NOT (SourceHostname IN ["MailServer1", "MailServer2", "ExchangeServer"])
+    | NOT (SourceHostname IN ["AuthServer1", "AuthServer2", "CAS"])
+    | bucket(@timestamp, span=3m, as=time_bucket)
+    | groupBy([time_bucket, SourceHostname, EventCode, TargetUserName], function=[count(DestinationHostname, distinct=true, as=unique_dest_hosts), count(as=event_count)])
+    | unique_dest_hosts >= 2
+    | event_count >= 5
+    | table([time_bucket, SourceHostname, EventCode, TargetUserName, unique_dest_hosts, event_count])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (529, 4625, 4776, 680, 681)
+    | filter action_evtlog_event_data_Status = "0xC0000064" or action_evtlog_event_data_FailureCode = "0xC0000064"
+    | filter action_evtlog_event_data_TargetUserName != null and not action_evtlog_event_data_TargetUserName ~= "\$$"
+    | alter src_hostname = coalesce(action_evtlog_event_data_WorkstationName, action_evtlog_event_data_IpAddress)
+    | alter dst_hostname = agent_hostname
+    | filter src_hostname != null
+    | bin _time span=3m
+    | comp count_distinct(dst_hostname) as unique_destinations, count() as event_count by _time, src_hostname, action_evtlog_event_id, action_evtlog_event_data_TargetUserName
+    | filter event_count >= 5 and unique_destinations > 1
+    | fields _time, src_hostname, action_evtlog_event_id, action_evtlog_event_data_TargetUserName, unique_destinations, event_count
+  lucene: |
+    event.code:(529 OR 4625 OR 4776 OR 680 OR 681) AND winlog.event_data.Status:"0xC0000064" AND NOT user.name:*$ AND NOT destination.hostname:(dc01 OR dc02 OR dc03) AND NOT source.hostname:(mailserver* OR exchange*) AND NOT source.hostname:(auth* OR radius* OR ldap*)
+  sumo: |
+    _sourceCategory=*Windows*Security* ("4625" OR "529" OR "4776" OR "680" OR "681")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetUserName" as dest_user
+    | json field=_raw "IpAddress" as src_ip
+    | json field=_raw "WorkstationName" as src_hostname
+    | json field=_raw "Computer" as dest_hostname
+    | json field=_raw "Status" as failure_code
+    | where event_id in ("529", "4625", "4776", "680", "681")
+    | where failure_code = "0xC0000064"
+    | where !(dest_user matches "*$")
+    | where !(dest_hostname matches "*DC*" or dest_hostname matches "*DomainController*")
+    | where !(src_hostname matches "*MAIL*" or src_hostname matches "*Exchange*")
+    | where !(src_hostname matches "*Auth*" or src_hostname matches "*RADIUS*" or src_hostname matches "*NPS*")
+    | timeslice 3m
+    | count_distinct(dest_hostname) as unique_dests, count as failure_count by _timeslice, src_hostname, event_id, dest_user
+    | where failure_count >= 5 and unique_dests >= 2
+    | fields _timeslice, src_hostname, event_id, dest_user, failure_count, unique_dests
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -105,7 +168,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "5 Windows Authentication Failure Events \nFrom the same internal Source Hostname to the multiple Destination\nWhere the Event ID\
   \ in [529, 4625, 4776, 680, 681]\nWhere the Failure Code is \"0xC0000064\"\nWhere the Destination Username does NOT end with \"$\" \nWhere the\

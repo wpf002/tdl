@@ -23,81 +23,164 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 85
 queries:
-  spl: |
-    (index=wineventlog sourcetype=WinEventLog:Security (EventCode=5136 OR EventCode=5137) ObjectClass IN ("groupPolicyContainer","msDS-PasswordSettings") AttributeLDAPDisplayName IN ("gPCFileSysPath","msDS-PasswordComplexityEnabled","msDS-LockoutThreshold","msDS-MinimumPasswordLength","msDS-PasswordSettingsPrecedence") OpCorrelationID=*) OR (index=azure sourcetype=azure:aad:audit operationName IN ("Update conditional access policy","Delete conditional access policy") properties.targetResources{}.modifiedProperties{}.displayName IN ("BuiltInControls","GrantControls")) OR (index=aws sourcetype=aws:cloudtrail eventName IN ("PutUserPolicy","PutGroupPolicy","PutRolePolicy","DeleteUserPolicy","DeleteGroupPolicy","DeleteRolePolicy") requestParameters.policyDocument="*mfa*" OR requestParameters.policyName="*MFA*")
-    | eval policy_type=case(
-        isnotnull(ObjectClass), "Group Policy",
-        sourcetype="azure:aad:audit", "Azure Conditional Access",
-        sourcetype="aws:cloudtrail", "AWS IAM Policy",
-        1=1, "Unknown")
-    | eval target_object=coalesce(ObjectDN, properties.targetResources{}.displayName, requestParameters.userName, requestParameters.groupName, requestParameters.roleName)
-    | eval actor=coalesce(SubjectUserName, properties.initiatedBy.user.userPrincipalName, userIdentity.principalId)
-    | eval host_system=coalesce(ComputerName, host, eventSource)
-    | stats count earliest(_time) as first_time latest(_time) as last_time values(AttributeLDAPDisplayName) as modified_attributes values(operationName) as operation values(eventName) as event_name by policy_type, target_object, actor, host_system
-    | where count >= 1
-    | table first_time, last_time, policy_type, actor, target_object, host_system, modified_attributes, operation, event_name, count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: "(index=wineventlog sourcetype=WinEventLog:Security (EventCode=5136 OR EventCode=5137) ObjectClass IN (\"groupPolicyContainer\",\"msDS-PasswordSettings\"\
+    ) AttributeLDAPDisplayName IN (\"gPCFileSysPath\",\"msDS-PasswordComplexityEnabled\",\"msDS-LockoutThreshold\",\"msDS-MinimumPasswordLength\"\
+    ,\"msDS-PasswordSettingsPrecedence\") OpCorrelationID=*) OR (index=azure sourcetype=azure:aad:audit operationName IN (\"Update conditional\
+    \ access policy\",\"Delete conditional access policy\") properties.targetResources{}.modifiedProperties{}.displayName IN (\"BuiltInControls\"\
+    ,\"GrantControls\")) OR (index=aws sourcetype=aws:cloudtrail eventName IN (\"PutUserPolicy\",\"PutGroupPolicy\",\"PutRolePolicy\",\"DeleteUserPolicy\"\
+    ,\"DeleteGroupPolicy\",\"DeleteRolePolicy\") requestParameters.policyDocument=\"*mfa*\" OR requestParameters.policyName=\"*MFA*\")\n| eval\
+    \ policy_type=case(\n    isnotnull(ObjectClass), \"Group Policy\",\n    sourcetype=\"azure:aad:audit\", \"Azure Conditional Access\",\n  \
+    \  sourcetype=\"aws:cloudtrail\", \"AWS IAM Policy\",\n    1=1, \"Unknown\")\n| eval target_object=coalesce(ObjectDN, properties.targetResources{}.displayName,\
+    \ requestParameters.userName, requestParameters.groupName, requestParameters.roleName)\n| eval actor=coalesce(SubjectUserName, properties.initiatedBy.user.userPrincipalName,\
+    \ userIdentity.principalId)\n| eval host_system=coalesce(ComputerName, host, eventSource)\n| stats count earliest(_time) as first_time latest(_time)\
+    \ as last_time values(AttributeLDAPDisplayName) as modified_attributes values(operationName) as operation values(eventName) as event_name\
+    \ by policy_type, target_object, actor, host_system\n| where count >= 1\n| table first_time, last_time, policy_type, actor, target_object,\
+    \ host_system, modified_attributes, operation, event_name, count\n"
+  kql: "union isfuzzy=true \n(SecurityEvent\n| where TimeGenerated > ago(24h)\n| where EventID == 5136\n| where ObjectClass == \"groupPolicyContainer\"\
+    \n| where (OperationType == \"%%14675\" or OperationType == \"Value Deleted\")\n| where (AttributeLDAPDisplayName has_any (\"gPCMachineExtensionNames\"\
+    ,\"gPCUserExtensionNames\",\"versionNumber\") \n    or ObjectDN has \"CN=Policies,CN=System,DC=\")\n| extend Actor = SubjectUserName, Target\
+    \ = ObjectDN, Activity = strcat(\"GPO Modified: \", AttributeLDAPDisplayName)\n| project TimeGenerated, Computer, Actor, Activity, Target,\
+    \ AttributeValue, OperationType),\n(AuditLogs\n| where TimeGenerated > ago(24h)\n| where OperationName in~ (\"Update conditional access policy\"\
+    ,\"Delete conditional access policy\")\n| extend PolicyDetails = tostring(TargetResources[0].modifiedProperties)\n| where PolicyDetails has_any\
+    \ (\"grantControls\",\"mfa\",\"authentication\")\n| extend Actor = tostring(InitiatedBy.user.userPrincipalName), Target = tostring(TargetResources[0].displayName)\n\
+    | extend Activity = OperationName\n| project TimeGenerated, Actor, Activity, Target, PolicyDetails, Result),\n(AuditLogs  \n| where TimeGenerated\
+    \ > ago(24h)\n| where OperationName =~ \"Update policy\"\n| extend PolicyDetails = tostring(TargetResources[0].modifiedProperties)\n| where\
+    \ PolicyDetails has_any (\"strongAuthentication\",\"MfaDetail\",\"authentication\")\n| extend Actor = tostring(InitiatedBy.user.userPrincipalName),\
+    \ Target = tostring(TargetResources[0].userPrincipalName)\n| extend Activity = \"MFA Policy Modified\"\n| where Target has_any (\"admin\"\
+    ,\"privileged\",\"root\",\"global\") or TargetResources[0].type =~ \"Role\"\n| project TimeGenerated, Actor, Activity, Target, PolicyDetails)\n\
+    | extend Severity = \"High\"\n"
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS source, CATEGORYNAME(category) AS event_category, "EventID", "Object DN" AS modified_object, "Operation Type" AS operation, "Target Object" AS target, UTF8(payload) AS raw_event
+    FROM events
+    WHERE (
+      ("EventID" IN ('5136', '5137', '5141') AND (UTF8(payload) ILIKE '%CN=Default Domain Policy%' OR UTF8(payload) ILIKE '%CN=Domain Controllers%' OR UTF8(payload) ILIKE '%CN=Enterprise Admins%' OR UTF8(payload) ILIKE '%CN=Domain Admins%' OR UTF8(payload) ILIKE '%msDS-StrongNTLMPolicy%' OR UTF8(payload) ILIKE '%msDS-AllowedToDelegateTo%' OR UTF8(payload) ILIKE '%ms-DS-MachineAccountQuota%' OR UTF8(payload) ILIKE '%smartcardlogonrequired%' OR UTF8(payload) ILIKE '%MinimumPasswordAge%' OR UTF8(payload) ILIKE '%LockoutBadCount%'))
+      OR
+      ("EventID" = '4719' AND (UTF8(payload) ILIKE '%Audit Policy Change%' OR UTF8(payload) ILIKE '%System Access%'))
+      OR
+      (UTF8(payload) ILIKE '%ConditionalAccess%' AND (UTF8(payload) ILIKE '%Update%' OR UTF8(payload) ILIKE '%Delete%') AND (UTF8(payload) ILIKE '%grantControls%' OR UTF8(payload) ILIKE '%builtInControls%' OR UTF8(payload) ILIKE '%mfa%' OR UTF8(payload) ILIKE '%compliantDevice%' OR UTF8(payload) ILIKE '%domainJoinedDevice%'))
+      OR
+      (category IN (SELECT category FROM categories WHERE high_level_category_id = 1000 OR high_level_category_id = 6000) AND (UTF8(payload) ILIKE '%UpdateConditionalAccessPolicy%' OR UTF8(payload) ILIKE '%Set-MsolDomainFederationSettings%' OR UTF8(payload) ILIKE '%Set-AzureADPolicy%' OR UTF8(payload) ILIKE '%Remove-MsolFederatedDomain%' OR UTF8(payload) ILIKE '%New-AzureADMSConditionalAccessPolicy%'))
+    )
+    AND username NOT IN ('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE')
+    LAST 24 HOURS
+  yara_l: |
+    rule mfa_policy_weakening {
+      meta:
+        author = "TDL"
+        description = "Detects modification of domain GPO or Azure AD Conditional Access policy that removes MFA/strong authentication requirements for privileged users"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1556"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        // Windows GPO modification events
+        ($w.metadata.event_type = "SETTING_MODIFICATION" or
+         $w.metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT") and
+        (
+          // Windows Event ID 5136 - Directory Service Changes (GPO modification)
+          $w.metadata.product_event_type = "5136" or
+          // Windows Event ID 4739 - Domain Policy Changed
+          $w.metadata.product_event_type = "4739" or
+          // Sysmon Event ID 13 - Registry Value Set (GPO registry changes)
+          $w.metadata.product_event_type = "13"
+        ) and
+        (
+          // GPO-related paths and MFA-related attributes
+          re.regex($w.target.resource.name, `(?i)(group.?policy|gpo|software\\policies)`) or
+          re.regex($w.target.resource.attribute.labels.value, `(?i)(smartcard|mfa|multi.?factor|strong.?auth|authentication.?policy)`) or
+          re.regex($w.security_result.summary, `(?i)(smartcard|mfa|multi.?factor|strong.?auth)`)
+        ) and
+        $w.principal.user.userid = $user and
+        $w.principal.hostname = $host
 
-    | where eventName matches regex ".+"
+        // Azure AD Conditional Access policy modification
+        or
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+        $a.metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT" and
+        (
+          re.regex($a.metadata.product_event_type, `(?i)(Update policy|Update conditional access policy|microsoft\.aad\.policy)`) or
+          re.regex($a.target.resource.name, `(?i)(conditional.?access|authentication.?policy)`) or
+          re.regex($a.target.resource.type, `(?i)(policy|microsoft\.aad\.policy)`)
+        ) and
+        (
+          re.regex($a.security_result.summary, `(?i)(mfa|multi.?factor|strong.?auth|grant.?controls|require.?mfa)`) or
+          re.regex($a.target.resource.attribute.labels.value, `(?i)(mfa|multi.?factor|requiremfa|grantcontrols|strongauth)`)
+        ) and
+        (
+          $a.security_result.action = "ALLOW" or
+          $a.security_result.action = "UPDATE"
+        ) and
+        $a.principal.user.userid = $user
 
-    | order by Count desc
+        // AWS IAM policy modification affecting MFA
+        or
 
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000749 {\n  meta:\n    author = \"TDL\"\n    description = \"Domain Authentication Policy Modified to Disable Strong\
-    \ Auth\"\n    severity = \"CRITICAL\"\n    tactic = \"TA0006\"\n    technique = \"T1556\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+        $aws.metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT" and
+        re.regex($aws.metadata.product_event_type, `(?i)(PutUserPolicy|PutGroupPolicy|PutRolePolicy|DeleteUserPolicy|DeleteGroupPolicy|DeleteRolePolicy|CreatePolicy|DeletePolicy|CreatePolicyVersion|SetDefaultPolicyVersion)`) and
+        (
+          re.regex($aws.security_result.summary, `(?i)mfa`) or
+          re.regex($aws.target.resource.attribute.labels.value, `(?i)mfa`)
+        ) and
+        $aws.principal.user.userid = $user
 
-    | WHERE @timestamp > NOW() - 1 hour
+      match:
+        $user over 5m
 
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $w or $a or $aws
+    }
+  esql: |
+    FROM logs-windows.security*, logs-azure.activitylogs*, logs-aws.cloudtrail*, logs-gcp.audit*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (event.code == "5136" AND winlog.event_data.ObjectClass == "groupPolicyContainer" AND (winlog.event_data.AttributeLDAPDisplayName LIKE "*authentication*" OR winlog.event_data.AttributeLDAPDisplayName LIKE "*mfa*"))
+        OR (event.action == "Update policy." AND azure.activitylogs.properties.category == "Policy" AND (TO_LOWER(event.original) LIKE "*mfa*" OR TO_LOWER(event.original) LIKE "*multifactor*" OR TO_LOWER(event.original) LIKE "*conditional access*"))
+        OR (event.action == "UpdateConditionalAccessPolicy" AND TO_LOWER(azure.activitylogs.properties.result) == "success")
+        OR (event.provider == "IAM" AND event.action IN ("PutUserPolicy", "PutRolePolicy", "UpdateAccessPolicy") AND TO_LOWER(event.original) LIKE "*mfa*")
+      )
+      AND user.name NOT IN ("system", "administrator", "root", "SYSTEM")
+    | KEEP @timestamp, host.name, user.name, event.code, event.action, event.provider, winlog.event_data.ObjectDN, winlog.event_data.AttributeLDAPDisplayName, azure.activitylogs.properties.targetResources, cloud.account.id
+  leql: |
+    where((source_json.EventID=5136 AND source_json.ObjectClass="groupPolicyContainer") OR (source_json.operationName ICONTAINS "Update conditional access policy" AND source_json.properties.conditionalAccessPolicy ICONTAINS "mfa") OR (source_json.EventID=4719 AND source_json.AuditPolicyChanges ICONTAINS "authentication")) groupby(user, asset) calculate(count)
+  crowdstrike: |
+    (event_simpleName=DomainControllerEvent OR EventCode IN [5136,5137,5141] OR #type="azure-audit" OR #type="aws-cloudtrail")
+    (
+      (EventCode IN [5136,5137,5141] AND (ObjectDN=*"Default Domain Policy"* OR ObjectDN=*"Default Domain Controllers Policy"* OR ObjectClass="groupPolicyContainer") AND (AttributeLDAPDisplayName IN ["gPCMachineExtensionNames","gPCUserExtensionNames","versionNumber"] OR OperationType IN ["%%14675","%%14674","%%14676"]))
+      OR
+      (#type="azure-audit" AND operationName IN ["Update policy","Delete policy","Update conditional access policy","Delete conditional access policy"] AND (properties.targetResources{}.modifiedProperties{}.displayName IN ["RequireMfa","BlockLegacyAuthentication","GrantControls","SessionControls"] OR resultDescription=*"MFA"* OR resultDescription=*"authentication strength"*) AND (identity.userPrincipalName=*admin* OR identity.userPrincipalName=*privileged* OR properties.initiatedBy.user.userPrincipalName=*admin*))
+      OR
+      (#type="aws-cloudtrail" AND eventName IN ["DeleteAccountPasswordPolicy","UpdateAccountPasswordPolicy","PutUserPolicy","DeleteUserPolicy","DetachUserPolicy"] AND (userIdentity.principalId=*admin* OR userIdentity.arn=*admin* OR requestParameters.policyDocument=*"Deny"* OR requestParameters.policyDocument=*"MFA"*))
+    )
+    | table([@timestamp, ComputerName, event_simpleName, EventCode, #type, operationName, eventName, ObjectDN, AttributeLDAPDisplayName, OperationType, identity.userPrincipalName, userIdentity.principalId, properties.targetResources, requestParameters])
+  xql: "dataset = cloud_audit_logs\n| filter cloud_provider in (\"AZURE\", \"AWS\") and operation_name in (\"Update Policy\", \"Set-MsolDomainFederationSettings\"\
+    , \"UpdateConditionalAccessPolicy\", \"PutGroupPolicy\", \"CreateGroupPolicy\", \"UpdateGroupPolicy\")\n| filter (\n    (cloud_provider =\
+    \ \"AZURE\" and (\n        lowercase(operation_name) contains \"conditionalaccesspolicy\" or \n        lowercase(operation_name) contains\
+    \ \"federationsettings\"\n    ) and (\n        lowercase(raw_log) ~= \".*mfa.*\" or \n        lowercase(raw_log) ~= \".*multi.?factor.*\"\
+    \ or \n        lowercase(raw_log) ~= \".*authentication.*method.*\" or\n        lowercase(raw_log) ~= \".*grant.*control.*\"\n    )) or\n\
+    \    (cloud_provider = \"AWS\" and lowercase(operation_name) contains \"grouppolicy\")\n)\n| filter outcome = \"success\" or outcome = \"\
+    Success\"\n| alter policy_name = coalesce(target_resource_name, resource_name, target_name)\n| alter principal = coalesce(caller_user_name,\
+    \ actor_user_name, identity_name)\n| comp count() as modifications by policy_name, principal, operation_name, cloud_provider\n| fields policy_name,\
+    \ principal, operation_name, cloud_provider, modifications\n| sort desc modifications\n"
+  lucene: |
+    (event.code:(5136 OR 5137 OR 5141) AND (winlog.event_data.ObjectClass:"groupPolicyContainer" OR winlog.event_data.AttributeLDAPDisplayName:*authentication*)) OR (event.dataset:"azure.auditlogs" AND azure.auditlogs.operation_name:("Update conditional access policy" OR "Delete conditional access policy") AND azure.auditlogs.properties.target_resources.modified_properties.new_value:*multifactor* AND azure.auditlogs.properties.target_resources.modified_properties.old_value:*required*) OR (event.dataset:"aws.cloudtrail" AND event.action:("PutUserPolicy" OR "PutGroupPolicy" OR "UpdateAccessKey") AND aws.cloudtrail.request_parameters:(*MFA* OR *MultiFactorAuth*))
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Azure* OR _sourceCategory=*AWS*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Activity" as activity
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "OperationName" as operation_name
+    | json field=_raw "CategoryDisplayName" as category
+    | json field=_raw "TargetUserName" as target_user
+    | json field=_raw "SubjectUserName" as subject_user
+    | json field=_raw "CallerIdentity" as caller
+    | json field=_raw "PolicyName" as policy_name
+    | json field=_raw "Properties" as properties
+    | where (event_id in ("5136", "5137", "4739") and properties matches "*MFA*" or properties matches "*authentication*" or properties matches "*multifactor*")
+       OR (operation_name matches "*ConditionalAccessPolicy*" and (operation_name matches "*Update*" or operation_name matches "*Delete*") and properties matches "*strongAuthentication*")
+       OR (activity matches "*Update policy*" and category = "Policy")
+       OR (event_name in ("UpdateConditionalAccessPolicy", "DeleteConditionalAccessPolicy", "UpdatePolicy", "SetUserMfaState"))
+    | where target_user matches "*admin*" OR target_user matches "*privileged*" OR subject_user matches "*admin*" OR properties matches "*admin*"
+    | fields _messageTime, _sourceHost, _sourceCategory, event_id, operation_name, activity, subject_user, target_user, caller, policy_name, properties
 pseudo_logic: Domain GPO or Azure AD Conditional Access policy modified to remove MFA/strong-auth for privileged users. Lowers the bar for credential
   abuse.
 false_positives:
@@ -117,7 +200,7 @@ references:
 - https://attack.mitre.org/techniques/T1556/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'

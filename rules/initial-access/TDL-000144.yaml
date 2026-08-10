@@ -24,77 +24,96 @@ queries:
     \ - last_recon_time) <= 604800 AND match(action, \"(?i)(allow|permitted)\")\n| stats earliest(_time) as first_recon_time, latest(_time) as\
     \ exploit_time, values(signature) as signatures, values(dest_ip) as targets by src_ip\n| eval time_delta=exploit_time-first_recon_time\n|\
     \ where time_delta <= 604800\n| table src_ip, first_recon_time, exploit_time, time_delta, signatures, targets\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000144 {\n  meta:\n    author = \"TDL\"\n    description = \"External Reconnaissance Followed by Allowed Exploit\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1203\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: "let PortScanEvents = \n    CommonSecurityLog\n    | where TimeGenerated > ago(7d)\n    | where DeviceVendor in (\"Palo Alto Networks\"\
+    , \"Fortinet\", \"Check Point\", \"Cisco\")\n    | where DeviceEventClassID in (\"port-scan\", \"service-discovery\", \"vulnerability-scan\"\
+    , \"vulnerability-sweep\")\n        or Activity has_any (\"Port Scan\", \"Service Discovery\", \"Vulnerability Scan\", \"Vulnerability Sweep\"\
+    )\n        or DeviceEventCategory has_any (\"port-scan\", \"service-discovery\", \"scan\")\n    | where CommunicationDirection == \"Inbound\"\
+    \ or DestinationIP in (toscalar(\n        CommonSecurityLog \n        | where TimeGenerated > ago(1d)\n        | summarize make_set(DestinationIP)\n\
+    \        | project set_DestinationIP\n        ))\n    | extend ScanTime = TimeGenerated\n    | project ScanTime, SourceIP, DestinationIP,\
+    \ DeviceVendor, DeviceProduct, Activity, DeviceEventClassID;\nlet ExploitEvents = \n    CommonSecurityLog\n    | where TimeGenerated > ago(7d)\n\
+    \    | where DeviceVendor in (\"Palo Alto Networks\", \"Fortinet\", \"Check Point\", \"Cisco\", \"Snort\", \"Suricata\")\n    | where DeviceEventClassID\
+    \ has_any (\"exploit\", \"intrusion\", \"attack\")\n        or Activity has_any (\"exploit\", \"intrusion\", \"attack\", \"malware\")\n  \
+    \      or DeviceEventCategory in (\"ids\", \"ips\", \"intrusion-detection\", \"intrusion-prevention\")\n    | where DeviceAction in (\"allowed\"\
+    , \"permit\", \"accept\", \"Allowed\", \"Allow\")\n    | extend ExploitTime = TimeGenerated\n    | project ExploitTime, SourceIP, DestinationIP,\
+    \ DeviceVendor, DeviceProduct, Activity, DeviceAction, DeviceEventClassID, Message;\nPortScanEvents\n| join kind=inner (\n    ExploitEvents\n\
+    ) on SourceIP\n| where ExploitTime >= ScanTime and ExploitTime <= ScanTime + 7d\n| project ScanTime, ExploitTime, SourceIP, DestinationIP,\
+    \ DestinationIP1, ScanActivity = Activity, ExploitActivity = Activity1, ExploitAction = DeviceAction, ScanDeviceVendor = DeviceVendor, ExploitDeviceVendor\
+    \ = DeviceVendor1, Message\n| summarize ScanCount = dcount(ScanActivity), ExploitCount = count(), FirstScan = min(ScanTime), LastExploit =\
+    \ max(ExploitTime), ExploitActivities = make_set(ExploitActivity), DestinationIPs = make_set(DestinationIP) by SourceIP\n"
+  aql: |
+    SELECT sourceip, COUNT(*) AS total_events, FIRST(eventtime) AS first_event, LAST(eventtime) AS last_event, LISTAGG(categoryname(category)) AS categories
+    FROM events
+    WHERE (categoryname(category) IN ('Port Scan Detected - Inbound', 'Service Discovery - Inbound', 'Vulnerability Scan - Inbound', 'Vulnerability Sweep - Inbound') OR categoryname(category) LIKE '%IDS%Exploit%' OR categoryname(category) LIKE '%IPS%Exploit%')
+      AND sourceip IN (SELECT sourceip FROM events WHERE categoryname(category) IN ('Port Scan Detected - Inbound', 'Service Discovery - Inbound', 'Vulnerability Scan - Inbound', 'Vulnerability Sweep - Inbound') LAST 7 DAYS)
+      AND sourceip IN (SELECT sourceip FROM events WHERE (categoryname(category) LIKE '%IDS%Exploit%' OR categoryname(category) LIKE '%IPS%Exploit%' OR categoryname(category) MATCHES '.*Exploit.*') AND (LOWER(qidname(qid)) LIKE '%allow%' OR LOWER(categoryname(category)) LIKE '%allow%') LAST 7 DAYS)
+    GROUP BY sourceip
+    HAVING COUNT(DISTINCT category) >= 2
+    LAST 7 DAYS
+  yara_l: "rule initial_access_exploit_after_scan {\n  meta:\n    author = \"TDL\"\n    description = \"Detects exploitation attempts following\
+    \ reconnaissance activity (T1203)\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1203\"\n    severity =\
+    \ \"HIGH\"\n    \n  events:\n    // Reconnaissance activity\n    $scan.metadata.event_type = \"NETWORK_CONNECTION\"\n    (\n      re.regex($scan.security_result.summary,\
+    \ `(?i)port scan.*inbound`) or\n      re.regex($scan.security_result.summary, `(?i)service discovery.*inbound`) or\n      re.regex($scan.security_result.summary,\
+    \ `(?i)vulnerability scan.*inbound`) or\n      re.regex($scan.security_result.summary, `(?i)vulnerability sweep.*inbound`)\n    )\n    $scan.principal.ip\
+    \ = $source_ip\n    $scan.target.ip = $target_ip\n    \n    // Exploitation attempt\n    $exploit.metadata.event_type = \"NETWORK_CONNECTION\"\
+    \n    re.regex($exploit.security_result.summary, `(?i)exploit`)\n    $exploit.security_result.action = \"ALLOW\"\n    $exploit.principal.ip\
+    \ = $source_ip\n    $exploit.target.ip = $target_ip\n    $exploit.metadata.event_timestamp.seconds >= $scan.metadata.event_timestamp.seconds\n\
+    \    \n  match:\n    $source_ip, $target_ip over 7d\n    \n  outcome:\n    $risk_score = 85\n    $source_ip\n    $target_ip\n    $scan_summary\
+    \ = $scan.security_result.summary\n    $exploit_summary = $exploit.security_result.summary\n    \n  condition:\n    $scan and $exploit\n}\n"
+  esql: "FROM logs-network.ids*, logs-network.firewall*, logs-network.ips*\n| WHERE @timestamp > NOW() - 7 days\n| EVAL event_type = CASE(\n \
+    \   event.category == \"intrusion_detection\" AND (\n      TO_LOWER(event.action) LIKE \"*port scan*\" AND TO_LOWER(event.action) LIKE \"\
+    *inbound*\" OR\n      TO_LOWER(event.action) LIKE \"*service discovery*\" AND TO_LOWER(event.action) LIKE \"*inbound*\" OR\n      TO_LOWER(event.action)\
+    \ LIKE \"*vulnerability scan*\" AND TO_LOWER(event.action) LIKE \"*inbound*\" OR\n      TO_LOWER(event.action) LIKE \"*vulnerability sweep*\"\
+    \ AND TO_LOWER(event.action) LIKE \"*inbound*\"\n    ), \"scan\",\n    event.category == \"intrusion_detection\" AND TO_LOWER(event.action)\
+    \ LIKE \"*exploit*\", \"exploit\",\n    \"other\"\n  )\n| WHERE event_type IN (\"scan\", \"exploit\")\n| EVAL is_allowed = CASE(\n    TO_LOWER(event.outcome)\
+    \ == \"allowed\" OR TO_LOWER(event.action) == \"allowed\", 1,\n    0\n  )\n| SORT source.ip, @timestamp\n| STATS \n    first_scan = MIN(@timestamp),\n\
+    \    last_scan = MAX(@timestamp),\n    scan_count = COUNT(*) WHERE event_type == \"scan\",\n    exploit_count = COUNT(*) WHERE event_type\
+    \ == \"exploit\" AND is_allowed == 1,\n    first_exploit = MIN(@timestamp) WHERE event_type == \"exploit\" AND is_allowed == 1\n    BY source.ip,\
+    \ destination.ip\n| WHERE scan_count >= 1 AND exploit_count >= 1 AND first_exploit >= first_scan AND (first_exploit - first_scan) <= 7 days\n\
+    | KEEP source.ip, destination.ip, first_scan, first_exploit, scan_count, exploit_count\n"
+  leql: "where(\n  (\n    (category=\"Port Scan\" AND direction=\"Inbound\") OR\n    (category=\"Service Discovery\" AND direction=\"Inbound\"\
+    ) OR\n    (category=\"Vulnerability Scan\" AND direction=\"Inbound\") OR\n    (category=\"Vulnerability Sweep\" AND direction=\"Inbound\"\
+    )\n  )\n  OR\n  (\n    category=\"IDS/IPS\" AND \n    event_type=\"Exploit\" AND \n    action=\"Allowed\"\n  )\n)\ngroupby(source_address)\n\
+    calculate(count)\n"
+  crowdstrike: |
+    (#type=firewall OR #type=ids_ips) (event_simpleName="PortScanDetected" OR event_simpleName="ServiceDiscovery" OR event_simpleName="VulnerabilityScan" OR event_simpleName="VulnerabilitySweep" OR EventType="Port Scan" OR EventType="Service Discovery" OR EventType="Vulnerability Scan" OR EventType="Vulnerability Sweep") Direction=Inbound
+    | groupBy([SourceIP], function=selectLast([@timestamp], as=scan_time))
+    | join({
+        (#type=ids_ips) (event_simpleName="ExploitDetected" OR EventType="Exploit" OR Signature=*exploit*) Action=Allowed
+        | groupBy([SourceIP], function=selectFirst([@timestamp], as=exploit_time))
+      }, field=[SourceIP], include=[exploit_time])
+    | exploit_time >= scan_time
+    | exploit_time <= scan_time + 7d
+    | table([SourceIP, scan_time, exploit_time])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter (threat_name contains \"Port Scan\" and direction = \"Inbound\") \n   or (threat_name contains\
+    \ \"Service Discovery\" and direction = \"Inbound\")\n   or (threat_name contains \"Vulnerability Scan\" and direction = \"Inbound\")\n  \
+    \ or (threat_name contains \"Vulnerability Sweep\" and direction = \"Inbound\")\n| alter scan_time = _time, scan_src_ip = src_ip\n| fields\
+    \ scan_time, scan_src_ip\n| join type=inner (\n    dataset = panw_ngfw_traffic_raw\n    | filter threat_category = \"exploit\" and action\
+    \ in (\"allow\", \"alert\")\n    | alter exploit_time = _time, exploit_src_ip = src_ip\n    | fields exploit_time, exploit_src_ip, threat_name,\
+    \ dst_ip, dst_port, action\n  ) as exploits\n  scan_src_ip = exploits.exploit_src_ip\n| filter exploits.exploit_time >= scan_time and exploits.exploit_time\
+    \ <= arrayindex(arraymap([scan_time], \"@element\" -> timestamp_diff(@element, current_time())), 0) + 604800000\n| fields scan_time, scan_src_ip,\
+    \ exploits.exploit_time, exploits.threat_name, exploits.dst_ip, exploits.dst_port, exploits.action\n"
+  lucene: "(event.category:\"network\" OR event.category:\"intrusion_detection\") AND (\n  (event.type:\"scan\" AND network.direction:\"inbound\"\
+    \ AND (tags:\"port_scan\" OR tags:\"service_discovery\" OR tags:\"vulnerability_scan\" OR tags:\"vulnerability_sweep\")) \n  OR \n  (event.type:\"\
+    exploit\" AND network.direction:\"inbound\" AND event.action:\"allowed\")\n)\n"
+  sumo: |
+    _sourceCategory=*Firewall* OR _sourceCategory=*IDS* OR _sourceCategory=*IPS*
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "action" as action
+    | json field=_raw "signature" as signature
+    | where (event_type matches "*Port Scan*Inbound*" OR event_type matches "*Service Discovery*Inbound*" OR event_type matches "*Vulnerability Scan*Inbound*" OR event_type matches "*Vulnerability Sweep*Inbound*" OR signature matches "*Port Scan*Inbound*" OR signature matches "*Service Discovery*Inbound*" OR signature matches "*Vulnerability Scan*Inbound*" OR signature matches "*Vulnerability Sweep*Inbound*")
+    | fields _messageTime as scan_time, src_ip, event_type, signature
+    | join (
+        _sourceCategory=*IDS* OR _sourceCategory=*IPS*
+        | json field=_raw "event_type" as event_type
+        | json field=_raw "src_ip" as src_ip
+        | json field=_raw "action" as action
+        | json field=_raw "signature" as signature
+        | where (event_type matches "*Exploit*" OR signature matches "*Exploit*") AND action matches "*Allow*"
+        | fields _messageTime as exploit_time, src_ip, action, signature
+    ) as exploit on src_ip=exploit.src_ip
+    | where (exploit_time - scan_time) <= 604800000 AND exploit_time > scan_time
+    | fields scan_time, exploit_time, src_ip, event_type, exploit.signature, exploit.action
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -104,7 +123,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Port Scan Detected - Inbound, Service Discovery - Inbound, Vulnerability Scan - Inbound, OR Vulnerability Sweep - Inbound Event
 

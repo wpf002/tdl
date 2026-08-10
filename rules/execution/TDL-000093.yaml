@@ -15,79 +15,102 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=proxy (tld IN ("tk", "ml", "ga", "cf", "gq", "pw", "top", "bid", "work", "click", "link", "webcam", "download", "racing", "stream", "party", "review", "trade", "date", "accountant", "science", "cricket", "faith", "loan", "win", "men", "download", "zip", "country") OR (file_extension IN ("exe", "dll", "bat", "cmd", "ps1", "vbs", "scr", "hta", "msi", "jar", "com", "pif", "reg", "wsf", "cpl", "msp", "gadget", "inf", "ins", "inx", "isu", "job", "lnk", "msc", "mst", "paf", "rgs", "scf", "sct", "shb", "shs", "u3p", "vbe", "vbscript", "ws", "wsc", "application", "appref-ms") AND content_type IN ("application/x-msdownload", "application/x-msdos-program", "application/x-executable", "application/octet-stream", "application/exe", "application/x-exe", "application/dos-exe", "application/x-winexe", "application/msdos-windows", "application/x-msi", "application/x-bat", "application/x-dosexec", "application/vnd.microsoft.portable-executable"))) | table _time, src_ip, dest, url, tld, file_extension, content_type, user
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
+  spl: 'index=proxy (tld IN ("tk", "ml", "ga", "cf", "gq", "pw", "top", "bid", "work", "click", "link", "webcam", "download", "racing", "stream",
+    "party", "review", "trade", "date", "accountant", "science", "cricket", "faith", "loan", "win", "men", "download", "zip", "country") OR (file_extension
+    IN ("exe", "dll", "bat", "cmd", "ps1", "vbs", "scr", "hta", "msi", "jar", "com", "pif", "reg", "wsf", "cpl", "msp", "gadget", "inf", "ins",
+    "inx", "isu", "job", "lnk", "msc", "mst", "paf", "rgs", "scf", "sct", "shb", "shs", "u3p", "vbe", "vbscript", "ws", "wsc", "application",
+    "appref-ms") AND content_type IN ("application/x-msdownload", "application/x-msdos-program", "application/x-executable", "application/octet-stream",
+    "application/exe", "application/x-exe", "application/dos-exe", "application/x-winexe", "application/msdos-windows", "application/x-msi", "application/x-bat",
+    "application/x-dosexec", "application/vnd.microsoft.portable-executable"))) | table _time, src_ip, dest, url, tld, file_extension, content_type,
+    user
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    union isfuzzy=true
+    (W3CIISLog
+    | where TimeGenerated > ago(24h)
+    | extend TLD = extract(@"\.([a-z]{2,})(?:\:[0-9]+)?(?:/|$)", 1, tolower(csUriStem))
+    | where TLD in~ ("zip","review","country","kim","science","work","party","gq","link","tk","ml","ga","cf")
+    ),
+    (W3CIISLog
+    | where TimeGenerated > ago(24h)
+    | extend FileExtension = extract(@"\.([a-z0-9]+)(?:\?|$)", 1, tolower(csUriStem))
+    | where FileExtension in~ ("exe","dll","bat","cmd","ps1","vbs","js","jar","msi","scr","com","pif")
+    | where scStatus == 200
+    | where csMethod =~ "GET"
+    | extend ContentType = tolower(scContentType)
+    | where ContentType has_any ("application/octet-stream","application/x-msdownload","application/x-msdos-program","application/exe","application/x-exe","application/dos-exe","application/x-winexe")
+    )
+    | project TimeGenerated, csUriStem, cIP, sIP, scStatus, csMethod, scContentType, csUserAgent
+  aql: |
+    SELECT sourceip, destinationip, username, "URL", "File Extension", "Content Type", "Top Level Domain", COUNT(*) AS event_count
+    FROM events
+    WHERE (categoryname(category) ILIKE '%proxy%' OR categoryname(category) ILIKE '%web%')
+      AND (
+        "Top Level Domain" IN ('.xyz', '.top', '.work', '.click', '.link', '.download', '.tk', '.ml', '.ga', '.cf', '.gq', '.pw', '.cc')
+        OR (
+          "File Extension" IN ('.exe', '.dll', '.bat', '.cmd', '.ps1', '.vbs', '.js', '.jar', '.scr', '.com', '.pif', '.msi', '.hta', '.cpl', '.reg')
+          AND "Content Type" IN ('application/x-msdownload', 'application/x-msdos-program', 'application/exe', 'application/x-exe', 'application/dos-exe', 'application/x-winexe', 'application/msdos-windows', 'application/octet-stream', 'application/x-dosexec')
+        )
+      )
+    GROUP BY sourceip, destinationip, username, "URL", "File Extension", "Content Type", "Top Level Domain"
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exe_000093 {\n  meta:\n    author = \"TDL\"\n    description = \"Executable from Suspicious Top Level Domain\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  yara_l: "rule user_execution_high_risk_tld_or_executable_download {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects\
+    \ user execution via high-risk TLD access or executable file downloads from forward proxy events\"\n    mitre_attack_tactic = \"Execution\"\
+    \n    mitre_attack_technique = \"T1204\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.metadata.product_name\
+    \ = \"Proxy\" or $e.metadata.product_name = \"Web Proxy\"\n    \n    // Extract TLD and file extension from URL\n    $e.target.url = $url\n\
+    \    $e.principal.user.userid = $user\n    $e.principal.hostname = $host\n    \n    // High-risk TLD check\n    (\n      re.regex($e.target.url,\
+    \ `\\.(?:tk|ml|ga|cf|gq|work|top|xyz|pw|cc|ws|buzz|link|download|bid|racing|stream|date|review|country|science|party|trade|webcam|win|club|kim|click)(?:/|$)`)\
+    \ or\n      \n      // Executable file extension check with executable content type\n      (\n        re.regex($e.target.url, `\\.(?:exe|dll|bat|cmd|ps1|vbs|js|jse|jar|scr|msi|com|pif|hta|wsf|wsh|reg|cpl|vbe|application)(?:\\\
+    ?|$|#)`) and\n        re.regex($e.network.http.response_headers, `(?i)content-type:\\s*(?:application/(?:x-msdownload|x-msdos-program|x-executable|octet-stream|x-dosexec|x-bat|x-ms-dos-executable)|application/(?:vnd\\\
+    .microsoft\\.portable-executable)|text/(?:x-bat|x-script|x-vbscript))`)\n      )\n    )\n    \n  match:\n    $user, $host over 5m\n    \n\
+    \  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.network*, logs-network_traffic.*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        event.category == "network" OR winlog.event_id IN (22, 3)
+      )
+      AND (
+        url.domain RLIKE ".*\\.(tk|ml|ga|cf|gq|zip|top|work|click|loan|download|racing|stream|trade|webcam|xyz|club|bid|win|review|country|science|party|accountant|kim|cricket|date|faith|space)$"
+        OR (
+          file.extension IN ("exe", "dll", "com", "bat", "cmd", "scr", "vbs", "js", "jar", "msi", "ps1", "hta", "wsf", "reg", "vbe", "jse")
+          AND http.response.mime_type IN ("application/x-msdownload", "application/x-msdos-program", "application/octet-stream", "application/exe", "application/x-exe", "application/dos-exe", "application/x-winexe", "application/msdos-windows", "application/x-zip-compressed", "application/zip", "application/java-archive", "application/x-java-archive")
+        )
+      )
+    | STATS event_count = COUNT(*) BY host.name, user.name, url.domain, url.full, file.extension, http.response.mime_type, destination.ip
+    | KEEP @timestamp, host.name, user.name, url.domain, url.full, file.extension, http.response.mime_type, destination.ip, event_count
+  leql: |
+    where((tld IN ["tk", "ml", "ga", "cf", "gq", "pw", "cc", "to", "ws", "info", "buzz", "click", "link", "top", "country", "stream", "download", "science", "racing", "gdn", "trade", "date", "party", "review", "loan", "win", "bid", "webcam", "men", "faith", "cricket"]) OR ((file_extension IN ["exe", "dll", "scr", "com", "bat", "cmd", "vbs", "js", "jse", "wsf", "wsh", "msi", "jar", "app", "deb", "rpm", "run", "bin", "dmg", "pkg", "ps1", "psm1", "psd1"]) AND (content_type IN ["application/x-msdownload", "application/x-dosexec", "application/x-executable", "application/x-msdos-program", "application/octet-stream", "application/exe", "application/x-exe", "application/dos-exe", "application/x-winexe", "application/msdos-windows", "application/x-msi", "application/x-ms-installer"])))
+  crowdstrike: |
+    (#type=proxy OR event_simpleName=*Proxy* OR EventCode=*Proxy*)
+    (tld IN [xyz, top, tk, ml, ga, cf, gq, work, click, link, loan, racing, science, download, bid, stream, review, date, win, trade, party, faith, accountant, cricket, zip, pw, cc, wang, quest, academy]
+    OR
+    (file_extension IN [exe, dll, scr, bat, cmd, com, pif, vbs, js, jar, msi, ps1, psm1, hta, cpl, vbe, jse, wsf, wsh, lnk, reg, app, deb, rpm, dmg, pkg, run, bin, sh, elf, apk, ipa, gadget, inf, scf]
+    AND
+    content_type IN ["application/x-msdownload", "application/x-msdos-program", "application/x-executable", "application/x-dosexec", "application/octet-stream", "application/exe", "application/x-exe", "application/dos-exe", "application/x-winexe", "application/msdos-windows", "application/x-msi", "application/x-bat", "application/x-sh", "application/x-shellscript", "application/java-archive", "application/x-java-archive"]))
+    | table([@timestamp, ComputerName, UserName, url, tld, file_extension, content_type, src_ip, dest_ip])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter app = \"web-browsing\" or app = \"ssl\"\n| alter tld = arrayindex(regextract(http_hostname,\
+    \ \"\\.([^\\.]+)$\"), 0),\n        file_ext = lowercase(arrayindex(regextract(http_url, \"\\.([a-z0-9]{2,4})(?:\\?|$)\"), 0)),\n        content_type_lower\
+    \ = lowercase(http_content_type)\n| filter (tld in (\"zip\", \"review\", \"country\", \"kim\", \"science\", \"work\", \"party\", \"gq\", \"\
+    link\", \"top\", \"tk\", \"ml\", \"ga\", \"cf\", \"men\", \"click\", \"loan\", \"download\", \"racing\", \"pw\", \"win\", \"bid\", \"stream\"\
+    , \"accountant\", \"date\", \"faith\", \"cricket\", \"trade\"))\n   or (file_ext in (\"exe\", \"dll\", \"bat\", \"cmd\", \"vbs\", \"js\",\
+    \ \"jar\", \"ps1\", \"com\", \"scr\", \"msi\", \"hta\", \"reg\", \"wsf\", \"pif\", \"application\", \"gadget\", \"msp\", \"lnk\", \"inf\"\
+    , \"cpl\") \n       and content_type_lower in (\"application/x-msdownload\", \"application/x-msdos-program\", \"application/x-executable\"\
+    , \"application/octet-stream\", \"application/x-dosexec\", \"application/exe\", \"application/x-exe\", \"application/dos-exe\", \"application/x-winexe\"\
+    , \"application/msdos-windows\", \"application/x-zip-compressed\", \"application/java-archive\"))\n| fields _time, srcip, dstip, http_hostname,\
+    \ http_url, file_ext, content_type_lower, tld, srcuser\n"
+  lucene: |
+    (event.code:(3128 OR 3127) OR log_type:"proxy" OR source_type:"proxy") AND (tld:(tk OR ml OR ga OR cf OR gq OR zip OR buzz OR click OR top OR work OR loan OR download OR racing OR science OR xyz OR review) OR (file_extension:(exe OR dll OR bat OR cmd OR ps1 OR vbs OR js OR jar OR scr OR com OR pif OR msi OR hta OR cpl OR wsf OR lnk OR application OR gadget) AND content_type:("application/x-msdownload" OR "application/x-msdos-program" OR "application/x-executable" OR "application/exe" OR "application/x-exe" OR "application/dos-exe" OR "application/x-winexe" OR "application/msdos-windows" OR "application/x-msi" OR "application/octet-stream" OR "application/java-archive" OR "application/x-java-archive")))
+  sumo: "_sourceCategory=*Proxy* OR _sourceCategory=*Web* OR _sourceCategory=*Firewall*\n| json field=_raw \"url\" as url\n| json field=_raw \"\
+    content_type\" as content_type\n| json field=_raw \"file_extension\" as file_extension\n| json field=_raw \"domain\" as domain\n| json field=_raw\
+    \ \"tld\" as tld\n| parse regex field=url \"\\.(?<extracted_tld>[a-z]{2,})(/|$|\\?)\" nodrop\n| parse regex field=url \"\\.(?<extracted_ext>\\\
+    w+)(\\?|$)\" nodrop\n| if(isNull(tld), extracted_tld, tld) as top_level_domain\n| if(isNull(file_extension), extracted_ext, file_extension)\
+    \ as file_ext\n| where top_level_domain in (\"zip\", \"review\", \"country\", \"kim\", \"science\", \"work\", \"party\", \"gq\", \"link\"\
+    , \"cf\", \"ml\", \"ga\", \"tk\") \n   OR (file_ext in (\"exe\", \"dll\", \"bat\", \"cmd\", \"ps1\", \"vbs\", \"js\", \"jar\", \"scr\", \"\
+    msi\", \"com\", \"pif\") \n       AND content_type in (\"application/x-msdownload\", \"application/x-msdos-program\", \"application/x-executable\"\
+    , \"application/octet-stream\", \"application/x-dosexec\", \"application/exe\", \"application/x-exe\", \"application/dos-exe\"))\n| fields\
+    \ _messageTime, url, top_level_domain, file_ext, content_type, domain, _sourceHost\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -97,7 +120,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Forward Proxy Event\nWhere the Top Level Domain is on the High Risk Top Level Domains List\nOR\n\tWhere the File Extension is\
   \ in the Executable File Extensions List\n\t\n\tWhere Content Type is in the Executable Content Types List"

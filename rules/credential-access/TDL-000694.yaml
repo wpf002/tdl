@@ -17,74 +17,61 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security EventCode=4794
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security EventCode=4794
+
     | table _time, ComputerName, Account_Name, Subject_Account_Name, Subject_Domain_Name, Caller_Computer_Name
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4794")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4794')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000694 {\n  meta:\n    author = \"TDL\"\n    description = \"Directory Service Restore Mode Account Password Modification\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.event_id = /(4794)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4794
+    | project TimeGenerated, Computer, Account, SubjectUserName, SubjectDomainName, TargetUserName, TargetDomainName, EventData
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Target Username", sourceip, destinationip
+    FROM events
+    WHERE "EventID" = '4794'
+    LAST 24 HOURS
+  yara_l: |
+    rule windows_dpapi_master_key_backup_attempt {
+      meta:
+        author = "TDL"
+        description = "Detects attempts to backup DPAPI Master Key (Event ID 4794) which may indicate credential access activity"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
+        $e.metadata.product_event_type = "4794"
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND event_id IN ("4794")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4794])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4794)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4794")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4794)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4794")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code == "4794"
+    | KEEP @timestamp, host.name, user.name, winlog.event_data.SubjectUserName, winlog.event_data.SubjectDomainName, winlog.event_data.TargetUserName, winlog.computer_name
+  leql: |
+    where(source_json.EventID=4794)
+  crowdstrike: |
+    EventCode=4794
+    | table([@timestamp, ComputerName, SubjectUserName, SubjectDomainName, TargetUserName, CallerProcessName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4794
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_message, action_evtlog_event_data_SubjectUserName, action_evtlog_event_data_SubjectDomainName
+  lucene: |
+    event.code:4794
+  sumo: |
+    _sourceCategory=*Windows*Security* "4794"
+    | json field=_raw "EventID" as event_id
+    | where event_id = "4794"
+    | fields _messageTime, _sourceHost, event_id
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -94,7 +81,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Security Event
 

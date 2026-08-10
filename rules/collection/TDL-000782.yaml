@@ -18,85 +18,100 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=network sourcetype=bro:arp:json OR sourcetype=suricata OR sourcetype=zeek_arp OR index=ids (arp_opcode=2 OR arp.opcode=2 OR operation=reply OR arp_operation=reply)
+  spl: 'index=network sourcetype=bro:arp:json OR sourcetype=suricata OR sourcetype=zeek_arp OR index=ids (arp_opcode=2 OR arp.opcode=2 OR operation=reply
+    OR arp_operation=reply)
+
     | bin _time span=1m
+
     | eval gateway_ip=coalesce(gateway_ip, "192.168.1.1", "10.0.0.1", "172.16.0.1")
+
     | eval is_gateway_claim=if(match(arp_dst_hw, "ff:ff:ff:ff:ff:ff") OR unsolicited="true" OR gratuitous="true", 1, 0)
+
     | stats count by _time, src_mac, src_ip
+
     | where count > 100
+
     | table _time, src_mac, src_ip, count
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: |
+    Event
+    | where TimeGenerated > ago(5m)
+    | where Source == "Sysmon" and EventID == 255
+    | extend EventData = parse_xml(EventData)
+    | extend ArpOperation = tostring(EventData.DataItem.EventData.Data[0])
+    | extend SourceIP = tostring(EventData.DataItem.EventData.Data[1])
+    | extend SourceMAC = tostring(EventData.DataItem.EventData.Data[2])
+    | extend DestinationIP = tostring(EventData.DataItem.EventData.Data[3])
+    | where ArpOperation == "2"
+    | extend IsGatewayIP = DestinationIP matches regex @"^(10\.0\.0\.1|192\.168\.(0|1)\.1|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.1)$"
+    | where IsGatewayIP == true
+    | summarize ArpReplies = count() by bin(TimeGenerated, 1m), Computer, SourceMAC, DestinationIP
+    | where ArpReplies > 100
+    | project TimeGenerated, Computer, SourceMAC, DestinationIP, ArpReplies
+  aql: "SELECT sourceip, destinationip, QIDNAME(qid) AS event_name, COUNT(*) AS arp_replies\nFROM events\nWHERE (qid IN (SELECT qid FROM qideventmap\
+    \ WHERE logsourcetypename(logsourcetypeid) ILIKE '%IDS%') \n       AND (LOGSOURCENAME(logsourceid) ILIKE '%IDS%' OR categoryname(category)\
+    \ ILIKE '%IDS%')\n       AND (qidname(qid) ILIKE '%ARP%' AND qidname(qid) ILIKE '%reply%'))\nGROUP BY sourceip, destinationip\nHAVING arp_replies\
+    \ > 100\nLAST 1 MINUTES\n"
+  yara_l: |
+    rule arp_spoofing_mitm_collection {
+      meta:
+        author = "TDL"
+        description = "Detects ARP spoofing attacks - single host emitting >100 unsolicited ARP replies per minute claiming gateway IP"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1557"
+        severity = "HIGH"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        re.regex($e.metadata.product_event_type, `(?i)arp.*reply`)
+        $e.principal.hostname = $host
+        $e.principal.mac = $mac
+        $e.network.direction = "OUTBOUND"
 
-    WHERE "network.protocol" LIKE ''%tcp%''
+      match:
+        $host, $mac over 1m
 
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_col_000782 {\n  meta:\n    author = \"TDL\"\n    description = \"ARP Reply Storm to Default Gateway MAC\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0009\"\n    technique = \"T1557\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e > 100
+    }
+  esql: "FROM logs-network*, logs-windows.sysmon_operational*\n| WHERE @timestamp > NOW() - 1 minute \n  AND (network.protocol == \"arp\" OR event.action\
+    \ == \"arp_reply\" OR network.type == \"arp\")\n  AND (event.action LIKE \"*reply*\" OR network.transport == \"arp\")\n  AND (destination.ip\
+    \ RLIKE \".*\\\\.1$\" OR destination.ip RLIKE \".*\\\\.254$\" OR network.direction == \"outbound\")\n| STATS reply_count = COUNT(*) BY source.ip,\
+    \ source.mac, destination.ip, host.name, bucket = BUCKET(@timestamp, 1 minute)\n| WHERE reply_count > 100\n| KEEP bucket, source.ip, source.mac,\
+    \ destination.ip, host.name, reply_count\n"
+  leql: |
+    where(source_json.event_type="arp" AND source_json.arp_opcode=2) groupby(source_address, source_json.sender_ip) calculate(count)
+  crowdstrike: |
+    #type=arp OR event_simpleName=ArpReply OR EventCode=*arp*
+    arp.opcode=2 OR arp.op=reply OR arp.op=2
+    | groupBy([ComputerName, arp.src.mac, arp.src.ip], function=count(as=arp_replies), span=1m)
+    | arp_replies > 100
+    | table([@timestamp, ComputerName, arp.src.mac, arp.src.ip, arp.dst.ip, arp_replies])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter subtype = "arp" and action = "reply"
+    | bin _time span=1m
+    | comp count() as arp_replies by _time, src_ip, dst_ip
+    | filter arp_replies > 100
+    | fields _time, src_ip, dst_ip, arp_replies
+  lucene: |
+    event.type:arp AND arp.opcode:2 AND arp.src.proto_ipv4:(gateway_ip_1 OR gateway_ip_2 OR gateway_ip_3) AND NOT source.mac:(legitimate_gateway_mac_1 OR legitimate_gateway_mac_2)
+  sumo: |
+    _sourceCategory=*Network* OR _sourceCategory=*Sysmon* (arp OR "ARP" OR "Address Resolution Protocol")
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "src_mac" as src_mac
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "arp_op" as arp_op
+    | json field=_raw "arp_spa" as arp_spa
+    | json field=_raw "arp_sha" as arp_sha
+    | where event_type matches "*arp*" AND (arp_op = "2" OR arp_op = "reply")
+    | where arp_spa matches "*.*.*.1" OR arp_spa matches "*.*.*.254"
+    | timeslice 1m
+    | count as arp_replies by _timeslice, src_ip, arp_sha, arp_spa
+    | where arp_replies > 100
+    | fields _timeslice, src_ip, arp_sha, arp_spa, arp_replies
 pseudo_logic: Single host emitting >100 unsolicited ARP replies per minute claiming gateway IP. ARP-spoof MITM precursor for collection.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -114,7 +129,7 @@ references:
 - https://attack.mitre.org/techniques/T1557/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'

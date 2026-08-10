@@ -15,74 +15,78 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=azure sourcetype=azure:aad:signin
-    | search ResultType=0 AppId IN ("1b730954-1685-4b74-9bfd-dac224a7b894", "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "1950a258-227b-4e31-a9cf-717495945fc2", "a0c73c16-a7e3-4564-9a95-2bdf47383716", "fb78d390-0c51-40cd-8e17-fdbfab77341b", "d1ddf0e4-d672-4dae-b554-9d5bdfd93547", "9bc3ab49-b65d-410a-85ad-de819febfddc", "12128f48-ec9e-42f0-b203-ea49fb6af367", "23d8f6bd-1eb0-4cc2-a08c-7bf525c67bcd", "31359c7f-bd7e-475c-86db-fdb8c937548e", "90f610bf-206d-4950-b61d-37fa6fd1b224", "14d82eec-204b-4c2f-b7e8-296a70dab67e")
+  spl: 'index=azure sourcetype=azure:aad:signin
+
+    | search ResultType=0 AppId IN ("1b730954-1685-4b74-9bfd-dac224a7b894", "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "1950a258-227b-4e31-a9cf-717495945fc2",
+    "a0c73c16-a7e3-4564-9a95-2bdf47383716", "fb78d390-0c51-40cd-8e17-fdbfab77341b", "d1ddf0e4-d672-4dae-b554-9d5bdfd93547", "9bc3ab49-b65d-410a-85ad-de819febfddc",
+    "12128f48-ec9e-42f0-b203-ea49fb6af367", "23d8f6bd-1eb0-4cc2-a08c-7bf525c67bcd", "31359c7f-bd7e-475c-86db-fdb8c937548e", "90f610bf-206d-4950-b61d-37fa6fd1b224",
+    "14d82eec-204b-4c2f-b7e8-296a70dab67e")
+
     | lookup "TDL - Azure Guest Account Tracker" user as UserPrincipalName OUTPUT guest_user
+
     | where isnotnull(guest_user)
+
     | table _time, UserPrincipalName, AppId, AppDisplayName, IPAddress, Location, DeviceDetail.displayName, ResultType, ResultDescription
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000375 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Suspicious Guest User Activity\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1059\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    let GuestAppIds = dynamic(["1b730954-1685-4b74-9bfd-dac224a7b894", "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "1950a258-227b-4e31-a9cf-717495945fc2", "a0c73c16-a7e3-4564-9a95-2bdf47383716", "fb78d390-0c51-40cd-8e17-fdbfab77341b", "d1ddf0e4-d672-4dae-b554-9d5bdfd93547", "9bc3ab49-b65d-410a-85ad-de819febfddc", "12128f48-ec9e-42f0-b203-ea49fb6af367", "23d8f6bd-1eb0-4cc2-a08c-7bf525c67bcd", "31359c7f-bd7e-475c-86db-fdb8c937548e", "90f610bf-206d-4950-b61d-37fa6fd1b224", "14d82eec-204b-4c2f-b7e8-296a70dab67e"]);
+    let GuestUsers = _GetWatchlist('TDL - Azure Guest Account Tracker') | project GuestUserPrincipalName = UserPrincipalName;
+    SigninLogs
+    | where AppId in (GuestAppIds)
+    | join kind=inner (GuestUsers) on $left.UserPrincipalName == $right.GuestUserPrincipalName
+    | project TimeGenerated, UserPrincipalName, AppId, AppDisplayName, IPAddress, Location, ResultType, ResultDescription
+  aql: "SELECT username, \"Application ID\", \"Application Name\", LOGSOURCENAME(logsourceid) AS source, eventtime, COUNT(*) AS event_count\n\
+    FROM events\nWHERE LOGSOURCETYPE(devicetype) ILIKE '%Azure%' \n  AND (QIDNAME(qid) ILIKE '%sign-in%' OR categoryname(category) ILIKE '%sign-in%')\n\
+    \  AND \"Application ID\" IN ('1b730954-1685-4b74-9bfd-dac224a7b894', '04b07795-8ddb-461a-bbee-02f9e1bf7b46', '1950a258-227b-4e31-a9cf-717495945fc2',\
+    \ 'a0c73c16-a7e3-4564-9a95-2bdf47383716', 'fb78d390-0c51-40cd-8e17-fdbfab77341b', 'd1ddf0e4-d672-4dae-b554-9d5bdfd93547', '9bc3ab49-b65d-410a-85ad-de819febfddc',\
+    \ '12128f48-ec9e-42f0-b203-ea49fb6af367', '23d8f6bd-1eb0-4cc2-a08c-7bf525c67bcd', '31359c7f-bd7e-475c-86db-fdb8c937548e', '90f610bf-206d-4950-b61d-37fa6fd1b224',\
+    \ '14d82eec-204b-4c2f-b7e8-296a70dab67e')\n  AND username IN (SELECT \"Guest User\" FROM REFERENCE.SET.\"TDL - Azure Guest Account Tracker\"\
+    )\nGROUP BY username, \"Application ID\", \"Application Name\", LOGSOURCENAME(logsourceid), eventtime\nLAST 24 HOURS\n"
+  yara_l: "rule azure_guest_signin_suspicious_apps {\n  meta:\n    author = \"TDL\"\n    description = \"Detects Azure AD sign-in activity from\
+    \ guest users to specific application IDs associated with T1059\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1059\"\n    severity = \"Medium\"\n\n  events:\n    $e.metadata.product_name = \"Azure Active Directory\"\n    $e.metadata.product_event_type\
+    \ = \"Sign-in activity\"\n    (\n      $e.target.application = \"1b730954-1685-4b74-9bfd-dac224a7b894\" or\n      $e.target.application =\
+    \ \"04b07795-8ddb-461a-bbee-02f9e1bf7b46\" or\n      $e.target.application = \"1950a258-227b-4e31-a9cf-717495945fc2\" or\n      $e.target.application\
+    \ = \"a0c73c16-a7e3-4564-9a95-2bdf47383716\" or\n      $e.target.application = \"fb78d390-0c51-40cd-8e17-fdbfab77341b\" or\n      $e.target.application\
+    \ = \"d1ddf0e4-d672-4dae-b554-9d5bdfd93547\" or\n      $e.target.application = \"9bc3ab49-b65d-410a-85ad-de819febfddc\" or\n      $e.target.application\
+    \ = \"12128f48-ec9e-42f0-b203-ea49fb6af367\" or\n      $e.target.application = \"23d8f6bd-1eb0-4cc2-a08c-7bf525c67bcd\" or\n      $e.target.application\
+    \ = \"31359c7f-bd7e-475c-86db-fdb8c937548e\" or\n      $e.target.application = \"90f610bf-206d-4950-b61d-37fa6fd1b224\" or\n      $e.target.application\
+    \ = \"14d82eec-204b-4c2f-b7e8-296a70dab67e\"\n    )\n    $e.target.user.userid = $user\n    \n  match:\n    $user over 5m\n\n  outcome:\n\
+    \    $risk_score = 65\n    $app_id = array_distinct($e.target.application)\n    $user_email = array_distinct($e.target.user.userid)\n\n  condition:\n\
+    \    $e and #user in %azure_guest_accounts\n}\n"
+  esql: |
+    FROM logs-azure.signinlogs*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND event.action == "Sign-in activity"
+      AND azure.signinlogs.properties.app_id IN ("1b730954-1685-4b74-9bfd-dac224a7b894", "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "1950a258-227b-4e31-a9cf-717495945fc2", "a0c73c16-a7e3-4564-9a95-2bdf47383716", "fb78d390-0c51-40cd-8e17-fdbfab77341b", "d1ddf0e4-d672-4dae-b554-9d5bdfd93547", "9bc3ab49-b65d-410a-85ad-de819febfddc", "12128f48-ec9e-42f0-b203-ea49fb6af367", "23d8f6bd-1eb0-4cc2-a08c-7bf525c67bcd", "31359c7f-bd7e-475c-86db-fdb8c937548e", "90f610bf-206d-4950-b61d-37fa6fd1b224", "14d82eec-204b-4c2f-b7e8-296a70dab67e")
+    | ENRICH tdl-azure-guest-account-tracker ON user.name
+    | WHERE azure.signinlogs.properties.user_type == "Guest"
+    | KEEP @timestamp, user.name, azure.signinlogs.properties.app_id, azure.signinlogs.properties.app_display_name, source.ip, user.id
+  leql: |
+    where(source_json.operationName="Sign-in activity" AND source_json.appId IN [1b730954-1685-4b74-9bfd-dac224a7b894, 04b07795-8ddb-461a-bbee-02f9e1bf7b46, 1950a258-227b-4e31-a9cf-717495945fc2, a0c73c16-a7e3-4564-9a95-2bdf47383716, fb78d390-0c51-40cd-8e17-fdbfab77341b, d1ddf0e4-d672-4dae-b554-9d5bdfd93547, 9bc3ab49-b65d-410a-85ad-de819febfddc, 12128f48-ec9e-42f0-b203-ea49fb6af367, 23d8f6bd-1eb0-4cc2-a08c-7bf525c67bcd, 31359c7f-bd7e-475c-86db-fdb8c937548e, 90f610bf-206d-4950-b61d-37fa6fd1b224, 14d82eec-204b-4c2f-b7e8-296a70dab67e] AND source_json.userPrincipalName ICONTAINS "#EXT#")
+  crowdstrike: |
+    #repo=azure event_simpleName="Sign-in activity" ApplicationId in [1b730954-1685-4b74-9bfd-dac224a7b894, 04b07795-8ddb-461a-bbee-02f9e1bf7b46, 1950a258-227b-4e31-a9cf-717495945fc2, a0c73c16-a7e3-4564-9a95-2bdf47383716, fb78d390-0c51-40cd-8e17-fdbfab77341b, d1ddf0e4-d672-4dae-b554-9d5bdfd93547, 9bc3ab49-b65d-410a-85ad-de819febfddc, 12128f48-ec9e-42f0-b203-ea49fb6af367, 23d8f6bd-1eb0-4cc2-a08c-7bf525c67bcd, 31359c7f-bd7e-475c-86db-fdb8c937548e, 90f610bf-206d-4950-b61d-37fa6fd1b224, 14d82eec-204b-4c2f-b7e8-296a70dab67e]
+    | match(file="TDL - Azure Guest Account Tracker", field=TargetUserName, include=[GuestUser])
+    | table([@timestamp, TargetUserName, ApplicationId, ComputerName, IPAddress])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AZURE" and operation_name = "Sign-in activity"
+    | filter json_extract_scalar(raw_log, "$.properties.appId") in ("1b730954-1685-4b74-9bfd-dac224a7b894", "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "1950a258-227b-4e31-a9cf-717495945fc2", "a0c73c16-a7e3-4564-9a95-2bdf47383716", "fb78d390-0c51-40cd-8e17-fdbfab77341b", "d1ddf0e4-d672-4dae-b554-9d5bdfd93547", "9bc3ab49-b65d-410a-85ad-de819febfddc", "12128f48-ec9e-42f0-b203-ea49fb6af367", "23d8f6bd-1eb0-4cc2-a08c-7bf525c67bcd", "31359c7f-bd7e-475c-86db-fdb8c937548e", "90f610bf-206d-4950-b61d-37fa6fd1b224", "14d82eec-204b-4c2f-b7e8-296a70dab67e")
+    | lookup TDL_Azure_Guest_Account_Tracker as guest_list guest_user = identity_name
+    | filter guest_list.guest_user != null
+    | fields _time, identity_name, operation_name, cloud_provider, raw_log
+  lucene: |
+    operationName:"Sign-in activity" AND appId:(1b730954-1685-4b74-9bfd-dac224a7b894 OR 04b07795-8ddb-461a-bbee-02f9e1bf7b46 OR 1950a258-227b-4e31-a9cf-717495945fc2 OR a0c73c16-a7e3-4564-9a95-2bdf47383716 OR fb78d390-0c51-40cd-8e17-fdbfab77341b OR d1ddf0e4-d672-4dae-b554-9d5bdfd93547 OR 9bc3ab49-b65d-410a-85ad-de819febfddc OR 12128f48-ec9e-42f0-b203-ea49fb6af367 OR 23d8f6bd-1eb0-4cc2-a08c-7bf525c67bcd OR 31359c7f-bd7e-475c-86db-fdb8c937548e OR 90f610bf-206d-4950-b61d-37fa6fd1b224 OR 14d82eec-204b-4c2f-b7e8-296a70dab67e) AND userType:Guest
+  sumo: |
+    _sourceCategory=*Azure* *Sign-in*
+    | json field=_raw "properties.appId" as app_id
+    | json field=_raw "properties.userPrincipalName" as user_principal_name
+    | json field=_raw "properties.userType" as user_type
+    | where app_id in ("1b730954-1685-4b74-9bfd-dac224a7b894", "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "1950a258-227b-4e31-a9cf-717495945fc2", "a0c73c16-a7e3-4564-9a95-2bdf47383716", "fb78d390-0c51-40cd-8e17-fdbfab77341b", "d1ddf0e4-d672-4dae-b554-9d5bdfd93547", "9bc3ab49-b65d-410a-85ad-de819febfddc", "12128f48-ec9e-42f0-b203-ea49fb6af367", "23d8f6bd-1eb0-4cc2-a08c-7bf525c67bcd", "31359c7f-bd7e-475c-86db-fdb8c937548e", "90f610bf-206d-4950-b61d-37fa6fd1b224", "14d82eec-204b-4c2f-b7e8-296a70dab67e")
+    | lookup user_principal_name from shared://TDL_Azure_Guest_Account_Tracker on user_principal_name = guest_user
+    | where !isNull(guest_user)
+    | fields _messageTime, user_principal_name, app_id, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -92,7 +96,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure AD Event
 

@@ -15,97 +15,74 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=firewall action=allowed
-    | eval direction=case(
-        cidrmatch("10.0.0.0/8", src_ip) OR cidrmatch("172.16.0.0/12", src_ip) OR cidrmatch("192.168.0.0/16", src_ip), "internal",
-        1=1, "external"
-    )
-    | eval dest_direction=case(
-        cidrmatch("10.0.0.0/8", dest_ip) OR cidrmatch("172.16.0.0/12", dest_ip) OR cidrmatch("192.168.0.0/16", dest_ip), "internal",
-        1=1, "external"
-    )
-    | where direction="internal" AND dest_direction="external" AND (dest_port="22" OR app="ssh")
-    | eval baseline_start=relative_time(now(), "-90d")
-    | eval baseline_end=relative_time(now(), "-30d")
-    | eval is_baseline=if(_time >= baseline_start AND _time < baseline_end, 1, 0)
-    | eval is_detection_window=if(_time >= baseline_end, 1, 0)
-    | eventstats values(eval(if(is_baseline=1, dest_ip, null()))) as baseline_dest_ips by src_ip
-    | where is_detection_window=1
-    | eval is_new=if(NOT mvfind(baseline_dest_ips, "^".dest_ip."$") >= 0, 1, 0)
-    | where is_new=1
-    | table _time, src_ip, dest_ip, dest_port, app, action
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where application matches regex "ssh"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "application" LIKE ''%ssh%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000487 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Allowed Outbound SSH Traffic\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1133\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.application\
-    \ = /ssh/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND application LIKE "%ssh%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND application=/ssh/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*ssh*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND application ~= "ssh"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND application:*ssh*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where application matches "*ssh*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  spl: "index=firewall action=allowed\n| eval direction=case(\n    cidrmatch(\"10.0.0.0/8\", src_ip) OR cidrmatch(\"172.16.0.0/12\", src_ip) OR\
+    \ cidrmatch(\"192.168.0.0/16\", src_ip), \"internal\",\n    1=1, \"external\"\n)\n| eval dest_direction=case(\n    cidrmatch(\"10.0.0.0/8\"\
+    , dest_ip) OR cidrmatch(\"172.16.0.0/12\", dest_ip) OR cidrmatch(\"192.168.0.0/16\", dest_ip), \"internal\",\n    1=1, \"external\"\n)\n|\
+    \ where direction=\"internal\" AND dest_direction=\"external\" AND (dest_port=\"22\" OR app=\"ssh\")\n| eval baseline_start=relative_time(now(),\
+    \ \"-90d\")\n| eval baseline_end=relative_time(now(), \"-30d\")\n| eval is_baseline=if(_time >= baseline_start AND _time < baseline_end, 1,\
+    \ 0)\n| eval is_detection_window=if(_time >= baseline_end, 1, 0)\n| eventstats values(eval(if(is_baseline=1, dest_ip, null()))) as baseline_dest_ips\
+    \ by src_ip\n| where is_detection_window=1\n| eval is_new=if(NOT mvfind(baseline_dest_ips, \"^\".dest_ip.\"$\") >= 0, 1, 0)\n| where is_new=1\n\
+    | table _time, src_ip, dest_ip, dest_port, app, action\n"
+  kql: "let TrainingPeriod = 90d;\nlet BaselinePeriod = 30d;\nlet DetectionPeriod = 1d;\nlet BaselineEndTime = DetectionPeriod;\nlet BaselineStartTime\
+    \ = BaselinePeriod + DetectionPeriod;\nlet BaselineDestinations = \n    CommonSecurityLog\n    | where TimeGenerated between (ago(BaselineStartTime)\
+    \ .. ago(BaselineEndTime))\n    | where DeviceVendor has \"Firewall\" or DeviceProduct has \"Firewall\"\n    | where DeviceDirection =~ \"\
+    Outbound\"\n    | where DeviceAction =~ \"Allow\" or DeviceAction =~ \"Allowed\"\n    | where DestinationPort == 22 or ApplicationProtocol\
+    \ =~ \"ssh\"\n    | where isnotempty(DestinationIP)\n    | summarize by SourceIP, DestinationIP;\nCommonSecurityLog\n| where TimeGenerated\
+    \ > ago(DetectionPeriod)\n| where DeviceVendor has \"Firewall\" or DeviceProduct has \"Firewall\"\n| where DeviceDirection =~ \"Outbound\"\
+    \n| where DeviceAction =~ \"Allow\" or DeviceAction =~ \"Allowed\"\n| where DestinationPort == 22 or ApplicationProtocol =~ \"ssh\"\n| where\
+    \ isnotempty(DestinationIP)\n| join kind=leftanti BaselineDestinations on SourceIP, DestinationIP\n| project TimeGenerated, SourceIP, DestinationIP,\
+    \ DestinationPort, ApplicationProtocol, DeviceAction, DeviceVendor, DeviceProduct, SourceHostName, DestinationHostName\n"
+  aql: "SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count\nFROM events\nWHERE (destinationip NOT IN (SELECT sourceip FROM\
+    \ events WHERE INOFFENSE(sourceip) = false LAST 90 DAYS) OR destinationip NOT MATCHES '^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\\
+    .)')\n  AND (sourceip MATCHES '^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)')\n  AND (categoryname(category) ILIKE '%accept%' OR categoryname(category)\
+    \ ILIKE '%allow%' OR categoryname(category) ILIKE '%permit%' OR destinationport = 22 OR qidname(qid) ILIKE '%ssh%')\n  AND destinationip NOT\
+    \ IN (\n    SELECT destinationip \n    FROM events \n    WHERE (sourceip MATCHES '^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)')\n\
+    \      AND (destinationip NOT MATCHES '^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)')\n      AND (categoryname(category) ILIKE '%accept%'\
+    \ OR categoryname(category) ILIKE '%allow%' OR categoryname(category) ILIKE '%permit%' OR destinationport = 22 OR qidname(qid) ILIKE '%ssh%')\n\
+    \    START '30 days ago' STOP 'now'\n  )\nGROUP BY sourceip, destinationip, destinationport\nLAST 90 DAYS\n"
+  yara_l: "rule ssh_new_external_destination {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"T1133 - External Remote Services:\
+    \ SSH to new external destination\"\n    mitre_attack_technique = \"T1133\"\n    mitre_attack_tactic = \"Initial Access\"\n    severity =\
+    \ \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.security_result.action = \"ALLOW\"\n    $e.network.direction\
+    \ = \"OUTBOUND\"\n    (\n      $e.target.port = 22 or\n      $e.network.application_protocol = \"SSH\"\n    )\n    $e.principal.ip = $src_ip\n\
+    \    $e.target.ip = $dst_ip\n    not net.ip_in_range_cidr($e.target.ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($e.target.ip, \"172.16.0.0/12\"\
+    )\n    not net.ip_in_range_cidr($e.target.ip, \"192.168.0.0/16\")\n    \n  match:\n    $src_ip over 1h\n    \n  outcome:\n    $risk_score\
+    \ = 50\n    $new_destination = array_distinct($dst_ip)\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-network.firewall*
+    | WHERE @timestamp > NOW() - 90 days
+      AND network.direction == "outbound"
+      AND source.nat.ip IS NOT NULL
+      AND destination.ip IS NOT NULL
+      AND NOT CIDR_MATCH(destination.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+      AND (event.action == "allowed" OR destination.port == 22 OR network.application == "ssh")
+    | EVAL baseline_start = NOW() - 90 days
+    | EVAL baseline_end = NOW() - 30 days
+    | EVAL is_baseline = CASE(@timestamp >= baseline_start AND @timestamp < baseline_end, 1, 0)
+    | EVAL is_recent = CASE(@timestamp >= baseline_end, 1, 0)
+    | STATS baseline_dests = COUNT_DISTINCT(destination.ip) WHERE is_baseline == 1,
+            recent_dests = VALUES(destination.ip) WHERE is_recent == 1
+      BY source.ip
+    | MV_EXPAND recent_dests
+    | WHERE recent_dests IS NOT NULL
+    | EVAL dest_ip = recent_dests
+    | STATS baseline_count = MAX(baseline_dests) BY source.ip, dest_ip
+    | WHERE baseline_count == 0
+    | KEEP source.ip, dest_ip
+  leql: |
+    where(direction=OUTBOUND AND action=ALLOW AND (destination_port=22 OR application ICONTAINS "ssh"))
+    groupby(destination_address) calculate(count)
+  crowdstrike: "#type=firewall Action=Allowed (DestinationPort=22 OR Application=ssh) \n| match(file=\"baseline_ssh_destinations.csv\", field=[SourceIP,\
+    \ DestinationIP], include=[SourceIP, DestinationIP], strict=false)\n| !_exists\n| table([@timestamp, SourceIP, DestinationIP, DestinationPort,\
+    \ Application, Action])\n"
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter action_firewall_rule_action = \"allow\" \n  and dest_port = 22 \n  and action_app_id_category\
+    \ = \"ssh\"\n  and ipv4(src_ip, \"private\")\n  and not ipv4(dst_ip, \"private\")\n| comp count_distinct(dst_ip) as unique_dests by src_ip\n\
+    | filter unique_dests > 0\n"
+  lucene: |
+    (action:allowed OR destination.port:22 OR application:ssh) AND direction:outbound AND source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)
+  sumo: "_sourceCategory=*Firewall* \n| where direction=\"outbound\" OR src_ip matches \"10.*\" OR src_ip matches \"172.16.*\" OR src_ip matches\
+    \ \"192.168.*\"\n| where action=\"allowed\" OR action=\"accept\" OR action=\"permit\"\n| where dest_port=\"22\" OR application=\"ssh\" OR\
+    \ app=\"ssh\"\n| timeslice 1d\n| count_distinct(dest_ip) as new_dest_ips by src_ip, _timeslice\n| where new_dest_ips >= 1\n| fields _timeslice,\
+    \ src_ip, dest_ip, dest_port, application\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -115,7 +92,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Firewall Event \nFrom one internal source to one external destination (Outbound)\nWhere the Action is Allowed\nOR\n    Where\
   \ the Destination Port is \"22\"\n\n    Where the Application is \"ssh\"\n\nBaseline Learning: 30 Days\nRetention: 90 Days\n\nNew Value: Destination\

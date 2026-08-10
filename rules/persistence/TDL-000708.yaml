@@ -36,71 +36,116 @@ queries:
     \n| stats earliest(_time) as first_seen latest(_time) as last_seen values(file_path) as paths values(CommandLine) as commands values(registry_path)\
     \ as registry_keys by ComputerName, host, user, User, browser, extension_id\n| table first_seen, last_seen, ComputerName, host, user, User,\
     \ browser, extension_id, paths, commands, registry_keys\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    DeviceFileEvents
+    | where TimeGenerated > ago(24h)
+    | where FolderPath has_any ("\\AppData\\Local\\Google\\Chrome\\User Data", "\\AppData\\Local\\Microsoft\\Edge\\User Data", "\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles", "Library/Application Support/Google/Chrome", "Library/Application Support/Microsoft Edge", "Library/Application Support/Firefox/Profiles", ".config/google-chrome", ".config/microsoft-edge", ".mozilla/firefox")
+    | where FileName =~ "manifest.json"
+    | extend ExtensionPath = FolderPath
+    | join kind=inner (
+        DeviceProcessEvents
+        | where TimeGenerated > ago(24h)
+        | where ProcessCommandLine has_any ("--load-extension", "--load-and-launch-app", "about:debugging", "chrome://extensions", "edge://extensions")
+        | project DeviceId, DeviceName, AccountName, ProcessCommandLine, Timestamp
+    ) on DeviceId
+    | where abs(datetime_diff('minute', TimeGenerated, Timestamp)) <= 10
+    | project TimeGenerated, DeviceName, AccountName, ExtensionPath, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine
+    | summarize ExtensionInstalls = count(), Extensions = make_set(ExtensionPath), Commands = make_set(ProcessCommandLine) by DeviceName, AccountName, bin(TimeGenerated, 1h)
+    | where ExtensionInstalls >= 1
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process Name", "Process CommandLine", "File Path" AS extension_path, "Registry Key" AS registry_key
+    FROM events
+    WHERE (
+      ("Process Name" ILIKE '%chrome.exe%' OR "Process Name" ILIKE '%msedge.exe%' OR "Process Name" ILIKE '%firefox.exe%')
+      AND (
+        "Process CommandLine" ILIKE '%--load-extension%'
+        OR "Process CommandLine" ILIKE '%--load-unpacked%'
+        OR "Registry Key" ILIKE '%Software\\Google\\Chrome\\Extensions%'
+        OR "Registry Key" ILIKE '%Software\\Microsoft\\Edge\\Extensions%'
+        OR "Registry Key" ILIKE '%Software\\Mozilla\\Firefox\\Extensions%'
+        OR "File Path" ILIKE '%\\Extensions\\%'
+      )
+      AND "Process CommandLine" NOT ILIKE '%ExtensionInstallForcelist%'
+      AND "Process CommandLine" NOT ILIKE '%ExtensionInstallAllowlist%'
+    )
+    LAST 24 HOURS
+  yara_l: |
+    rule browser_extension_sideload_persistence {
+      meta:
+        author = "TDL"
+        description = "Detects browser extension loaded via developer mode or sideload not from managed policy - T1176 persistence"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1176"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          re.regex($e.principal.process.command_line, `(?i)(chrome|msedge|firefox).*--load-extension`) or
+          re.regex($e.principal.process.command_line, `(?i)(chrome|msedge).*--disable-extensions-except`) or
+          re.regex($e.principal.process.command_line, `(?i)firefox.*-profile.*extensions`)
+        )
+        not re.regex($e.principal.process.command_line, `(?i)ExtensionInstallForcelist`)
+        not re.regex($e.principal.process.command_line, `(?i)ExtensionSettings`)
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $user
 
-    | where process_name matches regex ".+"
+      match:
+        $host, $user over 1h
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      outcome:
+        $risk_score = 65
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000708 {\n  meta:\n    author = \"TDL\"\n    description = \"New Browser Extension Installed Outside Managed Channel\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1176\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
-    \n    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint.events.file*, logs-endpoint.events.process*, logs-endpoint.events.registry*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (file.path LIKE "*chrome*Extensions*" AND file.path LIKE "*manifest.json" AND file.extension == "json" AND event.action == "creation")
+        OR (file.path LIKE "*firefox*extensions*" AND file.extension == "xpi" AND event.action == "creation")
+        OR (file.path LIKE "*Edge*Extensions*" AND file.path LIKE "*manifest.json" AND file.extension == "json" AND event.action == "creation")
+        OR (process.command_line LIKE "*--load-extension*")
+        OR (process.command_line LIKE "*--load-unpacked*")
+        OR (process.command_line LIKE "*chrome.exe*" AND process.command_line LIKE "*--enable-features*")
+        OR (registry.path LIKE "*Software\\Google\\Chrome\\Extensions*" AND registry.path LIKE "*update_url*" AND event.action == "modification")
+        OR (registry.path LIKE "*Software\\Microsoft\\Edge\\Extensions*" AND registry.path LIKE "*update_url*" AND event.action == "modification")
+      )
+    | EVAL extension_path = COALESCE(file.path, registry.path, "from_cmdline")
+    | STATS install_count = COUNT(*) BY host.name, user.name, extension_path, process.name
+    | WHERE install_count > 0
+    | KEEP @timestamp, host.name, user.name, extension_path, process.name, install_count
+    | SORT @timestamp DESC
+    | LIMIT 1000
+  leql: |
+    where((process_cmd_line ICONTAINS "--load-extension" OR process_cmd_line ICONTAINS "--load-and-launch-app" OR process_cmd_line ICONTAINS "about:debugging" OR process_cmd_line ICONTAINS "chrome://extensions" OR process_cmd_line ICONTAINS "edge://extensions") AND (process_name ICONTAINS "chrome.exe" OR process_name ICONTAINS "msedge.exe" OR process_name ICONTAINS "firefox.exe" OR process_name ICONTAINS "chrome" OR process_name ICONTAINS "firefox")) groupby(asset, user, process_cmd_line) calculate(count)
+  crowdstrike: "event_simpleName=BrowserExtensionLoad \n| groupBy([ComputerName, aid, BrowserName, ExtensionId, ExtensionName], function=selectLast([LoadMethod,\
+    \ IsManagedExtension, @timestamp]))\n| IsManagedExtension=false \n| (LoadMethod=*developer* OR LoadMethod=*sideload* OR LoadMethod=*unpacked*)\n\
+    | table([@timestamp, ComputerName, aid, BrowserName, ExtensionId, ExtensionName, LoadMethod])\n"
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_FILE\n| filter (action_file_path ~= \".*\\\\\\\\AppData\\\\\\\\Local\\\\\\\\\
+    Google\\\\\\\\Chrome\\\\\\\\User Data\\\\\\\\Default\\\\\\\\Extensions\\\\\\\\.*\\\\\\\\manifest\\\\.json$\" \n    or action_file_path ~=\
+    \ \".*\\\\\\\\AppData\\\\\\\\Roaming\\\\\\\\Mozilla\\\\\\\\Firefox\\\\\\\\Profiles\\\\\\\\.*\\\\\\\\extensions\\\\\\\\.*\\\\.xpi$\"\n    or\
+    \ action_file_path ~= \".*\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Microsoft\\\\\\\\Edge\\\\\\\\User Data\\\\\\\\Default\\\\\\\\Extensions\\\\\\\
+    \\.*\\\\\\\\manifest\\\\.json$\"\n    or action_file_path ~= \".*/Library/Application Support/Google/Chrome/.*/Extensions/.*/manifest\\\\\
+    .json$\"\n    or action_file_path ~= \".*/Library/Application Support/Mozilla/.*\\\\.xpi$\"\n    or action_file_path ~= \".*/.config/google-chrome/.*/Extensions/.*/manifest\\\
+    \\.json$\"\n    or action_file_path ~= \".*/.mozilla/firefox/.*\\\\.xpi$\")\n| filter action_file_name in (\"manifest.json\", \"manifest.json.tmp\"\
+    ) or action_file_name ~= \".*\\\\.xpi$\"\n| filter actor_process_image_name not in (\"chrome.exe\", \"msedge.exe\", \"firefox.exe\", \"Google\
+    \ Chrome\", \"Microsoft Edge\", \"Firefox\")\n| filter action_process_image_command_line not contains \"--load-extension\" and action_process_image_command_line\
+    \ not contains \"ExtensionInstallForcelist\"\n| fields _time, agent_hostname, actor_effective_username, action_file_path, actor_process_image_name,\
+    \ action_process_image_command_line, actor_process_image_path\n"
+  lucene: |
+    (process.name:(chrome.exe OR msedge.exe OR firefox.exe) AND process.command_line:(*--load-extension* OR *--load-and-launch-app* OR *--pack-extension* OR *about\:debugging* OR *chrome\:\/\/extensions*)) OR (file.path:(*\\Local\\Google\\Chrome\\User\ Data\\*\\Extensions\\* OR *\\Local\\Microsoft\\Edge\\User\ Data\\*\\Extensions\\* OR *\\Roaming\\Mozilla\\Firefox\\Profiles\\*\\extensions\\* OR *\/Library\/Application\ Support\/Google\/Chrome\/*\/Extensions\/* OR *\/Library\/Application\ Support\/Microsoft\ Edge\/*\/Extensions\/* OR *\/.mozilla\/firefox\/*\/extensions\/*) AND file.extension:(crx OR xpi OR zip) AND NOT registry.path:(*ExtensionInstallForcelist* OR *ExtensionInstallAllowlist*)) OR (event.action:(file_creation OR file_modification) AND file.name:manifest.json AND file.path:(*\\Local\\Google\\Chrome\\User\ Data\\*\\Extensions\\* OR *\\Local\\Microsoft\\Edge\\User\ Data\\*\\Extensions\\* OR *\\Roaming\\Mozilla\\Firefox\\Profiles\\*\\extensions\\* OR *\/Library\/Application\ Support\/Google\/Chrome\/*\/Extensions\/* OR *\/Library\/Application\ Support\/Microsoft\ Edge\/*\/Extensions\/* OR *\/.mozilla\/firefox\/*\/extensions\/*) AND NOT process.name:(chrome.exe OR msedge.exe OR firefox.exe OR Software\ Update.app))
+  sumo: "_sourceCategory=*EDR* OR _sourceCategory=*Browser* (chrome OR edge OR firefox) (extension OR \"developer mode\" OR \"load unpacked\"\
+    \ OR sideload OR \".crx\" OR \".xpi\")\n| json field=_raw \"event_type\" as event_type\n| json field=_raw \"process_name\" as process_name\n\
+    | json field=_raw \"command_line\" as command_line\n| json field=_raw \"file_path\" as file_path\n| json field=_raw \"registry_path\" as registry_path\n\
+    | json field=_raw \"user\" as user\n| json field=_raw \"host\" as host\n| where (process_name matches \"*chrome*\" OR process_name matches\
+    \ \"*msedge*\" OR process_name matches \"*firefox*\") \n  AND (command_line matches \"*--load-extension*\" \n    OR command_line matches \"\
+    *--load-and-launch-app*\"\n    OR file_path matches \"*Extensions*\" \n    OR file_path matches \"*.crx\"\n    OR file_path matches \"*.xpi\"\
+    \n    OR registry_path matches \"*SOFTWARE\\\\Google\\\\Chrome\\\\Extensions*\"\n    OR registry_path matches \"*SOFTWARE\\\\Microsoft\\\\\
+    Edge\\\\Extensions*\"\n    OR registry_path matches \"*SOFTWARE\\\\Mozilla\\\\Firefox\\\\Extensions*\")\n| where !(registry_path matches \"\
+    *ExtensionInstallForcelist*\" OR registry_path matches \"*ExtensionInstallAllowlist*\")\n| dedup host, user, file_path\n| fields _messageTime,\
+    \ host, user, process_name, command_line, file_path, registry_path\n"
 pseudo_logic: Chrome/Edge/Firefox extension installed via developer-mode load or sideload, not from the managed extension policy. Persistence
   + credential-theft vector.
 false_positives:
@@ -119,7 +164,7 @@ references:
 - https://attack.mitre.org/techniques/T1176/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'

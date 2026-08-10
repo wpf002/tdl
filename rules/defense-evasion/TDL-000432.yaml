@@ -22,77 +22,108 @@ queries:
     *OpenVAS*\" OR http_user_agent=\"*monitoring*\" OR http_user_agent=\"*agent*\"))\n| stats count as event_count, dc(dest_ip) as unique_dest_ips,\
     \ sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port\n| where event_count >= 1\n| sort - total_bytes_out\n| table src_ip, dest_ip,\
     \ dest_port, event_count, unique_dest_ips, total_bytes_out\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(90d)\n| where DeviceVendor has_any (\"Palo Alto Networks\", \"Fortinet\", \"Cisco\", \"\
+    Zscaler\", \"Barracuda\", \"Check Point\", \"Squid\") or DeviceProduct has_any (\"Firewall\", \"Proxy\", \"Web Security\")\n| where ApplicationProtocol\
+    \ =~ \"tcp\" or Protocol =~ \"TCP\"\n| where RequestContext has_any (\"Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 5.1; .NET CLR 1.1.4322)\"\
+    , \"Mozilla/5.0 (Windows; U; MSIE 7.0; Windows NT 6.0; en-US)\", \"Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.1; Trident/4.0)\", \"Mozilla/5.0\
+    \ (compatible; MSIE 9.0; Windows NT 6.1; WOW64; Trident/5.0)\", \"Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; rv:11.0) like Gecko\",\
+    \ \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\", \"User-Agent: \", \"Mozilla/4.0 (compatible; )\", \"Mozilla/5.0 (Windows\
+    \ NT 6.3; Trident/7.0; rv:11.0) like Gecko\", \"curl/\", \"python-requests\", \"Wget/\", \"Java/\", \"Go-http-client\", \"\") \n    or RequestContext\
+    \ matches regex @\"^[A-Za-z0-9+/]{200,}={0,2}$\"\n    or RequestContext matches regex @\"Mozilla/[45]\\.0 \\(compatible; MSIE [6-9]\\.0; Windows\
+    \ NT [56]\\.[01]\"\n    or RequestContext contains \"Trident\" and RequestContext !contains \"Edge\"\n    or RequestContext matches regex\
+    \ @\"^[\\x20-\\x7E]{1,20}$\" and RequestContext !has \"Mozilla\"\n| where SourceIP !in (\"10.0.0.100\", \"10.0.0.101\", \"192.168.1.50\",\
+    \ \"172.16.0.10\")\n| where SourceIP !has \"scanner\" and RequestContext !has \"Qualys\" and RequestContext !has \"Nessus\"\n| summarize event_count\
+    \ = count(), unique_dest_ips = dcount(DestinationIP), total_bytes_out = sum(SentBytes) by SourceIP, DestinationIP, DestinationPort, RequestContext\n\
+    | where event_count >= 1\n| sort by total_bytes_out desc\n| project SourceIP, DestinationIP, DestinationPort, RequestContext, event_count,\
+    \ unique_dest_ips, total_bytes_out\n"
+  aql: "SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_dest_ips, SUM(bytesout)\
+    \ AS total_bytes_out, \"User-Agent\"\nFROM flows\nWHERE protocol = '6' \n  AND (\"User-Agent\" MATCHES '.*Mozilla\\/[0-9]\\.[0-9] \\(compatible;\
+    \ MSIE [0-9]\\.[0-9]; Windows NT [0-9]\\.[0-9]; \\.NET CLR.*\\).*'\n       OR \"User-Agent\" MATCHES '.*Mozilla\\/[0-9]\\.[0-9] \\(Windows\
+    \ NT [0-9]\\.[0-9]; (WOW64|Win64|x64); Trident\\/[0-9]\\.[0-9]; rv:[0-9]+\\.[0-9]+\\).*'\n       OR \"User-Agent\" ILIKE '%Windows-Update-Agent%'\n\
+    \       OR \"User-Agent\" = 'Internet Explorer'\n       OR \"User-Agent\" MATCHES '^[A-Za-z]{8}$'\n       OR \"User-Agent\" ILIKE '%Cobalt\
+    \ Strike%'\n       OR \"User-Agent\" = ''\n       OR \"User-Agent\" IS NULL)\n  AND sourceip NOT IN ('10.0.0.100', '10.0.0.101', '192.168.1.50')\n\
+    GROUP BY sourceip, destinationip, destinationport, \"User-Agent\"\nHAVING event_count >= 1\nORDER BY total_bytes_out DESC\nLAST 24 HOURS\n"
+  yara_l: |
+    rule cobalt_strike_malleable_c2_user_agent {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects malformed or suspicious User-Agent strings associated with Cobalt Strike Malleable C2 Profiles"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1071"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.network.ip_protocol = "TCP"
+        (
+          re.regex($e.network.http.user_agent, `^$`) or
+          re.regex($e.network.http.user_agent, `(?i)Mozilla\/[45]\.0 \(compatible; MSIE [6-9]\.0; Windows NT [56]\.[01]; Trident\/[45]\.0\)`) or
+          re.regex($e.network.http.user_agent, `(?i)Internet Explorer`) or
+          re.regex($e.network.http.user_agent, `(?i)^(curl|wget|python|powershell|winhttp)`) or
+          re.regex($e.network.http.user_agent, `(?i)Mozilla\/4\.0 \(compatible\)$`) or
+          re.regex($e.network.http.user_agent, `(?i)^User-Agent:`) or
+          re.regex($e.network.http.user_agent, `(?i)MSIE [6-8]\.0`) or
+          strings.concat("") = $e.network.http.user_agent
+        )
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dest_ip
+        $e.target.port = $dest_port
+        not (
+          net.ip_in_range_cidr($src_ip, "10.100.200.0/24") or
+          net.ip_in_range_cidr($src_ip, "172.16.50.0/24") or
+          $e.principal.hostname = /(?i)(scanner|monitor|probe)/
+        )
 
-    | where network.protocol matches regex "tcp"
+      match:
+        $src_ip, $dest_ip, $dest_port over 1h
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+      outcome:
+        $risk_score = 75
+        $total_events = count_distinct($e.metadata.id)
+        $unique_dest_ips = count_distinct($e.target.ip)
+        $total_bytes_out = sum($e.network.sent_bytes)
 
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_de_000432 {\n  meta:\n    author = \"TDL\"\n    description = \"CobaltStrike Malformed UAs in Malleable Profiles\"\n \
-    \   severity = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: "FROM logs-network*\n| WHERE @timestamp > NOW() - 24 hours\n  AND network.protocol == \"tcp\"\n  AND (\n    http.request.headers.user-agent\
+    \ LIKE \"*Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1; SV1; .NET CLR 2.0.50727)*\"\n    OR http.request.headers.user-agent LIKE \"*Mozilla/5.0\
+    \ (Windows; U; MSIE 7.0; Windows NT 6.0; en-US)*\"\n    OR http.request.headers.user-agent LIKE \"*Mozilla/4.0 (compatible; MSIE 8.0; Windows\
+    \ NT 6.1; Trident/4.0)*\"\n    OR http.request.headers.user-agent LIKE \"*Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; WOW64; Trident/5.0)*\"\
+    \n    OR http.request.headers.user-agent LIKE \"*Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; rv:11.0) like Gecko*\"\n    OR http.request.headers.user-agent\
+    \ RLIKE \"Mozilla/[0-9]\\\\.[0-9] \\\\(Windows NT [0-9]\\\\.[0-9]; (Win64; x64|WOW64)\\\\)\"\n    OR TO_LOWER(http.request.headers.user-agent)\
+    \ LIKE \"*cobalt*\"\n    OR TO_LOWER(http.request.headers.user-agent) LIKE \"*beacon*\"\n  )\n  AND NOT (\n    source.ip IN (\"10.0.0.100\"\
+    , \"10.0.0.101\", \"172.16.1.50\", \"192.168.10.200\")\n    OR source.ip LIKE \"10.10.10.*\"\n  )\n| STATS event_count = COUNT(*), \n    \
+    \    unique_dest_ips = COUNT_DISTINCT(destination.ip), \n        total_bytes_out = SUM(source.bytes)\n  BY source.ip, destination.ip, destination.port\n\
+    | WHERE event_count >= 1\n| SORT total_bytes_out DESC\n| KEEP source.ip, destination.ip, destination.port, event_count, unique_dest_ips, total_bytes_out\n"
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp" AND (source_json.user_agent=/.*Mozilla\/4\.0 \(compatible; MSIE [6-8]\.0; Windows NT \d\.\d; Trident\/\d\.\d\).*/ OR source_json.user_agent=/.*Mozilla\/5\.0 \(Windows NT \d\.\d; Win64; x64\) AppleWebKit\/537\.36.*/ OR source_json.user_agent ICONTAINS "JDYI" OR source_json.user_agent ICONTAINS "jdyi" OR source_json.http_user_agent=/.*Mozilla\/4\.0 \(compatible; MSIE [6-8]\.0; Windows NT \d\.\d; Trident\/\d\.\d\).*/ OR source_json.http_user_agent=/.*Mozilla\/5\.0 \(Windows NT \d\.\d; Win64; x64\) AppleWebKit\/537\.36.*/ OR source_json.http_user_agent ICONTAINS "JDYI" OR source_json.http_user_agent ICONTAINS "jdyi" OR user_agent=/.*Mozilla\/4\.0 \(compatible; MSIE [6-8]\.0; Windows NT \d\.\d; Trident\/\d\.\d\).*/ OR user_agent=/.*Mozilla\/5\.0 \(Windows NT \d\.\d; Win64; x64\) AppleWebKit\/537\.36.*/ OR user_agent ICONTAINS "JDYI" OR user_agent ICONTAINS "jdyi") AND source_address NOT IN ["10.0.0.50", "10.0.0.51", "10.0.0.52", "192.168.1.100", "192.168.1.101"]) groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    #type=firewall OR #type=ids network.protocol=*tcp* (http.user_agent=/^(Mozilla\/4\.0 \(compatible; MSIE [6-8]\.0;|curl\/[0-9]\.|python-requests\/|Wget\/|Go-http-client\/|Java\/1\.[5-8]|libwww-perl\/|Lynx\/|Nmap Scripting Engine|masscan\/|zgrab\/|sqlmap\/|Nikto\/|WinHTTP\/|JNDI|\.NET CLR|User-Agent:$)/ OR http.user_agent=/^[A-Z]{8,}$/ OR http.user_agent=/^(internal dummy connection|cloudflare-nginx|nginx-ssl early data)$/)
+    | src_ip!=10.50.100.* AND src_ip!=10.50.101.* AND src_ip!=172.16.200.5 AND src_ip!=192.168.250.10
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=event_count), count(dest_ip, distinct=true, as=unique_dest_ips), sum(bytes_out, as=total_bytes_out)])
+    | event_count >= 1
+    | sort(field=total_bytes_out, order=desc)
+    | table([src_ip, dest_ip, dest_port, event_count, unique_dest_ips, total_bytes_out])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter action_networkprotocol = \"tcp\" \n  and (http_headers_map.User_Agent ~= \".*(?i)(internet explorer|msie|trident).*(compatible|windows\
+    \ nt|wow64|win64).*\" \n    or http_headers_map.User_Agent ~= \".*(?i)(mozilla|gecko).*\" \n    or http_headers_map.User_Agent ~= \"^[a-zA-Z0-9+/]{20,}={0,2}$\"\
+    \n    or http_headers_map.User_Agent ~= \".*(?i)(cobalt|malleable|beacon).*\"\n    or http_headers_map.User_Agent = \"\"\n    or http_headers_map.User_Agent\
+    \ ~= \"^[^\\s]{200,}$\")\n  and action_source_translated_ip not in (\"10.0.0.5\", \"192.168.1.100\", \"172.16.0.10\")\n  and action_source_translated_ip\
+    \ not in (\"10.0.0.20\", \"192.168.1.200\")\n| comp count() as event_count, count_distinct(action_destination_translated_ip) as unique_dest_ips,\
+    \ sum(action_upload_bytes) as total_bytes_out by action_source_translated_ip, action_destination_translated_ip, action_destination_translated_port\n\
+    | filter event_count >= 1\n| sort desc total_bytes_out\n| fields action_source_translated_ip, action_destination_translated_ip, action_destination_translated_port,\
+    \ event_count, unique_dest_ips, total_bytes_out\n"
+  lucene: |
+    network.protocol:tcp AND (http.request.headers.user_agent:(*MSOffice* OR *Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 5.1; Trident/4.0)* OR *Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; rv:11.0)* OR *curl/* OR *python-requests* OR *Wget* OR *WinHTTP* OR *BTSC* OR *Internet\ Explorer*)) AND NOT (source.ip:(10.0.0.5 OR 10.0.0.6 OR 192.168.1.100))
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*ids*
+    | where protocol matches "*tcp*" OR protocol matches "*TCP*"
+    | parse regex field=user_agent "(?i)(HttpBrowser/1\.0|Wget/|python-requests|curl/|Go-http-client|okhttp|JNDI|Cobalt Strike|stage\.|beacon\.|rundll32|MSOffice|Mozilla/4\.0 \(compatible; MSIE 6\.0; Windows NT 5\.1; SV1\)|Mozilla/4\.0 \(compatible; MSIE 7\.0; Windows NT 6\.0\)|Mozilla/4\.0 \(compatible; MSIE 8\.0; Windows NT 6\.1\)|Mozilla/5\.0 \(Windows; U; MSIE|stage1\.|stage2\.|Mozilla\/[0-9]\.[0-9] \(compatible\)|Internet Explorer|Microsoft BITS|WinHTTP)"
+    | where !(src_ip matches "10.50.100.*" OR src_ip matches "172.16.200.*" OR user_agent matches "*Zabbix*" OR user_agent matches "*Nagios*" OR user_agent matches "*PRTG*")
+    | count as event_count, count_distinct(dest_ip) as unique_dest_ips, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port, user_agent
+    | where event_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, user_agent, event_count, unique_dest_ips, total_bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -102,7 +133,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

@@ -21,71 +21,113 @@ queries:
     | where ((match(cmd_lower, \"\\\\pipe\\\\\") AND match(cmd_lower, \"/c\") AND match(cmd_lower, \"echo\") AND (match(cmd_lower, \"cmd\") OR\
     \ match(cmd_lower, \"%comspec%\"))) OR (match(cmd_lower, \"rundll32\") AND match(cmd_lower, \"\\\\.dll,a\") AND match(cmd_lower, \"/p\")))\
     \ AND NOT match(cmd_lower, \"mpcmdrun\")\n| table _time, ComputerName, ParentProcessName, ProcessName, CommandLine, SubjectUserName\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (592, 4688)
+    | where ParentProcessName endswith "\\services.exe"
+    | where (
+        (CommandLine has "\\pipe\\" and CommandLine has "/c" and CommandLine has "echo" and (CommandLine has "cmd" or CommandLine has "%comspec%"))
+        or
+        (CommandLine has "rundll32" and CommandLine has ".dll,a" and CommandLine has "/p")
+    )
+    | where CommandLine !has "mpcmdrun"
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName, EventID
+  aql: |
+    SELECT eventtime, sourceip, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Parent Process Name"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Parent Process Name" ILIKE '%services.exe'
+      AND (
+        ("Process CommandLine" ILIKE '%\pipe\%' AND "Process CommandLine" ILIKE '%/c%' AND "Process CommandLine" ILIKE '%echo%' AND ("Process CommandLine" ILIKE '%cmd%' OR "Process CommandLine" ILIKE '%%comspec%%'))
+        OR
+        ("Process CommandLine" ILIKE '%rundll32%' AND "Process CommandLine" ILIKE '%.dll,a%' AND "Process CommandLine" ILIKE '%/p%')
+      )
+      AND "Process CommandLine" NOT ILIKE '%mpcmdrun%'
+    LAST 24 HOURS
+  yara_l: |
+    rule privilege_escalation_token_manipulation_via_services {
+      meta:
+        author = "TDL"
+        description = "Detects T1134 Token Manipulation via services.exe spawning suspicious command patterns"
+        mitre_attack_tactic = "Privilege Escalation"
+        mitre_attack_technique = "T1134"
+        severity = "High"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        ($e.metadata.product_event_type = "592" or $e.metadata.product_event_type = "4688")
+        re.regex($e.principal.process.parent_process.file.full_path, `(?i)\\services\.exe$`)
+        (
+          (
+            re.regex($e.principal.process.command_line, `(?i)\\pipe\\`) and
+            re.regex($e.principal.process.command_line, `(?i)/c`) and
+            re.regex($e.principal.process.command_line, `(?i)echo`) and
+            (
+              re.regex($e.principal.process.command_line, `(?i)cmd`) or
+              re.regex($e.principal.process.command_line, `(?i)%comspec%`)
+            )
+          )
+          or
+          (
+            re.regex($e.principal.process.command_line, `(?i)rundll32`) and
+            re.regex($e.principal.process.command_line, `(?i)\.dll,a`) and
+            re.regex($e.principal.process.command_line, `(?i)/p`)
+          )
+        )
+        not re.regex($e.principal.process.command_line, `(?i)mpcmdrun`)
+        $e.principal.hostname = $host
 
-    | where process_name in ("services.exe")
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('services.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_pe_000363 {\n  meta:\n    author = \"TDL\"\n    description = \"Meterpreter or Cobalt Strike Getsystem Usage\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0004\"\n    technique = \"T1134\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(services.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("services.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [services.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (services.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("services.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(services.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("services.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-windows.sysmon_operational*, logs-system.security*, winlogbeat-*, logs-endpoint.events.process*\n| WHERE event.code IN (\"\
+    592\", \"4688\") \n  AND process.parent.name == \"services.exe\"\n  AND (\n    (process.command_line LIKE \"*\\\\pipe\\\\*\" AND process.command_line\
+    \ LIKE \"*/c*\" AND process.command_line LIKE \"*echo*\" \n     AND (process.command_line LIKE \"*cmd*\" OR process.command_line LIKE \"*%comspec%*\"\
+    ))\n    OR\n    (process.command_line LIKE \"*rundll32*\" AND process.command_line LIKE \"*.dll,a*\" AND process.command_line LIKE \"*/p*\"\
+    )\n  )\n  AND NOT process.command_line LIKE \"*mpcmdrun*\"\n| KEEP @timestamp, host.name, user.name, process.name, process.parent.name, process.command_line,\
+    \ process.executable\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND parent_process_name="services.exe" AND ((process_cmd_line ICONTAINS "\pipe\" AND process_cmd_line ICONTAINS "/c" AND process_cmd_line ICONTAINS "echo" AND (process_cmd_line ICONTAINS "cmd" OR process_cmd_line ICONTAINS "%comspec%")) OR (process_cmd_line ICONTAINS "rundll32" AND process_cmd_line ICONTAINS ".dll,a" AND process_cmd_line ICONTAINS "/p")) AND NOT(process_cmd_line ICONTAINS "mpcmdrun"))
+  crowdstrike: |
+    EventCode=4688 ParentBaseFileName=services.exe
+    (
+      (CommandLine=*\pipe\* CommandLine=*/c* CommandLine=*echo* (CommandLine=*cmd* OR CommandLine=*%comspec%*))
+      OR
+      (CommandLine=*rundll32* CommandLine=*.dll,a* CommandLine=*/p*)
+    )
+    CommandLine!=*mpcmdrun*
+    | table([@timestamp, ComputerName, UserName, ParentBaseFileName, FileName, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter lowercase(actor_process_image_name) contains "services.exe"
+    | filter (
+        (lowercase(action_process_image_command_line) contains "\pipe\" and lowercase(action_process_image_command_line) contains "/c" and lowercase(action_process_image_command_line) contains "echo" and (lowercase(action_process_image_command_line) contains "cmd" or lowercase(action_process_image_command_line) contains "%comspec%"))
+        or
+        (lowercase(action_process_image_command_line) contains "rundll32" and lowercase(action_process_image_command_line) contains ".dll,a" and lowercase(action_process_image_command_line) contains "/p")
+    )
+    | filter not lowercase(action_process_image_command_line) contains "mpcmdrun"
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:4688 AND process.parent.name:services.exe AND ((process.command_line:*\pipe\* AND process.command_line:*\/c* AND process.command_line:*echo* AND (process.command_line:*cmd* OR process.command_line:*%comspec%*)) OR (process.command_line:*rundll32* AND process.command_line:*.dll,a* AND process.command_line:*\/p*)) AND NOT process.command_line:*mpcmdrun*
+  sumo: |
+    _sourceCategory=*Windows* "4688"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ParentProcessName" as parent_process
+    | json field=_raw "CommandLine" as cmd
+    | where event_id in ("592", "4688")
+    | where parent_process matches "*services.exe"
+    | where (
+        (cmd matches "*\\pipe\\*" and cmd matches "*/c*" and cmd matches "*echo*" and (cmd matches "*cmd*" or cmd matches "*%comspec%*"))
+        or
+        (cmd matches "*rundll32*" and cmd matches "*.dll,a*" and cmd matches "*/p*")
+    )
+    | where !(cmd matches "*mpcmdrun*")
+    | fields _messageTime, _sourceHost, parent_process, cmd
 false_positives:
 - Security software
 - Authorized admin tools
@@ -95,7 +137,7 @@ tags:
 - privilege-escalation
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows Process Creation Event\nWhere the Event ID is in [592, 4688]\nWhere Parent Process Name equals \"services.exe\"\nAND\n\
   \tCommand Line contains all of [\"\\pipe\\\", \"/c\", \"echo\"]\n\tAND Command Line contains any of [\"cmd\", \"%comspec%\"]\nOR\n\tCommand\

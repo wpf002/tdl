@@ -18,77 +18,51 @@ queries:
   spl: "index=proxy \n| bin _time span=20m \n| lookup threat_intel_list domain as dest_domain OUTPUT is_threat \n| where is_threat=\"true\" OR\
     \ is_threat=1 \n| stats dc(dest_domain) as unique_threat_domains values(dest_domain) as threat_domains by _time, src_ip \n| where unique_threat_domains\
     \ >= 5\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "http"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%http%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000085 {\n  meta:\n    author = \"TDL\"\n    description = \"HTTP Traffic Pattern to Threat Domains\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1189\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /http/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%http%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/http/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*http*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "http"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*http*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*http*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(20m)\n| where DeviceVendor has \"Proxy\" or DeviceProduct has \"Proxy\" or DeviceEventClassID\
+    \ in (\"proxied\", \"web-request\")\n| join kind=inner (\n    ThreatIntelligenceIndicator\n    | where isnotempty(DomainName)\n    | where\
+    \ TimeGenerated > ago(20m)\n    | project DomainName, ThreatType, ConfidenceScore\n) on $left.DestinationHostName == $right.DomainName\n|\
+    \ summarize \n    ThreatDomains = make_set(DestinationHostName),\n    UniqueDomainCount = dcount(DestinationHostName),\n    ThreatTypes =\
+    \ make_set(ThreatType),\n    FirstSeen = min(TimeGenerated),\n    LastSeen = max(TimeGenerated)\n    by SourceIP, bin(TimeGenerated, 20m)\n\
+    | where UniqueDomainCount >= 5\n| project TimeGenerated, SourceIP, UniqueDomainCount, ThreatDomains, ThreatTypes, FirstSeen, LastSeen\n"
+  aql: |
+    SELECT sourceip, UNIQUECOUNT(destinationip) AS unique_domains, COUNT(*) AS event_count, QIDNAME(qid) AS event_name
+    FROM events
+    WHERE categoryid IN (SELECT category_id FROM categories WHERE name ILIKE '%proxy%' OR name ILIKE '%web%')
+      AND (destinationip IN (SELECT destinationip FROM events WHERE categoryid IN (SELECT category_id FROM categories WHERE name ILIKE '%threat%' OR name ILIKE '%intelligence%'))
+           OR qid IN (SELECT qid FROM qidmap WHERE name ILIKE '%threat%' OR name ILIKE '%malicious%'))
+    GROUP BY sourceip
+    HAVING event_count >= 5 AND unique_domains >= 5
+    LAST 20 MINUTES
+  yara_l: "rule drive_by_compromise_multiple_malicious_domains {\n  meta:\n    author = \"TDL\"\n    description = \"Detects potential drive-by\
+    \ compromise via multiple malicious domain visits from same source IP\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1189\"\n    severity = \"High\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.metadata.product_name = \"Forward\
+    \ Proxy\"\n    $e.principal.ip = $source_ip\n    $e.target.hostname = $domain\n    \n    // Threat intelligence match on destination domain\n\
+    \    $e.target.hostname in %ti_domain_list\n\n  match:\n    $source_ip over 20m\n\n  outcome:\n    $risk_score = max(75)\n    $source_ip =\
+    \ array_distinct($source_ip)\n    $malicious_domains = array_distinct($domain)\n    $domain_count = count_distinct($domain)\n\n  condition:\n\
+    \    #e >= 5 and $domain_count >= 5\n}\n"
+  esql: |
+    FROM logs-network.proxy*
+    | WHERE @timestamp > NOW() - 20 minutes
+      AND threat.indicator.matched.field IS NOT NULL
+    | STATS unique_domains = COUNT_DISTINCT(destination.domain) BY source.ip, time_window = BUCKET(@timestamp, 20 minutes)
+    | WHERE unique_domains >= 5
+  leql: |
+    where(threat_command_and_control_domains=true) groupby(source_address) calculate(unique:destination_domain)
+  crowdstrike: "#type=proxy \n| match(file=\"threat_intel_domains.csv\", field=DestinationDomain, include=[DestinationDomain], strict=false)\n\
+    | groupBy([SourceIP], function=[count(DestinationDomain, distinct=true, as=unique_domains), collect([DestinationDomain])], limit=max)\n| unique_domains\
+    \ >= 5\n| table([SourceIP, unique_domains, DestinationDomain])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_dest_threat_matched = "true"
+    | bin _time span=20m
+    | comp count_distinct(action_destination_fqdn) as unique_domains, count() as total_events by _time, action_source_ip
+    | filter unique_domains >= 5
+    | fields _time, action_source_ip, unique_domains, total_events
+  lucene: |
+    event.type:"proxy" AND threat.indicator.matched.atomic:* AND _exists_:source.ip AND _exists_:destination.domain
+  sumo: "_sourceCategory=*Proxy* \n| json field=_raw \"src_ip\" as src_ip\n| json field=_raw \"dest_domain\" as dest_domain\n| where dest_domain\
+    \ in (threatintel_domain_list)\n| timeslice 20m\n| count_distinct(dest_domain) as unique_domains by _timeslice, src_ip\n| where unique_domains\
+    \ >= 5\n"
 false_positives:
 - Authorized pen testing
 - Security research
@@ -98,7 +72,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '5 Forward Proxy Events
 

@@ -26,71 +26,153 @@ queries:
     *Domain Admins*\"))\n| search NOT (AdditionalFields=\"*(domainSid=)*\" OR AdditionalFields=\"*(objectSid=)*\")\n| search AdditionalFields=\"\
     *nTSecurityDescriptor*\"\n| table _time, DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName, InitiatingProcessCommandLine,\
     \ SearchScope, AdditionalFields\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000637 {\n  meta:\n    author = \"TDL\"\n    description = \"LDAP Group Recon - Defender\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0007\"\n    technique = \"T1069\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceEvents
+    | where ActionType == "LdapSearch"
+    | where AdditionalFields !~ "[ ]"
+    | where AdditionalFields !has "\"Scope\":\"Base\""
+    | where (
+        AdditionalFields has "(adminCount=1)"
+        or
+        (
+            (
+                AdditionalFields has_any ("(groupType:1.2.840.113556.1.4.803:=2147483648)", "(groupType:1.2.840.113556.1.4.803:=2147483656)", "(groupType:1.2.840.113556.1.4.803:=2147483652)", "(groupType:1.2.840.113556.1.4.803:=2147483650)", "(sAMAccountType=536870913)", "(sAMAccountType=536870912)", "(sAMAccountType=268435457)", "(sAMAccountType=268435456)", "(objectCategory=organizationalUnit)", "(objectCategory=group)", "(objectClass=group)", "(primaryGroupID=512)", "Domain Admins")
+            )
+            and
+            (
+                AdditionalFields !has "(domainSid=)"
+                and AdditionalFields !has "(objectSid=)"
+            )
+        )
+    )
+    | where AdditionalFields has "nTSecurityDescriptor"
+    | project Timestamp, DeviceName, AccountName, InitiatingProcessAccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, ActionType, AdditionalFields
+  aql: |
+    SELECT sourceip, username, "Additional Fields" AS additional_fields, eventtime, LOGSOURCENAME(logsourceid) AS host, COUNT(*) AS event_count
+    FROM events
+    WHERE "Action Type" = 'LdapSearch'
+      AND "Tags" != '[ ]'
+      AND "Scope" != 'Base'
+      AND (
+        "Additional Fields" ILIKE '%adminCount=1%'
+        OR "Additional Fields" ILIKE '%groupType:1.2.840.113556.1.4.803:=2147483648%'
+        OR "Additional Fields" ILIKE '%groupType:1.2.840.113556.1.4.803:=2147483656%'
+        OR "Additional Fields" ILIKE '%groupType:1.2.840.113556.1.4.803:=2147483652%'
+        OR "Additional Fields" ILIKE '%groupType:1.2.840.113556.1.4.803:=2147483650%'
+        OR "Additional Fields" ILIKE '%sAMAccountType=536870913%'
+        OR "Additional Fields" ILIKE '%sAMAccountType=536870912%'
+        OR "Additional Fields" ILIKE '%sAMAccountType=268435457%'
+        OR "Additional Fields" ILIKE '%sAMAccountType=268435456%'
+        OR "Additional Fields" ILIKE '%objectCategory=organizationalUnit%'
+        OR "Additional Fields" ILIKE '%objectCategory=group%'
+        OR "Additional Fields" ILIKE '%objectClass=group%'
+        OR "Additional Fields" ILIKE '%primaryGroupID=512%'
+        OR "Additional Fields" ILIKE '%Domain Admins%'
+      )
+      AND "Additional Fields" NOT ILIKE '%domainSid=%'
+      AND "Additional Fields" NOT ILIKE '%objectSid=%'
+      AND "Additional Fields" ILIKE '%nTSecurityDescriptor%'
+    GROUP BY sourceip, username, "Additional Fields", eventtime, logsourceid
+    LAST 24 HOURS
+  yara_l: "rule mitre_t1069_ldap_enumeration {\n  meta:\n    author = \"TDL\"\n    description = \"Detects LDAP searches targeting privileged\
+    \ accounts and groups via Microsoft Defender\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1069\"\n    severity\
+    \ = \"Medium\"\n\n  events:\n    $e.metadata.product_name = \"Microsoft Defender for Endpoint\"\n    $e.metadata.product_event_type = \"LdapSearch\"\
+    \n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    \n    // tags != \"[ ]\" - tags field exists and is not empty brackets\n    not\
+    \ re.regex($e.about.labels.value, `^\\[\\s*\\]$`)\n    \n    // scope != \"Base\"\n    not re.regex($e.additional.fields.value, `(?i)\"scope\"\
+    \\s*:\\s*\"Base\"`)\n    \n    // Check for privilege indicators\n    (\n      re.regex($e.additional.fields.value, `\\(adminCount=1\\)`)\
+    \ or\n      (\n        (\n          re.regex($e.additional.fields.value, `\\(groupType:1\\.2\\.840\\.113556\\.1\\.4\\.803:=2147483648\\)`)\
+    \ or\n          re.regex($e.additional.fields.value, `\\(groupType:1\\.2\\.840\\.113556\\.1\\.4\\.803:=2147483656\\)`) or\n          re.regex($e.additional.fields.value,\
+    \ `\\(groupType:1\\.2\\.840\\.113556\\.1\\.4\\.803:=2147483652\\)`) or\n          re.regex($e.additional.fields.value, `\\(groupType:1\\.2\\\
+    .840\\.113556\\.1\\.4\\.803:=2147483650\\)`) or\n          re.regex($e.additional.fields.value, `\\(sAMAccountType=536870913\\)`) or\n   \
+    \       re.regex($e.additional.fields.value, `\\(sAMAccountType=536870912\\)`) or\n          re.regex($e.additional.fields.value, `\\(sAMAccountType=268435457\\\
+    )`) or\n          re.regex($e.additional.fields.value, `\\(sAMAccountType=268435456\\)`) or\n          re.regex($e.additional.fields.value,\
+    \ `\\(objectCategory=organizationalUnit\\)`) or\n          re.regex($e.additional.fields.value, `\\(objectCategory=group\\)`) or\n       \
+    \   re.regex($e.additional.fields.value, `\\(objectClass=group\\)`) or\n          re.regex($e.additional.fields.value, `\\(primaryGroupID=512\\\
+    )`) or\n          re.regex($e.additional.fields.value, `Domain Admins`)\n        ) and\n        not re.regex($e.additional.fields.value, `\\\
+    (domainSid=\\)`) and\n        not re.regex($e.additional.fields.value, `\\(objectSid=\\)`)\n      )\n    )\n    \n    // Must include nTSecurityDescriptor\
+    \ in query\n    re.regex($e.additional.fields.value, `nTSecurityDescriptor`)\n    \n    $e.principal.hostname = $host\n\n  match:\n    $host\
+    \ over 5m\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-m365_defender.event*
+    | WHERE event.category == "AdvancedHunting-DeviceEvents"
+      AND event.type == "LdapSearch"
+      AND event.tags != "[ ]"
+      AND microsoft_defender.event.scope != "Base"
+      AND (
+        microsoft_defender.event.additional_fields LIKE "*(adminCount=1)*"
+        OR (
+          (
+            microsoft_defender.event.additional_fields LIKE "*(groupType:1.2.840.113556.1.4.803:=2147483648)*"
+            OR microsoft_defender.event.additional_fields LIKE "*(groupType:1.2.840.113556.1.4.803:=2147483656)*"
+            OR microsoft_defender.event.additional_fields LIKE "*(groupType:1.2.840.113556.1.4.803:=2147483652)*"
+            OR microsoft_defender.event.additional_fields LIKE "*(groupType:1.2.840.113556.1.4.803:=2147483650)*"
+            OR microsoft_defender.event.additional_fields LIKE "*(sAMAccountType=536870913)*"
+            OR microsoft_defender.event.additional_fields LIKE "*(sAMAccountType=536870912)*"
+            OR microsoft_defender.event.additional_fields LIKE "*(sAMAccountType=268435457)*"
+            OR microsoft_defender.event.additional_fields LIKE "*(sAMAccountType=268435456)*"
+            OR microsoft_defender.event.additional_fields LIKE "*(objectCategory=organizationalUnit)*"
+            OR microsoft_defender.event.additional_fields LIKE "*(objectCategory=group)*"
+            OR microsoft_defender.event.additional_fields LIKE "*(objectClass=group)*"
+            OR microsoft_defender.event.additional_fields LIKE "*(primaryGroupID=512)*"
+            OR microsoft_defender.event.additional_fields LIKE "*Domain Admins*"
+          )
+          AND NOT microsoft_defender.event.additional_fields LIKE "*(domainSid=)*"
+          AND NOT microsoft_defender.event.additional_fields LIKE "*(objectSid=)*"
+        )
+      )
+      AND microsoft_defender.event.additional_fields LIKE "*nTSecurityDescriptor*"
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, microsoft_defender.event.additional_fields
+  leql: |
+    where(source_json.event_category="AdvancedHunting-DeviceEvents" AND source_json.event_type="LdapSearch" AND source_json.tags!="[ ]" AND source_json.scope!="Base" AND ((source_json.additional_fields ICONTAINS "(adminCount=1)") OR ((source_json.additional_fields ICONTAINS "(groupType:1.2.840.113556.1.4.803:=2147483648)" OR source_json.additional_fields ICONTAINS "(groupType:1.2.840.113556.1.4.803:=2147483656)" OR source_json.additional_fields ICONTAINS "(groupType:1.2.840.113556.1.4.803:=2147483652)" OR source_json.additional_fields ICONTAINS "(groupType:1.2.840.113556.1.4.803:=2147483650)" OR source_json.additional_fields ICONTAINS "(sAMAccountType=536870913)" OR source_json.additional_fields ICONTAINS "(sAMAccountType=536870912)" OR source_json.additional_fields ICONTAINS "(sAMAccountType=268435457)" OR source_json.additional_fields ICONTAINS "(sAMAccountType=268435456)" OR source_json.additional_fields ICONTAINS "(objectCategory=organizationalUnit)" OR source_json.additional_fields ICONTAINS "(objectCategory=group)" OR source_json.additional_fields ICONTAINS "(objectClass=group)" OR source_json.additional_fields ICONTAINS "(primaryGroupID=512)" OR source_json.additional_fields ICONTAINS "Domain Admins") AND NOT (source_json.additional_fields ICONTAINS "(domainSid=)" OR source_json.additional_fields ICONTAINS "(objectSid=)"))) AND source_json.additional_fields ICONTAINS "nTSecurityDescriptor")
+  crowdstrike: |
+    event_category="AdvancedHunting-DeviceEvents" event_type="LdapSearch" tags!=*"[ ]"* scope!="Base"
+    | test(match("*nTSecurityDescriptor*", field=additional_fields))
+    | test(match("*(adminCount=1)*", field=additional_fields) OR match("*(groupType:1.2.840.113556.1.4.803:=2147483648)*", field=additional_fields) OR match("*(groupType:1.2.840.113556.1.4.803:=2147483656)*", field=additional_fields) OR match("*(groupType:1.2.840.113556.1.4.803:=2147483652)*", field=additional_fields) OR match("*(groupType:1.2.840.113556.1.4.803:=2147483650)*", field=additional_fields) OR match("*(sAMAccountType=536870913)*", field=additional_fields) OR match("*(sAMAccountType=536870912)*", field=additional_fields) OR match("*(sAMAccountType=268435457)*", field=additional_fields) OR match("*(sAMAccountType=268435456)*", field=additional_fields) OR match("*(objectCategory=organizationalUnit)*", field=additional_fields) OR match("*(objectCategory=group)*", field=additional_fields) OR match("*(objectClass=group)*", field=additional_fields) OR match("*(primaryGroupID=512)*", field=additional_fields) OR match("*Domain Admins*", field=additional_fields))
+    | test(!match("*(domainSid=)*", field=additional_fields) AND !match("*(objectSid=)*", field=additional_fields))
+  xql: |
+    dataset = msft_defender_event
+    | filter event_type = "LdapSearch"
+    | filter action_evtlog_event_data_AdditionalFields != "[ ]"
+    | filter action_evtlog_event_data_Scope != "Base"
+    | filter (
+        action_evtlog_event_data_AdditionalFields contains "(adminCount=1)"
+        or (
+            (
+                action_evtlog_event_data_AdditionalFields contains "(groupType:1.2.840.113556.1.4.803:=2147483648)"
+                or action_evtlog_event_data_AdditionalFields contains "(groupType:1.2.840.113556.1.4.803:=2147483656)"
+                or action_evtlog_event_data_AdditionalFields contains "(groupType:1.2.840.113556.1.4.803:=2147483652)"
+                or action_evtlog_event_data_AdditionalFields contains "(groupType:1.2.840.113556.1.4.803:=2147483650)"
+                or action_evtlog_event_data_AdditionalFields contains "(sAMAccountType=536870913)"
+                or action_evtlog_event_data_AdditionalFields contains "(sAMAccountType=536870912)"
+                or action_evtlog_event_data_AdditionalFields contains "(sAMAccountType=268435457)"
+                or action_evtlog_event_data_AdditionalFields contains "(sAMAccountType=268435456)"
+                or action_evtlog_event_data_AdditionalFields contains "(objectCategory=organizationalUnit)"
+                or action_evtlog_event_data_AdditionalFields contains "(objectCategory=group)"
+                or action_evtlog_event_data_AdditionalFields contains "(objectClass=group)"
+                or action_evtlog_event_data_AdditionalFields contains "(primaryGroupID=512)"
+                or action_evtlog_event_data_AdditionalFields contains "Domain Admins"
+            )
+            and action_evtlog_event_data_AdditionalFields !contains "(domainSid=)"
+            and action_evtlog_event_data_AdditionalFields !contains "(objectSid=)"
+        )
+    )
+    | filter action_evtlog_event_data_AdditionalFields contains "nTSecurityDescriptor"
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_data_AdditionalFields, action_evtlog_event_data_Scope
+  lucene: |
+    event_category:"AdvancedHunting-DeviceEvents" AND event_type:"LdapSearch" AND _exists_:tags AND NOT tags:"[ ]" AND NOT scope:"Base" AND (additional_fields:*\(adminCount\=1\)* OR (additional_fields:(*\(groupType\:1.2.840.113556.1.4.803\:\=2147483648\)* OR *\(groupType\:1.2.840.113556.1.4.803\:\=2147483656\)* OR *\(groupType\:1.2.840.113556.1.4.803\:\=2147483652\)* OR *\(groupType\:1.2.840.113556.1.4.803\:\=2147483650\)* OR *\(sAMAccountType\=536870913\)* OR *\(sAMAccountType\=536870912\)* OR *\(sAMAccountType\=268435457\)* OR *\(sAMAccountType\=268435456\)* OR *\(objectCategory\=organizationalUnit\)* OR *\(objectCategory\=group\)* OR *\(objectClass\=group\)* OR *\(primaryGroupID\=512\)* OR *Domain\ Admins*) AND NOT additional_fields:*\(domainSid\=\)* AND NOT additional_fields:*\(objectSid\=\)*)) AND additional_fields:*nTSecurityDescriptor*
+  sumo: |
+    _sourceCategory=*Defender* OR _sourceCategory=*AdvancedHunting* "LdapSearch"
+    | json field=_raw "ActionType" as event_type
+    | json field=_raw "AdditionalFields" as additional_fields
+    | json field=_raw "Tags" as tags
+    | json field=_raw "Scope" as scope
+    | where event_type = "LdapSearch"
+    | where tags != "[ ]"
+    | where scope != "Base"
+    | where (additional_fields matches "*(adminCount=1)*" OR (additional_fields matches "*(groupType:1.2.840.113556.1.4.803:=2147483648)*" OR additional_fields matches "*(groupType:1.2.840.113556.1.4.803:=2147483656)*" OR additional_fields matches "*(groupType:1.2.840.113556.1.4.803:=2147483652)*" OR additional_fields matches "*(groupType:1.2.840.113556.1.4.803:=2147483650)*" OR additional_fields matches "*(sAMAccountType=536870913)*" OR additional_fields matches "*(sAMAccountType=536870912)*" OR additional_fields matches "*(sAMAccountType=268435457)*" OR additional_fields matches "*(sAMAccountType=268435456)*" OR additional_fields matches "*(objectCategory=organizationalUnit)*" OR additional_fields matches "*(objectCategory=group)*" OR additional_fields matches "*(objectClass=group)*" OR additional_fields matches "*(primaryGroupID=512)*" OR additional_fields matches "*Domain Admins*"))
+    | where !(additional_fields matches "*(domainSid=)*") AND !(additional_fields matches "*(objectSid=)*")
+    | where additional_fields matches "*nTSecurityDescriptor*"
+    | fields _messageTime, event_type, additional_fields, tags, scope
 false_positives:
 - Security software
 - Authorized admin tools
@@ -100,7 +182,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 AdvancedHunting Device Event\nWhere event_category = \"AdvancedHunting-DeviceEvents\"\nWhere event_type = \"LdapSearch\"\nWhere\
   \ tags != \"[ ]\"\nWhere scope!= \"Base\"\n\nWhere (\n    additional_fields contains \"(adminCount=1)\"\n    OR\n    (\n        Where additional_fields\

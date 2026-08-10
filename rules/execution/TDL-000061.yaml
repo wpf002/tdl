@@ -16,77 +16,81 @@ lifecycle: Proposed
 risk_score: 55
 queries:
   spl: "index=proxy action=blocked \n| bin _time span=5m \n| stats count by _time, src_ip, url \n| where count >= 10\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(5m)
+    | where DeviceVendor has "Proxy" or DeviceProduct has "Proxy" or DeviceEventClassID has "Proxy"
+    | where DeviceAction =~ "Blocked" or DeviceAction =~ "Deny" or DeviceAction =~ "Block"
+    | summarize EventCount = count() by bin(TimeGenerated, 5m), SourceIP, RequestURL
+    | where EventCount >= 10
+    | project TimeGenerated, SourceIP, RequestURL, EventCount
+  aql: |
+    SELECT sourceip, URL, COUNT(*) AS blocked_attempts
+    FROM events
+    WHERE categoryname(category) ILIKE '%proxy%'
+      AND (qidname(qid) ILIKE '%block%' OR qidname(qid) ILIKE '%denied%')
+    GROUP BY sourceip, URL
+    HAVING blocked_attempts >= 10
+    LAST 5 MINUTES
+  yara_l: |
+    rule blocked_proxy_requests_same_url {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects 10 or more blocked forward proxy requests to the same URL from the same source IP within 5 minutes"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.security_result.action = "BLOCK"
+        $e.principal.ip = $src_ip
+        $e.target.url = $url
 
-    | where network.protocol matches regex "tcp"
+      match:
+        $src_ip, $url over 5m
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exe_000061 {\n  meta:\n    author = \"TDL\"\n    description = \"Mass URL Blocked - Same Source\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 10
+    }
+  esql: |
+    FROM logs-network.proxy*
+    | WHERE @timestamp > NOW() - 5 minutes AND event.action == "blocked"
+    | STATS count = COUNT(*) BY source.ip, url.full, time_window = BUCKET(@timestamp, 5 minutes)
+    | WHERE count >= 10
+    | KEEP source.ip, url.full, count, time_window
+  leql: |
+    where(action=BLOCKED) groupby(source_address, url) calculate(count)
+  crowdstrike: |
+    #type=forward_proxy action=blocked
+    | bucket(span=5m)
+    | groupBy([_bucket, source_ip, url], function=count(as=event_count))
+    | event_count >= 10
+    | table([_bucket, source_ip, url, event_count])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action = "deny" or action = "drop" or action = "block-url" or action = "block"
+    | bin _time span=5m
+    | comp count() as event_count by _time, src_ip, url_name
+    | filter event_count >= 10
+    | fields _time, src_ip, url_name, event_count
+  lucene: |
+    _exists_:source.ip AND _exists_:url AND action:blocked
+  sumo: |
+    _sourceCategory=*Forward*Proxy* OR _sourceCategory=*Proxy* action=blocked OR Action=blocked OR status=blocked
+    | json field=_raw "Action" as action_field
+    | json field=_raw "SourceIP" as source_ip_field
+    | json field=_raw "URL" as url_field
+    | json field=_raw "src_ip" as src_ip_alt
+    | json field=_raw "url" as url_alt
+    | json field=_raw "destination" as dest_alt
+    | where (action_field matches "*block*" OR action_field matches "*denied*" OR action_field matches "*Block*" OR action_field matches "*Denied*")
+    | if(isNull(source_ip_field), src_ip_alt, source_ip_field) as src_ip
+    | if(isNull(url_field), if(isNull(url_alt), dest_alt, url_alt), url_field) as url
+    | timeslice 5m
+    | count as event_count by _timeslice, src_ip, url
+    | where event_count >= 10
+    | fields _timeslice, src_ip, url, event_count
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -96,7 +100,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '10 Forward Proxy Events
 

@@ -19,78 +19,116 @@ queries:
     \    (src_ip!=10.* OR src_ip=10.*) (dest_ip!=10.* AND dest_ip!=172.16.* AND dest_ip!=192.168.*)\n    bytes_out>5242880\n    NOT [| inputlookup\
     \ high_value_targets.csv | fields src_ip]\n) OR\n(index=dlp event_name=\"*exfiltration*\")\n| table _time, src_ip, dest_ip, dest_port, app,\
     \ bytes_out, event_name, action\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  kql: "let HighValueTargets = dynamic([]); // Replace with actual high-value target IPs\nlet ExfilPorts = dynamic([20, 21, 22, 23, 69, 115, 989,\
+    \ 990]);\nlet ExfilApps = dynamic([\"ftp\", \"ssh\", \"telnet\", \"tftp\", \"sftp\", \"ftps\"]);\nlet FirewallExfil = \n    CommonSecurityLog\n\
+    \    | where TimeGenerated > ago(1h)\n    | where DeviceVendor has \"Firewall\" or DeviceProduct has \"Firewall\"\n    | where DeviceDirection\
+    \ =~ \"Outbound\" or CommunicationDirection =~ \"Outbound\"\n    | where isnotempty(SourceIP) and isnotempty(DestinationIP)\n    | where not(ipv4_is_private(DestinationIP))\n\
+    \    | where ipv4_is_private(SourceIP)\n    | where (DestinationPort in (ExfilPorts) or ApplicationProtocol in (ExfilApps))\n    | where SentBytes\
+    \ > 5242880\n    | where SourceIP !in (HighValueTargets)\n    | project TimeGenerated, SourceIP, DestinationIP, DestinationPort, ApplicationProtocol,\
+    \ SentBytes, DeviceVendor, DeviceProduct, DeviceAction, Activity;\nlet DLPExfil = \n    CommonSecurityLog\n    | where TimeGenerated > ago(1h)\n\
+    \    | where Activity has \"exfiltration\" or DeviceEventCategory has \"exfiltration\" or Message has \"exfiltration\"\n    | project TimeGenerated,\
+    \ SourceIP, DestinationIP, Activity, DeviceEventCategory, Message, DeviceVendor, DeviceProduct;\nunion FirewallExfil, DLPExfil\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, QIDNAME(qid) AS event_name, SUM(bytesout) AS total_bytes_out, COUNT(*) AS event_count
+    FROM events
+    WHERE (destinationport IN (20, 21, 22, 23, 69, 115, 989, 990) OR QIDNAME(qid) ILIKE '%ftp%' OR QIDNAME(qid) ILIKE '%ssh%' OR QIDNAME(qid) ILIKE '%telnet%' OR QIDNAME(qid) ILIKE '%tftp%' OR QIDNAME(qid) ILIKE '%sftp%' OR QIDNAME(qid) ILIKE '%ftps%' OR QIDNAME(qid) ILIKE '%exfiltration%')
+    AND INOFFENSE(sourceip) = FALSE
+    GROUP BY sourceip, destinationip, destinationport, QIDNAME(qid)
+    HAVING total_bytes_out > 5242880
+    LAST 24 HOURS
+  yara_l: |
+    rule data_exfiltration_over_legacy_protocols {
+      meta:
+        author = "TDL"
+        description = "Detects potential data exfiltration over legacy file transfer protocols or via DLP alerts"
+        mitre_attack_tactic = "Exfiltration"
+        mitre_attack_technique = "T1030"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        // Firewall outbound traffic over legacy protocols with high data transfer
+        (
+          $firewall.metadata.event_type = "NETWORK_CONNECTION"
+          $firewall.network.direction = "OUTBOUND"
+          (
+            $firewall.target.port in [20, 21, 22, 23, 69, 115, 989, 990] or
+            re.regex($firewall.network.application_protocol, `(?i)(ftp|ssh|telnet|tftp|sftp|ftps)`)
+          )
+          $firewall.network.sent_bytes > 5242880
+          not re.regex($firewall.principal.ip, `^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)`) = false
+          $firewall.principal.ip = $src_ip
+          $firewall.target.ip = $dst_ip
+        ) or
+        // DLP exfiltration event
+        (
+          $dlp.metadata.event_type = "GENERIC_EVENT"
+          re.regex($dlp.metadata.product_event_type, `(?i)exfiltration`)
+          $dlp.principal.ip = $src_ip
+        )
 
-    | where destination_port in ("20", "21", "22", "23", "69", "115", "989", "990")
+      match:
+        $src_ip over 5m
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+      outcome:
+        $risk_score = max(85)
+        $bytes_out = max($firewall.network.sent_bytes)
+        $destination_ip = array_distinct($dst_ip)
+        $protocols = array_distinct($firewall.network.application_protocol)
 
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "destination_port" IN (''20'', ''21'', ''22'', ''23'', ''69'', ''115'', ''989'', ''990'')
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exf_000053 {\n  meta:\n    author = \"TDL\"\n    description = \"Potential Data Exfiltration\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0010\"\n    technique = \"T1030\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.destination_port\
-    \ = /(20|21|22|23|69|115|989|990)/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND destination_port IN ("20", "21", "22", "23", "69", "115", "989", "990")
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND destination_port IN [20, 21, 22, 23, 69, 115, 989, 990])
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND destination_port IN (20, 21, 22, 23, 69, 115, 989,
-    990)
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND destination_port in ("20", "21", "22", "23", "69", "115", "989", "990")
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND destination_port:(20 OR 21 OR 22 OR 23 OR 69 OR 115 OR 989 OR 990)
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where destination_port IN ("20", "21", "22", "23", "69", "115", "989", "990")
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $firewall or $dlp
+    }
+  esql: |
+    FROM logs-network.firewall*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND network.direction == "outbound"
+      AND (
+        destination.port IN (20, 21, 22, 23, 69, 115, 989, 990)
+        OR TO_LOWER(network.application) IN ("ftp", "ssh", "telnet", "tftp", "sftp", "ftps")
+      )
+      AND destination.bytes > 5242880
+      AND NOT CIDR_MATCH(source.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    | STATS total_bytes = SUM(destination.bytes), connections = COUNT(*) BY source.ip, destination.ip, destination.port, network.application
+    | KEEP source.ip, destination.ip, destination.port, network.application, total_bytes, connections
+  leql: |
+    where((direction=OUTBOUND AND (destination_port IN [20, 21, 22, 23, 69, 115, 989, 990] OR application IN [ftp, ssh, telnet, tftp, sftp, ftps]) AND bytes_out > 5242880) OR (event_name ICONTAINS "exfiltration")) AND source_address != /High Value Target/
+  crowdstrike: |
+    (#type=firewall OR event_simpleName=*Firewall* OR event_simpleName=*NetworkConnect*)
+    (
+      (DestinationPort IN [20, 21, 22, 23, 69, 115, 989, 990])
+      OR (Application IN [ftp, ssh, telnet, tftp, sftp, ftps])
+    )
+    | eval bytes_out_mb = BytesOut / 1048576
+    | bytes_out_mb > 5
+    | !match(file="high_value_targets.csv", field=SourceIP, include=[SourceIP], strict=false)
+    | table([@timestamp, SourceIP, DestinationIP, DestinationPort, Application, BytesOut, bytes_out_mb])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_source_translated_ip != null and action_destination_translated_ip != null
+    | filter direction_of_traffic = "Outbound"
+    | filter (action_destination_port in (20, 21, 22, 23, 69, 115, 989, 990) or lowercase(app) in ("ftp", "ssh", "telnet", "tftp", "sftp", "ftps"))
+    | alter bytes_out_mb = to_number(action_upload_bytes) / 1048576
+    | filter bytes_out_mb > 5
+    | filter action_source_ip not in (<high_value_target_list>)
+    | fields _time, action_source_ip, action_destination_ip, action_destination_port, app, bytes_out_mb, agent_hostname
+  lucene: |
+    (event_type:firewall AND direction:outbound AND bytes_out:>5242880 AND destination.ip:(NOT 10.0.0.0/8 AND NOT 172.16.0.0/12 AND NOT 192.168.0.0/16) AND (destination.port:(20 OR 21 OR 22 OR 23 OR 69 OR 115 OR 989 OR 990) OR application:(ftp OR ssh OR telnet OR tftp OR sftp OR ftps)) AND NOT source.ip:(high_value_target_list)) OR (event_type:dlp AND event_name:*exfiltration*)
+  sumo: |
+    _sourceCategory=*Firewall* OR _sourceCategory=*DLP*
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "application" as application
+    | json field=_raw "bytes_out" as bytes_out
+    | json field=_raw "direction" as direction
+    | json field=_raw "event_name" as event_name
+    | where (
+        (direction = "outbound" AND (dest_port in ("20", "21", "22", "23", "69", "115", "989", "990") OR application in ("ftp", "ssh", "telnet", "tftp", "sftp", "ftps")) AND num(bytes_out) > 5242880 AND NOT (src_ip in ("10.0.0.100", "10.0.0.200")))
+        OR
+        (event_name matches "*exfiltration*")
+    )
+    | fields _messageTime, src_ip, dest_ip, dest_port, application, bytes_out, event_name, event_type
 false_positives:
 - It is best practice to use specific hosts for these file transfers which can be whitelisted from triggering the alarm.
 tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
@@ -99,7 +137,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Firewall Event\nFrom one internal source to one external destination (Outbound)\nOR\n\tWhere the Destination Port is in [20,\
   \ 21, 22, 23, 69, 115, 989, 990]\n\tWhere the Application is in [ftp, ssh, telnet, tftp, sftp, ftps]\n\t\nWhere the Bytes Out is greater than\

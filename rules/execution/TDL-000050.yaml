@@ -19,71 +19,79 @@ queries:
   spl: "index=* sourcetype IN (antivirus, av, symantec:*, mcafee:*, trendmicro:*, carbonblack:*, crowdstrike:*) \n(Signature=*ransom* OR Signature=*lock*\
     \ OR Signature=*crypt*) \nNOT (Signature=*block* OR Signature=*currency* OR Signature=*cryptonight*)\n| table _time, host, Signature, File_Name,\
     \ File_Path, User, Action\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceVendor has "antivirus" or DeviceProduct has "antivirus" or DeviceEventClassID in ("alert", "malware", "threat")
+    | where Activity has_any ("detected", "blocked", "prevented", "found")
+    | extend SignatureLower = tolower(DeviceCustomString2)
+    | where SignatureLower has_any ("ransom", "lock", "crypt")
+    | where SignatureLower !has_any ("block", "currency", "cryptonight")
+    | project TimeGenerated, DeviceVendor, DeviceProduct, Activity, Signature = DeviceCustomString2, FileName = FileName, FilePath = FilePath, SourceIP, DestinationIP, DeviceName = Computer
+  aql: |
+    SELECT sourceip, destinationip, username, LOGSOURCENAME(logsourceid) AS host, qidname(qid) AS signature, eventtime
+    FROM events
+    WHERE CATEGORYNAME(category) ILIKE '%malware%'
+      AND (qidname(qid) ILIKE '%ransom%' OR qidname(qid) ILIKE '%lock%' OR qidname(qid) ILIKE '%crypt%')
+      AND qidname(qid) NOT ILIKE '%block%'
+      AND qidname(qid) NOT ILIKE '%currency%'
+      AND qidname(qid) NOT ILIKE '%cryptonight%'
+    LAST 24 HOURS
+  yara_l: |
+    rule ransomware_malware_detection {
+      meta:
+        author = "TDL"
+        description = "Detects antivirus signatures indicating ransomware activity based on T1486 Impact - Data Encrypted for Impact"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1486"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "SCAN_UNCATEGORIZED"
+        $e.metadata.product_log_id = "ANTIVIRUS"
+        (
+          re.regex($e.security_result.description, `(?i)ransom`) or
+          re.regex($e.security_result.description, `(?i)lock`) or
+          re.regex($e.security_result.description, `(?i)crypt`)
+        )
+        not re.regex($e.security_result.description, `(?i)block`)
+        not re.regex($e.security_result.description, `(?i)currency`)
+        not re.regex($e.security_result.description, `(?i)cryptonight`)
+        $e.principal.hostname = $host
 
-    | where process_name matches regex ".+"
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      outcome:
+        $risk_score = 85
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000050 {\n  meta:\n    author = \"TDL\"\n    description = \"Ransomware AV Detection\"\n    severity = \"CRITICAL\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1486\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-endpoint.alerts*, .alerts-security.alerts-*\n| WHERE event.category == \"malware\" \n  AND (\n    TO_LOWER(threat.indicator.description)\
+    \ LIKE \"*ransom*\" \n    OR TO_LOWER(threat.indicator.description) LIKE \"*lock*\" \n    OR TO_LOWER(threat.indicator.description) LIKE \"\
+    *crypt*\"\n  )\n  AND NOT (\n    TO_LOWER(threat.indicator.description) LIKE \"*block*\" \n    OR TO_LOWER(threat.indicator.description) LIKE\
+    \ \"*currency*\" \n    OR TO_LOWER(threat.indicator.description) LIKE \"*cryptonight*\"\n  )\n| KEEP @timestamp, host.name, user.name, threat.indicator.description,\
+    \ file.path, process.name, process.executable\n"
+  leql: |
+    where(source_json.Signature ICONTAINS "ransom" OR source_json.Signature ICONTAINS "lock" OR source_json.Signature ICONTAINS "crypt") AND NOT (source_json.Signature ICONTAINS "block" OR source_json.Signature ICONTAINS "currency" OR source_json.Signature ICONTAINS "cryptonight")
+  crowdstrike: "event_simpleName=DetectionSummaryEvent \n(Technique=*T1486* OR PatternDispositionDescription=*ransom* OR PatternDispositionDescription=*lock*\
+    \ OR PatternDispositionDescription=*crypt*)\n(PatternDispositionDescription!=*block* AND PatternDispositionDescription!=*currency* AND PatternDispositionDescription!=*cryptonight*)\n\
+    | table([@timestamp, ComputerName, UserName, FileName, PatternDispositionDescription, DetectDescription, SHA256HashData])\n"
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_ANTI_MALWARE and event_sub_type = ENUM.EVENT_SUB_TYPE_MALWARE_DETECTED
+    | filter (lowercase(action_evtlog_message) contains "ransom" or lowercase(action_evtlog_message) contains "lock" or lowercase(action_evtlog_message) contains "crypt")
+    | filter not (lowercase(action_evtlog_message) contains "block" or lowercase(action_evtlog_message) contains "currency" or lowercase(action_evtlog_message) contains "cryptonight")
+    | fields _time, agent_hostname, action_evtlog_message, actor_effective_username, action_file_path
+  lucene: |
+    signature:(*ransom* OR *lock* OR *crypt*) AND NOT signature:(*block* OR *currency* OR *cryptonight*)
+  sumo: |
+    _sourceCategory=*Antivirus* OR _sourceCategory=*AV* OR _sourceCategory=*Malware*
+    | parse regex field=_raw "(?i)(?:signature|malware|threat)[\s\"\:]+(?<signature>[^\"\,\n]+)"
+    | where signature matches /(?i).*(ransom|lock|crypt).*/
+    | where !(signature matches /(?i).*(block|currency|cryptonight).*/)
+    | fields _messageTime, _sourceHost, signature
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +101,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Malware Detection Event
 

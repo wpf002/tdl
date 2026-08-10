@@ -33,68 +33,133 @@ queries:
     \ OR match(actions, \"(?i)(query|read|access)\"))\n| eval host=coalesce(host, ComputerName), process_id=coalesce(process_id, pid, ProcessId),\
     \ process=coalesce(process_names, images)\n| table _time, host, process_id, process, parent_process_id, parent_process, ParentImage, duration,\
     \ registry_paths, target_objects, command_lines, cmd_line, file_paths, event_codes\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: "DeviceProcessEvents\n| where TimeGenerated > ago(24h)\n| where ProcessCommandLine has_any (\"SYSTEM\\\\HardwareConfig\", \"Win32_BIOS\"\
+    , \"Win32_ComputerSystem\", \"Manufacturer\", \"VBOX\", \"VMware\", \"VirtualBox\", \"vmtools\")\n    or InitiatingProcessCommandLine has_any\
+    \ (\"SYSTEM\\\\HardwareConfig\", \"Win32_BIOS\", \"Win32_ComputerSystem\", \"Manufacturer\", \"VBOX\", \"VMware\", \"VirtualBox\", \"vmtools\"\
+    )\n| extend ProcessDuration = datetime_diff('second', Timestamp, todatetime(ProcessCreationTime))\n| where ProcessDuration <= 5\n| join kind=inner\
+    \ (\n    union DeviceRegistryEvents, DeviceEvents\n    | where TimeGenerated > ago(24h)\n    | where RegistryKey has \"SYSTEM\\\\HardwareConfig\"\
+    \ \n        or ActionType in (\"RegistryValueRead\", \"RegistryKeyOpened\")\n        or AdditionalFields has_any (\"VBOX\", \"VMware\", \"\
+    VirtualBox\")\n    | project DeviceId, DeviceName, Timestamp, ActionType, RegistryKey, InitiatingProcessFileName, InitiatingProcessCommandLine\n\
+    ) on DeviceId\n| where datetime_diff('second', Timestamp, Timestamp1) between (-5 .. 5)\n| project TimeGenerated, DeviceName, AccountName,\
+    \ FileName, ProcessCommandLine, InitiatingProcessFileName, ProcessDuration, ActionType, RegistryKey\n| distinct TimeGenerated, DeviceName,\
+    \ AccountName, FileName, ProcessCommandLine\n"
+  aql: |
+    SELECT "Process Name", "Process CommandLine", username, sourceip, LOGSOURCENAME(logsourceid) AS host, eventtime, "Target Object", "Image"
+    FROM events
+    WHERE (
+      ("Target Object" ILIKE '%HKLM\SYSTEM\HardwareConfig\%' AND ("EventID" = '12' OR "EventID" = '13'))
+      OR ("Process CommandLine" ILIKE '%Win32_BIOS%' OR "Process CommandLine" ILIKE '%Win32_ComputerSystem%' OR "Process CommandLine" ILIKE '%Manufacturer%')
+      OR ("Process CommandLine" ILIKE '%vbox%' OR "Process CommandLine" ILIKE '%vmware%' OR "Process CommandLine" ILIKE '%virtualbox%')
+      OR ("Target Object" ILIKE '%vbox%' OR "Target Object" ILIKE '%vmware%')
+    )
+    AND "Process Name" NOT ILIKE '%svchost.exe%'
+    AND "Process Name" NOT ILIKE '%explorer.exe%'
+    LAST 5 MINUTES
+  yara_l: |
+    rule virtualization_check_with_quick_exit {
+      meta:
+        author = "TDL"
+        description = "Detects T1497 - Process reads hardware/BIOS info or checks for VM artifacts then exits within 5 seconds"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1497"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        // Registry read of BIOS/hardware config
+        ($reg.metadata.event_type = "REGISTRY_OPEN" or $reg.metadata.event_type = "REGISTRY_QUERY")
+        re.regex($reg.target.registry.registry_key, `(?i)HKLM\\SYSTEM\\HardwareConfig\\`)
+        $reg.principal.process.pid = $pid
+        $reg.principal.hostname = $host
+        $reg.metadata.event_timestamp.seconds = $reg_time
 
-    | where eventName matches regex ".+"
+        // Or WMI query for BIOS/Manufacturer info
+        or (
+          $wmi.metadata.event_type = "PROCESS_LAUNCH"
+          re.regex($wmi.principal.process.command_line, `(?i)(Win32_BIOS|Win32_ComputerSystem|Win32_BaseBoard)`)
+          $wmi.principal.process.pid = $pid
+          $wmi.principal.hostname = $host
+          $wmi.metadata.event_timestamp.seconds = $wmi_time
+        )
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+        // Or file access to VMware/VirtualBox drivers
+        or (
+          ($file.metadata.event_type = "FILE_OPEN" or $file.metadata.event_type = "FILE_READ")
+          re.regex($file.target.file.full_path, `(?i)(vbox|vmware|vmmouse|vmhgfs)`)
+          $file.principal.process.pid = $pid
+          $file.principal.hostname = $host
+          $file.metadata.event_timestamp.seconds = $file_time
+        )
 
-    | order by Count desc
+        // Process termination within 5 seconds
+        $exit.metadata.event_type = "PROCESS_TERMINATION"
+        $exit.principal.process.pid = $pid
+        $exit.principal.hostname = $host
+        $exit.metadata.event_timestamp.seconds = $exit_time
 
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000744 {\n  meta:\n    author = \"TDL\"\n    description = \"Process Reads VM/Sandbox Indicators Then Exits Quickly\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1497\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+      match:
+        $host, $pid over 5s
 
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        ($reg or $wmi or $file) and $exit and (
+          ($reg and ($exit_time - $reg_time <= 5)) or
+          ($wmi and ($exit_time - $wmi_time <= 5)) or
+          ($file and ($exit_time - $file_time <= 5))
+        )
+    }
+  esql: |
+    FROM logs-endpoint.events.*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (event.category == "registry" AND registry.path LIKE "*HKLM\\SYSTEM\\HardwareConfig\\*")
+        OR (event.category == "process" AND (
+          process.command_line LIKE "*Win32_BIOS*"
+          OR process.command_line LIKE "*Win32_ComputerSystem*"
+          OR process.command_line LIKE "*Manufacturer*"
+          OR process.command_line LIKE "*VBOX*"
+          OR process.command_line LIKE "*VMware*"
+          OR process.command_line LIKE "*VirtualBox*"
+        ))
+      )
+    | EVAL detection_time = @timestamp
+    | STATS first_event = MIN(@timestamp), last_event = MAX(@timestamp), event_count = COUNT(*) BY process.entity_id, process.executable, host.name, user.name
+    | EVAL duration_seconds = (last_event - first_event) / 1000
+    | WHERE duration_seconds <= 5 OR event_count == 1
+    | KEEP host.name, user.name, process.executable, process.entity_id, first_event, last_event, duration_seconds, event_count
+  leql: |
+    where((source_json.TargetObject ICONTAINS "HKLM\\SYSTEM\\HardwareConfig" OR source_json.QueryResults ICONTAINS "Win32_BIOS" OR source_json.QueryResults ICONTAINS "Manufacturer" OR source_json.ImageLoaded ICONTAINS "vbox" OR source_json.ImageLoaded ICONTAINS "vmware" OR process_cmd_line ICONTAINS "Win32_BIOS" OR process_cmd_line ICONTAINS "Win32_ComputerSystem") AND source_json.EventID IN [1, 12, 13, 7, 3]) groupby(process_name, asset, source_json.ParentImage) calculate(count)
+  crowdstrike: |
+    event_simpleName IN [ProcessRollup2, RegQueryValueIpV4, RegistryQueryValue, WmiGetInstanceIpV4, AsepValueUpdate, FileOpenInfo]
+    (
+      (RegObjectName=*\\SYSTEM\\HardwareConfig\\* OR RegObjectName=*\\HARDWARE\\DESCRIPTION\\System\\BIOS*)
+      OR (WmiNameSpace=*root\\cimv2* AND (WmiClassName=Win32_BIOS OR WmiClassName=Win32_ComputerSystem) AND (WmiQueryString=*Manufacturer* OR WmiQueryString=*SerialNumber* OR WmiQueryString=*Version*))
+      OR (FileName IN [*vbox*, *vmware*, *VBox*, *VMware*, *vmtools*, *vmmouse*, *vmhgfs*])
+      OR (CommandLine=*vbox* OR CommandLine=*vmware* OR CommandLine=*qemu* OR CommandLine=*virtualbox* OR CommandLine=*VM*)
+    )
+    | selfJoinFilter([ContextProcessId], where=[{event_simpleName=EndOfProcess}], prefilter=true, window=5s)
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName, ContextProcessId, RegObjectName, WmiClassName])
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_PROCESS\n| alter has_vm_indicator = \n    (action_registry_key_name ~= \".*HKLM\\\
+    \\\\\\SYSTEM\\\\\\\\HardwareConfig.*\" \n     or action_process_image_command_line ~= \".*Win32_BIOS.*\"\n     or action_process_image_command_line\
+    \ ~= \".*Manufacturer.*\"\n     or action_process_image_command_line ~= \".*(VBOX|VMware).*\")\n| filter has_vm_indicator = true\n| comp min(_time)\
+    \ as start_time, max(_time) as end_time by action_process_causality_id, agent_hostname, action_process_image_name, actor_effective_username\n\
+    | alter time_diff_seconds = to_integer((end_time - start_time) / 1000)\n| filter time_diff_seconds <= 5\n| fields agent_hostname, action_process_image_name,\
+    \ actor_effective_username, start_time, end_time, time_diff_seconds, action_process_causality_id\n"
+  lucene: |
+    (registry.path:*\\SYSTEM\\HardwareConfig\\* OR (process.command_line:*Win32_BIOS* OR process.command_line:*Manufacturer* OR process.command_line:*wmic* AND process.command_line:*bios*) OR (process.command_line:*vbox* OR process.command_line:*vmware* OR process.command_line:*VBoxGuest* OR process.command_line:*vmtoolsd* OR file.path:*VBox* OR file.path:*VMware*)) AND process.duration:[0 TO 5000]
+  sumo: "_sourceCategory=*EDR* OR _sourceCategory=*Windows* OR _sourceCategory=*Sysmon*\n| json field=_raw \"EventID\" as event_id\n| json field=_raw\
+    \ \"ProcessId\" as process_id\n| json field=_raw \"Image\" as image\n| json field=_raw \"TargetObject\" as target_object\n| json field=_raw\
+    \ \"QueryName\" as query_name\n| json field=_raw \"ImageLoaded\" as image_loaded\n| json field=_raw \"Computer\" as computer\n| json field=_raw\
+    \ \"UtcTime\" as utc_time\n| where (event_id = \"13\" and target_object matches \"*HKLM\\\\SYSTEM\\\\HardwareConfig\\\\*\") \n   OR (event_id\
+    \ = \"13\" and target_object matches \"*HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\VBoxGuest*\")\n   OR (event_id = \"13\" and target_object\
+    \ matches \"*HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\VBoxMouse*\")\n   OR (event_id = \"13\" and target_object matches \"*HKLM\\\
+    \\SYSTEM\\\\CurrentControlSet\\\\Services\\\\VBoxSF*\")\n   OR (event_id = \"13\" and target_object matches \"*HKLM\\\\SYSTEM\\\\CurrentControlSet\\\
+    \\Services\\\\vmci*\")\n   OR (event_id = \"13\" and target_object matches \"*HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\vmmouse*\"\
+    )\n   OR (event_id = \"13\" and target_object matches \"*HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\VBoxVideo*\")\n   OR (event_id\
+    \ = \"19\" and query_name matches \"*Win32_BIOS*\")\n   OR (event_id = \"19\" and query_name matches \"*Win32_ComputerSystem*\")\n   OR (event_id\
+    \ = \"7\" and (image_loaded matches \"*vboxguest*\" OR image_loaded matches \"*vmware*\" OR image_loaded matches \"*vmmouse*\"))\n| parse\
+    \ field=utc_time \"*T*.*Z\" as date, time, ms\n| concat(date, \"T\", time, \"Z\") as timestamp\n| parseDate(timestamp, \"yyyy-MM-dd'T'HH:mm:ss'Z'\"\
+    ) as event_time_ms\n| fields event_time_ms, process_id, image, computer, event_id, target_object, query_name, image_loaded\n| sort by process_id,\
+    \ event_time_ms\n| first(event_time_ms) as first_event, last(event_time_ms) as last_event by process_id, image, computer\n| where (last_event\
+    \ - first_event) <= 5000\n| fields computer, image, process_id, first_event, last_event\n"
 pseudo_logic: Process reads HKLM\SYSTEM\HardwareConfig\* (BIOS strings), checks WMI Win32_BIOS / Manufacturer, or scans for VBOX/VMware drivers
   and exits within 5s.
 false_positives:
@@ -112,7 +177,7 @@ references:
 - https://attack.mitre.org/techniques/T1497/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

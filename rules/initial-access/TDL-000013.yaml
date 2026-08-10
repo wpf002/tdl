@@ -18,77 +18,191 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=624 OR EventCode=4720 OR EventCode=626 OR EventCode=4722 OR EventCode=632 OR EventCode=4728 OR EventCode=636 OR EventCode=4732 OR EventCode=660 OR EventCode=4756)
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=624 OR EventCode=4720 OR EventCode=626 OR EventCode=4722 OR EventCode=632
+    OR EventCode=4728 OR EventCode=636 OR EventCode=4732 OR EventCode=660 OR EventCode=4756)
+
     NOT (TargetDomainName IN ("corp.company.com", "company.local", "company.com"))
+
     NOT (Group_Domain IN ("corp.company.com", "company.local", "company.com"))
-    | transaction TargetUserName maxspan=5m startswith=(EventCode=624 OR EventCode=4720 OR EventCode=626 OR EventCode=4722) endswith=(EventCode=632 OR EventCode=4728 OR EventCode=636 OR EventCode=4732 OR EventCode=660 OR EventCode=4756 OR Group_Name="Administrator" OR Group_Name IN ("Administrators", "Domain Admins", "Enterprise Admins", "Backup Operators", "Account Operators"))
+
+    | transaction TargetUserName maxspan=5m startswith=(EventCode=624 OR EventCode=4720 OR EventCode=626 OR EventCode=4722) endswith=(EventCode=632
+    OR EventCode=4728 OR EventCode=636 OR EventCode=4732 OR EventCode=660 OR EventCode=4756 OR Group_Name="Administrator" OR Group_Name IN ("Administrators",
+    "Domain Admins", "Enterprise Admins", "Backup Operators", "Account Operators"))
+
     | where eventcount >= 2
+
     | table _time, ComputerName, TargetUserName, TargetDomainName, Group_Name, Group_Domain, EventCode
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4720", "4722", "4728", "4732", "4756")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4720', '4722', '4728', '4732', '4756')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000013 {\n  meta:\n    author = \"TDL\"\n    description = \"Local Admin Created\"\n    severity = \"LOW\"\n    tactic\
-    \ = \"TA0001\"\n    technique = \"T1136\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(4720|4722|4728|4732|4756)/\n\
-    \    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
+  kql: |
+    let CompanyADDomains = dynamic(["CORP", "DOMAIN", "CONTOSO"]);
+    let LocalAdminGroups = dynamic(["Administrators", "Domain Admins", "Enterprise Admins", "Schema Admins", "Backup Operators"]);
+    let UserCreation = SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (624, 4720, 626, 4722)
+    | extend DestUser = coalesce(TargetUserName, "")
+    | extend DestDomain = coalesce(TargetDomainName, "")
+    | where DestDomain !in (CompanyADDomains)
+    | project CreationTime = TimeGenerated, Computer, DestUser, DestDomain, CreationEventID = EventID, SubjectAccount;
+    let GroupAddition = SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (632, 4728, 636, 4732, 660, 4756)
+    | extend DestUser = coalesce(TargetUserName, "")
+    | extend GroupName = coalesce(TargetAccount, "")
+    | extend GroupDomain = coalesce(TargetDomainName, "")
+    | where GroupDomain !in (CompanyADDomains)
+    | where GroupName =~ "Administrator" or GroupName in (LocalAdminGroups)
+    | project AdditionTime = TimeGenerated, Computer, DestUser, GroupName, GroupDomain, AdditionEventID = EventID, SubjectAccount;
+    UserCreation
+    | join kind=inner (GroupAddition) on Computer, DestUser
+    | where AdditionTime >= CreationTime and AdditionTime <= CreationTime + 5m
+    | project CreationTime, AdditionTime, Computer, DestUser, DestDomain, GroupName, GroupDomain, CreationEventID, AdditionEventID, SubjectAccount
+  aql: "SELECT \n    e1.eventtime AS creation_time,\n    e2.eventtime AS group_add_time,\n    e1.\"Target Username\" AS username,\n    e1.\"Target\
+    \ User Domain\" AS user_domain,\n    e2.\"Group Name\" AS group_name,\n    e2.\"Group Domain\" AS group_domain,\n    e1.sourceip,\n    LOGSOURCENAME(e1.logsourceid)\
+    \ AS host\nFROM events e1\nJOIN events e2 \n    ON e1.\"Target Username\" = e2.\"Target Username\"\n    AND e2.eventtime BETWEEN e1.eventtime\
+    \ AND (e1.eventtime + 300000)\nWHERE e1.\"EventID\" IN ('624', '4720', '626', '4722')\n    AND e1.\"Target User Domain\" NOT IN ('CORP', 'DOMAIN',\
+    \ 'ENTERPRISE')\n    AND e2.\"EventID\" IN ('632', '4728', '636', '4732', '660', '4756')\n    AND e2.\"Group Domain\" NOT IN ('CORP', 'DOMAIN',\
+    \ 'ENTERPRISE')\nLAST 24 HOURS\n"
+  yara_l: |
+    rule new_user_added_to_admin_group {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects user creation followed by addition to administrative group outside company AD domains - T1136"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1136"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 day
+      events:
+        $create.metadata.event_type = "USER_CREATION"
+        (
+          $create.metadata.product_event_type = "624" or
+          $create.metadata.product_event_type = "4720" or
+          $create.metadata.product_event_type = "626" or
+          $create.metadata.product_event_type = "4722"
+        )
+        not (
+          $create.target.user.windows_sid contains "\\CompanyDomain1" or
+          $create.target.user.windows_sid contains "\\CompanyDomain2"
+        )
+        $create.target.user.userid = $user
 
-    | WHERE event.category == "authentication" AND event_id IN ("4720", "4722", "4728", "4732", "4756")
+        $add.metadata.event_type = "GROUP_MODIFICATION"
+        (
+          $add.metadata.product_event_type = "632" or
+          $add.metadata.product_event_type = "4728" or
+          $add.metadata.product_event_type = "636" or
+          $add.metadata.product_event_type = "4732" or
+          $add.metadata.product_event_type = "660" or
+          $add.metadata.product_event_type = "4756"
+        )
+        (
+          re.regex($add.target.group.group_display_name, `(?i)administrator`) or
+          re.regex($add.target.group.group_display_name, `(?i)administrators`) or
+          re.regex($add.target.group.group_display_name, `(?i)domain admins`) or
+          re.regex($add.target.group.group_display_name, `(?i)enterprise admins`)
+        )
+        not (
+          $add.target.group.windows_sid contains "\\CompanyDomain1" or
+          $add.target.group.windows_sid contains "\\CompanyDomain2"
+        )
+        $add.target.user.userid = $user
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+        $create.metadata.event_timestamp.seconds <= $add.metadata.event_timestamp.seconds
 
-    | SORT count DESC
+      match:
+        $user over 5m
 
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4720, 4722, 4728, 4732, 4756])
+      outcome:
+        $risk_score = 75
+        $user_created = array_distinct($create.target.user.userid)
+        $group_added = array_distinct($add.target.group.group_display_name)
+        $host = array_distinct($create.principal.hostname)
 
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4720, 4722, 4728, 4732, 4756)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4720", "4722", "4728", "4732", "4756")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4720 OR 4722 OR 4728 OR 4732 OR 4756)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4720", "4722", "4728", "4732", "4756")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+      condition:
+        $create and $add and ($add.metadata.event_timestamp.seconds - $create.metadata.event_timestamp.seconds <= 300)
+    }
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE @timestamp > NOW() - 1 hour
+    | WHERE event.code IN ("624", "4720", "626", "4722", "632", "4728", "636", "4732", "660", "4756")
+    | EVAL event_type = CASE(
+        event.code IN ("624", "4720", "626", "4722"), "user_created",
+        event.code IN ("632", "4728", "636", "4732", "660", "4756"), "group_add",
+        "other"
+      )
+    | EVAL dest_user = COALESCE(winlog.event_data.TargetUserName, user.target.name)
+    | EVAL dest_domain = COALESCE(winlog.event_data.TargetDomainName, user.target.domain)
+    | EVAL group_name = COALESCE(winlog.event_data.TargetSid, group.name)
+    | EVAL group_domain = COALESCE(winlog.event_data.TargetDomainName, group.domain)
+    | WHERE dest_domain NOT IN ("CORP", "CORPORATE", "COMPANY") AND group_domain NOT IN ("CORP", "CORPORATE", "COMPANY")
+    | STATS created = COUNT(*) BY dest_user, host.name, window = BUCKET(@timestamp, 5 minute), event_type
+    | WHERE created > 0
+    | KEEP @timestamp, host.name, dest_user, event_type, created
+  leql: |
+    where(source_json.EventID IN [624, 4720, 626, 4722]) groupby(destination_user) calculate(count)
+  crowdstrike: |
+    EventCode IN [624, 4720, 626, 4722]
+    | case {
+        TargetUserName=* | DestUser := TargetUserName;
+        TargetDomainName=* | DestDomain := TargetDomainName;
+        * | DestUser := "";
+      }
+    | DestDomain != /^(CONTOSO|CORP|FABRIKAM)$/i
+    | selfJoinFilter(field=[DestUser], where=[{EventCode IN [632, 4728, 636, 4732, 660, 4756]} OR {GroupName=Administrator} OR {GroupName IN [Administrators, "Domain Admins", "Enterprise Admins"]}], prefilter=false)
+    | case {
+        TargetDomainName=* | GroupDomain := TargetDomainName;
+        * | GroupDomain := "";
+      }
+    | GroupDomain != /^(CONTOSO|CORP|FABRIKAM)$/i
+    | timeDiff := @timestamp - @timestamp
+    | timeDiff <= 300000
+    | table([@timestamp, ComputerName, DestUser, DestDomain, EventCode, GroupName, GroupDomain])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (624, 4720, 626, 4722)
+    | alter user_created_time = _time,
+            created_username = coalesce(action_evtlog_event_data_TargetUserName, action_evtlog_event_data_SubjectUserName),
+            created_domain = coalesce(action_evtlog_event_data_TargetDomainName, action_evtlog_event_data_SubjectDomainName),
+            created_host = agent_hostname
+    | filter created_domain not in ("corp.company.com", "company.local", "company.com")
+    | fields user_created_time, created_username, created_domain, created_host
+    | join type=inner (
+        dataset = xdr_data
+        | filter action_evtlog_event_id in (632, 4728, 636, 4732, 660, 4756)
+        | alter group_added_time = _time,
+                added_username = coalesce(action_evtlog_event_data_TargetUserName, action_evtlog_event_data_MemberName),
+                group_name = coalesce(action_evtlog_event_data_TargetUserName, action_evtlog_event_data_GroupName),
+                group_domain = coalesce(action_evtlog_event_data_TargetDomainName, action_evtlog_event_data_SubjectDomainName),
+                group_host = agent_hostname
+        | filter group_domain not in ("corp.company.com", "company.local", "company.com")
+        | filter group_name in ("Administrator", "Administrators", "Domain Admins", "Enterprise Admins", "Builtin\\Administrators")
+        | fields group_added_time, added_username, group_name, group_domain, group_host
+    ) as group_event group_event.added_username = created_username
+    | filter group_event.group_added_time >= user_created_time and group_event.group_added_time <= arraysum(array(user_created_time, to_epoch(300000, "MILLISECONDS")))
+    | fields user_created_time, created_username, created_domain, created_host, group_event.group_added_time, group_event.group_name, group_event.group_domain, group_event.group_host
+  lucene: |
+    (event.code:(624 OR 4720 OR 626 OR 4722) AND NOT winlog.event_data.TargetDomainName:(company_domain1 OR company_domain2)) OR (event.code:(632 OR 4728 OR 636 OR 4732 OR 660 OR 4756) AND (winlog.event_data.TargetSid:*-500 OR winlog.event_data.TargetUserName:Administrator* OR winlog.event_data.GroupName:(Administrators OR "Domain Admins" OR "Enterprise Admins")) AND NOT winlog.event_data.SubjectDomainName:(company_domain1 OR company_domain2))
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*AD*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetUserName" as target_user
+    | json field=_raw "TargetDomainName" as target_domain
+    | json field=_raw "MemberName" as member_name
+    | json field=_raw "TargetSid" as target_sid
+    | json field=_raw "SubjectUserName" as subject_user
+    | json field=_raw "TargetAccountName" as target_account
+    | json field=_raw "GroupName" as group_name
+    | json field=_raw "GroupDomainName" as group_domain
+    | where (event_id in ("624", "4720", "626", "4722") and !(target_domain matches "*CORP*" or target_domain matches "*DOMAIN*"))
+           or (event_id in ("632", "4728", "636", "4732", "660", "4756") and !(group_domain matches "*CORP*" or group_domain matches "*DOMAIN*"))
+    | if(event_id in ("624", "4720", "626", "4722"), 1, 0) as is_create
+    | if(event_id in ("632", "4728", "636", "4732", "660", "4756"), 1, 0) as is_add
+    | if(isNull(target_user), target_account, target_user) as user_name
+    | sort by _messageTime asc
+    | transpose row _messageTime column event_id
+    | where isNotNull(is_create) and isNotNull(is_add)
+    | where (is_add_time - is_create_time) <= 300000
+    | fields _messageTime, user_name, target_domain, group_name, group_domain, event_id
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -98,7 +212,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows User Created Event\nWhere the Event ID is in [624, 4720, 626, 4722]\nWhere the Destination User Domain is NOT in the\
   \ Company AD Domains List\n\nFollowed By\n\n1 Windows User Added to Security Group Event\nWhere the Event ID is in [632, 4728, 636, 4732, 660,\

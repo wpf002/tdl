@@ -17,79 +17,107 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=windows (EventCode=592 OR EventCode=4688 OR EventCode=4104)
-    (
-        (EventCode=592 OR EventCode=4688) (Image="*\\powershell.exe" OR process_name="*powershell.exe" OR process="*powershell.exe") (CommandLine="*Out-Minidump*" OR CommandLine="*Invoke-OfficeScrape*" OR CommandLine="*Invoke-OfficeScraper*")
+  spl: "index=windows (EventCode=592 OR EventCode=4688 OR EventCode=4104)\n(\n    (EventCode=592 OR EventCode=4688) (Image=\"*\\\\powershell.exe\"\
+    \ OR process_name=\"*powershell.exe\" OR process=\"*powershell.exe\") (CommandLine=\"*Out-Minidump*\" OR CommandLine=\"*Invoke-OfficeScrape*\"\
+    \ OR CommandLine=\"*Invoke-OfficeScraper*\")\n    OR\n    (EventCode=4104) (ScriptBlockText=\"*Out-Minidump*\" OR ScriptBlockText=\"*Invoke-OfficeScrape*\"\
+    \ OR ScriptBlockText=\"*Invoke-OfficeScraper*\")\n)\n| table _time, ComputerName, EventCode, User, Image, process_name, CommandLine, ScriptBlockText\n"
+  kql: |
+    union
+    (SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (592, 4688)
+    | where Process has "powershell.exe" or CommandLine has_any ("Out-Minidump", "Invoke-OfficeScrape", "Invoke-OfficeScraper")
+    | project TimeGenerated, Computer, Account, EventID, Process, CommandLine, ParentProcessName),
+    (Event
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4104
+    | where ParameterXml has_any ("Out-Minidump", "Invoke-OfficeScrape", "Invoke-OfficeScraper") or RenderedDescription has_any ("Out-Minidump", "Invoke-OfficeScrape", "Invoke-OfficeScraper")
+    | extend ScriptBlockText = tostring(EventData.ScriptBlockText)
+    | project TimeGenerated, Computer, EventID, ScriptBlockText, ParameterXml, RenderedDescription)
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "ScriptBlockText"
+    FROM events
+    WHERE (("EventID" IN ('592', '4688') AND "Process Name" ILIKE '%powershell.exe%')
+       OR ("EventID" IN ('592', '4688') AND ("Process CommandLine" ILIKE '%Out-Minidump%' OR "Process CommandLine" ILIKE '%Invoke-OfficeScrape%' OR "Process CommandLine" ILIKE '%Invoke-OfficeScraper%'))
+       OR ("EventID" = '4104' AND ("ScriptBlockText" ILIKE '%Out-Minidump%' OR "ScriptBlockText" ILIKE '%Invoke-OfficeScrape%' OR "ScriptBlockText" ILIKE '%Invoke-OfficeScraper%')))
+    LAST 1 HOURS
+  yara_l: |
+    rule powershell_malicious_commands {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects execution of malicious PowerShell commands including Out-Minidump, Invoke-OfficeScrape, Invoke-OfficeScraper"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "High"
+
+      events:
+        (
+          $proc.metadata.event_type = "PROCESS_LAUNCH"
+          (
+            $proc.metadata.product_event_type = "592" or
+            $proc.metadata.product_event_type = "4688"
+          )
+          re.regex($proc.principal.process.file.full_path, `(?i)powershell\.exe$`)
+          (
+            re.regex($proc.principal.process.command_line, `(?i)Out-Minidump`) or
+            re.regex($proc.principal.process.command_line, `(?i)Invoke-OfficeScrape`) or
+            re.regex($proc.principal.process.command_line, `(?i)Invoke-OfficeScraper`)
+          )
+          $proc.principal.hostname = $host
+        )
+        or
+        (
+          $script.metadata.product_event_type = "4104"
+          (
+            re.regex($script.principal.process.command_line, `(?i)Out-Minidump`) or
+            re.regex($script.principal.process.command_line, `(?i)Invoke-OfficeScrape`) or
+            re.regex($script.principal.process.command_line, `(?i)Invoke-OfficeScraper`)
+          )
+          $script.principal.hostname = $host
+        )
+
+      match:
+        $host over 5m
+
+      condition:
+        $proc or $script
+    }
+  esql: |
+    FROM logs-windows.powershell*, logs-system.security*, logs-endpoint.events.process*, winlogbeat-*
+    | WHERE (
+        (event.code IN ("592", "4688") AND process.name == "powershell.exe" AND (process.command_line LIKE "*Out-Minidump*" OR process.command_line LIKE "*Invoke-OfficeScrape*" OR process.command_line LIKE "*Invoke-OfficeScraper*"))
         OR
-        (EventCode=4104) (ScriptBlockText="*Out-Minidump*" OR ScriptBlockText="*Invoke-OfficeScrape*" OR ScriptBlockText="*Invoke-OfficeScraper*")
+        (event.code == "4104" AND (powershell.file.script_block_text LIKE "*Out-Minidump*" OR powershell.file.script_block_text LIKE "*Invoke-OfficeScrape*" OR powershell.file.script_block_text LIKE "*Invoke-OfficeScraper*"))
+      )
+    | KEEP @timestamp, host.name, user.name, event.code, process.name, process.command_line, powershell.file.script_block_text, process.parent.name
+  leql: |
+    where((source_json.EventID IN [592, 4688] AND (process_name ICONTAINS "powershell.exe" OR process_cmd_line ICONTAINS "Out-Minidump" OR process_cmd_line ICONTAINS "Invoke-OfficeScrape" OR process_cmd_line ICONTAINS "Invoke-OfficeScraper")) OR (source_json.EventID=4104 AND (source_json.ScriptBlockText ICONTAINS "Out-Minidump" OR source_json.ScriptBlockText ICONTAINS "Invoke-OfficeScrape" OR source_json.ScriptBlockText ICONTAINS "Invoke-OfficeScraper")))
+  crowdstrike: |
+    (EventCode=4688 OR EventCode=592 OR EventCode=4104)
+    (
+      (EventCode=4688 AND (NewProcessName=*powershell.exe OR ProcessName=*powershell.exe) AND (CommandLine=*Out-Minidump* OR CommandLine=*Invoke-OfficeScrape* OR CommandLine=*Invoke-OfficeScraper*))
+      OR
+      (EventCode=592 AND (NewProcessName=*powershell.exe OR ProcessName=*powershell.exe) AND (CommandLine=*Out-Minidump* OR CommandLine=*Invoke-OfficeScrape* OR CommandLine=*Invoke-OfficeScraper*))
+      OR
+      (EventCode=4104 AND (ScriptBlockText=*Out-Minidump* OR ScriptBlockText=*Invoke-OfficeScrape* OR ScriptBlockText=*Invoke-OfficeScraper*))
     )
-    | table _time, ComputerName, EventCode, User, Image, process_name, CommandLine, ScriptBlockText
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("powershell.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('powershell.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000518 {\n  meta:\n    author = \"TDL\"\n    description = \"Microsoft Office Access Token Scraping Commandlet Activity\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
-    \n    $e.process_name = /(powershell.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("powershell.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [powershell.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+    | table([@timestamp, ComputerName, EventCode, UserName, ProcessName, NewProcessName, CommandLine, ScriptBlockText])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) and (lowercase(action_process_image_name) contains "powershell.exe" or action_process_image_command_line ~= "(?i)(Out-Minidump|Invoke-OfficeScrape|Invoke-OfficeScraper)"))
+       or (action_evtlog_event_id = 4104 and action_evtlog_message ~= "(?i)(Out-Minidump|Invoke-OfficeScrape|Invoke-OfficeScraper)")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_id, action_process_image_name, action_process_image_command_line, action_evtlog_message
+  lucene: |
+    (event.code:(592 OR 4688) AND process.name:powershell.exe AND (process.command_line:(*Out-Minidump* OR *Invoke-OfficeScrape* OR *Invoke-OfficeScraper*))) OR (event.code:4104 AND winlog.event_data.ScriptBlockText:(*Out-Minidump* OR *Invoke-OfficeScrape* OR *Invoke-OfficeScraper*))
+  sumo: |
+    _sourceCategory=*Windows* (EventID=4688 OR EventID=592 OR EventID=4104)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "ScriptBlockText" as script_block
+    | where (event_id in ("4688", "592") and (process_name matches "*powershell.exe" or command_line matches "*Out-Minidump*" or command_line matches "*Invoke-OfficeScrape*" or command_line matches "*Invoke-OfficeScraper*"))
+       or (event_id = "4104" and (script_block matches "*Out-Minidump*" or script_block matches "*Invoke-OfficeScrape*" or script_block matches "*Invoke-OfficeScraper*"))
+    | fields _messageTime, _sourceHost, event_id, process_name, command_line, script_block
 false_positives:
 - Security software
 - Authorized admin tools
@@ -99,7 +127,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe\nOR\n    Where\
   \ Command contains \"Out-Minidump\"\n    Where Command contains \"Invoke-OfficeScrape\"\n    Where Command contains \"Invoke-OfficeScraper\"\

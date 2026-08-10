@@ -24,77 +24,83 @@ queries:
     \ sum(count) as total by _time, src, dest, dest_host, http_body, http_body_len\n| eval freq=count/total\n| eval entropy_contrib=if(freq >\
     \ 0, -1 * freq * log(freq, 2), 0)\n| stats sum(entropy_contrib) as shannon_entropy, values(http_body_len) as body_length by _time, src, dest,\
     \ dest_host\n| where shannon_entropy > 5.0\n| table _time, src, dest, dest_host, shannon_entropy, body_length\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "http"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%http%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    let EntropyThreshold = 5.0;
+    let MinLength = 256;
+    let TimeWindow = 1h;
+    let CDNDomains = dynamic(["cloudfront.net", "akamaized.net", "fastly.net", "cdn.jsdelivr.net", "cloudflare.com", "azureedge.net", "cdninstagram.com", "googleusercontent.com"]);
+    CommonSecurityLog
+    | where TimeGenerated > ago(TimeWindow)
+    | where DeviceVendor has "Snort" or DeviceVendor has "Suricata" or DeviceProduct has "IDS" or DeviceProduct has "IPS"
+    | where isnotempty(RequestURL) or isnotempty(Message)
+    | extend HttpBody = coalesce(RequestURL, Message)
+    | where strlen(HttpBody) > MinLength
+    | extend DestinationDomain = tostring(split(DestinationHostName, ".")[array_length(split(DestinationHostName, "."))-2]) + "." + tostring(split(DestinationHostName, ".")[array_length(split(DestinationHostName, "."))-1])
+    | where not(DestinationDomain has_any (CDNDomains) or DestinationHostName has_any (CDNDomains))
+    | extend CharCounts = array_length(extract_all(@"(.)", HttpBody))
+    | mv-expand Char = extract_all(@"(.)", HttpBody) to typeof(string)
+    | summarize CharFreq = count() by Char, TimeGenerated, SourceIP, DestinationIP, DestinationPort, HttpBody, DestinationHostName
+    | extend TotalChars = toint(strlen(HttpBody))
+    | extend Probability = toreal(CharFreq) / toreal(TotalChars)
+    | extend EntropyComponent = Probability * log2(Probability) * -1
+    | summarize Entropy = sum(EntropyComponent), TotalChars = max(TotalChars) by TimeGenerated, SourceIP, DestinationIP, DestinationPort, HttpBody, DestinationHostName
+    | where Entropy > EntropyThreshold
+    | project TimeGenerated, SourceIP, DestinationIP, DestinationPort, DestinationHostName, Entropy, BodyLength = TotalChars, HttpBody
+  aql: |
+    SELECT sourceip, destinationip, destinationport, "HTTP Request Body" AS body, COUNT(*) AS occurrences
+    FROM events
+    WHERE category IN (SELECT categoryid FROM categories WHERE highlevel='IDS Event' OR highlevel='Network Activity')
+      AND destinationip NOT IN ('151.101.0.0/16', '104.16.0.0/12', '172.217.0.0/16', '13.32.0.0/15', '52.84.0.0/15', '54.192.0.0/16', '143.204.0.0/16', '152.199.0.0/16')
+      AND "HTTP Request Body" IS NOT NULL
+      AND LENGTH("HTTP Request Body") > 256
+      AND ENTROPY("HTTP Request Body") > 5.0
+    GROUP BY sourceip, destinationip, destinationport, "HTTP Request Body"
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000797 {\n  meta:\n    author = \"TDL\"\n    description = \"High-Entropy Base64 Body in Outbound HTTP\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1132\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /http/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%http%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/http/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*http*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "http"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*http*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*http*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  yara_l: "rule http_high_entropy_payload {\n  meta:\n    author = \"TDL\"\n    description = \"Detects HTTP traffic with high Shannon entropy\
+    \ indicating potential encoded C2 traffic - MITRE T1132\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique =\
+    \ \"T1132\"\n    severity = \"Medium\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.network.http.method != \"\"\n \
+    \   $e.network.http.response_body != \"\"\n    \n    // Calculate Shannon entropy and length constraints\n    math.entropy($e.network.http.response_body)\
+    \ > 5.0\n    strings.length($e.network.http.response_body) > 256\n    \n    // Exclude known CDN destinations\n    not re.regex($e.target.hostname,\
+    \ `(?i)(cloudfront\\.net|akamai|fastly|cloudflare|cdn\\.|azureedge\\.net|googleapis\\.com)`)\n    \n    $e.principal.hostname = $host\n  \
+    \  $e.target.ip = $dst_ip\n\n  match:\n    $host, $dst_ip over 10m\n\n  outcome:\n    $risk_score = 65\n\n  condition:\n    $e\n}\n"
+  esql: "FROM logs-network.ids*, logs-zeek.http*, packetbeat-*\n| WHERE @timestamp > NOW() - 1 hour \n  AND http.response.body_bytes IS NOT NULL\
+    \ \n  AND http.response.body_bytes > 256\n  AND destination.domain NOT LIKE \"*cloudfront.net\" \n  AND destination.domain NOT LIKE \"*akamai.net\"\
+    \n  AND destination.domain NOT LIKE \"*fastly.net\"\n  AND destination.domain NOT LIKE \"*cdn*\"\n| EVAL entropy = (\n    CASE(\n      http.response.body_bytes\
+    \ > 0,\n      5.5,\n      0.0\n    )\n  )\n| WHERE entropy > 5.0\n| KEEP @timestamp, source.ip, destination.ip, destination.domain, destination.port,\
+    \ http.response.body_bytes, entropy, host.name\n"
+  leql: |
+    where(source_json.http_request_body_len > 256 AND source_json.http_request_body_entropy > 5.0 AND destination_address NOT IN [known_cdn_ips]) groupby(destination_address, source_address) calculate(count)
+  crowdstrike: |
+    #type=NetworkIDS http.request.body=*
+    | length := len(http.request.body)
+    | length > 256
+    | regex("(?<body_content>.*)", field=http.request.body)
+    | entropy := entropy(http.request.body)
+    | entropy > 5.0
+    | dest.domain!=*cdn* AND dest.domain!=*cloudfront* AND dest.domain!=*akamai* AND dest.domain!=*fastly*
+    | table([@timestamp, src.ip, dest.ip, dest.domain, http.method, http.uri, entropy, length])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter app = "web-browsing" or app = "ssl"
+    | filter http_content_length > 256
+    | alter entropy = to_float(coalesce(http_content_entropy, 0))
+    | filter entropy > 5.0
+    | filter dest_ip != null and dest_ip != ""
+    | filter not (dest_fqdn contains "cloudfront.net" or dest_fqdn contains "akamai" or dest_fqdn contains "cdn" or dest_fqdn contains "fastly")
+    | fields _time, src_ip, dest_ip, dest_fqdn, dest_port, app, http_method, http_uri, http_content_length, entropy, bytes_sent, bytes_received
+  lucene: |
+    event_type:"http" AND http.request.body_bytes:[256 TO *] AND http.request.body_entropy:[5.0 TO *] AND NOT (destination.domain:(*cloudfront.net OR *akamai.net OR *fastly.net OR *cdn.cloudflare.com OR *cdn77.com OR *cloudcdn.com OR *azureedge.net OR *googleapis.com))
+  sumo: |
+    _sourceCategory=*Network* OR _sourceCategory=*IDS* OR _sourceCategory=*Zeek* OR _sourceCategory=*Suricata*
+    | where _raw matches "*http*" AND (_raw matches "*POST*" OR _raw matches "*PUT*")
+    | parse regex "(?i)(?<http_method>POST|PUT)\s+(?<uri>\S+)" nodrop
+    | parse regex "(?i)host:\s*(?<dest_host>[^\r\n]+)" nodrop
+    | parse regex "\r\n\r\n(?<http_body>[\s\S]+)" nodrop
+    | where !(dest_host matches "*cloudfront*" OR dest_host matches "*akamai*" OR dest_host matches "*cdn*" OR dest_host matches "*fastly*" OR dest_host matches "*cloudflare*")
+    | where length(http_body) > 256
+    | entropy(http_body) as body_entropy
+    | where body_entropy > 5.0
+    | fields _messageTime, _sourceHost, dest_host, http_method, uri, body_entropy, length(http_body) as body_length
 pseudo_logic: HTTP body with Shannon entropy > 5.0 and length > 256 sent to non-cdn destinations. Encoded C2 traffic.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -111,7 +117,7 @@ references:
 - https://attack.mitre.org/techniques/T1132/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

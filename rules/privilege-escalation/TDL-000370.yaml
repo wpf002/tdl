@@ -16,71 +16,76 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=azuread (Operation="Set federation settings on domain" OR Operation="Set domain authentication") ResultStatus=success
+  spl: 'index=azuread (Operation="Set federation settings on domain" OR Operation="Set domain authentication") ResultStatus=success
+
     | table _time, User, Operation, ResultStatus, TargetResources, IPAddress
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_pe_000370 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Domain Trust Modification Detected\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0004\"\n    technique = \"T1484\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AuditLogs
+    | where TimeGenerated > ago(24h)
+    | where OperationName in ("Set federation settings on domain", "Set domain authentication")
+    | where Result == "success"
+    | extend InitiatedBy = tostring(InitiatedBy.user.userPrincipalName)
+    | extend TargetResources = tostring(TargetResources[0].displayName)
+    | project TimeGenerated, OperationName, Result, InitiatedBy, TargetResources, ActivityDisplayName, CorrelationId, Identity
+  aql: |
+    SELECT username, sourceip, devicetype, qidname(qid), LOGSOURCENAME(logsourceid), "Action", "EventName", eventtime
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%Azure%'
+      AND ("EventName" IN ('Set federation settings on domain', 'Set domain authentication') OR qidname(qid) IN ('Set federation settings on domain', 'Set domain authentication'))
+      AND ("Action" = 'success' OR qidname(qid) ILIKE '%success%')
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_ad_domain_federation_modification {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects successful Azure AD domain federation or authentication setting modifications (T1484)"
+        mitre_attack_tactic = "Privilege Escalation"
+        mitre_attack_technique = "T1484"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Microsoft"
+        $e.metadata.product_name = "Azure Active Directory"
+        (
+          $e.metadata.product_event_type = "Set federation settings on domain" or
+          $e.metadata.product_event_type = "Set domain authentication"
+        )
+        $e.security_result.action = "ALLOW"
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $domain
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user, $domain over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-azure.auditlogs*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.action IN (\"Set federation settings on domain\", \"\
+    Set domain authentication\")\n  AND event.outcome == \"success\"\n| KEEP @timestamp, azure.auditlogs.properties.initiated_by_user.user_principal_name,\
+    \ event.action, azure.tenantid, azure.auditlogs.properties.target_resources\n"
+  leql: |
+    where(source_json.category="AuditLogs" AND source_json.operationName IN ["Set federation settings on domain", "Set domain authentication"] AND source_json.resultType="0")
+  crowdstrike: |
+    #type=AzureAD (OperationName="Set federation settings on domain" OR OperationName="Set domain authentication") ResultStatus=success
+    | table([@timestamp, UserPrincipalName, OperationName, ResultStatus, IPAddress, TargetResources])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = ENUM.CLOUD_PROVIDER_AZURE
+    | filter operation_name in ("Set federation settings on domain", "Set domain authentication")
+    | filter outcome = "success"
+    | fields _time, operation_name, identity_name, resource_name, outcome, cloud_provider
+  lucene: |
+    (event.action:"Set federation settings on domain" OR event.action:"Set domain authentication") AND event.outcome:success
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*AzureAD* OR _sourceCategory=*Azure*AD*
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "resultType" as result_type
+    | json field=_raw "properties.result" as result
+    | where (operation_name matches "*Set federation settings on domain*" OR operation_name matches "*Set domain authentication*")
+    | where (result_type = "Success" OR result = "success" OR result_type matches "*success*")
+    | fields _messageTime, _sourceHost, operation_name, result_type, result
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +95,7 @@ tags:
 - privilege-escalation
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure AD Event
 

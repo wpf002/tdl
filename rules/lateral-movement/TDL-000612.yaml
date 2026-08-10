@@ -15,85 +15,106 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=firewall action=allowed (dest_port IN ("139", "445") OR app="*smb*" OR app="*samba*") src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) NOT dest_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+  spl: 'index=firewall action=allowed (dest_port IN ("139", "445") OR app="*smb*" OR app="*samba*") src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+    NOT dest_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+
     | eval baseline_start=relative_time(now(), "-90d")
+
     | eval baseline_end=relative_time(now(), "-30d")
+
     | eventstats dc(dest_ip) as historical_dest_count values(dest_ip) as historical_dest_ips by src_ip
+
     | eval is_new_dest=if(NOT match(historical_dest_ips, dest_ip) AND _time > baseline_end, 1, 0)
+
     | where is_new_dest=1
+
     | table _time, src_ip, dest_ip, dest_port, app, action
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where application matches regex "smb"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "application" LIKE ''%smb%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_lm_000612 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Allowed Outbound SMB Traffic\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0008\"\n    technique = \"T1021\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.application\
-    \ = /smb/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND application LIKE "%smb%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND application=/smb/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*smb*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND application ~= "smb"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND application:*smb*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where application matches "*smb*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: "let baseline_period = 90d;\nlet learning_period = 30d;\nlet detection_window = 1h;\nlet baseline_destinations = \n    CommonSecurityLog\n\
+    \    | where TimeGenerated between (ago(baseline_period) .. ago(learning_period))\n    | where DeviceVendor has \"firewall\" or DeviceProduct\
+    \ has \"firewall\" or DeviceEventClassID has_any (\"firewall\", \"traffic\", \"allow\", \"deny\")\n    | where CommunicationDirection =~ \"\
+    Outbound\" or DestinationIP !startswith \"10.\" and DestinationIP !startswith \"172.16.\" and DestinationIP !startswith \"192.168.\"\n   \
+    \ | where DeviceAction =~ \"Allow\" or DeviceAction =~ \"Allowed\" or DeviceAction =~ \"Permitted\"\n    | where DestinationPort in (\"139\"\
+    , \"445\") or ApplicationProtocol contains \"smb\" or ApplicationProtocol contains \"samba\" or DeviceCustomString1 contains \"smb\" or DeviceCustomString1\
+    \ contains \"samba\"\n    | where isnotempty(DestinationIP)\n    | where ipv4_is_private(SourceIP) == true\n    | where ipv4_is_private(DestinationIP)\
+    \ == false\n    | summarize by SourceIP, DestinationIP;\nCommonSecurityLog\n| where TimeGenerated > ago(detection_window)\n| where DeviceVendor\
+    \ has \"firewall\" or DeviceProduct has \"firewall\" or DeviceEventClassID has_any (\"firewall\", \"traffic\", \"allow\", \"deny\")\n| where\
+    \ CommunicationDirection =~ \"Outbound\" or DestinationIP !startswith \"10.\" and DestinationIP !startswith \"172.16.\" and DestinationIP\
+    \ !startswith \"192.168.\"\n| where DeviceAction =~ \"Allow\" or DeviceAction =~ \"Allowed\" or DeviceAction =~ \"Permitted\"\n| where DestinationPort\
+    \ in (\"139\", \"445\") or ApplicationProtocol contains \"smb\" or ApplicationProtocol contains \"samba\" or DeviceCustomString1 contains\
+    \ \"smb\" or DeviceCustomString1 contains \"samba\"\n| where isnotempty(DestinationIP)\n| where ipv4_is_private(SourceIP) == true\n| where\
+    \ ipv4_is_private(DestinationIP) == false\n| join kind=leftanti baseline_destinations on SourceIP, DestinationIP\n| project TimeGenerated,\
+    \ SourceIP, DestinationIP, DestinationPort, ApplicationProtocol, DeviceAction, DeviceVendor, DeviceProduct, Message\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, application, COUNT(*) AS event_count, LOGSOURCENAME(logsourceid) AS firewall
+    FROM events
+    WHERE category IN (SELECT categoryid FROM categories WHERE high_level_category_name = 'Network Activity')
+      AND (destinationip NOT LIKE '10.%' AND destinationip NOT LIKE '172.16.%' AND destinationip NOT LIKE '172.17.%' AND destinationip NOT LIKE '172.18.%' AND destinationip NOT LIKE '172.19.%' AND destinationip NOT LIKE '172.20.%' AND destinationip NOT LIKE '172.21.%' AND destinationip NOT LIKE '172.22.%' AND destinationip NOT LIKE '172.23.%' AND destinationip NOT LIKE '172.24.%' AND destinationip NOT LIKE '172.25.%' AND destinationip NOT LIKE '172.26.%' AND destinationip NOT LIKE '172.27.%' AND destinationip NOT LIKE '172.28.%' AND destinationip NOT LIKE '172.29.%' AND destinationip NOT LIKE '172.30.%' AND destinationip NOT LIKE '172.31.%' AND destinationip NOT LIKE '192.168.%')
+      AND (CATEGORYNAME(category) ILIKE '%accept%' OR CATEGORYNAME(category) ILIKE '%permit%' OR CATEGORYNAME(category) ILIKE '%allow%')
+      AND (destinationport IN ('139', '445') OR application ILIKE '%smb%' OR application ILIKE '%samba%')
+    GROUP BY sourceip, destinationip, destinationport, application, logsourceid
+    LAST 24 HOURS
+  yara_l: "rule lateral_movement_smb_outbound_new_destination {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects\
+    \ outbound SMB connections to new external destinations - MITRE T1021\"\n    severity = \"Medium\"\n    mitre_attack_tactic = \"Lateral Movement\"\
+    \n    mitre_attack_technique = \"T1021\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.metadata.product_log_id\
+    \ = \"FIREWALL\"\n    $e.network.direction = \"OUTBOUND\"\n    $e.security_result.action = \"ALLOW\"\n    (\n      $e.target.port = 139 or\n\
+    \      $e.target.port = 445 or\n      re.regex($e.network.application_protocol, `(?i)smb`) or\n      re.regex($e.network.application_protocol,\
+    \ `(?i)samba`)\n    )\n    net.ip_in_range_cidr($e.principal.ip, \"10.0.0.0/8\") or\n    net.ip_in_range_cidr($e.principal.ip, \"172.16.0.0/12\"\
+    ) or\n    net.ip_in_range_cidr($e.principal.ip, \"192.168.0.0/16\")\n    not net.ip_in_range_cidr($e.target.ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($e.target.ip,\
+    \ \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($e.target.ip, \"192.168.0.0/16\")\n    $e.principal.ip = $src_ip\n    $e.target.ip = $dst_ip\n\
+    \n  match:\n    $src_ip over 1h\n    \n  outcome:\n    $risk_score = max(50)\n    $new_destination_ip = array_distinct($dst_ip)\n    $connection_count\
+    \ = count_distinct($dst_ip)\n    \n  condition:\n    $e and #dst_ip > 0\n}\n"
+  esql: "FROM logs-network.firewall*\n| WHERE @timestamp > NOW() - 90 days\n  AND network.direction == \"outbound\"\n  AND event.action == \"\
+    allowed\"\n  AND source.ip RLIKE \"^(10\\\\.|172\\\\.(1[6-9]|2[0-9]|3[01])\\\\.|192\\\\.168\\\\.)\"\n  AND NOT destination.ip RLIKE \"^(10\\\
+    \\.|172\\\\.(1[6-9]|2[0-9]|3[01])\\\\.|192\\\\.168\\\\.)\"\n  AND (\n    destination.port IN (\"139\", \"445\")\n    OR TO_LOWER(network.application)\
+    \ LIKE \"*smb*\"\n    OR TO_LOWER(network.application) LIKE \"*samba*\"\n  )\n| EVAL baseline_end = NOW() - 60 days\n| EVAL is_baseline =\
+    \ CASE(@timestamp <= baseline_end, 1, 0)\n| EVAL is_recent = CASE(@timestamp > baseline_end, 1, 0)\n| STATS \n    baseline_count = SUM(is_baseline),\n\
+    \    recent_count = SUM(is_recent),\n    first_seen = MIN(@timestamp),\n    last_seen = MAX(@timestamp)\n  BY source.ip, destination.ip\n\
+    | WHERE baseline_count == 0 AND recent_count > 0\n| KEEP source.ip, destination.ip, first_seen, last_seen, recent_count\n"
+  leql: |
+    where(direction=OUTBOUND AND action=ALLOW AND (destination_port IN [139, 445] OR application ICONTAINS "smb" OR application ICONTAINS "samba")) groupby(source_address, destination_address) calculate(count)
+  crowdstrike: |
+    #type=firewall action=allowed (src_ip=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ OR src_ip=/^(fd|fe80):/)
+    NOT (dst_ip=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ OR dst_ip=/^(fd|fe80):/)
+    (dst_port IN [139, 445] OR application=*smb* OR application=*samba*)
+    | groupBy([dst_ip], function=selectLast([@timestamp], as=last_seen))
+    | last_seen > (now() - 30d)
+    | table([dst_ip, last_seen])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_network_creation_time >= current_time() - 90d
+    | filter action = "allow"
+    | filter dest_port in (139, 445) or lowercase(app) contains "smb" or lowercase(app) contains "samba"
+    | alter is_src_internal = incidr(src_ip, "10.0.0.0/8") or incidr(src_ip, "172.16.0.0/12") or incidr(src_ip, "192.168.0.0/16")
+    | alter is_dest_external = not (incidr(dest_ip, "10.0.0.0/8") or incidr(dest_ip, "172.16.0.0/12") or incidr(dest_ip, "192.168.0.0/16"))
+    | filter is_src_internal = true and is_dest_external = true
+    | alter baseline_start = current_time() - 90d
+    | alter baseline_end = current_time() - 30d
+    | alter is_baseline = _time >= baseline_start and _time < baseline_end
+    | alter is_detection_window = _time >= baseline_end
+    | comp values(dest_ip) as baseline_dest_ips by src_ip, is_baseline
+    | filter is_baseline = false
+    | comp values(dest_ip) as new_dest_ips by src_ip
+    | alter new_destinations = array_distinct(array_diff(new_dest_ips, baseline_dest_ips))
+    | filter new_destinations != null and array_length(new_destinations) > 0
+    | fields _time, src_ip, dest_ip, dest_port, app, action, new_destinations
+  lucene: |
+    (source.ip:10.0.0.0/8 OR source.ip:172.16.0.0/12 OR source.ip:192.168.0.0/16) AND NOT (destination.ip:10.0.0.0/8 OR destination.ip:172.16.0.0/12 OR destination.ip:192.168.0.0/16) AND (action:allowed OR destination.port:(139 OR 445) OR application:*smb* OR application:*samba*)
+  sumo: "_sourceCategory=*Firewall* \n| parse regex field=_raw \"(?<src_ip>\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\" nodrop\n| parse regex\
+    \ field=_raw \"(?<dest_ip>\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\" nodrop\n| parse regex field=_raw \"(?i)port[:\\s]+(?<dest_port>\\d+)\"\
+    \ nodrop\n| parse regex field=_raw \"(?i)action[:\\s]+(?<action>\\w+)\" nodrop\n| parse regex field=_raw \"(?i)app(?:lication)?[:\\s]+(?<application>[^\\\
+    s,]+)\" nodrop\n| where (src_ip matches \"10.*.*.*\" or src_ip matches \"172.16.*.*\" or src_ip matches \"172.17.*.*\" or src_ip matches \"\
+    172.18.*.*\" or src_ip matches \"172.19.*.*\" or src_ip matches \"172.20.*.*\" or src_ip matches \"172.21.*.*\" or src_ip matches \"172.22.*.*\"\
+    \ or src_ip matches \"172.23.*.*\" or src_ip matches \"172.24.*.*\" or src_ip matches \"172.25.*.*\" or src_ip matches \"172.26.*.*\" or src_ip\
+    \ matches \"172.27.*.*\" or src_ip matches \"172.28.*.*\" or src_ip matches \"172.29.*.*\" or src_ip matches \"172.30.*.*\" or src_ip matches\
+    \ \"172.31.*.*\" or src_ip matches \"192.168.*.*\")\n| where !(dest_ip matches \"10.*.*.*\" or dest_ip matches \"172.16.*.*\" or dest_ip matches\
+    \ \"172.17.*.*\" or dest_ip matches \"172.18.*.*\" or dest_ip matches \"172.19.*.*\" or dest_ip matches \"172.20.*.*\" or dest_ip matches\
+    \ \"172.21.*.*\" or dest_ip matches \"172.22.*.*\" or dest_ip matches \"172.23.*.*\" or dest_ip matches \"172.24.*.*\" or dest_ip matches\
+    \ \"172.25.*.*\" or dest_ip matches \"172.26.*.*\" or dest_ip matches \"172.27.*.*\" or dest_ip matches \"172.28.*.*\" or dest_ip matches\
+    \ \"172.29.*.*\" or dest_ip matches \"172.30.*.*\" or dest_ip matches \"172.31.*.*\" or dest_ip matches \"192.168.*.*\")\n| where (action\
+    \ matches \"*allow*\" or action matches \"*accept*\") or (dest_port in (\"139\", \"445\")) or (application matches \"*smb*\") or (application\
+    \ matches \"*samba*\")\n| where _messageTime >= now() - 90d\n| count by dest_ip, src_ip\n| fields dest_ip, src_ip\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -103,7 +124,7 @@ tags:
 - lateral-movement
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Firewall Event \nFrom one internal source to one external destination (Outbound)\nWhere the Action is Allowed\nOR\n    Where\
   \ the Destination Port IN (\"139\", \"445\")\n\n    Where the Application contains \"smb\"\n\n    Where the Application contains \"samba\"\n\

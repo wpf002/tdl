@@ -18,78 +18,131 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=azure OR index=o365 (sourcetype=azure:signinlogs OR sourcetype=o365:management:activity) action=success (Activity="UserLoggedIn" OR ResultType=0 OR Result=success) NOT (src_ip=10.* OR src_ip=192.168.* OR src_ip=172.16.* OR src_ip=172.17.* OR src_ip=172.18.* OR src_ip=172.19.* OR src_ip=172.20.* OR src_ip=172.21.* OR src_ip=172.22.* OR src_ip=172.23.* OR src_ip=172.24.* OR src_ip=172.25.* OR src_ip=172.26.* OR src_ip=172.27.* OR src_ip=172.28.* OR src_ip=172.29.* OR src_ip=172.30.* OR src_ip=172.31.*)
+  spl: 'index=azure OR index=o365 (sourcetype=azure:signinlogs OR sourcetype=o365:management:activity) action=success (Activity="UserLoggedIn"
+    OR ResultType=0 OR Result=success) NOT (src_ip=10.* OR src_ip=192.168.* OR src_ip=172.16.* OR src_ip=172.17.* OR src_ip=172.18.* OR src_ip=172.19.*
+    OR src_ip=172.20.* OR src_ip=172.21.* OR src_ip=172.22.* OR src_ip=172.23.* OR src_ip=172.24.* OR src_ip=172.25.* OR src_ip=172.26.* OR src_ip=172.27.*
+    OR src_ip=172.28.* OR src_ip=172.29.* OR src_ip=172.30.* OR src_ip=172.31.*)
+
     | eval user_agent=coalesce(UserAgent, http_user_agent, user_agent)
+
     | eval src_user=coalesce(user, UserId, UserPrincipalName, src_user)
+
     | where isnotnull(user_agent) AND isnotnull(src_user)
+
     | eventstats earliest(_time) as first_seen by src_user, user_agent
+
     | where (now() - first_seen) < 2592000
+
     | eval baseline_end=relative_time(now(), "-90d")
+
     | where first_seen >= baseline_end
+
     | table _time, src_user, user_agent, src_ip, src, ResultType, Activity, app, AppDisplayName
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000403 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen User Agent for User Remote Login\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    let baseline_start = 90d;
+    let baseline_end = 30d;
+    let detection_window = 30d;
+    let BaselineUserAgents = (
+        union isfuzzy=true
+            (SigninLogs
+            | where TimeGenerated between (ago(baseline_start) .. ago(baseline_end))
+            | where ResultType == 0
+            | where IPAddress !startswith "10." and IPAddress !startswith "172." and IPAddress !startswith "192.168."
+            | where isnotempty(UserAgent)
+            | summarize by UserPrincipalName, UserAgent),
+            (AADNonInteractiveUserSignInLogs
+            | where TimeGenerated between (ago(baseline_start) .. ago(baseline_end))
+            | where ResultType == 0
+            | where IPAddress !startswith "10." and IPAddress !startswith "172." and IPAddress !startswith "192.168."
+            | where isnotempty(UserAgent)
+            | summarize by UserPrincipalName, UserAgent),
+            (OfficeActivity
+            | where TimeGenerated between (ago(baseline_start) .. ago(baseline_end))
+            | where ClientIP !startswith "10." and ClientIP !startswith "172." and ClientIP !startswith "192.168."
+            | where isnotempty(UserAgent)
+            | summarize by UserPrincipalName = UserId, UserAgent)
+    );
+    union isfuzzy=true
+        (SigninLogs
+        | where TimeGenerated > ago(detection_window)
+        | where ResultType == 0
+        | where IPAddress !startswith "10." and IPAddress !startswith "172." and IPAddress !startswith "192.168."
+        | where isnotempty(UserAgent)
+        | project TimeGenerated, UserPrincipalName, UserAgent, IPAddress, Location, DeviceDetail, AppDisplayName, ResourceDisplayName),
+        (AADNonInteractiveUserSignInLogs
+        | where TimeGenerated > ago(detection_window)
+        | where ResultType == 0
+        | where IPAddress !startswith "10." and IPAddress !startswith "172." and IPAddress !startswith "192.168."
+        | where isnotempty(UserAgent)
+        | project TimeGenerated, UserPrincipalName, UserAgent, IPAddress, Location, DeviceDetail, AppDisplayName, ResourceDisplayName),
+        (OfficeActivity
+        | where TimeGenerated > ago(detection_window)
+        | where ClientIP !startswith "10." and ClientIP !startswith "172." and ClientIP !startswith "192.168."
+        | where isnotempty(UserAgent)
+        | project TimeGenerated, UserPrincipalName = UserId, UserAgent, IPAddress = ClientIP, Location = ""  , DeviceDetail = dynamic({}), AppDisplayName = Operation, ResourceDisplayName = OfficeWorkload)
+    | join kind=leftanti BaselineUserAgents on UserPrincipalName, UserAgent
+    | project TimeGenerated, UserPrincipalName, UserAgent, IPAddress, Location, DeviceDetail, AppDisplayName, ResourceDisplayName
+  aql: |
+    SELECT username, sourceip, "User Agent", COUNT(*) AS login_count
+    FROM events
+    WHERE category IN (SELECT categoryid FROM qidmap WHERE name ILIKE '%authentication%' OR name ILIKE '%logon%' OR name ILIKE '%sign%in%')
+      AND (logsourcetypename(logsourceid) ILIKE '%azure%' OR logsourcetypename(logsourceid) ILIKE '%office%365%' OR logsourcetypename(logsourceid) ILIKE '%vpn%')
+      AND (sourceip NOT IN (SELECT sourceip FROM events WHERE sourceip >= 167772160 AND sourceip <= 184549375 LAST 90 DAYS)
+           AND sourceip NOT IN (SELECT sourceip FROM events WHERE sourceip >= 2886729728 AND sourceip <= 2887778303 LAST 90 DAYS)
+           AND sourceip NOT IN (SELECT sourceip FROM events WHERE sourceip >= 3232235520 AND sourceip <= 3232301055 LAST 90 DAYS))
+      AND "User Agent" NOT IN (SELECT "User Agent" FROM events WHERE username = $1 LAST 30 DAYS)
+    GROUP BY username, sourceip, "User Agent"
+    LAST 90 DAYS
+  yara_l: "rule new_user_agent_remote_login {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects successful remote logins\
+    \ from external IPs with new user agents not seen in 30-day baseline\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1078\"\n    severity = \"Medium\"\n    \n  events:\n    $login.metadata.event_type = \"USER_LOGIN\"\n    $login.security_result.action\
+    \ = \"ALLOW\"\n    $login.principal.ip = $source_ip\n    $login.target.user.userid = $user\n    $login.network.http.user_agent = $user_agent\n\
+    \    not net.ip_in_range_cidr($source_ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($source_ip, \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($source_ip,\
+    \ \"192.168.0.0/16\")\n    \n  match:\n    $user over 1h\n    \n  outcome:\n    $risk_score = 50\n    $new_user_agent = array_distinct($user_agent)\n\
+    \    $source_ips = array_distinct($source_ip)\n    \n  condition:\n    $login and #user_agent == 0 over 30d before $login\n}\n"
+  esql: "FROM logs-azure.*, logs-o365.*, logs-m365.*\n| WHERE @timestamp > NOW() - 90 days\n  AND event.action IN (\"UserLoggedIn\", \"UserLoginSuccess\"\
+    , \"MailboxLogin\", \"successful logon\", \"VPN login success\")\n  AND event.outcome == \"success\"\n  AND NOT CIDR_MATCH(source.ip, \"10.0.0.0/8\"\
+    , \"172.16.0.0/12\", \"192.168.0.0/16\", \"127.0.0.0/8\", \"169.254.0.0/16\")\n| EVAL baseline_start = NOW() - 90 days\n| EVAL baseline_end\
+    \ = NOW() - 30 days\n| EVAL is_baseline = CASE(@timestamp >= baseline_start AND @timestamp < baseline_end, 1, 0)\n| EVAL is_detection = CASE(@timestamp\
+    \ >= baseline_end, 1, 0)\n| STATS \n    baseline_user_agents = VALUES(CASE(is_baseline == 1, user_agent.original, null)),\n    detection_user_agents\
+    \ = VALUES(CASE(is_detection == 1, user_agent.original, null))\n  BY user.name\n| WHERE is_detection == 1\n| EVAL new_user_agents = MV_SUBTRACT(detection_user_agents,\
+    \ baseline_user_agents)\n| WHERE MV_COUNT(new_user_agents) > 0\n| KEEP user.name, new_user_agents\n"
+  leql: |
+    where(result=SUCCESS AND source_address NOT IN [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]) groupby(source_user, user_agent) calculate(count)
+  crowdstrike: "event_simpleName=UserActivityAuditEvent \n| SuccessAuditEventType=\"*Login*\" \n| regex(\"(?<IsInternalIP>(^127\\.)|(^10\\.)|(^172\\\
+    .1[6-9]\\.)|(^172\\.2[0-9]\\.)|(^172\\.3[0-1]\\.)|(^192\\.168\\.))\", field=RemoteIP, strict=false)\n| !IsInternalIP=*\n| groupBy([UserName,\
+    \ UserAgent], function=count(as=event_count))\n| selfJoinFilter(field=[UserName, UserAgent], where=[{event_count >= 1}], window=90d, baselineWindow=30d)\n\
+    | table([@timestamp, UserName, UserAgent, RemoteIP, event_count])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter outcome = "SUCCESS" and operation_type in ("UserLoggedIn", "UserLogin") and not incidr(action_network_source_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    | alter user_agent_value = coalesce(action_app_id_name, action_user_agent, "unknown")
+    | comp values(user_agent_value) as historical_user_agents by actor_effective_username
+    | alter new_user_agent = arrayfilter(historical_user_agents, "@element" != user_agent_value)
+    | filter array_length(new_user_agent) > 0
+    | fields _time, actor_effective_username, action_network_source_ip, user_agent_value, action_country
+  lucene: |
+    event.outcome:success AND (event.category:authentication OR event.action:("UserLoggedIn" OR "UserLoginSuccess" OR "Sign-in activity")) AND NOT source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16 OR 127.0.0.0/8 OR fc00::/7 OR fe80::/10 OR ::1)
+  sumo: "_sourceCategory=*Azure* OR _sourceCategory=*Office* OR _sourceCategory=*O365* OR _sourceCategory=*VPN* (\"SignInLogs\" OR \"sign-in\"\
+    \ OR \"login\" OR \"authentication\")\n| json field=_raw \"properties.status.errorCode\" as error_code\n| json field=_raw \"properties.ipAddress\"\
+    \ as src_ip\n| json field=_raw \"properties.userPrincipalName\" as user\n| json field=_raw \"properties.userAgent\" as user_agent\n| json\
+    \ field=_raw \"resultType\" as result_type\n| json field=_raw \"identity.userPrincipalName\" as identity_user\n| json field=_raw \"UserId\"\
+    \ as office_user\n| json field=_raw \"ClientIP\" as office_ip\n| json field=_raw \"UserAgent\" as office_user_agent\n| where (error_code =\
+    \ \"0\" OR result_type = \"0\" OR error_code = \"\" OR isNull(error_code)) \n| where !(src_ip matches \"10.*\" OR src_ip matches \"172.16.*\"\
+    \ OR src_ip matches \"172.17.*\" OR src_ip matches \"172.18.*\" OR src_ip matches \"172.19.*\" OR src_ip matches \"172.20.*\" OR src_ip matches\
+    \ \"172.21.*\" OR src_ip matches \"172.22.*\" OR src_ip matches \"172.23.*\" OR src_ip matches \"172.24.*\" OR src_ip matches \"172.25.*\"\
+    \ OR src_ip matches \"172.26.*\" OR src_ip matches \"172.27.*\" OR src_ip matches \"172.28.*\" OR src_ip matches \"172.29.*\" OR src_ip matches\
+    \ \"172.30.*\" OR src_ip matches \"172.31.*\" OR src_ip matches \"192.168.*\" OR office_ip matches \"10.*\" OR office_ip matches \"172.16.*\"\
+    \ OR office_ip matches \"172.17.*\" OR office_ip matches \"172.18.*\" OR office_ip matches \"172.19.*\" OR office_ip matches \"172.20.*\"\
+    \ OR office_ip matches \"172.21.*\" OR office_ip matches \"172.22.*\" OR office_ip matches \"172.23.*\" OR office_ip matches \"172.24.*\"\
+    \ OR office_ip matches \"172.25.*\" OR office_ip matches \"172.26.*\" OR office_ip matches \"172.27.*\" OR office_ip matches \"172.28.*\"\
+    \ OR office_ip matches \"172.29.*\" OR office_ip matches \"172.30.*\" OR office_ip matches \"172.31.*\" OR office_ip matches \"192.168.*\"\
+    )\n| if(isNull(user), if(isNull(identity_user), office_user, identity_user), user) as username\n| if(isNull(user_agent), office_user_agent,\
+    \ user_agent) as ua\n| where !(isNull(username)) and !(isNull(ua))\n| count as event_count by username, ua\n| where event_count >= 1\n| lookup\
+    \ username from shared://baseline_user_agents on username = username, ua = user_agent_baseline\n| where isNull(user_agent_baseline)\n| fields\
+    \ username, ua, event_count\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -99,7 +152,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Successful Remote Login Event \nWhere the Source IP is an External IP\n\nBaseline Learning: 30 Days\nRetention: 90 Days\n\nNew\
   \ Value: User Agent\nPer Entity: Source Username"

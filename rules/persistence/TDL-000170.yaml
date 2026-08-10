@@ -17,78 +17,117 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=windows EventCode=4688 (process_name="*\\taskmgr.exe" OR ((user_id="S-1-5-18" OR User="SYSTEM") AND (TargetUserSid="S-1-5-18" OR TargetUserName="SYSTEM" OR (NOT TargetUserName="*"))))
+  spl: 'index=windows EventCode=4688 (process_name="*\\taskmgr.exe" OR ((user_id="S-1-5-18" OR User="SYSTEM") AND (TargetUserSid="S-1-5-18" OR
+    TargetUserName="SYSTEM" OR (NOT TargetUserName="*"))))
+
     | eval is_taskmgr=if(like(process_name, "%\\taskmgr.exe"), 1, 0)
+
     | eval is_system_pre_win10=if((TargetUserName="" OR isnull(TargetUserName)) AND (user_id="S-1-5-18" OR User="SYSTEM"), 1, 0)
-    | eval is_system_win10=if((TargetUserName!="" AND isnotnull(TargetUserName)) AND (TargetUserSid="S-1-5-18" OR TargetUserName="SYSTEM"), 1, 0)
+
+    | eval is_system_win10=if((TargetUserName!="" AND isnotnull(TargetUserName)) AND (TargetUserSid="S-1-5-18" OR TargetUserName="SYSTEM"), 1,
+    0)
+
     | where is_taskmgr=1 OR is_system_pre_win10=1 OR is_system_win10=1
+
     | table _time, ComputerName, process_name, User, user_id, TargetUserName, TargetUserSid, CommandLine
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("taskmgr.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('taskmgr.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000170 {\n  meta:\n    author = \"TDL\"\n    description = \"Task Manager Running as System\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0003\"\n    technique = \"T1543\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(taskmgr.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (592, 4688)
+    | where Process has "taskmgr.exe"
+        or (isempty(TargetUserName) and SubjectUserSid == "S-1-5-18")
+        or (isnotempty(TargetUserName) and TargetUserSid == "S-1-5-18")
+    | project TimeGenerated, Computer, EventID, Account, SubjectUserName, SubjectUserSid, TargetUserName, TargetUserSid, Process, CommandLine, ProcessId
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Subject User Name", "Target User Name", "Subject Security ID", "Target Security ID"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND (
+        "Process Name" ILIKE '%taskmgr.exe%'
+        OR (
+          ("Target User Name" IS NULL AND "Subject Security ID" ILIKE '%S-1-5-18%')
+          OR ("Target User Name" IS NOT NULL AND "Target Security ID" ILIKE '%S-1-5-18%')
+        )
+      )
+    LAST 24 HOURS
+  yara_l: |
+    rule windows_system_process_taskmgr_or_system_user {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects taskmgr.exe execution or processes running as SYSTEM user - T1543 Persistence"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1543"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688"
+        )
+        (
+          re.regex($e.principal.process.file.full_path, `(?i)taskmgr\.exe$`) or
+          (
+            $e.target.user.userid = "" and
+            $e.principal.user.userid = "SYSTEM"
+          ) or
+          (
+            $e.target.user.userid != "" and
+            $e.target.user.userid = "SYSTEM"
+          )
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name IN ("taskmgr.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [taskmgr.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (taskmgr.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("taskmgr.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(taskmgr.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("taskmgr.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*, logs-windows.security*, winlogbeat-*
+    | WHERE event.code IN ("592", "4688")
+    | WHERE process.name == "taskmgr.exe"
+      OR (
+        (winlog.event_data.TargetUserSid IS NULL AND winlog.event_data.SubjectUserSid == "S-1-5-18")
+        OR (winlog.event_data.TargetUserSid IS NOT NULL AND winlog.event_data.TargetUserSid == "S-1-5-18")
+      )
+    | KEEP @timestamp, host.name, event.code, process.name, user.name, winlog.event_data.SubjectUserSid, winlog.event_data.TargetUserSid, process.command_line, process.parent.name
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND process_name ICONTAINS "taskmgr.exe" AND ((destination_user=NULL AND source_json.SubjectUserSid="S-1-5-18") OR (destination_user!=NULL AND source_json.TargetUserSid="S-1-5-18")))
+  crowdstrike: |
+    EventCode=4688 FileName=*taskmgr.exe (SubjectUserSid="S-1-5-18" OR TargetUserSid="S-1-5-18")
+    | table([@timestamp, ComputerName, SubjectUserName, TargetUserName, SubjectUserSid, TargetUserSid, FileName, CommandLine, ParentProcessName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter (
+        lowercase(action_process_image_name) contains "taskmgr.exe"
+        or (
+            action_evtlog_event_data_TargetUserName = null
+            and action_evtlog_event_data_SubjectUserSid = "S-1-5-18"
+        )
+        or (
+            action_evtlog_event_data_TargetUserName != null
+            and action_evtlog_event_data_TargetUserSid = "S-1-5-18"
+        )
+    )
+    | fields _time, agent_hostname, action_process_image_name, action_evtlog_event_data_SubjectUserName, action_evtlog_event_data_TargetUserName, action_evtlog_event_data_SubjectUserSid, action_evtlog_event_data_TargetUserSid, action_process_image_command_line
+  lucene: |
+    event.code:(592 OR 4688) AND process.name:taskmgr.exe AND ((_exists_:user.id AND user.id:SYSTEM) OR (NOT _exists_:user.target.id AND user.id:SYSTEM) OR (_exists_:user.target.id AND user.target.id:SYSTEM))
+  sumo: |
+    _sourceCategory=*Windows* ("4688" OR "592")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "TargetUserName" as dest_user
+    | json field=_raw "SubjectUserName" as source_user
+    | json field=_raw "TargetUserSid" as dest_user_id
+    | json field=_raw "SubjectUserSid" as source_user_id
+    | where (event_id = "4688" OR event_id = "592")
+    | where (process_name matches "*taskmgr.exe" OR ((isNull(dest_user) AND source_user_id = "S-1-5-18") OR (NOT isNull(dest_user) AND dest_user_id = "S-1-5-18")))
+    | fields _messageTime, _sourceHost, event_id, process_name, source_user, dest_user, source_user_id, dest_user_id
 false_positives:
 - Security software
 - Authorized admin tools
@@ -98,7 +137,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is taskmgr.exe\nOR \n\tWhere Destination\
   \ User is NULL (Pre Windows 10/2016)\n\tWhere Source User ID is SYSTEM\n\t\n\tWhere Destination User is NOT NULL (Windows 10/2016)\n\tWhere\

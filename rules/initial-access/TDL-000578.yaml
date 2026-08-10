@@ -16,71 +16,77 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=kubernetes sourcetype=kube:events objectRef.resource="services" verb="create" requestObject.spec.type="NodePort"
+  spl: 'index=kubernetes sourcetype=kube:events objectRef.resource="services" verb="create" requestObject.spec.type="NodePort"
+
     | table _time, user.username, objectRef.namespace, objectRef.name, requestObject.spec.type, sourceIPs{}
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "NodePort"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%NodePort%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000578 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubernetes Service Created with NodePort\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1552\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /NodePort/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    KubernetesEvents
+    | where TimeGenerated > ago(24h)
+    | where ObjectKind =~ "Service"
+    | where Verb =~ "create"
+    | extend requestObject = parse_json(RequestObject)
+    | extend serviceType = tostring(requestObject.spec.type)
+    | where serviceType =~ "NodePort"
+    | project TimeGenerated, Namespace, Name, Verb, serviceType, User, SourceIPs, UserAgent, ObjectKind, RequestObject, ResponseStatus
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS k8s_cluster, "Resource", "Verb", "requestObject.spec.type", "User", "SourceIP"
+    FROM events
+    WHERE "Resource" = 'services'
+      AND "Verb" = 'create'
+      AND "requestObject.spec.type" = 'NodePort'
+    LAST 24 HOURS
+  yara_l: |
+    rule kubernetes_nodeport_service_creation {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects creation of NodePort services in Kubernetes which may expose services externally"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1552"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $k.metadata.event_type = "RESOURCE_CREATION"
+        $k.metadata.product_name = "Kubernetes"
+        $k.target.resource.name = "services"
+        $k.security_result.action = "create"
+        re.regex($k.target.resource.attribute.labels.value, `(?i)NodePort`)
+        $k.principal.user.userid = $user
+        $k.target.resource.attribute.cloud.project.name = $cluster
 
-    | WHERE eventName LIKE "%NodePort%"
+      match:
+        $user, $cluster over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/NodePort/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*NodePort*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "NodePort"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*NodePort*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*NodePort*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $k
+    }
+  esql: |
+    FROM logs-kubernetes.audit*
+    | WHERE kubernetes.audit.objectRef.resource == "services"
+      AND kubernetes.audit.verb == "create"
+      AND kubernetes.audit.requestObject.spec.type == "NodePort"
+    | KEEP @timestamp, kubernetes.audit.user.username, kubernetes.audit.objectRef.namespace, kubernetes.audit.objectRef.name, kubernetes.audit.requestObject.spec.type, kubernetes.audit.sourceIPs
+  leql: |
+    where(source_json.objectRef.resource="services" AND source_json.verb="create" AND source_json.requestObject.spec.type="NodePort")
+  crowdstrike: |
+    #type=kubernetes event.resource="services" event.verb="create" event.requestObject.spec.type="NodePort"
+    | table([@timestamp, event.user.username, event.objectRef.namespace, event.objectRef.name, event.requestObject.spec.type, event.sourceIPs])
+  xql: "dataset = cloud_audit_logs\n| filter cloud_provider = \"GCP\" and json_extract_scalar(resource, \"$.type\") = \"k8s_cluster\"\n| filter\
+    \ json_extract_scalar(protoPayload, \"$.resourceName\") contains \"/services/\" \n  and json_extract_scalar(protoPayload, \"$.request.kind\"\
+    ) = \"Service\"\n  and json_extract_scalar(protoPayload, \"$.methodName\") contains \"create\"\n  and json_extract_scalar(protoPayload, \"\
+    $.request.spec.type\") = \"NodePort\"\n| fields _time, json_extract_scalar(protoPayload, \"$.authenticationInfo.principalEmail\") as principal,\
+    \ json_extract_scalar(protoPayload, \"$.resourceName\") as service_name, json_extract_scalar(protoPayload, \"$.request.metadata.name\") as\
+    \ service, json_extract_scalar(resource, \"$.labels.cluster_name\") as cluster\n"
+  lucene: |
+    kubernetes.audit.objectRef.resource:services AND kubernetes.audit.verb:create AND kubernetes.audit.requestObject.spec.type:NodePort
+  sumo: |
+    _sourceCategory=*kubernetes* OR _sourceCategory=*k8s*
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "verb" as verb
+    | json field=_raw "requestObject.spec.type" as service_type
+    | where resource = "services" and verb = "create" and service_type = "NodePort"
+    | fields _messageTime, _sourceHost, resource, verb, service_type
 false_positives:
 - Security software
 - Authorized admin tools
@@ -90,7 +96,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere the Resource is \"services\"\nWhere Verb is \"create\"\nWhere the requestObject.spec.type is \"NodePort\""
 triage_steps:

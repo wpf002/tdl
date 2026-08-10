@@ -16,72 +16,71 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=salesforce sourcetype=salesforce:event EventType=createdrole
+  spl: 'index=salesforce sourcetype=salesforce:event EventType=createdrole
+
     | search NOT [ | inputlookup salesforce_admins.csv | fields SourceUsername ]
+
     | table _time, SourceUsername, EventType, User, SessionLevel, Application, LoginType
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000415 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized Role Creation - Salesforce\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    SalesforceEvents
+    | where TimeGenerated > ago(24h)
+    | where EventType == "createdrole"
+    | where SourceUsername !in (SalesforceAdminsList)
+    | project TimeGenerated, SourceUsername, EventType, TargetUsername, RoleName, SourceIpAddress, UserAgent
+  aql: |
+    SELECT username AS "Source Username", sourceip, eventtime, qidname(qid) AS "Event Name", LOGSOURCENAME(logsourceid) AS "Salesforce Org"
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%salesforce%'
+      AND (qidname(qid) ILIKE '%createdrole%' OR "Event Type" = 'createdrole')
+      AND username NOT IN ('admin@company.com', 'sysadmin@company.com', 'salesforce.admin@company.com')
+    LAST 24 HOURS
+  yara_l: |
+    rule salesforce_unauthorized_role_creation {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects creation of roles in Salesforce by non-admin users - MITRE T1078"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Salesforce"
+        $e.metadata.product_event_type = "createdrole"
+        $e.principal.user.userid = $source_user
+        not $source_user in %salesforce_admins
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $source_user over 1h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-salesforce*
+    | WHERE event.action == "createdrole" AND user.name NOT IN ("admin1", "admin2", "admin3")
+    | KEEP @timestamp, user.name, event.action, source.ip, user.email, salesforce.event.type
+  leql: |
+    where(source_json.EVENT_TYPE="createdrole" AND NOT(source_json.USER_NAME IN [/* Add Salesforce Admin usernames here */]))
+  crowdstrike: |
+    #type=salesforce EventType=createdrole
+    | NOT (SourceUsername IN [sfadmin1@company.com, sfadmin2@company.com, sfadmin3@company.com])
+    | table([@timestamp, SourceUsername, EventType, TargetUsername, RoleName, SourceIP])
+  xql: |
+    dataset = salesforce_data
+    | filter event_type = "createdRole"
+    | filter actor_effective_username not in ("admin@company.com", "sysadmin@company.com")
+    | fields _time, actor_effective_username, event_type, agent_hostname, action_external_hostname
+  lucene: |
+    eventtype:createdrole AND NOT source_username:(admin1 OR admin2 OR admin3)
+  sumo: |
+    _sourceCategory=*Salesforce* "CreatedRole"
+    | json field=_raw "EVENT_TYPE" as event_type
+    | json field=_raw "USER_NAME" as source_user
+    | where event_type = "CreatedRole"
+    | where !(source_user in ("admin@company.com", "sfadmin@company.com", "salesforce.admin@company.com"))
+    | fields _messageTime, source_user, event_type, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +90,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Salseforce Event  \nWhere the Event Type is 'createdrole'\nWhere the Source Username is NOT on the Salesforce Admins List"
 suppression:

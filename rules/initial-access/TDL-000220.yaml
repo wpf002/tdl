@@ -16,73 +16,68 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=email sourcetype=email_security action=permitted event_type="url_click"
+  spl: 'index=email sourcetype=email_security action=permitted event_type="url_click"
+
     | lookup high_value_targets.csv user_email AS src_user OUTPUT is_hvt
+
     | where isnull(is_hvt) OR is_hvt!=1
+
     | table _time, src_user, dest_url, subject, sender, src_ip
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000220 {\n  meta:\n    author = \"TDL\"\n    description = \"User Click Permitted\"\n    severity = \"MEDIUM\"\n\
-    \    tactic = \"TA0001\"\n    technique = \"T1566\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    EmailUrlInfo
+    | where TimeGenerated > ago(1h)
+    | where UrlClickAction == "Allowed" or UrlClickAction == "Permitted"
+    | join kind=leftanti (
+        _GetWatchlist('HighValueUsers')
+        | project SearchKey
+    ) on $left.NetworkMessageId == $right.SearchKey or $left.RecipientEmailAddress == $right.SearchKey
+    | project TimeGenerated, RecipientEmailAddress, SenderFromAddress, Subject, Url, UrlClickAction, NetworkMessageId, ThreatTypes
+  aql: "SELECT username, sourceip, destinationip, COUNT(*) AS click_count, QIDNAME(qid) AS event_name, LOGSOURCENAME(logsourceid) AS log_source\n\
+    FROM events\nWHERE categoryname(category) ILIKE '%email%' \n  AND (qidname(qid) ILIKE '%url%click%permit%' OR qidname(qid) ILIKE '%link%click%allow%'\
+    \ OR qidname(qid) ILIKE '%url%allow%')\n  AND username NOT IN (SELECT username FROM reference_set WHERE name='HighValueTargets')\nLAST 24\
+    \ HOURS\n"
+  yara_l: "rule phishing_url_click_non_hvt {\n  meta:\n    author = \"TDL\"\n    description = \"Detects URL clicks from email that are permitted\
+    \ for users not on high value target list - MITRE T1566 Initial Access\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1566\"\n    severity = \"Medium\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.security_result.action = \"ALLOW\"\
+    \n    $e.metadata.product_name = \"EMAIL_SECURITY\"\n    $e.principal.user.userid = $user\n    \n    // Exclude high value target users\n\
+    \    not re.regex($e.principal.user.userid, `(?i)(admin|root|administrator|exec|ceo|cfo|cto|president|director)`)\n\n  match:\n    $user over\
+    \ 5m\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-email*
+    | WHERE event.category == "network" AND event.action == "url_click" AND event.outcome == "allowed" AND @timestamp > NOW() - 24 hour
+    | ENRICH high_value_users ON user.email WITH hvt_flag
+    | WHERE hvt_flag IS NULL OR hvt_flag == false
+    | KEEP @timestamp, user.email, user.name, url.full, url.domain, source.ip, email.subject, email.from.address, host.name
+  leql: |
+    where(source_json.event_type="url_click_permitted" AND NOT(source_user IN ["hvt_user1@domain.com", "hvt_user2@domain.com", "hvt_user3@domain.com"]))
+  crowdstrike: |
+    #type=EmailSecurity event_simpleName=UrlClickPermitted
+    | not(in(field=UserPrincipalName, values=[HighValueTargetUserList]))
+    | table([@timestamp, UserPrincipalName, ComputerName, URL, Subject, Sender])
+  xql: |
+    dataset = email_security_logs
+    | filter event_type = "url_click_permitted"
+    | filter source_user not in (
+        "admin@company.com",
+        "ceo@company.com",
+        "cfo@company.com",
+        "cio@company.com"
+    )
+    | fields _time, source_user, url, email_subject, sender_address, recipient_address
+  lucene: |
+    event.action:"url_click_permitted" AND NOT user.name:(executive1 OR executive2 OR executive3 OR ceo OR cfo OR ciso OR admin OR sysadmin OR domainadmin)
+  sumo: |
+    _sourceCategory=*Email* OR _sourceCategory=*EmailSecurity* "url click" OR "URL Click" OR "click" permitted OR allowed
+    | json field=_raw "action" as action
+    | json field=_raw "user" as source_user
+    | json field=_raw "email" as source_user_email
+    | json field=_raw "sender" as sender
+    | json field=_raw "recipient" as recipient
+    | json field=_raw "url" as url
+    | where (action matches "*permit*" OR action matches "*allow*" OR action matches "*click*") AND !(source_user matches "*admin*" OR source_user matches "*executive*" OR source_user matches "*ceo*" OR source_user matches "*cfo*" OR source_user matches "*cio*" OR source_user matches "*president*" OR source_user matches "*vp*")
+    | fields _messageTime, source_user, source_user_email, recipient, sender, url, action, _sourceHost
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -92,7 +87,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 URL Click Permitted Event
 

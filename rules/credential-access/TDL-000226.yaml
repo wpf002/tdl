@@ -15,75 +15,59 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=windows (EventCode=592 OR EventCode=4688) (process_name IN ("wce.exe", "wce32.exe", "wce64.exe", "getlsasrvaddr.exe", "wce-universal.exe") OR Image IN ("*\\wce.exe", "*\\wce32.exe", "*\\wce64.exe", "*\\getlsasrvaddr.exe", "*\\wce-universal.exe") OR CommandLine IN ("*wce.exe*", "*wce32.exe*", "*wce64.exe*", "*getlsasrvaddr.exe*", "*wce-universal.exe*"))
+  spl: 'index=windows (EventCode=592 OR EventCode=4688) (process_name IN ("wce.exe", "wce32.exe", "wce64.exe", "getlsasrvaddr.exe", "wce-universal.exe")
+    OR Image IN ("*\\wce.exe", "*\\wce32.exe", "*\\wce64.exe", "*\\getlsasrvaddr.exe", "*\\wce-universal.exe") OR CommandLine IN ("*wce.exe*",
+    "*wce32.exe*", "*wce64.exe*", "*getlsasrvaddr.exe*", "*wce-universal.exe*"))
+
     | table _time, ComputerName, EventCode, User, Image, CommandLine, ParentImage
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("wce.exe", "wce32.exe", "wce64.exe", "getlsasrvaddr.exe", "wce-universal.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('wce.exe', 'wce32.exe', 'wce64.exe', 'getlsasrvaddr.exe',\
-    \ 'wce-universal.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000226 {\n  meta:\n    author = \"TDL\"\n    description = \"Windows Credential Editor Usage\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0006\"\n    technique = \"T1003\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(wce.exe|wce32.exe|wce64.exe|getlsasrvaddr.exe|wce-universal.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("wce.exe", "wce32.exe", "wce64.exe", "getlsasrvaddr.exe", "wce-universal.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [wce.exe, wce32.exe, wce64.exe, getlsasrvaddr.exe, wce-universal.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (wce.exe, wce32.exe, wce64.exe, getlsasrvaddr.exe, wce-universal.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("wce.exe", "wce32.exe", "wce64.exe", "getlsasrvaddr.exe", "wce-universal.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(wce.exe OR wce32.exe OR wce64.exe OR getlsasrvaddr.exe OR wce-universal.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("wce.exe", "wce32.exe", "wce64.exe", "getlsasrvaddr.exe", "wce-universal.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (592, 4688)
+    | where Process has_any ("wce.exe", "wce32.exe", "wce64.exe", "getlsasrvaddr.exe", "wce-universal.exe")
+    | project TimeGenerated, Computer, Account, Process, CommandLine, EventID, SubjectUserName, ParentProcessName
+  aql: |
+    SELECT eventtime, sourceip, username, LOGSOURCENAME(logsourceid) AS host, "Process Name", "Process CommandLine"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND ("Process Name" ILIKE '%wce.exe' OR "Process Name" ILIKE '%wce32.exe' OR "Process Name" ILIKE '%wce64.exe' OR "Process Name" ILIKE '%getlsasrvaddr.exe' OR "Process Name" ILIKE '%wce-universal.exe')
+    LAST 24 HOURS
+  yara_l: "rule credential_access_wce_execution {\n  meta:\n    author = \"TDL\"\n    description = \"Detects execution of Windows Credential\
+    \ Editor (WCE) tools used for credential dumping\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique = \"T1003\"\
+    \n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      $e.metadata.product_event_type =\
+    \ \"592\" or\n      $e.metadata.product_event_type = \"4688\"\n    )\n    (\n      re.regex($e.target.process.file.full_path, `(?i)\\\\wce\\\
+    .exe$`) or\n      re.regex($e.target.process.file.full_path, `(?i)\\\\wce32\\.exe$`) or\n      re.regex($e.target.process.file.full_path,\
+    \ `(?i)\\\\wce64\\.exe$`) or\n      re.regex($e.target.process.file.full_path, `(?i)\\\\getlsasrvaddr\\.exe$`) or\n      re.regex($e.target.process.file.full_path,\
+    \ `(?i)\\\\wce-universal\\.exe$`)\n    )\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n  outcome:\n    $risk_score\
+    \ = 85\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-system.security*, winlogbeat-*\n| WHERE event.code IN (\"592\", \"4688\") \n  AND process.name IN (\"wce.exe\", \"wce32.exe\"\
+    , \"wce64.exe\", \"getlsasrvaddr.exe\", \"wce-universal.exe\")\n| KEEP @timestamp, host.name, user.name, process.name, process.command_line,\
+    \ process.parent.name, process.executable\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND (process_name ICONTAINS "wce.exe" OR process_name ICONTAINS "wce32.exe" OR process_name ICONTAINS "wce64.exe" OR process_name ICONTAINS "getlsasrvaddr.exe" OR process_name ICONTAINS "wce-universal.exe"))
+  crowdstrike: |
+    EventCode=4688 OR EventCode=592
+    | FileName IN [wce.exe, wce32.exe, wce64.exe, getlsasrvaddr.exe, wce-universal.exe]
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter lowercase(action_process_image_name) in ("wce.exe", "wce32.exe", "wce64.exe", "getlsasrvaddr.exe", "wce-universal.exe")
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, action_evtlog_event_id
+  lucene: |
+    event.code:(592 OR 4688) AND process.name:(wce.exe OR wce32.exe OR wce64.exe OR getlsasrvaddr.exe OR wce-universal.exe)
+  sumo: |
+    _sourceCategory=*Windows* (EventID=592 OR EventID=4688)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_path
+    | json field=_raw "ProcessName" as process_path_alt
+    | where event_id in ("592", "4688")
+    | parse regex field=process_path "(?i)(?<process_name>[^\\\/]+\.exe)$"
+    | parse regex field=process_path_alt "(?i)(?<process_name_alt>[^\\\/]+\.exe)$"
+    | where process_name in ("wce.exe", "wce32.exe", "wce64.exe", "getlsasrvaddr.exe", "wce-universal.exe") OR process_name_alt in ("wce.exe", "wce32.exe", "wce64.exe", "getlsasrvaddr.exe", "wce-universal.exe")
+    | fields _messageTime, _sourceHost, event_id, process_path, process_path_alt, process_name, process_name_alt
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +77,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name in [wce.exe, wce32.exe, wce64.exe,\
   \ getlsasrvaddr.exe, wce-universal.exe]"

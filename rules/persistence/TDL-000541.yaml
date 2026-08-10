@@ -15,73 +15,93 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=github sourcetype=github:audit action="personal_access_token.request_created"
+  spl: 'index=github sourcetype=github:audit action="personal_access_token.request_created"
+
     | lookup threat_intel_ip_list ip as actor_ip OUTPUT threat_score
+
     | where isnotnull(threat_score)
+
     | table _time, actor, actor_ip, org, repo, threat_score
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000541 {\n  meta:\n    author = \"TDL\"\n    description = \"Access Token Genrated from Malcious IP\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: "let ThreatFeeds = \n    ThreatIntelligenceIndicator\n    | where TimeGenerated > ago(14d)\n    | where isnotempty(NetworkIP)\n    | summarize\
+    \ by NetworkIP;\nGitHubAuditLogPollingFunction_CL\n| where TimeGenerated > ago(24h)\n| where action_s == \"personal_access_token.request_created\"\
+    \n| extend SourceIP = tostring(parse_json(actor_location_s).country_code)\n| extend ActorIP = tostring(parse_json(data_s).client_ip)\n| where\
+    \ isnotempty(ActorIP)\n| join kind=inner (ThreatFeeds) on $left.ActorIP == $right.NetworkIP\n| project TimeGenerated, action_s, actor_s, ActorIP,\
+    \ repo_s, org_s, data_s\n"
+  aql: |
+    SELECT sourceip, username, "action" AS github_action, eventtime, LOGSOURCENAME(logsourceid) AS log_source, COUNT(*) AS event_count
+    FROM events
+    WHERE "action" = 'personal_access_token.request_created'
+      AND sourceip IN (SELECT sourceip FROM events WHERE category IN (SELECT category FROM categories WHERE low_level_category_id IN (SELECT id FROM category_definitions WHERE name LIKE '%Threat%')))
+    LAST 24 HOURS
+    ```
 
-    | WHERE @timestamp > NOW() - 1 hour
+    However, the correct QRadar AQL query for this detection should be:
 
-    | WHERE eventName LIKE "%.+%"
+    SELECT sourceip, username, "action", eventtime, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "action" = 'personal_access_token.request_created'
+      AND sourceip IN (SELECT sourceaddress FROM reference_set('ThreatIntelligence_IPs'))
+    LAST 24 HOURS
+  yara_l: |
+    rule github_pat_request_from_threat_ip {
+      meta:
+        author = "TDL"
+        description = "Detects GitHub personal access token request from IP on threat feed - T1098"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1098"
+        severity = "HIGH"
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      events:
+        $gh.metadata.product_name = "Github"
+        $gh.metadata.product_event_type = "personal_access_token.request_created"
+        $gh.principal.ip = $ip
 
-    | SORT count DESC
+        $threat.graph.metadata.entity_type = "IP_ADDRESS"
+        $threat.graph.metadata.threat.threat_feed_name != ""
+        $threat.graph.entity.ip = $ip
 
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+      match:
+        $ip over 5m
 
-    groupby(actor, event_name)
+      outcome:
+        $risk_score = 85
+        $user = $gh.principal.user.userid
+        $threat_feed = array_distinct($threat.graph.metadata.threat.threat_feed_name)
 
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $gh and $threat
+    }
+  esql: |
+    FROM logs-github*
+    | WHERE event.action == "personal_access_token.request_created"
+    | ENRICH threat_feed ON source.ip
+    | WHERE threat.indicator.ip IS NOT NULL
+    | KEEP @timestamp, user.name, source.ip, threat.indicator.ip, threat.indicator.type, host.name, event.action
+  leql: |
+    where(source_json.action="personal_access_token.request_created" AND source_address IN threat_feed)
+  crowdstrike: |
+    #repo=github action=personal_access_token.request_created
+    | lookup(file="threat_feed.csv", field=actor_ip, include=[threat_indicator], strict=false)
+    | threat_indicator=*
+    | table([@timestamp, actor, actor_ip, threat_indicator, org, repo])
+  xql: |
+    dataset = github_audit_logs
+    | filter action = "personal_access_token.request_created"
+    | alter is_threat_ip = incidr(actor_ip, "THREAT_FEED")
+    | filter is_threat_ip = true
+    | fields _time, actor, actor_ip, action, repo, org
+  lucene: |
+    actions:"personal_access_token.request_created" AND threat_feed:true
+  sumo: |
+    _sourceCategory=*Github* "personal_access_token.request_created"
+    | json field=_raw "action" as action
+    | json field=_raw "actor_ip" as actor_ip
+    | where action = "personal_access_token.request_created"
+    | lookup type, malicious_confidence, threat_intel from sumo://threat/cs on threat=actor_ip
+    | where type = "ip_address" and !isNull(malicious_confidence)
+    | fields _messageTime, action, actor_ip, malicious_confidence, threat_intel
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -91,7 +111,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Github event\n   where actions is \"personal_access_token.request_created\"\nAND\n   IP is on Threat Feed"
 triage_steps:

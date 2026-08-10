@@ -18,77 +18,103 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    (index=okta OR index=azure OR index=duo) (sourcetype=OktaIM2:log OR sourcetype=azure:monitor:aad OR sourcetype=duo:authentication) (outcome.result=SUCCESS OR result=success OR result=SUCCESS OR eventOutcome=Success) (client.geographicalContext.country=* OR location.countryOrRegion=* OR access_device.location.country=*) (authenticationContext.externalSessionId=* OR client.ipAddress!=* OR access_device.ip!=*)
-    | eval src_ip=coalesce('client.ipAddress', 'ipAddress', 'access_device.ip', src)
-    | eval auth_result=coalesce('outcome.result', result, eventOutcome)
-    | eval event_type=coalesce(eventType, 'eventType', 'activity.category')
+  spl: '(index=okta OR index=azure OR index=duo) (sourcetype=OktaIM2:log OR sourcetype=azure:monitor:aad OR sourcetype=duo:authentication) (outcome.result=SUCCESS
+    OR result=success OR result=SUCCESS OR eventOutcome=Success) (client.geographicalContext.country=* OR location.countryOrRegion=* OR access_device.location.country=*)
+    (authenticationContext.externalSessionId=* OR client.ipAddress!=* OR access_device.ip!=*)
+
+    | eval src_ip=coalesce(''client.ipAddress'', ''ipAddress'', ''access_device.ip'', src)
+
+    | eval auth_result=coalesce(''outcome.result'', result, eventOutcome)
+
+    | eval event_type=coalesce(eventType, ''eventType'', ''activity.category'')
+
     | where (auth_result="SUCCESS" OR auth_result="success" OR auth_result="Success")
+
     | lookup threat_intel_ips ip as src_ip OUTPUT threat_level
+
     | where isnotnull(threat_level)
+
     | table _time, user, src_ip, threat_level, sourcetype, event_type, auth_result
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000600 {\n  meta:\n    author = \"TDL\"\n    description = \"Successful MFA Login from Threat Host\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
+  kql: "let ThreatIntelIPs = \n    ThreatIntelligenceIndicator\n    | where TimeGenerated > ago(14d)\n    | where isnotempty(NetworkIP)\n    |\
+    \ summarize by NetworkIP;\nunion \n    (SigninLogs\n    | where TimeGenerated > ago(1h)\n    | where ResultType == 0\n    | where AuthenticationRequirement\
+    \ == \"multiFactorAuthentication\"\n    | where NetworkLocationDetails !has \"trustedNamedLocation\"\n    | extend SourceIP = IPAddress\n\
+    \    | project TimeGenerated, UserPrincipalName, SourceIP, Location, AppDisplayName, DeviceDetail, ResultType),\n    (OfficeActivity\n   \
+    \ | where TimeGenerated > ago(1h)\n    | where Operation == \"UserLoggedIn\"\n    | where RecordType in (15, 25)\n    | extend SourceIP =\
+    \ ClientIP\n    | project TimeGenerated, UserId, SourceIP, Operation, ClientIP),\n    (Okta_CL\n    | where TimeGenerated > ago(1h)\n    |\
+    \ where outcome_result_s == \"SUCCESS\"\n    | where array_length(parse_json(authenticationContext_s).credentialType) > 0\n    | extend SourceIP\
+    \ = tostring(parse_json(client_s).ipAddress)\n    | project TimeGenerated, actor_alternateId_s, SourceIP, eventType_s),\n    (DuoSecurity_CL\n\
+    \    | where TimeGenerated > ago(1h)\n    | where result_s == \"SUCCESS\"\n    | where factor_s in (\"push\", \"phone\", \"passcode\")\n \
+    \   | extend SourceIP = access_device_ip_s\n    | project TimeGenerated, user_name_s, SourceIP, factor_s, result_s)\n| join kind=inner ThreatIntelIPs\
+    \ on $left.SourceIP == $right.NetworkIP\n| project TimeGenerated, SourceIP, UserPrincipalName, UserId, actor_alternateId_s, user_name_s, Location,\
+    \ AppDisplayName, Operation, eventType_s\n"
+  aql: |
+    SELECT username, sourceip, destinationip, LOGSOURCENAME(logsourceid) AS log_source, CATEGORYNAME(category) AS event_category, "MFA Result", qidname(qid) AS event_name, COUNT(*) AS login_count
+    FROM events
+    WHERE (LOGSOURCENAME(logsourceid) ILIKE '%Duo%' OR LOGSOURCENAME(logsourceid) ILIKE '%Okta%' OR LOGSOURCENAME(logsourceid) ILIKE '%Azure%')
+      AND (qidname(qid) ILIKE '%success%' OR qidname(qid) ILIKE '%login%' OR categoryname(category) ILIKE '%authentication%')
+      AND (qidname(qid) ILIKE '%MFA%' OR qidname(qid) ILIKE '%multi%factor%' OR "MFA Result" IS NOT NULL)
+      AND sourceip NOT IN (SELECT sourceip FROM reference_data WHERE reference_set_name = 'Internal_IP_Ranges')
+      AND sourceip IN (SELECT sourceip FROM reference_data WHERE reference_set_name = 'Threat_Intelligence_IPs')
+    GROUP BY username, sourceip, destinationip, LOGSOURCENAME(logsourceid), CATEGORYNAME(category), "MFA Result", qidname(qid)
+    LAST 24 HOURS
+  yara_l: "rule suspicious_mfa_login_from_threat_ip {\n  meta:\n    author = \"TDL\"\n    description = \"Detects successful MFA login from IP\
+    \ on threat intelligence list - T1078 Initial Access\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1078\"\
+    \n    severity = \"HIGH\"\n\n  events:\n    $login.metadata.event_type = \"USER_LOGIN\"\n    $login.security_result.action = \"ALLOW\"\n \
+    \   $login.security_result.summary = /(?i)(mfa|multi.factor|2fa|two.factor)/\n    $login.principal.ip = $source_ip\n    $login.target.user.userid\
+    \ = $user\n    \n    // Threat intelligence match\n    $threat.graph.metadata.entity_type = \"IP_ADDRESS\"\n    $threat.graph.metadata.threat.threat_feed_name\
+    \ != \"\"\n    $threat.graph.entity.ip = $source_ip\n    \n    // External source condition\n    net.ip_in_range_cidr($source_ip, \"10.0.0.0/8\"\
+    ) = false\n    net.ip_in_range_cidr($source_ip, \"172.16.0.0/12\") = false\n    net.ip_in_range_cidr($source_ip, \"192.168.0.0/16\") = false\n\
+    \n  match:\n    $user, $source_ip over 5m\n\n  outcome:\n    $risk_score = max(85)\n    $threat_feed = array_distinct($threat.graph.metadata.threat.threat_feed_name)\n\
+    \    $user_id = $user\n    $suspicious_ip = $source_ip\n\n  condition:\n    $login and $threat\n}\n"
+  esql: |
+    FROM logs-okta*, logs-azure*, logs-duo*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      AND event.outcome == "success"
+      AND (event.action IN ("user.authentication.auth_via_mfa", "user.session.start", "authentication_success") OR event.category == "authentication")
+      AND threat.indicator.ip IS NOT NULL
+      AND (source.ip == threat.indicator.ip OR client.ip == threat.indicator.ip)
+    | STATS login_count = COUNT(*) BY user.name, source.ip, threat.indicator.ip, host.name, event.action
+    | KEEP @timestamp, user.name, source.ip, threat.indicator.ip, host.name, event.action, login_count
+  leql: |
+    where(result=SUCCESS AND source_json.mfa_result=SUCCESS AND source_json.context.isProxy=false AND source_address IN threat_list)
+  crowdstrike: "(#type=okta OR #type=azure OR #type=duo) \n(outcome.result=SUCCESS OR result=success OR status=success OR ResultType=0)\n(event.type=user.authentication*\
+    \ OR eventType=user.authentication* OR Activity=\"Sign-in activity\" OR event_simpleName=*MFA* OR factor=*) \n| case {\n    #type=okta | client.geographicalContext.country\
+    \ != \"US\" ;\n    #type=azure | Location != \"US\" ;\n    #type=duo | access_device.location.country != \"US\" ;\n    * | true ;\n  }\n|\
+    \ in(field=client.ipAddress, repo=\"threatintel\") OR in(field=ipaddr, repo=\"threatintel\") OR in(field=RemoteAddressIP4, repo=\"threatintel\"\
+    ) OR in(field=IPAddress, repo=\"threatintel\") OR in(field=SourceIP, repo=\"threatintel\")\n| table([@timestamp, #type, client.ipAddress,\
+    \ ipaddr, IPAddress, SourceIP, RemoteAddressIP4, actor.alternateId, user, UserPrincipalName, user.name, outcome.result, result, status, ResultType])\n"
+  xql: |
+    dataset = auth_logs
+    | filter outcome = "success" and action_type = "mfa" and (action_app_id_name contains "Azure" or action_app_id_name contains "Okta" or action_app_id_name contains "Duo")
+    | filter action_external_hostname != null or action_country != null
+    | alter threat_intel = arrayindex(regextract(action_remote_ip, "^(.*)$"), 0)
+    | comp threat_intel_match = array_agg(action_remote_ip) by action_remote_ip
+    | filter action_remote_ip in (threat_intel_match)
+    | join type=inner (dataset = threat_intel_feeds | fields indicator_value) as threat threat.indicator_value = action_remote_ip
+    | fields _time, actor_effective_username, action_remote_ip, action_country, action_app_id_name, agent_hostname, outcome
+  lucene: |
+    (event.action:"user.authentication.sso" OR event.action:"user.session.start" OR event.outcome:"success" OR event.category:"authentication") AND (event.outcome:"success" OR result:"success" OR authentication.result:"success") AND (mfa_result:"success" OR duo.result:"success" OR okta.authentication_context.credential_type:(*mfa* OR *duo* OR *totp* OR *push*) OR azure.properties.authenticationDetails.succeeded:true) AND NOT (source.ip:10.0.0.0/8 OR source.ip:172.16.0.0/12 OR source.ip:192.168.0.0/16 OR source.ip:127.0.0.1) AND (threat.indicator.ip:* OR source.geo.threat_intel:true OR threat.enrichments.matched.atomic:* OR ioc_match:true)
+  sumo: |
+    (_sourceCategory=*Duo* OR _sourceCategory=*Okta* OR _sourceCategory=*Azure*) AND (result=success OR outcome.result=SUCCESS OR status=success OR ResultType=0) AND (factor=push OR factor=phone OR factor=sms OR authenticationMethod=* OR CredentialType=*)
+    | json field=_raw "result" as duo_result
+    | json field=_raw "factor" as duo_factor
+    | json field=_raw "access_device.ip" as duo_ip
+    | json field=_raw "outcome.result" as okta_result
+    | json field=_raw "client.ipAddress" as okta_ip
+    | json field=_raw "debugContext.debugData.factor" as okta_factor
+    | json field=_raw "authenticationMethod" as azure_method
+    | json field=_raw "ipAddress" as azure_ip
+    | json field=_raw "ResultType" as azure_result
+    | json field=_raw "status" as azure_status
+    | if(isBlank(duo_ip), if(isBlank(okta_ip), azure_ip, okta_ip), duo_ip) as source_ip
+    | if(isBlank(duo_result), if(isBlank(okta_result), if(azure_result="0" OR azure_status="success", "success", ""), okta_result), duo_result) as login_result
+    | if(isBlank(duo_factor), if(isBlank(okta_factor), azure_method, okta_factor), duo_factor) as mfa_method
+    | where (login_result matches "*success*" OR login_result matches "*SUCCESS*") AND !isBlank(mfa_method) AND !isBlank(source_ip)
+    | lookup type, actor, raw, threatlevel as malicious_confidence from sumo://threat/cs on threat=source_ip
+    | where type="ip_address" AND !isBlank(malicious_confidence)
+    | fields _messageTime, _sourceCategory, source_ip, login_result, mfa_method, type, actor, malicious_confidence
 false_positives:
 - Authorized pen testing
 - Security research
@@ -98,7 +124,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Successful MFA Login Event \nFrom an external source\nWhere the Source IP is on a Threat Intelligence List"
 triage_steps:

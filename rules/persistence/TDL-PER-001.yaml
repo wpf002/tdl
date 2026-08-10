@@ -13,76 +13,107 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 70
 queries:
-  spl: |
-    index=endpoint sourcetype=Sysmon EventCode=13 (TargetObject="*\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\*" OR TargetObject="*\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\*") NOT (Image="*\\msiexec.exe" OR Image="*\\setup.exe" OR Image="*\\installer.exe" OR Image="*\\TrustedInstaller.exe")
-    | eval process_name=mvindex(split(Image,"\\"),-1), parent_process_name=mvindex(split(ParentImage,"\\"),-1), command_line=CommandLine, host=ComputerName, user=User
+  spl: 'index=endpoint sourcetype=Sysmon EventCode=13 (TargetObject="*\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\*" OR TargetObject="*\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\*")
+    NOT (Image="*\\msiexec.exe" OR Image="*\\setup.exe" OR Image="*\\installer.exe" OR Image="*\\TrustedInstaller.exe")
+
+    | eval process_name=mvindex(split(Image,"\\"),-1), parent_process_name=mvindex(split(ParentImage,"\\"),-1), command_line=CommandLine, host=ComputerName,
+    user=User
+
     | dedup host, TargetObject, user
+
     | table _time, host, user, process_name, parent_process_name, command_line, TargetObject, Details
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_001 {\n  meta:\n    author = \"TDL\"\n    description = \"Registry Run Key Persistence Added\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1547.001\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: "Event\n| where TimeGenerated > ago(90d)\n| where Source == \"Microsoft-Windows-Sysmon\" and EventID == 13\n| extend RegistryDetails =\
+    \ parse_xml(EventData)\n| extend TargetObject = tostring(RegistryDetails.DataItem.EventData.Data.[5].[\"#text\"])\n| extend ProcessName =\
+    \ tostring(RegistryDetails.DataItem.EventData.Data.[6].[\"#text\"])\n| extend ProcessCommandLine = tostring(RegistryDetails.DataItem.EventData.Data.[10].[\"\
+    #text\"])\n| extend User = tostring(RegistryDetails.DataItem.EventData.Data.[1].[\"#text\"])\n| extend Image = tostring(RegistryDetails.DataItem.EventData.Data.[6].[\"\
+    #text\"])\n| where TargetObject matches regex @\"(?i).*\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\(Run|RunOnce).*\"\n| where\
+    \ ProcessName !in~ (\"msiexec.exe\", \"setup.exe\", \"installutil.exe\", \"regsvr32.exe\", \"rundll32.exe\", \"svchost.exe\", \"services.exe\"\
+    )\n| extend ProcessNameOnly = tostring(split(ProcessName, \"\\\\\")[-1])\n| summarize FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),\
+    \ Count = count() \n    by Computer, User, TargetObject, ProcessNameOnly, ProcessCommandLine\n| project FirstSeen, LastSeen, Computer, User,\
+    \ TargetObject, ProcessNameOnly, ProcessCommandLine, Count\n"
+  aql: "SELECT FIRST(eventtime) AS first_seen, \n       LOGSOURCENAME(logsourceid) AS host, \n       username, \n       \"TargetObject\", \n \
+    \      \"Image\" AS process_name, \n       \"ParentImage\" AS parent_process_name, \n       \"CommandLine\" AS command_line, \n       \"Details\"\
+    \ AS registry_value\nFROM events\nWHERE \"EventID\" = '13'\n  AND (\"TargetObject\" ILIKE '%\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\
+    \\Run\\\\%'\n       OR \"TargetObject\" ILIKE '%\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\RunOnce\\\\%')\n  AND \"Image\"\
+    \ NOT IN ('C:\\\\Windows\\\\System32\\\\msiexec.exe', \n                      'C:\\\\Windows\\\\System32\\\\svchost.exe',\n              \
+    \        'C:\\\\Windows\\\\explorer.exe',\n                      'C:\\\\Program Files\\\\Common Files\\\\Microsoft Shared\\\\ClickToRun\\\\\
+    OfficeClickToRun.exe',\n                      'C:\\\\Windows\\\\System32\\\\services.exe')\nGROUP BY \"TargetObject\", username, LOGSOURCENAME(logsourceid)\n\
+    LAST 24 HOURS\n"
+  yara_l: |
+    rule registry_run_key_persistence {
+      meta:
+        author = "TDL"
+        description = "Detects persistence via Run/RunOnce registry keys - MITRE T1547.001"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1547.001"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "REGISTRY_MODIFICATION"
+        $e.metadata.product_event_type = "13"
+        re.regex($e.target.registry.registry_key, `(?i)(HKLM|HKEY_LOCAL_MACHINE|HKCU|HKEY_CURRENT_USER)\\Software\\Microsoft\\Windows\\CurrentVersion\\(Run|RunOnce)`)
+        not re.regex($e.principal.process.file.full_path, `(?i)(msiexec\.exe|setup\.exe|installagent\.exe|wuauclt\.exe|svchost\.exe|trustedinstaller\.exe)$`)
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $user
+        $e.target.registry.registry_key = $regkey
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host, $user, $regkey over 1h
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
+        $process_name = array_distinct($e.principal.process.file.full_path)
+        $parent_process = array_distinct($e.principal.process.parent_process.file.full_path)
+        $command_line = array_distinct($e.principal.process.command_line)
+        $registry_path = array_distinct($e.target.registry.registry_key)
+        $registry_value = array_distinct($e.target.registry.registry_value_data)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*
+    | WHERE winlog.event_id == 13
+      AND (
+        winlog.event_data.TargetObject LIKE "*\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\*"
+        OR winlog.event_data.TargetObject LIKE "*\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\*"
+      )
+      AND process.name NOT IN ("msiexec.exe", "setup.exe", "installer.exe", "MsiExec.exe", "InstallShield.exe", "inno_setup.exe")
+    | EVAL normalized_path = TO_LOWER(winlog.event_data.TargetObject)
+    | STATS first_seen = MIN(@timestamp) BY host.name, user.name, normalized_path, process.name, process.parent.name, process.command_line
+    | KEEP first_seen, host.name, user.name, normalized_path, process.name, process.parent.name, process.command_line
+  leql: |
+    where(source_json.EventID=13 AND (source_json.TargetObject ICONTAINS "\Software\Microsoft\Windows\CurrentVersion\Run" OR source_json.TargetObject ICONTAINS "\Software\Microsoft\Windows\CurrentVersion\RunOnce") AND source_json.Image NOT IN ["C:\\Windows\\System32\\msiexec.exe", "C:\\Windows\\SysWOW64\\msiexec.exe", "C:\\Program Files\\Common Files\\Microsoft Shared\\ClickToRun\\OfficeClickToRun.exe", "C:\\Windows\\System32\\svchost.exe"]) groupby(source_json.TargetObject, source_json.User, asset) calculate(count)
+  crowdstrike: |
+    EventCode=13 TargetObject=/(HKLM|HKCU|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER)\\Software\\Microsoft\\Windows\\CurrentVersion\\(Run|RunOnce)/i
+    | !in(field=Image, values=["*\\msiexec.exe","*\\setup.exe","*\\installer.exe","*\\wusa.exe","*\\TrustedInstaller.exe","*\\MpCmdRun.exe"])
+    | groupBy([ComputerName, TargetObject, User], function=selectFromMin(field=@timestamp, include=[Image, ParentImage, CommandLine]))
+    | table([@timestamp, ComputerName, User, Image, ParentImage, CommandLine, TargetObject])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 13
+    | filter action_registry_key_name ~= ".*\\Software\\Microsoft\\Windows\\CurrentVersion\\Run.*"
+    | filter action_process_image_name not in ("msiexec.exe", "setup.exe", "installer.exe", "InstallShield.exe", "InnoSetup.exe")
+    | dedup agent_hostname, action_registry_key_name, actor_effective_username
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, actor_process_image_name, action_process_image_command_line, action_registry_key_name, action_registry_value_name, action_registry_data
+  lucene: |
+    winlog.event_id:13 AND winlog.event_data.TargetObject:(*\\Software\\Microsoft\\Windows\\CurrentVersion\\Run* OR *\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce*) AND NOT process.name:(msiexec.exe OR setup.exe OR installer.exe OR steam.exe OR chrome_installer.exe OR firefox*.exe OR teams_installer.exe OR ccmsetup.exe OR wuauclt.exe OR trustedinstaller.exe OR windowsupdatesetup.exe)
+  sumo: |
+    _sourceCategory=*Sysmon* "13"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetObject" as target_object
+    | json field=_raw "Image" as process_name
+    | json field=_raw "ParentImage" as parent_process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "User" as user
+    | json field=_raw "Computer" as host
+    | where event_id = "13"
+    | where target_object matches "*\\Software\\Microsoft\\Windows\\CurrentVersion\\Run*" or target_object matches "*\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce*"
+    | where !(process_name matches "*msiexec.exe" or process_name matches "*setup.exe" or process_name matches "*installer.exe" or process_name matches "*wusa.exe" or process_name matches "*TrustedInstaller.exe")
+    | dedup by target_object, user, host
+    | fields _messageTime, host, user, process_name, parent_process_name, command_line, target_object
 false_positives:
 - Software installers adding legitimate startup entries
 tags:
@@ -92,7 +123,7 @@ tags:
 author: TDL
 created: '2024-01-20'
 test_method: synthetic
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'
 - Inspect the registry hive, key path, value name, and writing process — verify the persistence target points to an unusual location or unsigned

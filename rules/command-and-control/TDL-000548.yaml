@@ -16,70 +16,61 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=github action="org.transfer" | table _time, actor, org, repo, action, created_at
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+  spl: 'index=github action="org.transfer" | table _time, actor, org, repo, action, created_at
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000548 {\n  meta:\n    author = \"TDL\"\n    description = \"Organization Transfered to New Enterprise\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    GitHubAuditLogPolling
+    | where Action == "org.transfer"
+    | extend ActorUser = tostring(Actor)
+    | extend OrgName = tostring(Organization)
+    | extend RepoName = tostring(Repository)
+    | project TimeGenerated, ActorUser, OrgName, RepoName, Action, ActorLocation, UserAgent
+  aql: |
+    SELECT eventtime, username, sourceip, destinationip, "Action" AS action, "Organization", QIDNAME(qid), LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%github%' AND "Action" = 'org.transfer'
+    LAST 24 HOURS
+  yara_l: |
+    rule github_org_transfer_detection {
+      meta:
+        author = "TDL"
+        description = "Detects GitHub organization transfer events (T1078 - Valid Accounts)"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "GitHub"
+        $e.metadata.product_event_type = "org.transfer"
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-github.audit-*
+    | WHERE event.action == "org.transfer"
+    | KEEP @timestamp, organization.name, user.name, github.actor, github.repo, event.action, source.ip
+  leql: |
+    where(source_json.action="org.transfer")
+  crowdstrike: |
+    #repo=github action=org.transfer
+    | table([@timestamp, actor, org, created_at, action, repo, data])
+  xql: |
+    dataset = github_audit_log_raw
+    | filter action = "org.transfer"
+    | fields _time, actor, org, action, repo, created_at
+  lucene: |
+    event.action:"org.transfer"
+  sumo: |
+    _sourceCategory=*Github* "org.transfer"
+    | json field=_raw "action" as action
+    | where action = "org.transfer"
+    | fields _messageTime, _sourceHost, action, *
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -89,7 +80,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Github event\n   where actions is \"org.transfer\""
 triage_steps:

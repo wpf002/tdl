@@ -17,74 +17,105 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    (index=windows (EventCode=592 OR EventCode=4688) Image="*\\powershell.exe" CommandLine="*Invoke-TotalExec*") OR (index=windows EventCode=4104 ScriptBlockText="*Invoke-TotalExec*")
+  spl: '(index=windows (EventCode=592 OR EventCode=4688) Image="*\\powershell.exe" CommandLine="*Invoke-TotalExec*") OR (index=windows EventCode=4104
+    ScriptBlockText="*Invoke-TotalExec*")
+
     | table _time, ComputerName, EventCode, User, Image, CommandLine, ScriptBlockText
-  kql: 'DeviceProcessEvents
 
+    '
+  kql: |
+    union isfuzzy=true
+    (
+    SecurityEvent
     | where TimeGenerated > ago(1d)
+    | where EventID == 4688
+    | where Process has "powershell.exe" or NewProcessName has "powershell.exe"
+    | where CommandLine has "Invoke-TotalExec"
+    | project TimeGenerated, Computer, Account, Process, CommandLine, EventID, SubjectUserName
+    ),
+    (
+    Event
+    | where TimeGenerated > ago(1d)
+    | where EventID == 4104
+    | where RenderedDescription has "Invoke-TotalExec" or ParameterBinding has "Invoke-TotalExec"
+    | project TimeGenerated, Computer, UserName, RenderedDescription, EventID
+    )
+  aql: |
+    SELECT username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process Name", "Process CommandLine", "ScriptBlockText", eventtime, "EventID"
+    FROM events
+    WHERE (("EventID" IN ('592', '4688') AND "Process Name" ILIKE '%powershell.exe%' AND "Process CommandLine" ILIKE '%Invoke-TotalExec%') OR ("EventID" = '4104' AND "ScriptBlockText" ILIKE '%Invoke-TotalExec%'))
+    LAST 24 HOURS
+  yara_l: |
+    rule invoke_totalexec_execution {
+      meta:
+        author = "TDL"
+        description = "Detects execution of Invoke-TotalExec via PowerShell process or script block logging"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "HIGH"
 
-    | where process_name in ("powershell.exe")
+      events:
+        // Process execution events (4688)
+        $proc.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $proc.metadata.product_event_type = "592" or
+          $proc.metadata.product_event_type = "4688"
+        )
+        re.regex($proc.principal.process.file.full_path, `(?i)powershell\.exe$`)
+        re.regex($proc.principal.process.command_line, `(?i)Invoke-TotalExec`)
+        $proc.principal.hostname = $host
+        $proc.target.user.userid = $user
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+        // PowerShell script block logging events (4104)
+        $script.metadata.event_type = "PROCESS_LAUNCH"
+        $script.metadata.product_event_type = "4104"
+        re.regex($script.principal.process.command_line, `(?i)Invoke-TotalExec`)
+        $script.principal.hostname = $host2
+        $script.target.user.userid = $user2
 
-    | order by Count desc
+      match:
+        $host over 5m
+        $host2 over 5m
 
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('powershell.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000517 {\n  meta:\n    author = \"TDL\"\n    description = \"Invoke-TotalExec Commandlet Activity\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(powershell.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+      outcome:
+        $risk_score = 85
 
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("powershell.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [powershell.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $proc or $script
+    }
+  esql: |
+    FROM logs-windows.powershell*, logs-system.security*, winlogbeat-*, logs-endpoint.events.process*
+    | WHERE (event.code IN ("592", "4688", "4104") OR winlog.event_id IN (592, 4688, 4104))
+      AND (
+        (process.name == "powershell.exe" AND process.command_line LIKE "*Invoke-TotalExec*")
+        OR (event.code == "4104" AND powershell.file.script_block_text LIKE "*Invoke-TotalExec*")
+        OR (winlog.event_id == 4104 AND winlog.event_data.ScriptBlockText LIKE "*Invoke-TotalExec*")
+      )
+    | KEEP @timestamp, host.name, user.name, event.code, winlog.event_id, process.name, process.command_line, powershell.file.script_block_text, winlog.event_data.ScriptBlockText
+  leql: |
+    where((source_json.EventID IN [592, 4688] AND process_name ICONTAINS "powershell.exe" AND process_cmd_line ICONTAINS "Invoke-TotalExec") OR (source_json.EventID=4104 AND source_json.ScriptBlockText ICONTAINS "Invoke-TotalExec"))
+  crowdstrike: |
+    (EventCode=4688 OR EventCode=592 OR EventCode=4104)
+    (
+      (EventCode=4688 AND NewProcessName=*powershell.exe CommandLine=*Invoke-TotalExec*)
+      OR
+      (EventCode=592 AND ProcessName=*powershell.exe CommandLine=*Invoke-TotalExec*)
+      OR
+      (EventCode=4104 ScriptBlockText=*Invoke-TotalExec*)
+    )
+    | table([@timestamp, ComputerName, EventCode, NewProcessName, ProcessName, CommandLine, ScriptBlockText, UserName])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) and lowercase(action_process_image_name) contains "powershell.exe" and action_process_image_command_line contains "Invoke-TotalExec")
+       or (action_evtlog_event_id = 4104 and action_evtlog_message contains "Invoke-TotalExec")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_id, action_process_image_name, action_process_image_command_line, action_evtlog_message
+  lucene: |
+    (event.code:(592 OR 4688) AND process.name:*powershell.exe AND process.command_line:*Invoke-TotalExec*) OR (event.code:4104 AND winlog.event_data.ScriptBlockText:*Invoke-TotalExec*)
+  sumo: "_sourceCategory=*Windows* (EventID=4688 OR EventID=592 OR EventID=4104)\n| json field=_raw \"EventID\" as event_id\n| json field=_raw\
+    \ \"NewProcessName\" as process_name\n| json field=_raw \"CommandLine\" as command_line\n| json field=_raw \"ScriptBlockText\" as script_text\n\
+    | where (event_id in (\"4688\", \"592\") and process_name matches \"*powershell.exe\" and command_line matches \"*Invoke-TotalExec*\") \n\
+    \   OR (event_id = \"4104\" and script_text matches \"*Invoke-TotalExec*\")\n| fields _messageTime, _sourceHost, event_id, process_name, command_line,\
+    \ script_text\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +125,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe\nWhere Command\
   \ contains \"Invoke-TotalExec\"\n\n---------------------------------------------------------------------------------------------------------------\n\

@@ -15,71 +15,79 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=kubernetes k8s.verb IN("get","list") k8s.resource="cronjob" k8s.subresource=""
+  spl: 'index=kubernetes k8s.verb IN("get","list") k8s.resource="cronjob" k8s.subresource=""
+
     | table _time, k8s.user, k8s.verb, k8s.resource, k8s.subresource, k8s.namespace, k8s.name, source_ip
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000566 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubernetes Cronjobs Listed\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1053\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    KubernetesEvent
+    | where TimeGenerated > ago(1h)
+    | where (Verb in~ ("get", "list") and Resource =~ "cronjob" and isempty(Subresource))
+         or (Resource =~ "cronjob" and Subresource =~ "cronjob")
+    | project TimeGenerated, Verb, Resource, Subresource, User, SourceIPs, ObjectName, Namespace, ResponseCode
+  aql: |
+    SELECT objectRef.name, objectRef.namespace, user.username, verb, sourceIPs, COUNT(*) AS event_count
+    FROM events
+    WHERE (verb IN ('get', 'list') AND objectRef.resource = 'cronjobs' AND objectRef.subresource IS NULL)
+       OR (objectRef.resource = 'cronjobs')
+    GROUP BY objectRef.name, objectRef.namespace, user.username, verb, sourceIPs
+    LAST 1 HOURS
+  yara_l: |
+    rule kubernetes_cronjob_enumeration {
+      meta:
+        author = "TDL"
+        description = "Detects enumeration of Kubernetes cronjobs via get/list verbs"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1053"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $k.metadata.product_name = "Kubernetes"
+        (
+          (
+            ($k.metadata.product_event_type = "get" or $k.metadata.product_event_type = "list")
+            $k.target.resource.name = "cronjob"
+            not $k.target.resource.attribute.labels.value != ""
+          )
+          or
+          (
+            $k.target.resource.name = "cronjob"
+            not $k.target.resource.attribute.labels.value != ""
+          )
+        )
+        $k.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $k
+    }
+  esql: |
+    FROM logs-kubernetes.audit*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND (
+        (kubernetes.audit.verb IN ("get", "list") AND kubernetes.audit.objectRef.resource == "cronjobs" AND kubernetes.audit.objectRef.subresource IS NULL)
+        OR
+        (kubernetes.audit.objectRef.resource == "cronjobs" AND kubernetes.audit.objectRef.subresource == "status")
+      )
+    | STATS event_count = COUNT(*) BY kubernetes.audit.user.username, kubernetes.audit.objectRef.namespace, kubernetes.audit.verb, kubernetes.audit.objectRef.name
+    | KEEP kubernetes.audit.user.username, kubernetes.audit.objectRef.namespace, kubernetes.audit.verb, kubernetes.audit.objectRef.name, event_count
+  leql: |
+    where((source_json.verb IN ["get", "list"] AND source_json.resource="cronjob" AND source_json.subresource=NULL) OR (source_json.resource="cronjob" AND source_json.subresource="cronjob"))
+  crowdstrike: |
+    #repo=kubernetes verb IN [get, list] ObjectRef.Resource=cronjob ObjectRef.Subresource=""
+    | table([@timestamp, User.Username, Verb, ObjectRef.Resource, ObjectRef.Namespace, ObjectRef.Name, SourceIPs, UserAgent])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "GCP" and resource_type = "k8s_cluster"
+    | filter (verb in ("get", "list") and resource = "cronjob" and (subresource = null or subresource = "")) or (resource = "cronjob" and subresource = "cronjob")
+    | fields _time, actor_user, verb, resource, subresource, cluster_name, namespace
+  lucene: |
+    (verb:("get" OR "list") AND resource:"cronjob" AND NOT _exists_:subresource) OR (resource:"cronjob" AND subresource:"cronjob")
+  sumo: "_sourceCategory=*Kubernetes* (verb=\"get\" OR verb=\"list\") resource=\"cronjob\" \n| where isNull(subresource) OR subresource=\"cronjob\"\
+    \n| fields _messageTime, _sourceHost, verb, resource, subresource, user, objectRef\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -89,7 +97,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere Verb is \"get\" OR \"list\"\nOR\n             Where Resource is \"cronjob\"\n             Where Subresource\
   \ is NULL\n\n             Where Subresource is \"cronjob\""

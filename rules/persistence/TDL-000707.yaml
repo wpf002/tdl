@@ -19,71 +19,69 @@ risk_score: 55
 queries:
   spl: "index=wineventlog sourcetype=\"WinEventLog:Microsoft-Windows-Bits-Client/Operational\" EventCode=3 \n| search NotifyCmdLine=* \n| table\
     \ _time, ComputerName, User, jobTitle, fileId, url, NotifyCmdLine\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 1
+    | where CommandLine has "bitsadmin" and (CommandLine has "/SetNotifyCmdLine" or CommandLine has "/SETNOTIFYCMDLINE")
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Image" AS image
+    FROM events
+    WHERE ("EventID" = '4688' OR "EventID" = '1')
+      AND ("Process CommandLine" ILIKE '%bitsadmin%' AND "Process CommandLine" ILIKE '%/SetNotifyCmdLine%')
+    LAST 24 HOURS
+  yara_l: |
+    rule bits_job_notify_command_persistence {
+      meta:
+        author = "TDL"
+        description = "Detects BITS job created with notify command for persistence (T1197)"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1197"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          re.regex($e.principal.process.file.full_path, `(?i)\\bitsadmin\.exe$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)\\powershell\.exe$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)\\cmd\.exe$`)
+        )
+        (
+          re.regex($e.principal.process.command_line, `(?i)bitsadmin.*\/SetNotifyCmdLine`) or
+          re.regex($e.principal.process.command_line, `(?i)Start-BitsTransfer.*-NotifyCmdLine`)
+        )
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $user
 
-    | where process_name matches regex ".+"
+      match:
+        $host, $user over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      outcome:
+        $risk_score = 65
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000707 {\n  meta:\n    author = \"TDL\"\n    description = \"BITS Job with SetNotifyCmdLine Configured\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1197\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-windows.sysmon_operational*\n| WHERE winlog.event_id == \"1\" \n  AND process.name == \"bitsadmin.exe\" \n  AND (process.command_line\
+    \ LIKE \"*/SetNotifyCmdLine*\" OR process.command_line LIKE \"*/SETNOTIFYCMDLINE*\" OR process.command_line LIKE \"*-SetNotifyCmdLine*\" OR\
+    \ process.command_line LIKE \"*-SETNOTIFYCMDLINE*\")\n| KEEP @timestamp, host.name, user.name, process.command_line, process.parent.name,\
+    \ process.parent.command_line\n"
+  leql: |
+    where(source_json.EventID=59 AND source_json.NotifyCmdLine EXISTS)
+  crowdstrike: |
+    (EventCode=4688 OR event_simpleName=ProcessRollup2) (CommandLine=*bitsadmin* AND (CommandLine=*/SetNotifyCmdLine* OR CommandLine=*/AddFile*)) OR (EventCode=59 OR event_simpleName=BitsJobCreated)
+    | table([@timestamp, ComputerName, UserName, CommandLine, FileName, ParentBaseFileName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (59, 60, 61) and action_evtlog_message contains "NotifyCmdLine"
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_data_JobTitle, action_evtlog_event_data_JobId, action_evtlog_message
+  lucene: |
+    event.code:1 AND (process.parent.name:bitsadmin.exe OR process.command_line:*bitsadmin* AND process.command_line:*/SetNotifyCmdLine*)
+  sumo: "_sourceCategory=*Sysmon* \"1\"\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"Image\" as image\n| json field=_raw \"\
+    CommandLine\" as command_line\n| json field=_raw \"ParentImage\" as parent_image\n| where event_id = \"1\" \n  and (image matches \"*bitsadmin.exe\"\
+    \ or command_line matches \"*Start-BitsTransfer*\")\n  and (command_line matches \"*/SetNotifyCmdLine*\" or command_line matches \"*-NotifyCmdLine*\"\
+    )\n| fields _messageTime, _sourceHost, image, command_line, parent_image\n"
 pseudo_logic: BITS job created with a notify command — BITS will execute the command when the transfer completes. Classic stealth persistence/launch
   primitive.
 false_positives:
@@ -102,7 +100,7 @@ references:
 - https://attack.mitre.org/techniques/T1197/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'

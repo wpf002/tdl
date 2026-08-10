@@ -19,77 +19,90 @@ queries:
   spl: "index=firewall \n| eval bytes_out_mb = bytes_out / 1048576 \n| where bytes_out_mb > 5 \n    AND NOT (dest_country IN (\"US\", \"CA\",\
     \ \"GB\", \"DE\", \"FR\", \"AU\", \"NZ\", \"JP\", \"SG\")) \n    AND isnotnull(dest_country) \n| table _time, src_ip, dest_ip, dest_country,\
     \ bytes_out_mb, action, app, dest_port\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceVendor has "firewall" or DeviceProduct has "firewall" or DeviceEventClassID has "firewall"
+    | extend BytesOut = coalesce(SentBytes, BytesSent, tolong(0))
+    | extend DestinationCountry = coalesce(DestinationGeoCountry, AdditionalExtensions)
+    | where BytesOut > 5242880
+    | where isnotempty(DestinationCountry)
+    | where DestinationCountry !in ("United States", "Canada", "United Kingdom", "Germany", "France")
+    | project TimeGenerated, SourceIP, DestinationIP, DestinationCountry, BytesOut, DeviceAction, ApplicationProtocol, DestinationPort, DeviceVendor, DeviceProduct
+  aql: |
+    SELECT sourceip, destinationip, "Destination Country", SUM(BytesOut) AS total_bytes_out, COUNT(*) AS event_count
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%firewall%'
+      AND "Destination Country" IS NOT NULL
+      AND "Destination Country" NOT IN ('US', 'CA', 'GB', 'AU', 'DE', 'FR', 'NL', 'SE', 'NO', 'DK', 'FI', 'IE', 'NZ', 'CH', 'AT', 'BE', 'LU', 'IT', 'ES', 'PT', 'JP', 'KR', 'SG')
+      AND BytesOut > 5242880
+    GROUP BY sourceip, destinationip, "Destination Country"
     LAST 1 HOURS
+  yara_l: |
+    rule exfiltration_to_unauthorized_country {
+      meta:
+        author = "Chronicle Detection"
+        description = "Detects network traffic over 5MB to unauthorized countries"
+        mitre_attack_tactic = "Exfiltration"
+        mitre_attack_technique = "T1071"
+        severity = "High"
 
-    '
-  yara_l: "rule tdl_tdl_exf_000253 {\n  meta:\n    author = \"TDL\"\n    description = \"Potential Data Exfiltration to Rare Geolocation\"\n \
-    \   severity = \"MEDIUM\"\n    tactic = \"TA0010\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.metadata.product_log_id = "FIREWALL"
+        not net.ip_in_range_cidr($e.target.ip, "10.0.0.0/8")
+        not net.ip_in_range_cidr($e.target.ip, "172.16.0.0/12")
+        not net.ip_in_range_cidr($e.target.ip, "192.168.0.0/16")
+        $e.network.sent_bytes > 5242880
+        $e.principal.location.country_or_region != ""
+        $e.target.location.country_or_region != ""
+        $e.target.location.country_or_region != "US"
+        $e.target.location.country_or_region != "United States"
+        $e.principal.hostname = $host
+        $e.target.ip = $dest_ip
+        $e.target.location.country_or_region = $country
 
-    | WHERE @timestamp > NOW() - 1 hour
+      match:
+        $host over 1h
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+      outcome:
+        $risk_score = 75
+        $bytes_out = max($e.network.sent_bytes)
+        $destination_country = $country
+        $destination_ip = $dest_ip
 
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network.firewall*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND destination.geo.country_name NOT IN ("United States", "Canada", "United Kingdom", "Germany", "France")
+      AND destination.bytes > 5242880
+    | STATS total_bytes = SUM(destination.bytes), connections = COUNT(*) BY source.ip, destination.ip, destination.geo.country_name, destination.port
+    | KEEP source.ip, destination.ip, destination.geo.country_name, destination.port, total_bytes, connections
+  leql: |
+    where(destination_country NOT IN ["US", "CA", "GB", "DE", "FR", "AU", "NZ", "JP", "SG", "IE", "NL", "SE", "NO", "DK", "FI", "CH", "AT", "BE", "ES", "IT"] AND bytes_out > 5242880)
+  crowdstrike: |
+    #type=firewall bytes_out>5242880
+    | !in(field=destination_country, values=["US", "CA", "GB", "DE", "FR", "AU", "JP"])
+    | table([@timestamp, source_ip, destination_ip, destination_country, bytes_out, protocol, destination_port])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter dest_country != null \n  and dest_country not in (\"US\", \"CA\", \"GB\", \"DE\", \"FR\", \"\
+    AU\", \"JP\", \"NZ\", \"IT\", \"ES\", \"NL\", \"SE\", \"NO\", \"DK\", \"FI\", \"IE\", \"CH\", \"AT\", \"BE\", \"SG\", \"KR\", \"IL\")\n  and\
+    \ bytes_out > 5242880\n| fields _time, src_ip, dest_ip, dest_country, dest_port, bytes_out, app, action, source_host\n"
+  lucene: |
+    event.type:firewall AND bytes_out:[5242880 TO *] AND NOT destination.geo.country_iso_code:(US OR CA OR GB OR DE OR FR) AND _exists_:destination.geo.country_iso_code
+  sumo: |
+    _sourceCategory=*Firewall* OR _sourceCategory=*firewall*
+    | parse regex "(?<bytes_out>\d+)" nodrop
+    | parse regex "(?<dest_country>[A-Z]{2})" nodrop
+    | json field=_raw "destination_country" as dest_country nodrop
+    | json field=_raw "bytes_out" as bytes_out nodrop
+    | json field=_raw "destination.geo.country_iso_code" as dest_country nodrop
+    | json field=_raw "bytes_sent" as bytes_out nodrop
+    | where !(dest_country in ("US", "CA", "GB", "AU", "DE", "FR", "JP"))
+    | where (tolong(bytes_out) > 5242880)
+    | fields _messageTime, _sourceHost, dest_country, bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -99,7 +112,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Firewall Event
 

@@ -18,73 +18,67 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=windows sourcetype=WinEventLog:Security (EventCode=628 OR EventCode=4724) TargetUserName="krbtgt"
+  spl: 'index=windows sourcetype=WinEventLog:Security (EventCode=628 OR EventCode=4724) TargetUserName="krbtgt"
+
     | table _time, ComputerName, SubjectUserName, TargetUserName, EventCode
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4724")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4724')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000020 {\n  meta:\n    author = \"TDL\"\n    description = \"Kerberos Account Password Reset\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(4724)/\n\
-    \    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (628, 4724)
+    | where TargetUserName =~ "krbtgt"
+    | project TimeGenerated, Computer, Account, TargetUserName, SubjectUserName, SubjectAccount, EventID, Activity
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Target Username", sourceip, destinationip, COUNT(*) AS reset_count
+    FROM events
+    WHERE "EventID" IN ('628', '4724')
+      AND ("Target Username" = 'krbtgt' OR "Target Username" ILIKE '%krbtgt%')
+    LAST 24 HOURS
+  yara_l: |
+    rule krbtgt_password_reset {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects password reset of krbtgt account - T1078 Initial Access"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 day
+      events:
+        $e.metadata.event_type = "USER_CHANGE_PASSWORD"
+        ($e.metadata.product_event_type = "628" or $e.metadata.product_event_type = "4724")
+        $e.target.user.userid = "krbtgt"
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "authentication" AND event_id IN ("4724")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4724])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4724)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4724")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4724)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4724")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*, logs-windows.security*, winlogbeat-*
+    | WHERE event.code IN ("628", "4724") AND TO_LOWER(winlog.event_data.TargetUserName) == "krbtgt"
+    | KEEP @timestamp, host.name, user.name, event.code, winlog.event_data.TargetUserName, winlog.event_data.SubjectUserName, winlog.event_data.SubjectDomainName
+  leql: |
+    where(source_json.EventID IN [628, 4724] AND source_json.TargetUserName="krbtgt")
+  crowdstrike: |
+    EventCode=4724 TargetUserName=krbtgt
+    | table([@timestamp, ComputerName, SubjectUserName, TargetUserName, TargetDomainName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (628, 4724)
+    | filter lowercase(action_evtlog_event_data_TargetUserName) = "krbtgt"
+    | fields _time, agent_hostname, action_evtlog_event_id, action_evtlog_event_data_TargetUserName, action_evtlog_event_data_SubjectUserName
+  lucene: |
+    event.code:4724 AND winlog.event_data.TargetUserName:krbtgt
+  sumo: |
+    _sourceCategory=*Windows* (EventID="628" OR EventID="4724")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetUserName" as target_user
+    | where event_id in ("628", "4724")
+    | where target_user = "krbtgt"
+    | fields _messageTime, _sourceHost, event_id, target_user
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -94,7 +88,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows Password Reset Event\nWhere the Event ID is in [628, 4724] \nWhere the Destination Username is \"krbtgt\""
 suppression:

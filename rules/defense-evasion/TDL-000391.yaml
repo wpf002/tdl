@@ -15,71 +15,53 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=azure sourcetype=azure:activity (operationName="MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE" OR operationName="Microsoft.Insights/DiagnosticSettings/Delete") status="Success"
+  spl: 'index=azure sourcetype=azure:activity (operationName="MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE" OR operationName="Microsoft.Insights/DiagnosticSettings/Delete")
+    status="Success"
+
     | table _time, user, resourceId, operationName, status, subscriptionId, resourceGroup
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000391 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Diagnostic Setting Deleted\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1489\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AzureActivity
+    | where TimeGenerated > ago(24h)
+    | where OperationNameValue =~ "MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE"
+    | where ActivityStatusValue =~ "Success"
+    | project TimeGenerated, Caller, SubscriptionId, ResourceGroup, Resource, OperationNameValue, ActivityStatusValue, Properties
+  aql: |
+    SELECT username, sourceip, eventtime, LOGSOURCENAME(logsourceid) AS log_source, qidname(qid) AS event_name
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%Azure%'
+      AND qidname(qid) ILIKE '%MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE%'
+      AND (qidname(qid) ILIKE '%Success%' OR categoryname(category) ILIKE '%Success%')
+    LAST 24 HOURS
+  yara_l: "rule azure_diagnostic_settings_deleted {\n  meta:\n    author = \"TDL\"\n    description = \"Detects deletion of Azure diagnostic settings\
+    \ (T1489 - Service Stop)\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1489\"\n    severity = \"Medium\"\
+    \n    \n  events:\n    $e.metadata.event_type = \"SYSTEM_AUDIT_LOG_UNCATEGORIZED\"\n    $e.metadata.product_name = \"Azure\"\n    $e.metadata.vendor_name\
+    \ = \"MICROSOFT\"\n    re.regex($e.metadata.product_event_type, `(?i)MICROSOFT\\.INSIGHTS/DIAGNOSTICSETTINGS/DELETE`)\n    $e.security_result.action\
+    \ = \"ALLOW\"\n    $e.security_result.summary = \"Success\"\n    $e.principal.user.userid = $user\n    $e.target.resource.name = $resource\n\
+    \    \n  match:\n    $user over 5m\n    \n  outcome:\n    $risk_score = 65\n    $resource_name = array_distinct($resource)\n    \n  condition:\n\
+    \    $e\n}\n"
+  esql: |
+    FROM logs-azure.activitylogs*
+    | WHERE event.action == "MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE" AND event.outcome == "success"
+    | KEEP @timestamp, azure.activitylogs.operation_name, azure.activitylogs.caller, azure.resource.id, event.outcome, cloud.account.id
+  leql: |
+    where(source_json.operationName="MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE" AND source_json.status="Success")
+  crowdstrike: |
+    #repo=azure event_simpleName=AzureActivityEvent OperationName="MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE" ActivityStatus="Success"
+    | table([@timestamp, ComputerName, UserName, OperationName, ActivityStatus, ResourceId, CallerIpAddress])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "Azure" and operation_name = "MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE" and outcome = "Success"
+    | fields _time, actor_user, resource_name, resource_type, project, operation_name, outcome
+  lucene: |
+    event.dataset:"azure.activitylogs" AND azure.activitylogs.operation_name:"MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE" AND event.outcome:"success"
+  sumo: |
+    _sourceCategory=*Azure* "MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE"
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "status.value" as status
+    | where operation_name = "MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE" and status = "Success"
+    | fields _messageTime, _sourceHost, operation_name, status
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +71,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure Activity Event
 

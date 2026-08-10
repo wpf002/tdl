@@ -23,68 +23,104 @@ queries:
     cmd.exe\" OR process_basename=\"powershel.exe\" OR process_basename=\"regsvr32.exe\" OR process_basename=\"mstsc.exe\" OR process_basename=\"\
     dllhost.exe\"))\n    OR (process_basename=\"lsass.exe\" AND (parent_basename=\"explorer.exe\" OR parent_basename=\"cmd.exe\" OR parent_basename=\"\
     lsass.exe\"))\n| table _time, ComputerName, parent_basename, process_basename, Process_Name, Parent_Process_Name, Account_Name\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where (ParentProcessName endswith "\\lsass.exe" and Process has_any ("cmd.exe", "powershel.exe", "regsvr32.exe", "mstsc.exe", "dllhost.exe"))
+        or (Process endswith "\\lsass.exe" and ParentProcessName has_any ("explorer.exe", "cmd.exe", "lsass.exe"))
+    | project TimeGenerated, Computer, Account, Process, ParentProcessName, CommandLine, NewProcessName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Parent Process Name", "Process Name", "Process CommandLine"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND (
+        ("Parent Process Name" ILIKE '%lsass.exe' AND "Process Name" IN ('%cmd.exe', '%powershel.exe', '%regsvr32.exe', '%mstsc.exe', '%dllhost.exe'))
+        OR
+        ("Process Name" ILIKE '%lsass.exe' AND "Parent Process Name" IN ('%explorer.exe', '%cmd.exe', '%lsass.exe'))
+      )
+    LAST 1 HOURS
+  yara_l: |
+    rule mitre_t1569_suspicious_lsass_child_processes {
+      meta:
+        author = "TDL"
+        description = "Detects suspicious child processes spawned from lsass.exe or lsass.exe spawned from unusual parent processes"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1569"
+        severity = "High"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "4688" or
+          $e.metadata.product_event_type = "592"
+        )
+        (
+          (
+            re.regex($e.principal.process.file.full_path, `(?i)\\lsass\.exe$`) and
+            (
+              re.regex($e.target.process.file.full_path, `(?i)\\cmd\.exe$`) or
+              re.regex($e.target.process.file.full_path, `(?i)\\powershel\.exe$`) or
+              re.regex($e.target.process.file.full_path, `(?i)\\regsvr32\.exe$`) or
+              re.regex($e.target.process.file.full_path, `(?i)\\mstsc\.exe$`) or
+              re.regex($e.target.process.file.full_path, `(?i)\\dllhost\.exe$`)
+            )
+          ) or
+          (
+            re.regex($e.target.process.file.full_path, `(?i)\\lsass\.exe$`) and
+            (
+              re.regex($e.principal.process.file.full_path, `(?i)\\explorer\.exe$`) or
+              re.regex($e.principal.process.file.full_path, `(?i)\\cmd\.exe$`) or
+              re.regex($e.principal.process.file.full_path, `(?i)\\lsass\.exe$`)
+            )
+          )
+        )
+        $e.principal.hostname = $host
 
-    | where eventName matches regex ".+"
+      match:
+        $host over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000200 {\n  meta:\n    author = \"TDL\"\n    description = \"Abnormal LSASS Parent Child Relationship\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1569\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*, logs-windows.security*, winlogbeat-*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND event.code IN ("592", "4688")
+      AND (
+        (process.parent.name == "lsass.exe" AND process.name IN ("cmd.exe", "powershel.exe", "regsvr32.exe", "mstsc.exe", "dllhost.exe"))
+        OR (process.name == "lsass.exe" AND process.parent.name IN ("explorer.exe", "cmd.exe", "lsass.exe"))
+      )
+    | KEEP @timestamp, host.name, user.name, process.name, process.parent.name, process.command_line, process.executable
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND ((parent_process_name="lsass.exe" AND process_name IN ["cmd.exe", "powershel.exe", "regsvr32.exe", "mstsc.exe", "dllhost.exe"]) OR (process_name="lsass.exe" AND parent_process_name IN ["explorer.exe", "cmd.exe", "lsass.exe"])))
+  crowdstrike: |
+    EventCode=4688
+    | case {
+        ParentBaseFileName=/^lsass\.exe$/i AND FileName IN [/^cmd\.exe$/i, /^powershel\.exe$/i, /^regsvr32\.exe$/i, /^mstsc\.exe$/i, /^dllhost\.exe$/i] | suspicious_reason := "lsass spawned suspicious process";
+        FileName=/^lsass\.exe$/i AND ParentBaseFileName IN [/^explorer\.exe$/i, /^cmd\.exe$/i, /^lsass\.exe$/i] | suspicious_reason := "lsass spawned by unusual parent";
+        * | suspicious_reason := null;
+      }
+    | suspicious_reason != null
+    | table([@timestamp, ComputerName, UserName, ParentBaseFileName, FileName, CommandLine, suspicious_reason])
+  xql: "dataset = xdr_data\n| filter action_evtlog_event_id in (592, 4688)\n| filter (lowercase(actor_process_image_name) contains \"lsass.exe\"\
+    \ \n          and (lowercase(action_process_image_name) contains \"cmd.exe\" \n               or lowercase(action_process_image_name) contains\
+    \ \"powershel.exe\" \n               or lowercase(action_process_image_name) contains \"regsvr32.exe\" \n               or lowercase(action_process_image_name)\
+    \ contains \"mstsc.exe\" \n               or lowercase(action_process_image_name) contains \"dllhost.exe\"))\n        or (lowercase(action_process_image_name)\
+    \ contains \"lsass.exe\" \n            and (lowercase(actor_process_image_name) contains \"explorer.exe\" \n                 or lowercase(actor_process_image_name)\
+    \ contains \"cmd.exe\" \n                 or lowercase(actor_process_image_name) contains \"lsass.exe\"))\n| fields _time, agent_hostname,\
+    \ actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_command_line\n"
+  lucene: |
+    (event.code:(592 OR 4688) AND process.parent.name:lsass.exe AND process.name:(cmd.exe OR powershel.exe OR regsvr32.exe OR mstsc.exe OR dllhost.exe)) OR (event.code:(592 OR 4688) AND process.name:lsass.exe AND process.parent.name:(explorer.exe OR cmd.exe OR lsass.exe))
+  sumo: |
+    _sourceCategory=*Windows* "4688"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ParentProcessName" as parent_process
+    | json field=_raw "NewProcessName" as process_name
+    | where event_id in ("592", "4688")
+    | where (parent_process matches "*\\lsass.exe" and process_name matches ("*\\cmd.exe", "*\\powershel.exe", "*\\regsvr32.exe", "*\\mstsc.exe", "*\\dllhost.exe"))
+       or (process_name matches "*\\lsass.exe" and parent_process matches ("*\\explorer.exe", "*\\cmd.exe", "*\\lsass.exe"))
+    | fields _messageTime, _sourceHost, event_id, parent_process, process_name
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +130,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Windows Process Creation Event
 

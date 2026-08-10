@@ -16,71 +16,73 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=github action IN ("secret_scanning.disable", "business_secret_scanning.disable", "repository_secret_scanning.disable", "secret_scanning_new_repos.disable", "business_secret_scanning.disabled_for_new_repos", "secret_scanning_push_protection.bypass", "business_secret_scanning_push_protection.disable", "repository_secret_scanning_push_protection.disable", "business_secret_scanning_push_protection.disabled_for_new_repos")
+  spl: 'index=github action IN ("secret_scanning.disable", "business_secret_scanning.disable", "repository_secret_scanning.disable", "secret_scanning_new_repos.disable",
+    "business_secret_scanning.disabled_for_new_repos", "secret_scanning_push_protection.bypass", "business_secret_scanning_push_protection.disable",
+    "repository_secret_scanning_push_protection.disable", "business_secret_scanning_push_protection.disabled_for_new_repos")
+
     | table _time, user, action, repo, org
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000542 {\n  meta:\n    author = \"TDL\"\n    description = \"Secret Scanning Disabled\"\n    severity = \"HIGH\"\n\
-    \    tactic = \"TA0005\"\n    technique = \"T1562\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    GitHubAuditLogPolling
+    | where Action in ("secret_scanning.disable", "business_secret_scanning.disable", "repository_secret_scanning.disable", "secret_scanning_new_repos.disable", "business_secret_scanning.disabled_for_new_repos", "secret_scanning_push_protection.bypass", "business_secret_scanning_push_protection.disable", "repository_secret_scanning_push_protection.disable", "business_secret_scanning_push_protection.disabled_for_new_repos")
+    | project TimeGenerated, Action, ActorUsername, Repository, Organization, IPaddress, UserAgent
+  aql: |
+    SELECT eventtime, username, sourceip, "action", "repository", "organization", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "action" IN ('secret_scanning.disable', 'business_secret_scanning.disable', 'repository_secret_scanning.disable', 'secret_scanning_new_repos.disable', 'business_secret_scanning.disabled_for_new_repos', 'secret_scanning_push_protection.bypass', 'business_secret_scanning_push_protection.disable', 'repository_secret_scanning_push_protection.disable', 'business_secret_scanning_push_protection.disabled_for_new_repos')
+    LAST 24 HOURS
+  yara_l: |
+    rule github_secret_scanning_disabled {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects disabling of GitHub secret scanning or push protection features - MITRE T1562 Defense Evasion"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1562"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "GITHUB"
+        $e.metadata.product_event_type = $action
+        (
+          $action = "secret_scanning.disable" or
+          $action = "business_secret_scanning.disable" or
+          $action = "repository_secret_scanning.disable" or
+          $action = "secret_scanning_new_repos.disable" or
+          $action = "business_secret_scanning.disabled_for_new_repos" or
+          $action = "secret_scanning_push_protection.bypass" or
+          $action = "business_secret_scanning_push_protection.disable" or
+          $action = "repository_secret_scanning_push_protection.disable" or
+          $action = "business_secret_scanning_push_protection.disabled_for_new_repos"
+        )
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-github*
+    | WHERE github.action IN ("secret_scanning.disable", "business_secret_scanning.disable", "repository_secret_scanning.disable", "secret_scanning_new_repos.disable", "business_secret_scanning.disabled_for_new_repos", "secret_scanning_push_protection.bypass", "business_secret_scanning_push_protection.disable", "repository_secret_scanning_push_protection.disable", "business_secret_scanning_push_protection.disabled_for_new_repos")
+    | KEEP @timestamp, github.actor, github.action, github.repository, github.org
+  leql: |
+    where(source_json.action IN [secret_scanning.disable, business_secret_scanning.disable, repository_secret_scanning.disable, secret_scanning_new_repos.disable, business_secret_scanning.disabled_for_new_repos, secret_scanning_push_protection.bypass, business_secret_scanning_push_protection.disable, repository_secret_scanning_push_protection.disable, business_secret_scanning_push_protection.disabled_for_new_repos])
+  crowdstrike: |
+    #repo=github action IN (secret_scanning.disable, business_secret_scanning.disable, repository_secret_scanning.disable, secret_scanning_new_repos.disable, business_secret_scanning.disabled_for_new_repos, secret_scanning_push_protection.bypass, business_secret_scanning_push_protection.disable, repository_secret_scanning_push_protection.disable, business_secret_scanning_push_protection.disabled_for_new_repos)
+    | table([@timestamp, actor, action, repo, org])
+  xql: |
+    dataset = github_audit_log_raw
+    | filter action in ("secret_scanning.disable", "business_secret_scanning.disable", "repository_secret_scanning.disable", "secret_scanning_new_repos.disable", "business_secret_scanning.disabled_for_new_repos", "secret_scanning_push_protection.bypass", "business_secret_scanning_push_protection.disable", "repository_secret_scanning_push_protection.disable", "business_secret_scanning_push_protection.disabled_for_new_repos")
+    | fields _time, action, actor, repo, org
+  lucene: |
+    actions:(secret_scanning.disable OR business_secret_scanning.disable OR repository_secret_scanning.disable OR secret_scanning_new_repos.disable OR business_secret_scanning.disabled_for_new_repos OR secret_scanning_push_protection.bypass OR business_secret_scanning_push_protection.disable OR repository_secret_scanning_push_protection.disable OR business_secret_scanning_push_protection.disabled_for_new_repos)
+  sumo: |
+    _sourceCategory=*Github* (secret_scanning.disable OR business_secret_scanning.disable OR repository_secret_scanning.disable OR secret_scanning_new_repos.disable OR business_secret_scanning.disabled_for_new_repos OR secret_scanning_push_protection.bypass OR business_secret_scanning_push_protection.disable OR repository_secret_scanning_push_protection.disable OR business_secret_scanning_push_protection.disabled_for_new_repos)
+    | json field=_raw "action" as action
+    | where action in ("secret_scanning.disable", "business_secret_scanning.disable", "repository_secret_scanning.disable", "secret_scanning_new_repos.disable", "business_secret_scanning.disabled_for_new_repos", "secret_scanning_push_protection.bypass", "business_secret_scanning_push_protection.disable", "repository_secret_scanning_push_protection.disable", "business_secret_scanning_push_protection.disabled_for_new_repos")
+    | fields _messageTime, _sourceHost, action
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -90,7 +92,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Github event\n   where actions IN (secret_scanning.disable, business_secret_scanning.disable, repository_secret_scanning.disable,\
   \ secret_scanning_new_repos.disable, business_secret_scanning.disabled_for_new_repos, secret_scanning_push_protection.bypass, business_secret_scanning_push_protection.disable,\

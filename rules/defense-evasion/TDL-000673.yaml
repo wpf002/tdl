@@ -19,71 +19,64 @@ queries:
   spl: "index=wineventlog sourcetype=WinEventLog:Security EventCode=4688 \n((New_Process_Name=\"*\\\\Taskmgr.exe\" Creator_Process_Name=\"*\\\\\
     defendnot-loader.exe\") OR (New_Process_Name=\"*\\\\defendnot-loader.exe\" Process_Command_Line=\"*defendnot-loader.exe*\"))\n| table _time,\
     \ ComputerName, New_Process_Name, Creator_Process_Name, Process_Command_Line, Account_Name\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("Taskmgr.exe", "defendnot-loader.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('Taskmgr.exe', 'defendnot-loader.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000673 {\n  meta:\n    author = \"TDL\"\n    description = \"Defendnot Process Creation\"\n    severity = \"HIGH\"\n\
-    \    tactic = \"TA0005\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(Taskmgr.exe|defendnot-loader.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("Taskmgr.exe", "defendnot-loader.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [Taskmgr.exe, defendnot-loader.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (Taskmgr.exe, defendnot-loader.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("Taskmgr.exe", "defendnot-loader.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(Taskmgr.exe OR defendnot-loader.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("Taskmgr.exe", "defendnot-loader.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | extend ProcessName = tostring(split(Process, '\\')[-1])
+    | extend ParentProcessName = tostring(split(ParentProcessName, '\\')[-1])
+    | where (ProcessName =~ "Taskmgr.exe" and ParentProcessName =~ "defendnot-loader.exe")
+        or (ProcessName =~ "defendnot-loader.exe" and CommandLine has "defendnot-loader.exe")
+    | project TimeGenerated, Computer, Account, ProcessName, ParentProcessName, CommandLine, Process, NewProcessName
+  aql: |
+    SELECT eventtime, sourceip, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Parent Process Name", "Process CommandLine"
+    FROM events
+    WHERE "EventID" = '4688'
+      AND (
+        ("Process Name" ILIKE '%Taskmgr.exe' AND "Parent Process Name" ILIKE '%defendnot-loader.exe')
+        OR
+        ("Process Name" ILIKE '%defendnot-loader.exe' AND "Process CommandLine" ILIKE '%defendnot-loader.exe%')
+      )
+    LAST 24 HOURS
+  yara_l: "rule defendnot_loader_execution {\n  meta:\n    author = \"TDL\"\n    description = \"Detects defendnot-loader.exe execution patterns\
+    \ via process creation\"\n    mitre_tactic = \"Defense Evasion\"\n    mitre_technique = \"T1078\"\n    \n  events:\n    $e.metadata.event_type\
+    \ = \"PROCESS_LAUNCH\"\n    $e.metadata.product_event_type = \"4688\"\n    (\n      (\n        re.regex($e.target.process.file.full_path,\
+    \ `(?i)\\\\Taskmgr\\.exe$`) and\n        re.regex($e.principal.process.file.full_path, `(?i)\\\\defendnot-loader\\.exe$`)\n      ) or\n  \
+    \    (\n        re.regex($e.target.process.file.full_path, `(?i)\\\\defendnot-loader\\.exe$`) and\n        re.regex($e.target.process.command_line,\
+    \ `(?i)defendnot-loader\\.exe`)\n      )\n    )\n    $e.principal.hostname = $host\n\n  match:\n    $host over 5m\n\n  condition:\n    $e\n\
+    }\n"
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE winlog.event_id == "4688" OR event.code == "4688"
+    | EVAL base_image = TO_LOWER(SUBSTRING(process.executable, 1 + MV_MAX(TO_INTEGER(LOCATE(process.executable, "\\"))), LENGTH(process.executable)))
+    | EVAL parent_base_image = TO_LOWER(SUBSTRING(process.parent.executable, 1 + MV_MAX(TO_INTEGER(LOCATE(process.parent.executable, "\\"))), LENGTH(process.parent.executable)))
+    | WHERE (base_image LIKE "*taskmgr.exe*" AND parent_base_image LIKE "*defendnot-loader.exe*")
+       OR (base_image LIKE "*defendnot-loader.exe*" AND TO_LOWER(process.command_line) LIKE "*defendnot-loader.exe*")
+    | KEEP @timestamp, host.name, user.name, process.executable, process.parent.executable, process.command_line
+  leql: |
+    where(source_json.EventID=4688 AND ((source_json.NewProcessName ICONTAINS "Taskmgr.exe" AND source_json.ParentProcessName ICONTAINS "defendnot-loader.exe") OR (source_json.NewProcessName ICONTAINS "defendnot-loader.exe" AND source_json.CommandLine ICONTAINS "defendnot-loader.exe")))
+  crowdstrike: |
+    EventCode=4688 ((NewProcessName=*Taskmgr.exe ParentProcessName=*defendnot-loader.exe) OR (NewProcessName=*defendnot-loader.exe CommandLine=*defendnot-loader.exe*))
+    | table([@timestamp, ComputerName, NewProcessName, ParentProcessName, CommandLine, SubjectUserName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4688
+    | filter (lowercase(action_process_image_name) contains "taskmgr.exe" and lowercase(actor_process_image_name) contains "defendnot-loader.exe")
+       or (lowercase(action_process_image_name) contains "defendnot-loader.exe" and lowercase(action_process_image_command_line) contains "defendnot-loader.exe")
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:4688 AND ((NewProcessName:*\\Taskmgr.exe AND ParentProcessName:*\\defendnot-loader.exe) OR (NewProcessName:*\\defendnot-loader.exe AND CommandLine:*defendnot-loader.exe*))
+  sumo: |
+    _sourceCategory=*Windows* "4688"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as new_process
+    | json field=_raw "ParentProcessName" as parent_process
+    | json field=_raw "CommandLine" as command_line
+    | where event_id = "4688"
+    | parse regex field=new_process "(?:[^\\]*\\)*(?<base_image>.*)" nodrop
+    | parse regex field=parent_process "(?:[^\\]*\\)*(?<parent_base_image>.*)" nodrop
+    | where (base_image matches "*Taskmgr.exe" and parent_base_image matches "*defendnot-loader.exe") or (base_image matches "*defendnot-loader.exe" and command_line matches "*defendnot-loader.exe*")
+    | fields _messageTime, _sourceHost, base_image, parent_base_image, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +86,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows event ID 4688\nbase image like \"Taskmgr.exe\" AND parent base image like \"defendnot-loader.exe\" \nOR\nbase image like\
   \ \"defendnot-loader.exe\" AND commandline like \"defendnot-loader.exe\""

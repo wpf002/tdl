@@ -15,71 +15,71 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=salesforce EventType=ReportExport NOT [| inputlookup salesforce_admins.csv | fields SourceUsername | format]
+  spl: 'index=salesforce EventType=ReportExport NOT [| inputlookup salesforce_admins.csv | fields SourceUsername | format]
+
     | table _time, SourceUsername, EventType, UserId, LoginHistoryId, SessionLevel, SessionKey, ClientBrowser, Platform, ApiType, ApiVersion
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000414 {\n  meta:\n    author = \"TDL\"\n    description = \"Sensitive Report Exported - Salesforce\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0009\"\n    technique = \"T1213\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    SalesforceServiceCloud
+    | where TimeGenerated > ago(1h)
+    | where EventType == "ReportExport"
+    | where SourceUserName !in ((externaldata(AdminUser:string)[@"https://raw.githubusercontent.com/Azure/Azure-Sentinel/master/Sample%20Data/Feeds/SalesforceAdmins.csv"] with (format="csv", ignoreFirstRecord=true)))
+    | project TimeGenerated, SourceUserName, EventType, SourceIp, UserId, ReportName, AdditionalInfo
+  aql: |
+    SELECT username, sourceip, COUNT(*) AS export_count, LOGSOURCENAME(logsourceid) AS source
+    FROM events
+    WHERE "Event Type" = 'ReportExport'
+      AND username NOT IN ('admin@company.com', 'salesforce_admin@company.com', 'service_account@company.com')
+    GROUP BY username, sourceip, logsourceid
+    LAST 24 HOURS
+  yara_l: |
+    rule salesforce_report_export_non_admin {
+      meta:
+        author = "TDL"
+        description = "Detects Salesforce report exports by non-admin users (T1213 - Data from Information Repositories)"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1213"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Salesforce"
+        $e.metadata.product_event_type = "ReportExport"
+        $e.principal.user.userid = $user
+        not $e.principal.user.attribute.labels.key = "salesforce_admin"
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-salesforce*
+    | WHERE event.action == "ReportExport"
+    | ENRICH salesforce_admins ON user.name
+    | WHERE salesforce_admins_user IS NULL
+    | KEEP @timestamp, user.name, user.email, source.ip, salesforce.event_type, salesforce.report.name, salesforce.report.id
+  leql: |
+    where(source_json.EVENT_TYPE="ReportExported" AND NOT(source_user IN ["admin1@company.com", "admin2@company.com", "salesforce_admin@company.com"]))
+  crowdstrike: |
+    #type=salesforce EventType=ReportExport
+    | SourceUsername!=*admin* AND SourceUsername!=*service*
+    | table([@timestamp, SourceUsername, EventType, ComputerName, RemoteAddressIP4])
+  xql: |
+    dataset = salesforce_raw
+    | filter event_type = "ReportExport"
+    | filter actor_effective_username not in ("salesforce_admin1@company.com", "salesforce_admin2@company.com")
+    | fields _time, actor_effective_username, event_type, agent_hostname
+  lucene: |
+    event.type:"ReportExport" AND NOT source.user.name:(admin1 OR admin2 OR admin3)
+  sumo: |
+    _sourceCategory=*Salesforce* "ReportExport"
+    | json field=_raw "EVENT_TYPE" as event_type
+    | json field=_raw "USER_NAME" as source_username
+    | where event_type = "ReportExport"
+    | where !(source_username in ("admin1@company.com", "admin2@company.com", "salesforce_admin@company.com"))
+    | fields _messageTime, source_username, event_type, _raw
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +89,7 @@ tags:
 - collection
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Salseforce Event  \nWhere the Event Type is 'ReportExport'\nWhere the Source Username is NOT on the Salesforce Admins List"
 suppression:

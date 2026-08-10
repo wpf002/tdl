@@ -16,72 +16,72 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=salesforce EventType=WaveDownload
+  spl: 'index=salesforce EventType=WaveDownload
+
     | search NOT [| inputlookup salesforce_admins.csv | fields SourceUsername]
+
     | table _time, SourceUsername, EventType, Resource, FileName, RecordId, SessionKey, LoginKey
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "WaveDownload"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%WaveDownload%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000417 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized WaveDownload Event - Salesforce\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0009\"\n    technique = \"T1213\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /WaveDownload/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    SalesforceServiceCloud
+    | where TimeGenerated > ago(1h)
+    | where EventType == "WaveDownload"
+    | where SourceUserName !in (externaldata(AdminUser:string)[@"https://raw.githubusercontent.com/Azure/Azure-Sentinel/master/Sample%20Data/Feeds/SalesforceAdmins.csv"] with (format="csv", ignoreFirstRecord=true))
+    | project TimeGenerated, SourceUserName, EventType, SourceIp, UserAgent, Browser, Platform, ClientVersion
+  aql: |
+    SELECT username, sourceip, COUNT(*) AS download_count, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%salesforce%'
+      AND "Event Type" = 'WaveDownload'
+      AND username NOT IN ('admin1@company.com', 'admin2@company.com', 'sfadmin@company.com')
+    GROUP BY username, sourceip, logsourceid
+    LAST 24 HOURS
+  yara_l: |
+    rule salesforce_wave_download_non_admin {
+      meta:
+        author = "TDL"
+        description = "Detects Salesforce Wave downloads by non-admin users - T1213 Collection"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1213"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Salesforce"
+        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
+        $e.metadata.product_event_type = "WaveDownload"
+        $e.principal.user.userid = $user
+        not $e.security_result.detection_fields["is_admin"] = "true"
 
-    | WHERE eventName LIKE "%WaveDownload%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/WaveDownload/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*WaveDownload*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "WaveDownload"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*WaveDownload*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*WaveDownload*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-salesforce*
+    | WHERE event.action == "WaveDownload" AND NOT user.name IN ("admin1", "admin2", "admin3")
+    | KEEP @timestamp, user.name, source.ip, event.action, salesforce.event_type
+  leql: |
+    where(source_json.EVENT_TYPE="WaveDownload" AND NOT(source_json.USER_NAME IN [/* Insert Salesforce Admin usernames here */]))
+  crowdstrike: "#type=salesforce EventType=WaveDownload \n| not(SourceUserName in [\"admin1@company.com\", \"admin2@company.com\", \"salesforce_admin@company.com\"\
+    ])\n| table([@timestamp, SourceUserName, EventType, SessionKey, ClientIP, RelatedEventIdentifier])\n"
+  xql: |
+    dataset = salesforce_raw
+    | filter event_type = "WaveDownload"
+    | alter is_admin = arrayindex(regextract(actor_effective_username, "(?i)(admin|administrator|salesforce.admin)"), 0)
+    | filter is_admin = null
+    | fields _time, actor_effective_username, event_type, action_file_name, agent_hostname
+  lucene: |
+    event_type:WaveDownload AND NOT source_username:(admin1 OR admin2 OR admin3)
+  sumo: |
+    _sourceCategory=*Salesforce* "WaveDownload"
+    | json field=_raw "EVENT_TYPE" as event_type
+    | json field=_raw "USER_NAME" as user_name
+    | where event_type = "WaveDownload"
+    | where !(user_name in ("admin1@company.com", "admin2@company.com", "salesforce.admin@company.com"))
+    | fields _messageTime, user_name, event_type, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +91,7 @@ tags:
 - collection
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Salseforce Event  \nWhere the Event Type is 'WaveDownload'\nWhere the Source Username is NOT on the Salesforce Admins List"
 suppression:

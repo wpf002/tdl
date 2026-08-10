@@ -16,71 +16,62 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=guardduty sourcetype=aws:cloudwatch:guardduty:findings type IN ("Execution:Runtime/ReverseShell")
-    | table _time, account, region, type, severity, resource.instanceDetails.instanceId, resource.instanceDetails.imageId, service.action.networkConnectionAction.remoteIpDetails.ipAddressV4, service.action.networkConnectionAction.remotePortDetails.port, title, description
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: 'index=guardduty sourcetype=aws:cloudwatch:guardduty:findings type IN ("Execution:Runtime/ReverseShell")
 
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+    | table _time, account, region, type, severity, resource.instanceDetails.instanceId, resource.instanceDetails.imageId, service.action.networkConnectionAction.remoteIpDetails.ipAddressV4,
+    service.action.networkConnectionAction.remotePortDetails.port, title, description
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000397 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Reverse Shell Activity - GuardDuty\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1059\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(24h)
+    | where Title has "Execution:Runtime/ReverseShell"
+    | project TimeGenerated, Title, Description, Severity, AccountId, Region, ResourceType, InstanceId = tostring(Resource.InstanceDetails.InstanceId), ServiceName = tostring(Service.ServiceName), ActionType = tostring(Service.Action.ActionType)
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS source, sourceip, destinationip, "Event Type", "Finding Description", "Severity"
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%GuardDuty%'
+      AND "Event Type" = 'Execution:Runtime/ReverseShell'
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_reverse_shell_execution {
+      meta:
+        author = "Chronicle Detection"
+        description = "Detects AWS GuardDuty reverse shell execution findings"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1059"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Amazon GuardDuty"
+        $e.metadata.product_event_type = "Execution:Runtime/ReverseShell"
+        $e.principal.resource.name = $resource
 
-    | WHERE eventName LIKE "%GuardDuty%"
+      match:
+        $resource over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM .ds-logs-aws.guardduty*
+    | WHERE @timestamp > NOW() - 24 hours AND event.type == "Execution:Runtime/ReverseShell"
+    | KEEP @timestamp, cloud.account.id, cloud.region, event.type, event.severity, aws.guardduty.resource.instance_details.instance_id, source.ip, destination.ip, destination.port
+  leql: |
+    where(source_json.type IN ["Execution:Runtime/ReverseShell"])
+  crowdstrike: |
+    #type=guardduty event.type="Execution:Runtime/ReverseShell"
+    | table([@timestamp, account.id, region, resource.resourceType, service.action.actionType, severity, description])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and event_type = "Execution:Runtime/ReverseShell"
+    | fields _time, cloud_provider, event_type, resource_name, resource_sub_type, actor_user, raw_log
+  lucene: |
+    event.type:"Execution:Runtime/ReverseShell"
+  sumo: |
+    _sourceCategory=*guardduty* OR _source=*guardduty* OR guardduty
+    | json field=_raw "type" as event_type
+    | where event_type = "Execution:Runtime/ReverseShell"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -90,7 +81,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Execution:Runtime/ReverseShell\"]"
 tuning_period: 7 days

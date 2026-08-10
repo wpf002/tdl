@@ -15,75 +15,45 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=linux sourcetype IN(linux_secure, syslog) sudo command
+  spl: 'index=linux sourcetype IN(linux_secure, syslog) sudo command
+
     | search (USER=* OR USER!=root) AND COMMAND=*
+
     | table _time, host, user, USER, COMMAND
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000423 {\n  meta:\n    author = \"TDL\"\n    description = \"Sudo Command Ran by Non Privileged User\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0005\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    Syslog
+    | where TimeGenerated > ago(1h)
+    | where Facility == "authpriv" and SyslogMessage has "sudo"
+    | where SyslogMessage has "COMMAND"
+    | project TimeGenerated, Computer, ProcessName, SyslogMessage, HostIP
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, \"Command\" AS sudo_command, sourceip\nFROM events\nWHERE (qidname(qid)\
+    \ ILIKE '%sudo%' OR \"Message\" ILIKE '%sudo%') \n  AND (\"Command\" IS NOT NULL OR \"Message\" ILIKE '%COMMAND=%')\nLAST 24 HOURS\n"
+  yara_l: "rule linux_sudo_command_execution {\n  meta:\n    author = \"TDL\"\n    description = \"Detects sudo command execution on Linux systems\"\
+    \n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"Low\"\n    \n  events:\n    $e.metadata.event_type\
+    \ = \"USER_LOGIN\"\n    re.regex($e.principal.process.command_line, `(?i)sudo\\s+`)\n    $e.principal.hostname = $host\n    \n  match:\n \
+    \   $host over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-system.syslog*
+    | WHERE @timestamp > NOW() - 24 hour AND process.name == "sudo" AND event.action == "executed"
+    | KEEP @timestamp, host.name, user.name, process.command_line, process.args
+  leql: |
+    where(process_name="sudo" OR process_cmd_line CONTAINS "sudo")
+  crowdstrike: |
+    event_platform=Lin (event_simpleName=UserLogon OR event_simpleName=AuditdSudoExecution OR #type=syslog) (CommandLine=*sudo* OR ProcessName=sudo OR Message=*sudo*)
+    | table([@timestamp, ComputerName, UserName, CommandLine, Message, event_simpleName])
+  xql: |
+    dataset = xdr_data
+    | filter agent_os_type = AGENT_OS_LINUX and event_type = ENUM.EVENT_TYPE_PROCESS and actor_process_image_name = "sudo"
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line
+  lucene: |
+    process.name:sudo OR (syslog.identifier:sudo OR program:sudo) OR message:*sudo*
+  sumo: |
+    _sourceCategory=*Linux* sudo
+    | parse regex "(?<timestamp>\w+\s+\d+\s+\d+:\d+:\d+)\s+(?<host>\S+)\s+sudo:\s+(?<user>\S+)\s+:\s+TTY=(?<tty>\S+)\s+;\s+PWD=(?<pwd>\S+)\s+;\s+USER=(?<sudo_user>\S+)\s+;\s+COMMAND=(?<command>.*)" nodrop
+    | where !isNull(command)
+    | fields _messageTime, host, user, sudo_user, tty, pwd, command
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +63,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: 1 Linux syslog where sudo is used to initiate a command.
 triage_steps:

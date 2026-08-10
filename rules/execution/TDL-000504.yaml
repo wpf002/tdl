@@ -15,82 +15,81 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) network.protocol="tcp" action=blocked NOT (src_ip IN ("10.0.0.1", "10.0.0.2", "192.168.1.100"))
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) network.protocol="tcp" action=blocked NOT (src_ip IN ("10.0.0.1", "10.0.0.2", "192.168.1.100"))
+
     | stats count sum(bytes_out) as bytes_out dc(dest_ip) as unique_dests by src_ip, dest_ip, dest_port
+
     | where count >= 1
+
     | sort - bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(1h)\n| where DeviceVendor has_any (\"Proxy\", \"Firewall\", \"IDS\") or DeviceProduct has_any\
+    \ (\"Proxy\", \"Firewall\", \"IDS\")\n| where Protocol =~ \"tcp\"\n| where DeviceAction in~ (\"blocked\", \"deny\", \"denied\", \"drop\",\
+    \ \"dropped\", \"reject\", \"rejected\")\n| where SourceIP !in (\"10.0.0.10\", \"10.0.0.11\", \"192.168.1.100\")\n| summarize \n    event_count\
+    \ = count(),\n    bytes_out_sum = sum(SentBytes)\n    by SourceIP, DestinationIP, DestinationPort\n| where event_count >= 1\n| join kind=inner\
+    \ (\n    CommonSecurityLog\n    | where TimeGenerated > ago(1h)\n    | where DeviceVendor has_any (\"Proxy\", \"Firewall\", \"IDS\") or DeviceProduct\
+    \ has_any (\"Proxy\", \"Firewall\", \"IDS\")\n    | where Protocol =~ \"tcp\"\n    | where DeviceAction in~ (\"blocked\", \"deny\", \"denied\"\
+    , \"drop\", \"dropped\", \"reject\", \"rejected\")\n    | where SourceIP !in (\"10.0.0.10\", \"10.0.0.11\", \"192.168.1.100\")\n    | summarize\
+    \ unique_dests = dcount(DestinationIP) by SourceIP\n) on SourceIP\n| project SourceIP, DestinationIP, DestinationPort, event_count, bytes_out_sum,\
+    \ unique_dests\n| sort by bytes_out_sum desc\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count, SUM(bytesout) AS total_bytes_out
     FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+    WHERE protocol = 6
+      AND sourceip NOT IN ('10.0.0.100', '10.0.0.101', '192.168.1.50')
     GROUP BY sourceip, destinationip, destinationport
-
+    HAVING event_count >= 1
+    ORDER BY total_bytes_out DESC
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exe_000504 {\n  meta:\n    author = \"TDL\"\n    description = \"Spike in Blocked Web Traffic from Single Source\"\n \
-    \   severity = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
+  yara_l: "rule web_traffic_application_layer_protocol_t1071 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects blocked web traffic\
+    \ events from internal sources for T1071 - Application Layer Protocol\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique\
+    \ = \"T1071\"\n    severity = \"Medium\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.ip_protocol = \"\
+    TCP\"\n    $e.security_result.action = \"BLOCK\"\n    $e.principal.ip = $src_ip\n    $e.target.ip = $dest_ip\n    $e.target.port = $dest_port\n\
+    \    \n    not (\n      $src_ip = \"10.0.0.100\" or\n      $src_ip = \"10.0.0.101\" or\n      $src_ip = \"192.168.1.100\"\n    )\n\n  match:\n\
+    \    $src_ip over 1h\n\n  outcome:\n    $unique_dests = count_distinct($dest_ip)\n    $total_bytes = sum($e.network.sent_bytes)\n    $dest_ips\
+    \ = array_distinct($dest_ip)\n    $dest_ports = array_distinct($dest_port)\n\n  condition:\n    #e >= 1\n}\n"
+  esql: "FROM logs-network*\n| WHERE @timestamp > NOW() - 1 hour\n  AND network.protocol == \"tcp\"\n  AND source.ip NOT IN (\"10.0.0.5\", \"\
+    10.0.0.6\", \"192.168.1.100\")\n| STATS event_count = COUNT(*), \n        bytes_out_sum = SUM(source.bytes), \n        unique_dests = COUNT_DISTINCT(destination.ip)\
+    \ \n  BY source.ip, destination.ip, destination.port\n| WHERE event_count >= 1\n| SORT bytes_out_sum DESC\n| KEEP source.ip, destination.ip,\
+    \ destination.port, event_count, bytes_out_sum, unique_dests\n"
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp" AND source_json.action IN ["blocked", "deny", "drop"] AND source_address NOT IN ["10.0.0.100", "10.0.0.101", "192.168.1.50"]) groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    #repo=network (sourcetype=firewall OR sourcetype=ids) network.protocol=*tcp* action=blocked
+    | !in(field=src_ip, values=["10.0.0.5", "10.0.0.6", "172.16.0.10", "192.168.1.100"])
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=event_count), sum(bytes_out, as=total_bytes)])
+    | event_count >= 1
+    | groupBy([src_ip], function=[count(dest_ip, distinct=true, as=unique_dests), sum(total_bytes, as=src_total_bytes)])
+    | sort(field=src_total_bytes, order=desc, limit=1000)
+    | table([src_ip, unique_dests, src_total_bytes])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter proto = "tcp" and action = "deny"
+    | filter src_ip not in ("10.0.0.100", "10.0.0.101", "192.168.1.50")
+    | comp count() as event_count, sum(bytes_sent) as bytes_out by src_ip, dst_ip, dst_port
+    | filter event_count >= 1
+    | alter unique_key = src_ip
+    | join type=left (dataset = panw_ngfw_traffic_raw | filter proto = "tcp" and action = "deny" | filter src_ip not in ("10.0.0.100", "10.0.0.101", "192.168.1.50") | comp count_distinct(dst_ip) as unique_dests by src_ip) as agg_data agg_data.src_ip = unique_key
     | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    | fields src_ip, dst_ip, dst_port, event_count, bytes_out, unique_dests
+  lucene: |
+    network.protocol:tcp AND (sourcetype:firewall OR sourcetype:ids) AND action:(blocked OR deny OR drop) AND NOT src_ip:(10.0.0.5 OR 10.0.0.6 OR 10.0.0.7)
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*network*
+    | where protocol matches "*tcp*" OR _raw matches "*tcp*"
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dest[_\s]*ip[\":\s=]+(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dest[_\s]*port[\":\s=]+(?<dest_port>\d+)" nodrop
+    | parse regex "bytes[_\s]*out[\":\s=]+(?<bytes_out>\d+)" nodrop
+    | where src_ip != "" and dest_ip != "" and dest_port != ""
+    | where !(src_ip in ("10.0.0.1", "10.0.0.2", "192.168.1.100"))
+    | count as event_count, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | where event_count >= 1
+    | count_distinct(dest_ip) as unique_dests by src_ip
+    | join (count as event_count, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port) on src_ip
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, event_count, unique_dests, total_bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -100,7 +99,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'

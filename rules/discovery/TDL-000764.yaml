@@ -18,75 +18,104 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 35
 queries:
-  spl: |
-    (index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (Image="*\\net.exe" OR Image="*\\net1.exe") CommandLine="*accounts*" CommandLine="*/domain*") OR (index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 Image="*\\powershell.exe" (CommandLine="*Get-ADDefaultDomainPasswordPolicy*" OR CommandLine="*Get-ADDomain*")) OR (index=linux sourcetype=linux_secure (comm="chage" args="*-l*") OR (comm="pwpolicy" args="*getaccountpolicies*"))
+  spl: '(index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (Image="*\\net.exe" OR Image="*\\net1.exe")
+    CommandLine="*accounts*" CommandLine="*/domain*") OR (index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+    Image="*\\powershell.exe" (CommandLine="*Get-ADDefaultDomainPasswordPolicy*" OR CommandLine="*Get-ADDomain*")) OR (index=linux sourcetype=linux_secure
+    (comm="chage" args="*-l*") OR (comm="pwpolicy" args="*getaccountpolicies*"))
+
     | eval host=coalesce(ComputerName, host)
+
     | table _time, host, User, Image, CommandLine, comm, args
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000764 {\n  meta:\n    author = \"TDL\"\n    description = \"net accounts / Get-ADDefaultDomainPasswordPolicy Executed\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1201\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: "union \n(SecurityEvent\n| where TimeGenerated > ago(1h)\n| where EventID == 1\n| where Process has_any (\"net.exe\", \"net1.exe\")\n|\
+    \ where CommandLine has_all (\"accounts\", \"/domain\")\n| project TimeGenerated, Computer, Account, Process, CommandLine, EventID),\n(SecurityEvent\n\
+    | where TimeGenerated > ago(1h)\n| where EventID == 1\n| where Process has_any (\"powershell.exe\", \"pwsh.exe\")\n| where CommandLine has\
+    \ \"Get-ADDefaultDomainPasswordPolicy\"\n| project TimeGenerated, Computer, Account, Process, CommandLine, EventID),\n(Event\n| where TimeGenerated\
+    \ > ago(1h)\n| where Source == \"Linux Syslog\" and EventID == 1\n| extend CommandLine = extract(@\"COMMAND=(.+)\", 1, RenderedDescription)\n\
+    | where CommandLine has_any (\"chage -l\", \"pwpolicy\")\n| project TimeGenerated, Computer, Account = UserName, Process = \"bash\", CommandLine,\
+    \ EventID)\n| where Computer !endswith \"-dc\" and Computer !startswith \"DC-\"\n"
+  aql: "SELECT username, sourceip, LOGSOURCENAME(logsourceid) AS hostname, \"Process CommandLine\", COUNT(*) AS command_count\nFROM events\nWHERE\
+    \ (\n  (\"Process CommandLine\" ILIKE '%net%accounts%/domain%' OR \n   \"Process CommandLine\" ILIKE '%net1%accounts%/domain%' OR\n   \"Process\
+    \ CommandLine\" ILIKE '%Get-ADDefaultDomainPasswordPolicy%' OR\n   \"Process CommandLine\" ILIKE '%chage -l%' OR\n   \"Process CommandLine\"\
+    \ ILIKE '%chage%-%l%' OR\n   \"Process CommandLine\" ILIKE '%pwpolicy%getaccountpolicies%' OR\n   \"Process CommandLine\" ILIKE '%pwpolicy%-getaccountpolicies%')\n\
+    \  AND LOGSOURCETYPENAME(devicetype) IN ('Microsoft Windows Security Event Log', 'Sysmon', 'Linux OS')\n)\nGROUP BY username, sourceip, LOGSOURCENAME(logsourceid),\
+    \ \"Process CommandLine\"\nLAST 1 HOURS\n"
+  yara_l: |
+    rule password_policy_discovery {
+      meta:
+        author = "TDL"
+        description = "Detects password policy enumeration commands - T1201"
+        mitre_attack_tactic = "Discovery"
+        mitre_attack_technique = "T1201"
+        severity = "Medium"
 
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          re.regex($e.principal.process.command_line, `(?i)net\s+(accounts|group|user).*\/domain`) or
+          re.regex($e.principal.process.command_line, `(?i)Get-ADDefaultDomainPasswordPolicy`) or
+          re.regex($e.principal.process.command_line, `(?i)chage\s+-l`) or
+          re.regex($e.principal.process.command_line, `(?i)pwpolicy\s+(get|getaccountpolicies)`)
+        )
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $user
+
+      match:
+        $host, $user over 5m
+
+      outcome:
+        $risk_score = 55
+
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint.events.process*, logs-windows.sysmon_operational*, logs-system.sysmon*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      AND (
+        (process.name IN ("net.exe", "net1.exe") AND process.command_line LIKE "*accounts*" AND process.command_line LIKE "*/domain*")
+        OR (process.name == "powershell.exe" AND process.command_line LIKE "*Get-ADDefaultDomainPasswordPolicy*")
+        OR (process.name IN ("chage", "pwpolicy") AND process.command_line LIKE "*-l*")
+      )
+      AND NOT host.name LIKE "*DC*"
+      AND NOT host.name LIKE "*server*"
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name
+  leql: |
+    where((process_name ICONTAINS "net.exe" AND process_cmd_line ICONTAINS "accounts" AND process_cmd_line ICONTAINS "/domain") OR (process_name ICONTAINS "powershell" AND process_cmd_line ICONTAINS "Get-ADDefaultDomainPasswordPolicy") OR (process_name ICONTAINS "chage" AND process_cmd_line ICONTAINS "-l") OR (process_name ICONTAINS "pwpolicy")) groupby(asset, user, process_name, process_cmd_line) calculate(count)
+  crowdstrike: "(event_simpleName=ProcessRollup2 OR #type=sysmon OR #type=auditd) \n(\n  (FileName=net.exe CommandLine=*/domain* CommandLine=*accounts*)\
+    \ OR\n  (FileName=powershell.exe CommandLine=*Get-ADDefaultDomainPasswordPolicy*) OR\n  (FileName=pwsh.exe CommandLine=*Get-ADDefaultDomainPasswordPolicy*)\
+    \ OR\n  (FileName=chage CommandLine=*-l*) OR\n  (FileName=pwpolicy)\n)\n| table([@timestamp, ComputerName, UserName, FileName, CommandLine,\
+    \ ParentBaseFileName])\n"
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter (
+        (action_process_image_name ~= "(?i).*\\\\net\\.exe$" and action_process_image_command_line ~= "(?i).*accounts.*/domain.*")
+        or (action_process_image_name ~= "(?i).*\\\\powershell\\.exe$|.*\\\\pwsh\\.exe$" and action_process_image_command_line ~= "(?i).*Get-ADDefaultDomainPasswordPolicy.*")
+        or (action_process_image_name ~= "(?i).*/chage$" and action_process_image_command_line ~= "(?i).*chage\\s+-l.*")
+        or (action_process_image_name ~= "(?i).*/pwpolicy$" and action_process_image_command_line ~= "(?i).*pwpolicy.*")
+    )
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, actor_process_image_name
+  lucene: |
+    (process.command_line:(*net* AND *accounts* AND */domain*) OR process.command_line:*Get-ADDefaultDomainPasswordPolicy* OR process.command_line:(*chage* AND *-l*) OR process.command_line:*pwpolicy*) AND NOT (host.name:*DC* OR host.name:*domain-controller* OR host.name:*ad-*)
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Linux* OR _sourceCategory=*Sysmon* OR _sourceCategory=*Auditd*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "Image" as image
+    | parse regex field=_raw "\"type\":\"(?<audit_type>[^\"]+)\"" nodrop
+    | parse regex field=_raw "\"exe\":\"(?<exe_path>[^\"]+)\"" nodrop
+    | parse regex field=_raw "\"comm\":\"(?<comm>[^\"]+)\"" nodrop
+    | parse regex field=_raw "a\d+=\"(?<args>[^\"]+)\"" nodrop
+    | where (event_id = "1" AND (image matches "*\\net.exe" OR image matches "*\\net1.exe" OR image matches "*/net") AND command_line matches "*accounts*" AND command_line matches "*/domain*")
+       OR (event_id = "1" AND image matches "*\\powershell.exe" AND command_line matches "*Get-ADDefaultDomainPasswordPolicy*")
+       OR (event_id = "1" AND (image matches "*\\chage" OR image matches "*/chage") AND command_line matches "*-l*")
+       OR (event_id = "1" AND image matches "*\\pwpolicy" AND command_line matches "*getaccountpolicies*")
+       OR (audit_type = "EXECVE" AND (comm matches "*chage*" OR exe_path matches "*/chage") AND args matches "*-l*")
+       OR (audit_type = "EXECVE" AND comm matches "*pwpolicy*" AND args matches "*getaccountpolicies*")
+    | fields _messageTime, _sourceHost, event_id, command_line, process_name, image, exe_path, comm, args
 pseudo_logic: net accounts /domain, Get-ADDefaultDomainPasswordPolicy or chage -l / pwpolicy from a workstation. Pre-spray reconnaissance.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -103,7 +132,7 @@ references:
 - https://attack.mitre.org/techniques/T1201/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

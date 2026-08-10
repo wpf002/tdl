@@ -15,73 +15,61 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail eventName=GetPasswordData
+  spl: 'index=aws sourcetype=aws:cloudtrail eventName=GetPasswordData
+
     | bin _time span=5m
+
     | stats count dc(eventName) as unique_events values(requestParameters.instanceId) as instances by _time, userIdentity.principalId, sourceIPAddress
+
     | where count >= 10
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000193 {\n  meta:\n    author = \"TDL\"\n    description = \"EC2 RDP Password Retrieval\"\n    severity = \"LOW\"\n\
-    \    tactic = \"TA0006\"\n    technique = \"T1552\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(5m)
+    | where EventName == "GetPasswordData"
+    | summarize EventCount = count() by bin(TimeGenerated, 5m), SourceIpAddress, UserIdentityPrincipalid
+    | where EventCount >= 10
+  aql: |
+    SELECT sourceip, username, COUNT(*) AS event_count
+    FROM events
+    WHERE qidname(qid) ILIKE '%GetPasswordData%'
+    GROUP BY sourceip, username
+    HAVING event_count >= 10
+    LAST 5 MINUTES
+  yara_l: "rule aws_getpassworddata_spike {\n  meta:\n    author = \"TDL\"\n    description = \"Detects multiple GetPasswordData API calls from\
+    \ same source and user within 5 minutes - T1552 Credential Access\"\n    severity = \"HIGH\"\n    mitre_attack_tactic = \"Credential Access\"\
+    \n    mitre_attack_technique = \"T1552\"\n    platform = \"AWS\"\n    \n  events:\n    $e.metadata.vendor_name = \"AMAZON\"\n    $e.metadata.product_name\
+    \ = \"AWS CloudTrail\"\n    $e.metadata.product_event_type = \"GetPasswordData\"\n    $e.principal.user.userid = $user\n    $e.principal.ip\
+    \ = $source_ip\n    \n  match:\n    $user, $source_ip over 5m\n    \n  condition:\n    #e >= 10\n}\n"
+  esql: "FROM logs-aws.cloudtrail*\n| WHERE @timestamp > NOW() - 5 minutes \n  AND event.action == \"GetPasswordData\"\n| STATS event_count =\
+    \ COUNT(*) BY source.ip, user.name, time_window = BUCKET(@timestamp, 5 minutes)\n| WHERE event_count >= 10\n| KEEP time_window, source.ip,\
+    \ user.name, event_count\n"
+  leql: |
+    where(source_json.eventName=GetPasswordData) groupby(source_json.sourceIPAddress, source_json.userIdentity.principalId) calculate(count)
+  crowdstrike: |
+    #repo=cloudtrail eventName=GetPasswordData
+    | bucket(span=5m, field=@timestamp, as=timeWindow)
+    | groupBy([timeWindow, userIdentity.principalId, sourceIPAddress], function=count(as=eventCount))
+    | eventCount >= 10
+    | table([timeWindow, userIdentity.principalId, sourceIPAddress, eventCount])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and event_type = "GetPasswordData"
+    | bin _time span=5m
+    | comp count() as event_count by _time, actor.user.identifier, src_ip
+    | filter event_count >= 10
+  lucene: |
+    eventSource:ec2.amazonaws.com AND eventName:GetPasswordData
+  sumo: |
+    _sourceCategory=*cloudtrail* GetPasswordData
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "userIdentity.principalId" as principal_id
+    | json field=_raw "sourceIPAddress" as source_ip
+    | where event_name = "GetPasswordData"
+    | timeslice 5m
+    | count as event_count by _timeslice, source_ip, principal_id
+    | where event_count >= 10
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +79,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '10 AWS CloudTrail Events
 

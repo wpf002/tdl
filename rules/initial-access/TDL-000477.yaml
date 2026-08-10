@@ -15,86 +15,88 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=firewall action=allowed src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) NOT dest_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+  spl: 'index=firewall action=allowed src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) NOT dest_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+
     | iplocation dest_ip
-    | eval dest_asn_org=coalesce('asn_org', "Unknown")
+
+    | eval dest_asn_org=coalesce(''asn_org'', "Unknown")
+
     | eval current_period=if(_time >= relative_time(now(), "-30d"), 1, 0)
+
     | eventstats dc(_time) as days_seen values(_time) as first_seen by src_ip, dest_asn_org
+
     | where current_period=1 AND days_seen=1 AND first_seen >= relative_time(now(), "-30d")
+
     | table _time, src_ip, dest_ip, dest_asn_org, action
+
     | sort 0 - _time
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000477 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Outbound Connection to ASN\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1021\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: "let baseline_period = 90d;\nlet detection_period = 1d;\nlet learning_period = 30d;\nlet baseline_start = ago(baseline_period);\nlet baseline_end\
+    \ = ago(learning_period);\nlet detection_start = ago(detection_period);\nlet baseline_asn = \n    CommonSecurityLog\n    | where TimeGenerated\
+    \ between (baseline_start .. baseline_end)\n    | where DeviceVendor has \"firewall\" or DeviceProduct has \"firewall\" or DeviceEventClassID\
+    \ has_any (\"traffic\", \"connection\", \"session\")\n    | where DeviceAction in~ (\"allow\", \"allowed\", \"accept\", \"permitted\")\n \
+    \   | where CommunicationDirection =~ \"outbound\" or (isnotempty(SourceIP) and isnotempty(DestinationIP) and not(ipv4_is_private(DestinationIP)))\n\
+    \    | where ipv4_is_private(SourceIP) and not(ipv4_is_private(DestinationIP))\n    | extend DestASN = tostring(split(AdditionalExtensions,\
+    \ \"DestinationASN=\")[1])\n    | extend DestASN = tostring(split(DestASN, \";\")[0])\n    | summarize by SourceIP, DestASN\n    | summarize\
+    \ baseline_asns = make_set(DestASN) by SourceIP;\nCommonSecurityLog\n| where TimeGenerated >= detection_start\n| where DeviceVendor has \"\
+    firewall\" or DeviceProduct has \"firewall\" or DeviceEventClassID has_any (\"traffic\", \"connection\", \"session\")\n| where DeviceAction\
+    \ in~ (\"allow\", \"allowed\", \"accept\", \"permitted\")\n| where CommunicationDirection =~ \"outbound\" or (isnotempty(SourceIP) and isnotempty(DestinationIP)\
+    \ and not(ipv4_is_private(DestinationIP)))\n| where ipv4_is_private(SourceIP) and not(ipv4_is_private(DestinationIP))\n| extend DestASN =\
+    \ tostring(split(AdditionalExtensions, \"DestinationASN=\")[1])\n| extend DestASN = tostring(split(DestASN, \";\")[0])\n| join kind=leftanti\
+    \ (baseline_asn | mv-expand baseline_asns | extend DestASN = tostring(baseline_asns) | project SourceIP, DestASN) on SourceIP, DestASN\n|\
+    \ summarize FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), ConnectionCount = count(), DestinationIPs = make_set(DestinationIP,\
+    \ 100) by SourceIP, DestinationIP, DestASN, DeviceVendor, DeviceProduct\n| project FirstSeen, LastSeen, SourceIP, DestinationIP, DestASN,\
+    \ ConnectionCount, DestinationIPs, DeviceVendor, DeviceProduct\n"
+  aql: |
+    SELECT sourceip, destinationip, QIDNAME(qid) AS event_name, LOGSOURCENAME(logsourceid) AS firewall, COUNT(*) AS event_count
+    FROM events
+    WHERE INOFFENSE(sourceip) = FALSE
+      AND RFC1918(sourceip) = TRUE
+      AND RFC1918(destinationip) = FALSE
+      AND categoryname(category) ILIKE '%firewall%'
+      AND (LOGSOURCETYPENAME(devicetype) ILIKE '%firewall%' OR categoryname(category) IN ('Permit', 'Accept', 'Allow'))
+      AND (qidname(qid) ILIKE '%accept%' OR qidname(qid) ILIKE '%allow%' OR qidname(qid) ILIKE '%permit%')
+    GROUP BY sourceip, destinationip, qid, logsourceid
+    LAST 90 DAYS
+  yara_l: "rule rare_outbound_destination_asn {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects outbound connections\
+    \ to rare destination ASN organizations not seen in 30-day baseline\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1021\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.direction =\
+    \ \"OUTBOUND\"\n    $e.security_result.action = \"ALLOW\"\n    net.ip_in_range_cidr($e.principal.ip, \"10.0.0.0/8\") or\n    net.ip_in_range_cidr($e.principal.ip,\
+    \ \"172.16.0.0/12\") or\n    net.ip_in_range_cidr($e.principal.ip, \"192.168.0.0/16\")\n    not net.ip_in_range_cidr($e.target.ip, \"10.0.0.0/8\"\
+    )\n    not net.ip_in_range_cidr($e.target.ip, \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($e.target.ip, \"192.168.0.0/16\")\n    $e.principal.ip\
+    \ = $src_ip\n    $e.target.ip = $dst_ip\n    $e.network.asn = $asn_org\n    \n  match:\n    $src_ip, $dst_ip over 5m\n    \n  outcome:\n \
+    \   $risk_score = 35\n    $asn_org_list = array_distinct($asn_org)\n    \n  condition:\n    $e and #asn_org == 1\n}\n"
+  esql: "FROM logs-network.firewall*\n| WHERE @timestamp > NOW() - 90 days\n  AND network.direction == \"outbound\"\n  AND event.action == \"\
+    allowed\"\n  AND source.nat.ip IS NOT NULL OR source.ip RLIKE \"^(10\\\\.|172\\\\.(1[6-9]|2[0-9]|3[01])\\\\.|192\\\\.168\\\\.)\"\n  AND destination.ip\
+    \ IS NOT NULL\n  AND NOT (destination.as.organization.name IS NULL)\n| EVAL baseline_end = NOW() - 30 days\n| EVAL is_baseline = CASE(@timestamp\
+    \ < baseline_end, 1, 0)\n| EVAL is_detection = CASE(@timestamp >= baseline_end, 1, 0)\n| STATS baseline_count = SUM(is_baseline), detection_count\
+    \ = SUM(is_detection), \n        first_seen = MIN(@timestamp), last_seen = MAX(@timestamp)\n  BY source.ip, destination.as.organization.name\n\
+    | WHERE baseline_count == 0 AND detection_count > 0\n| KEEP last_seen, source.ip, destination.as.organization.name, first_seen\n| SORT last_seen\
+    \ DESC\n"
+  leql: |
+    where(log_source_type="Firewall" AND direction="OUTBOUND" AND action="ALLOW" AND source_address=PRIVATE AND destination_address!=PRIVATE) groupby(destination_address) calculate(count)
+  crowdstrike: "#repo=firewall Action=Allowed Direction=Outbound \n| isPrivateIP(field=SourceIP, as=isPrivateSource) \n| isPrivateIP(field=DestinationIP,\
+    \ as=isPrivateDest) \n| isPrivateSource=true AND isPrivateDest=false\n| asn(DestinationIP, as=DestASN)\n| selfJoinFilter([DestASN], where=[{@timestamp\
+    \ < start() - 30d}])\n| table([@timestamp, SourceIP, DestinationIP, DestASN, Action])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_destination = Outbound and action_firewall_action = Allow and src_ip_loctype = Internal and dest_ip_loctype = External
+    | alter dest_asn_org = coalesce(dest_autonomous_system_organization, "Unknown")
+    | comp count() as conn_count by src_ip, dest_ip, dest_asn_org
+    | comp count_distinct(dest_asn_org) as unique_asn_orgs by src_ip
+    | filter unique_asn_orgs >= 1
+    | fields src_ip, dest_ip, dest_asn_org, conn_count
+  lucene: |
+    event_type:"firewall" AND action:"allowed" AND direction:"outbound" AND source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)
+  sumo: "_sourceCategory=*Firewall* \n| parse regex \"(?<src_ip>\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\" nodrop\n| parse regex \"dst=(?<dest_ip>\\\
+    d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\" nodrop\n| parse regex \"action=(?<action>\\w+)\" nodrop\n| where action matches \"*allow*\" or\
+    \ action matches \"*permit*\" or action matches \"*accept*\"\n| where !isPrivateIP(dest_ip) and isPrivateIP(src_ip)\n| lookup latitude, longitude,\
+    \ country_code, country_name, region, city, postal_code, area_code, metro_code, asn, organization from geo://location on ip=dest_ip\n| where\
+    \ !isNull(organization)\n| timeslice 1d\n| count as connections by _timeslice, src_ip, dest_ip, organization\n| where _timeslice >= now()\
+    \ - 90d\n| lookup latitude, longitude, country_code, country_name, region, city, postal_code, area_code, metro_code, asn, organization as\
+    \ baseline_org from geo://location on ip=dest_ip\n| where connections >= 1\n| first(organization) as current_org by src_ip, dest_ip\n| where\
+    \ !(current_org in (\"Microsoft Corporation\", \"Amazon.com\", \"Google LLC\", \"Cloudflare\", \"Akamai\"))\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -104,7 +106,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Firewall Event \nFrom one internal source to one external destination (Outbound)\nWhere the Action is Allowed\n\nBaseline Learning:\
   \ 30 Days\nRetention: 90 Days\n\nNew Value: Destination IP ASN Org"

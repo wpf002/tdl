@@ -20,76 +20,97 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 60
 queries:
-  spl: |
-    index=wineventlog (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1) OR (sourcetype=WinEventLog:Security EventCode=4688)
+  spl: 'index=wineventlog (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1) OR (sourcetype=WinEventLog:Security EventCode=4688)
+
     (Image="*\\schtasks.exe" CommandLine="*/create*") OR (ParentImage="*\\powershell.exe" CommandLine="*New-ScheduledTask*")
-    (CommandLine="*\\AppData\\*" OR CommandLine="*\\Temp\\*" OR CommandLine="*%TEMP%*" OR CommandLine="*%APPDATA%*" OR CommandLine="*%PUBLIC%*" OR CommandLine="*\\Users\\Public\\*")
+
+    (CommandLine="*\\AppData\\*" OR CommandLine="*\\Temp\\*" OR CommandLine="*%TEMP%*" OR CommandLine="*%APPDATA%*" OR CommandLine="*%PUBLIC%*"
+    OR CommandLine="*\\Users\\Public\\*")
+
     | table _time, ComputerName, User, Image, ParentImage, CommandLine
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000713 {\n  meta:\n    author = \"TDL\"\n    description = \"Scheduled Task Created Running From User-Writable Path\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1053\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
-    \n    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: "union SecurityEvent, Event\n| where TimeGenerated > ago(24h)\n| where (EventID == 4688 or EventID == 1) \n| where (\n    (ProcessCommandLine\
+    \ has \"schtasks\" and ProcessCommandLine has \"/create\" and ProcessCommandLine has_any (\"%TEMP%\", \"%APPDATA%\", \"%PUBLIC%\", \"\\\\\
+    Temp\\\\\", \"\\\\AppData\\\\\", \"\\\\Public\\\\\"))\n    or\n    (ProcessCommandLine has \"New-ScheduledTask\" and ProcessCommandLine has_any\
+    \ (\"%TEMP%\", \"%APPDATA%\", \"%PUBLIC%\", \"\\\\Temp\\\\\", \"\\\\AppData\\\\\", \"\\\\Public\\\\\"))\n    or\n    (CommandLine has \"schtasks\"\
+    \ and CommandLine has \"/create\" and CommandLine has_any (\"%TEMP%\", \"%APPDATA%\", \"%PUBLIC%\", \"\\\\Temp\\\\\", \"\\\\AppData\\\\\"\
+    , \"\\\\Public\\\\\"))\n    or\n    (CommandLine has \"New-ScheduledTask\" and CommandLine has_any (\"%TEMP%\", \"%APPDATA%\", \"%PUBLIC%\"\
+    , \"\\\\Temp\\\\\", \"\\\\AppData\\\\\", \"\\\\Public\\\\\"))\n)\n| extend AccountName = coalesce(SubjectUserName, Account, AccountName)\n\
+    | extend CommandLineUsed = coalesce(ProcessCommandLine, CommandLine)\n| project TimeGenerated, Computer, AccountName, CommandLineUsed, ParentProcessName,\
+    \ Process, EventID\n"
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS hostname, "Process CommandLine", "Parent Process Name", "Process Name"
+    FROM events
+    WHERE (("Process Name" ILIKE '%schtasks.exe%' AND "Process CommandLine" ILIKE '%/create%' AND ("Process CommandLine" ILIKE '%\\temp\\%' OR "Process CommandLine" ILIKE '%\\appdata\\%' OR "Process CommandLine" ILIKE '%\\public\\%')) OR ("Process CommandLine" ILIKE '%New-ScheduledTask%' AND ("Process CommandLine" ILIKE '%\\temp\\%' OR "Process CommandLine" ILIKE '%\\appdata\\%' OR "Process CommandLine" ILIKE '%\\public\\%')))
+    LAST 24 HOURS
+  yara_l: |
+    rule scheduled_task_suspicious_location {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects scheduled task creation with action pointing to suspicious temp/appdata locations - T1053 Persistence"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1053"
+        severity = "MEDIUM"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          re.regex($e.principal.process.file.full_path, `(?i)schtasks\.exe$`) or
+          re.regex($e.principal.process.command_line, `(?i)New-ScheduledTask`)
+        )
+        (
+          re.regex($e.principal.process.command_line, `(?i)/create`) or
+          re.regex($e.principal.process.command_line, `(?i)New-ScheduledTask`)
+        )
+        (
+          re.regex($e.principal.process.command_line, `(?i)%TEMP%`) or
+          re.regex($e.principal.process.command_line, `(?i)\\AppData\\Local\\Temp`) or
+          re.regex($e.principal.process.command_line, `(?i)\\Temp\\`) or
+          re.regex($e.principal.process.command_line, `(?i)%APPDATA%`) or
+          re.regex($e.principal.process.command_line, `(?i)\\AppData\\Roaming`) or
+          re.regex($e.principal.process.command_line, `(?i)%PUBLIC%`) or
+          re.regex($e.principal.process.command_line, `(?i)\\Users\\Public`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 65
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-endpoint.events.process*, logs-windows.sysmon_operational*, logs-system.security*\n| WHERE @timestamp > NOW() - 24 hours\n\
+    \  AND (\n    (process.name IN (\"schtasks.exe\", \"powershell.exe\", \"pwsh.exe\") \n     AND (\n       (process.command_line LIKE \"*schtasks*\"\
+    \ AND process.command_line LIKE \"*/create*\" \n        AND (process.command_line LIKE \"*%TEMP%*\" OR process.command_line LIKE \"*%APPDATA%*\"\
+    \ OR process.command_line LIKE \"*%PUBLIC%*\" \n             OR process.command_line LIKE \"*\\\\Temp\\\\*\" OR process.command_line LIKE\
+    \ \"*\\\\AppData\\\\*\" OR process.command_line LIKE \"*\\\\Users\\\\Public\\\\*\"))\n       OR\n       (process.command_line LIKE \"*New-ScheduledTask*\"\
+    \ \n        AND (process.command_line LIKE \"*%TEMP%*\" OR process.command_line LIKE \"*%APPDATA%*\" OR process.command_line LIKE \"*%PUBLIC%*\"\
+    \n             OR process.command_line LIKE \"*\\\\Temp\\\\*\" OR process.command_line LIKE \"*\\\\AppData\\\\*\" OR process.command_line\
+    \ LIKE \"*\\\\Users\\\\Public\\\\*\"))\n     ))\n  )\n| KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name,\
+    \ process.executable\n"
+  leql: |
+    where((process_name ICONTAINS "schtasks.exe" AND process_cmd_line ICONTAINS "/create" AND (process_cmd_line ICONTAINS "%TEMP%" OR process_cmd_line ICONTAINS "%APPDATA%" OR process_cmd_line ICONTAINS "%PUBLIC%" OR process_cmd_line ICONTAINS "\Temp\" OR process_cmd_line ICONTAINS "\AppData\" OR process_cmd_line ICONTAINS "\Public\")) OR (process_name ICONTAINS "powershell" AND process_cmd_line ICONTAINS "New-ScheduledTask" AND (process_cmd_line ICONTAINS "$env:TEMP" OR process_cmd_line ICONTAINS "$env:APPDATA" OR process_cmd_line ICONTAINS "$env:PUBLIC" OR process_cmd_line ICONTAINS "\Temp\" OR process_cmd_line ICONTAINS "\AppData\" OR process_cmd_line ICONTAINS "\Public\")))
+  crowdstrike: |
+    (event_simpleName=ProcessRollup2 OR EventCode=1) (CommandLine=*schtasks* CommandLine=*/create* OR CommandLine=*New-ScheduledTask*) (CommandLine=*%TEMP%* OR CommandLine=*%APPDATA%* OR CommandLine=*%PUBLIC%* OR CommandLine=*\\Temp\\* OR CommandLine=*\\AppData\\* OR CommandLine=*\\Users\\Public\\*)
+    | table([@timestamp, ComputerName, UserName, FileName, ParentBaseFileName, CommandLine])
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_PROCESS\n| filter (actor_process_image_name ~= \"(?i).*schtasks\\.exe$\" and\
+    \ action_process_image_command_line ~= \"(?i).*/create.*\") \n   or (actor_process_image_name ~= \"(?i).*powershell\\.exe$\" and action_process_image_command_line\
+    \ ~= \"(?i).*New-ScheduledTask.*\")\n| filter action_process_image_command_line ~= \"(?i).*(\\\\\\\\temp\\\\\\\\|\\\\\\\\appdata\\\\\\\\|\\\
+    \\\\\\public\\\\\\\\|%temp%|%appdata%|%public%).*\"\n| fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_command_line\n"
+  lucene: |
+    (process.name:(schtasks.exe OR powershell.exe OR pwsh.exe) AND (process.command_line:(*\/create* OR *New-ScheduledTask*) AND (process.command_line:(*%TEMP%* OR *%APPDATA%* OR *%PUBLIC%* OR *\/tmp\/* OR *\/var\/tmp\/* OR *C\:\\Users\\*\\AppData\\Local\\Temp* OR *C\:\\Users\\*\\AppData\\Roaming* OR *C\:\\Users\\Public*))))
+  sumo: |
+    _sourceCategory=*Windows* (schtasks OR "New-ScheduledTask" OR "Register-ScheduledTask" OR EventID=4698)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as cmd
+    | json field=_raw "TaskName" as task_name
+    | json field=_raw "TaskContent" as task_content
+    | where (cmd matches "*schtasks*" AND cmd matches "*/create*" AND (cmd matches "*%TEMP%*" OR cmd matches "*%APPDATA%*" OR cmd matches "*%PUBLIC%*" OR cmd matches "*\\Temp\\*" OR cmd matches "*\\AppData\\*" OR cmd matches "*\\Public\\*")) OR (cmd matches "*New-ScheduledTask*" AND (cmd matches "*%TEMP%*" OR cmd matches "*%APPDATA%*" OR cmd matches "*%PUBLIC%*" OR cmd matches "*\\Temp\\*" OR cmd matches "*\\AppData\\*" OR cmd matches "*\\Public\\*")) OR (cmd matches "*Register-ScheduledTask*" AND (cmd matches "*%TEMP%*" OR cmd matches "*%APPDATA%*" OR cmd matches "*%PUBLIC%*" OR cmd matches "*\\Temp\\*" OR cmd matches "*\\AppData\\*" OR cmd matches "*\\Public\\*")) OR (event_id = "4698" AND (task_content matches "*%TEMP%*" OR task_content matches "*%APPDATA%*" OR task_content matches "*%PUBLIC%*" OR task_content matches "*\\Temp\\*" OR task_content matches "*\\AppData\\*" OR task_content matches "*\\Public\\*"))
+    | fields _messageTime, _sourceHost, event_id, cmd, task_name, task_content
 pseudo_logic: schtasks /create or New-ScheduledTask with action pointing to %TEMP%/%APPDATA%/%PUBLIC%. Common malware persistence.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -107,7 +128,7 @@ references:
 - https://attack.mitre.org/techniques/T1053/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'

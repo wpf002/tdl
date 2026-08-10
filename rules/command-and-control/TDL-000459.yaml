@@ -15,77 +15,94 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
+  spl: 'index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit)
+
     | rex field=eventName "(?<domain>[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,})"
+
     | eval domain_length=len(domain)
+
     | where domain_length >= 50
+
     | search NOT (sourceIPAddress IN ("10.0.0.1", "192.168.1.1"))
+
     | stats count values(sourceIPAddress) as sourceIPAddress by userIdentity.arn, eventName, resources{}.ARN
+
     | where count >= 1
+
     | sort - count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000459 {\n  meta:\n    author = \"TDL\"\n    description = \"Web Request to Abnormally Long Domain Name\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(1h)\n| where DeviceVendor has \"Proxy\" or DeviceProduct has \"Proxy\" or DeviceEventClassID\
+    \ in (\"URL\", \"Web\", \"HTTP\")\n| extend Domain = coalesce(DestinationHostName, RequestURL, AdditionalExtensions)\n| where isnotempty(Domain)\n\
+    | extend DomainLength = strlen(Domain)\n| where DomainLength >= 75\n| extend UserAgent = coalesce(RequestClientApplication, DeviceCustomString2)\n\
+    | where UserAgent !has_any (\"scanner\", \"monitor\", \"nagios\", \"zabbix\", \"pingdom\", \"uptimerobot\", \"bot\", \"crawler\")\n| summarize\
+    \ \n    RequestCount = count(),\n    SourceIPs = make_set(SourceIP),\n    DestinationResources = make_set(Domain)\n    by SourceUserName,\
+    \ Domain, DomainLength\n| where RequestCount >= 1\n| sort by RequestCount desc\n| project TimeGenerated = now(), SourceUserName, Domain, DomainLength,\
+    \ RequestCount, SourceIPs, DestinationResources\n"
+  aql: "SELECT username, \n       QIDNAME(qid) AS event_name, \n       destinationip, \n       DOMAINNAME(destinationip) AS domain, \n       COUNT(*)\
+    \ AS request_count, \n       ARRAYTOSTRING(COLLECT(sourceip), ', ') AS source_ips\nFROM events\nWHERE (LOGSOURCETYPENAME(devicetype) ILIKE\
+    \ '%proxy%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%web%')\n  AND LENGTH(DOMAINNAME(destinationip)) > 50\n  AND username NOT IN ('monitoring_agent',\
+    \ 'scanner_account', 'authorized_scanner')\n  AND sourceip NOT IN ('10.0.0.100', '192.168.1.50')\nGROUP BY username, QIDNAME(qid), destinationip,\
+    \ DOMAINNAME(destinationip)\nHAVING request_count >= 1\nORDER BY request_count DESC\nLAST 1 HOURS\n"
+  yara_l: "rule excessive_domain_length_web_request {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects web requests\
+    \ to abnormally long domain names indicating potential C2 beaconing\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique\
+    \ = \"T1071\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.metadata.product_log_id =\
+    \ \"FORWARD_PROXY\"\n    $e.target.url != \"\"\n    \n    // Extract domain from URL and check length > 63 characters (abnormally long subdomain/domain)\n\
+    \    #domain_length = strings.length(re.capture($e.target.url, `^https?://([^/:]+)`))\n    #domain_length > 63\n    \n    $e.principal.user.userid\
+    \ = $user\n    $e.principal.ip = $src_ip\n    $e.target.url = $url\n    \n    // Exclude authorized scanners and monitoring agents\n    not\
+    \ re.regex($e.principal.user.user_display_name, `(?i)(scanner|monitor|qualys|nessus|tanium|crowdstrike)`)\n    not re.regex($e.network.http.user_agent,\
+    \ `(?i)(scanner|monitor|bot|crawler|qualys|nessus)`)\n    \n  match:\n    $user, $url over 5m\n    \n  outcome:\n    $risk_score = 65\n  \
+    \  $source_ips = array_distinct($src_ip)\n    $request_count = count_distinct($e.metadata.id)\n    \n  condition:\n    #e >= 1\n}\n"
+  esql: |
+    FROM logs-proxy*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND event.category == "web"
+      AND LENGTH(url.domain) > 100
+    | STATS count = COUNT(*), source_ips = VALUES(source.ip) BY user.name, url.domain, url.full
+    | WHERE count >= 1
+      AND NOT (user.name IN ("scanner_service", "monitoring_agent", "health_check"))
     | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    | KEEP user.name, url.domain, url.full, count, source_ips
+  leql: |
+    where(log_source_type="Forward Proxy" AND LENGTH(destination_domain) > 75) groupby(source_address, destination_domain, user) calculate(count)
+  crowdstrike: |
+    #repo=cloud (#type=aws:cloudtrail OR #type=azure:auditlogs OR #type=gcp:audit)
+    | regex("^.{50,}$", field=eventName, strict=false)
+    | groupBy([userIdentity.arn, eventName, resources{}.ARN], function=[count(as=cnt), collect(sourceIPAddress)])
+    | cnt >= 1
+    | not(sourceIPAddress=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ OR sourceIPAddress=/scanner|monitor|authorized/i)
+    | sort(cnt, order=desc)
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action = "allow" and app_category = "web-browsing"
+    | alter domain_length = len(http_hostname)
+    | filter domain_length > 60
+    | alter user_arn = coalesce(src_user, "unknown")
+    | comp count() as req_count, array_agg(src_ip) as source_ips by user_arn, http_hostname, dst_ip
+    | filter req_count >= 1
+    | filter http_hostname not contains "scanner" and http_hostname not contains "monitor"
+    | sort desc req_count
+    | fields user_arn, http_hostname, dst_ip, req_count, source_ips
+  lucene: |
+    sourcetype:(aws\:cloudtrail OR azure\:auditlogs OR gcp\:audit) AND eventName:/.*[a-z0-9\-]{50,}.*/ AND NOT (sourceIPAddress:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) OR userAgent:(*scanner* OR *monitor* OR *nagios* OR *zabbix*))
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*dns*
+    | json field=_raw "domain" as domain
+    | json field=_raw "url" as url
+    | json field=_raw "user" as user
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest" as dest
+    | parse regex field=domain "(?<extracted_domain>[a-zA-Z0-9\-\.]+)"
+    | parse regex field=url "https?://(?<url_domain>[^/]+)"
+    | if(isNull(extracted_domain), url_domain, extracted_domain) as final_domain
+    | where !isNull(final_domain)
+    | length(final_domain) as domain_length
+    | where domain_length >= 80
+    | where !(user matches "*scanner*" or user matches "*monitor*" or src_ip matches "10.0.0.*")
+    | count as request_count, values(src_ip) as source_ips by user, final_domain
+    | where request_count >= 1
+    | sort by request_count desc
+    | fields user, final_domain, domain_length, request_count, source_ips
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -95,7 +112,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

@@ -20,71 +20,65 @@ queries:
     *New-Object*\" ImagePath=\"*Net.Webclient*\" ImagePath=\"*DownloadString*\" ImagePath=\"*127.0.0.1*\") OR (index=wineventlog sourcetype=WinEventLog:Security\
     \ EventCode=4697 ServiceFileName=\"*IEX*\" ServiceFileName=\"*New-Object*\" ServiceFileName=\"*Net.Webclient*\" ServiceFileName=\"*DownloadString*\"\
     \ ServiceFileName=\"*127.0.0.1*\") \n| table _time, host, EventCode, EventSourceName, ImagePath, ServiceFileName, Service_Name, ComputerName\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("7045", "4697")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('7045', '4697')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000660 {\n  meta:\n    author = \"TDL\"\n    description = \"Cobalt Strike Download\"\n    severity = \"CRITICAL\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1569\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(7045|4697)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND event_id IN ("7045", "4697")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [7045, 4697])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (7045, 4697)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("7045", "4697")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(7045 OR 4697)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("7045", "4697")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where (EventID == 7045 and EventSourceName =~ "Service Control Manager" and ServiceFileName contains "IEX" and ServiceFileName contains "New-Object" and ServiceFileName contains "Net.Webclient" and ServiceFileName contains "DownloadString" and ServiceFileName contains "127.0.0.1")
+        or (EventID == 4697 and ServiceFileName contains "IEX" and ServiceFileName contains "New-Object" and ServiceFileName contains "Net.Webclient" and ServiceFileName contains "DownloadString" and ServiceFileName contains "127.0.0.1")
+    | project TimeGenerated, Computer, EventID, EventSourceName, ServiceName, ServiceFileName, Account, SubjectUserName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, "EventID", "Service Name", COALESCE("ImagePath", "Service File Name") AS command_line, username
+    FROM events
+    WHERE ("EventID" = '7045' OR "EventID" = '4697')
+      AND (("ImagePath" IS NOT NULL AND "ImagePath" ILIKE '%IEX%' AND "ImagePath" ILIKE '%New-Object%' AND "ImagePath" ILIKE '%Net.Webclient%' AND "ImagePath" ILIKE '%DownloadString%' AND "ImagePath" ILIKE '%127.0.0.1%')
+        OR ("Service File Name" IS NOT NULL AND "Service File Name" ILIKE '%IEX%' AND "Service File Name" ILIKE '%New-Object%' AND "Service File Name" ILIKE '%Net.Webclient%' AND "Service File Name" ILIKE '%DownloadString%' AND "Service File Name" ILIKE '%127.0.0.1%'))
+    LAST 24 HOURS
+  yara_l: "rule suspicious_service_powershell_download {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects service creation\
+    \ with PowerShell download cradle patterns pointing to localhost\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique =\
+    \ \"T1569\"\n    severity = \"High\"\n\n  events:\n    (\n      $e.metadata.event_type = \"SERVICE_CREATION\" and\n      $e.metadata.product_event_type\
+    \ = \"7045\" and\n      re.regex($e.target.process.command_line, `(?i)IEX`) and\n      re.regex($e.target.process.command_line, `(?i)New-Object`)\
+    \ and\n      re.regex($e.target.process.command_line, `(?i)Net\\.Webclient`) and\n      re.regex($e.target.process.command_line, `(?i)DownloadString`)\
+    \ and\n      re.regex($e.target.process.command_line, `127\\.0\\.0\\.1`)\n    ) or (\n      $e.metadata.event_type = \"SERVICE_CREATION\"\
+    \ and\n      $e.metadata.product_event_type = \"4697\" and\n      re.regex($e.target.resource.name, `(?i)IEX`) and\n      re.regex($e.target.resource.name,\
+    \ `(?i)New-Object`) and\n      re.regex($e.target.resource.name, `(?i)Net\\.Webclient`) and\n      re.regex($e.target.resource.name, `(?i)DownloadString`)\
+    \ and\n      re.regex($e.target.resource.name, `127\\.0\\.0\\.1`)\n    )\n    \n    $e.principal.hostname = $host\n\n  match:\n    $host over\
+    \ 5m\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-system.system*, logs-system.security*
+    | WHERE (event.code == "7045" AND winlog.event_data.ImagePath LIKE "*IEX*" AND winlog.event_data.ImagePath LIKE "*New-Object*" AND winlog.event_data.ImagePath LIKE "*Net.Webclient*" AND winlog.event_data.ImagePath LIKE "*DownloadString*" AND winlog.event_data.ImagePath LIKE "*127.0.0.1*")
+       OR (event.code == "4697" AND winlog.event_data.ServiceFileName LIKE "*IEX*" AND winlog.event_data.ServiceFileName LIKE "*New-Object*" AND winlog.event_data.ServiceFileName LIKE "*Net.Webclient*" AND winlog.event_data.ServiceFileName LIKE "*DownloadString*" AND winlog.event_data.ServiceFileName LIKE "*127.0.0.1*")
+    | KEEP @timestamp, host.name, event.code, winlog.event_data.ServiceName, winlog.event_data.ImagePath, winlog.event_data.ServiceFileName, user.name
+  leql: |
+    where((source_json.EventID=7045 AND source_json.ImagePath ICONTAINS "IEX" AND source_json.ImagePath ICONTAINS "New-Object" AND source_json.ImagePath ICONTAINS "Net.Webclient" AND source_json.ImagePath ICONTAINS "DownloadString" AND source_json.ImagePath ICONTAINS "127.0.0.1") OR (source_json.EventID=4697 AND source_json.ServiceFileName ICONTAINS "IEX" AND source_json.ServiceFileName ICONTAINS "New-Object" AND source_json.ServiceFileName ICONTAINS "Net.Webclient" AND source_json.ServiceFileName ICONTAINS "DownloadString" AND source_json.ServiceFileName ICONTAINS "127.0.0.1"))
+  crowdstrike: |
+    (EventCode=7045 OR EventCode=4697)
+    (ImagePath=*IEX* OR ServiceFileName=*IEX*)
+    (ImagePath=*New-Object* OR ServiceFileName=*New-Object*)
+    (ImagePath=*Net.Webclient* OR ServiceFileName=*Net.Webclient*)
+    (ImagePath=*DownloadString* OR ServiceFileName=*DownloadString*)
+    (ImagePath=*127.0.0.1* OR ServiceFileName=*127.0.0.1*)
+    | table([@timestamp, ComputerName, EventCode, ServiceName, ImagePath, ServiceFileName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (7045, 4697)
+    | alter service_path = coalesce(action_evtlog_event_data_ImagePath, action_evtlog_event_data_ServiceFileName)
+    | filter service_path contains "IEX"
+        and service_path contains "New-Object"
+        and service_path contains "Net.Webclient"
+        and service_path contains "DownloadString"
+        and service_path contains "127.0.0.1"
+    | fields _time, agent_hostname, action_evtlog_event_id, service_path, action_evtlog_event_data_ServiceName
+  lucene: |
+    (event.code:7045 AND winlog.event_data.ImagePath:(*IEX* AND *New-Object* AND *Net.Webclient* AND *DownloadString* AND *127.0.0.1*)) OR (event.code:4697 AND winlog.event_data.ServiceFileName:(*IEX* AND *New-Object* AND *Net.Webclient* AND *DownloadString* AND *127.0.0.1*))
+  sumo: |
+    (_sourceCategory=*Windows*System* OR _sourceCategory=*Windows*Security*)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "EventSourceName" as event_source
+    | json field=_raw "ImagePath" as image_path
+    | json field=_raw "ServiceFileName" as service_file_name
+    | where (event_id = "7045" and event_source = "Service Control Manager" and image_path matches "*IEX*" and image_path matches "*New-Object*" and image_path matches "*Net.Webclient*" and image_path matches "*DownloadString*" and image_path matches "*127.0.0.1*")
+       OR (event_id = "4697" and service_file_name matches "*IEX*" and service_file_name matches "*New-Object*" and service_file_name matches "*Net.Webclient*" and service_file_name matches "*DownloadString*" and service_file_name matches "*127.0.0.1*")
+    | fields _messageTime, _sourceHost, event_id, event_source, image_path, service_file_name
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +88,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows System Event \nWhere EventSourceName is \"Service Control Manager\"\nWhere the Event ID is 7045 \nWhere ImagePath contains\
   \ \"IEX\"\nWhere ImagePath contains \"New-Object\" \nWhere ImagePath contains \"Net.Webclient\" \nWhere ImagePath contains \"DownloadString\"\

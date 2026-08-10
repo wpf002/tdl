@@ -17,74 +17,60 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=windows (EventCode=592 OR EventCode=4688) (Process_Name="*\\rundll32.exe" OR Image="*\\rundll32.exe") (CommandLine="* startw*" OR CommandLine="*,startw*")
+  spl: 'index=windows (EventCode=592 OR EventCode=4688) (Process_Name="*\\rundll32.exe" OR Image="*\\rundll32.exe") (CommandLine="* startw*" OR
+    CommandLine="*,startw*")
+
     | table _time, ComputerName, User, Process_Name, Image, CommandLine, ParentImage, Parent_Process_Name
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("rundll32.exe", "RunDLL32.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('rundll32.exe', 'RunDLL32.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000251 {\n  meta:\n    author = \"TDL\"\n    description = \"Cobalt Strike DLL Loaded with StartW Function\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1218\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(rundll32.exe|RunDLL32.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("rundll32.exe", "RunDLL32.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [rundll32.exe, RunDLL32.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (rundll32.exe, RunDLL32.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("rundll32.exe", "RunDLL32.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(rundll32.exe OR RunDLL32.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("rundll32.exe", "RunDLL32.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (592, 4688)
+    | where Process endswith "rundll32.exe"
+    | where CommandLine has_any (" startw", ",startw")
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", sourceip
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Process Name" ILIKE '%rundll32.exe%'
+      AND ("Process CommandLine" ILIKE '% startw%' OR "Process CommandLine" ILIKE '%,startw%')
+    LAST 24 HOURS
+  yara_l: "rule rundll32_startw_execution {\n  meta:\n    author = \"TDL\"\n    description = \"Detects rundll32.exe execution with startw parameter\
+    \ - T1218 Defense Evasion\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1218\"\n    \n  events:\n    $e.metadata.event_type\
+    \ = \"PROCESS_LAUNCH\"\n    (\n      $e.metadata.product_event_type = \"592\" or\n      $e.metadata.product_event_type = \"4688\"\n    )\n\
+    \    re.regex($e.target.process.file.full_path, `(?i)\\\\rundll32\\.exe$`)\n    (\n      re.regex($e.target.process.command_line, `(?i) startw`)\
+    \ or\n      re.regex($e.target.process.command_line, `(?i),startw`)\n    )\n    $e.principal.hostname = $host\n    \n  match:\n    $host over\
+    \ 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code IN ("592", "4688")
+      AND process.name == "rundll32.exe"
+      AND (process.command_line LIKE "* startw*" OR process.command_line LIKE "*,startw*")
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.executable
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND process_name="rundll32.exe" AND (process_cmd_line ICONTAINS " startw" OR process_cmd_line ICONTAINS ",startw"))
+  crowdstrike: |
+    EventCode=4688 FileName=rundll32.exe (CommandLine=*\ startw* OR CommandLine=*,startw*)
+    | table([@timestamp, ComputerName, UserName, ParentBaseFileName, CommandLine, FileName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter lowercase(action_process_image_name) contains "rundll32.exe"
+    | filter action_process_image_command_line ~= "(?i)(\\s|,)startw"
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, action_process_image_path
+  lucene: |
+    event.code:(592 OR 4688) AND process.name:rundll32.exe AND (process.command_line:*\ startw* OR process.command_line:*,startw*)
+  sumo: |
+    _sourceCategory=*Windows* ("4688" OR "592")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | where event_id in ("4688", "592")
+    | where process_name matches "*rundll32.exe"
+    | where command_line matches "* startw*" OR command_line matches "*,startw*"
+    | fields _messageTime, _sourceHost, event_id, process_name, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +80,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Windows Process Creation Event
 

@@ -19,77 +19,78 @@ queries:
   spl: "index=proxy sourcetype=proxy OR sourcetype=bluecoat OR sourcetype=squid \n    (url_category=\"malicious\" OR url_category=\"phishing\"\
     \ OR url_category=\"malware\" OR url_category=\"command and control\" OR url_category=\"botnet\" OR url_category=\"compromised\" OR url_category=\"\
     known malicious\")\n| bin _time span=5m\n| stats count by _time, src_ip\n| where count >= 10\n| table _time, src_ip, count\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(1h)
+    | where DeviceVendor has "Proxy" or DeviceProduct has "Proxy" or DeviceEventClassID has "URL"
+    | where DeviceCustomString2 in ("Malware", "Phishing", "Malicious", "Botnet", "Command and Control", "C2", "Malicious Sites", "Malicious Sources", "Suspicious")
+    | summarize EventCount = count() by bin(TimeGenerated, 5m), SourceIP, DeviceName
+    | where EventCount >= 10
+    | project TimeGenerated, SourceIP, DeviceName, EventCount
+  aql: |
+    SELECT sourceip, CATEGORYNAME(category) AS url_category, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_destinations
+    FROM events
+    WHERE category IN (SELECT category FROM categories WHERE low_level_category_id IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50))
+    GROUP BY sourceip, category
+    HAVING event_count >= 10
+    LAST 5 MINUTES
+  yara_l: |
+    rule drive_by_compromise_malicious_urls {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects multiple forward proxy requests to malicious URL categories from the same source IP within 5 minutes - MITRE T1189"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1189"
+        severity = "High"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.metadata.product_name = "Forward Proxy" or $e.metadata.log_type = "PROXY"
+        (
+          $e.network.http.parsed_user_agent != "" or
+          $e.target.url != ""
+        )
+        (
+          re.regex($e.security_result.category_details, `(?i)(malware|malicious|phishing|botnet|command.?and.?control|c2|trojan|exploit|ransomware|spyware)`) or
+          $e.security_result.summary = "MALICIOUS" or
+          $e.security_result.summary = "MALWARE" or
+          $e.security_result.summary = "PHISHING"
+        )
+        $e.principal.ip = $source_ip
 
-    | where network.protocol matches regex "tcp"
+      match:
+        $source_ip over 5m
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000255 {\n  meta:\n    author = \"TDL\"\n    description = \"Traffic Pattern to Maliciously Categorized URL\"\n \
-    \   severity = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1189\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 10
+    }
+  esql: "FROM logs-network.proxy*\n| WHERE @timestamp > NOW() - 5 minutes \n  AND url.category IN (\"malware\", \"phishing\", \"spam\", \"exploit\"\
+    , \"malicious\", \"hacking\", \"botnet\", \"c2\", \"command and control\")\n| STATS event_count = COUNT(*) BY source.ip, time_window = BUCKET(@timestamp,\
+    \ 5 minutes)\n| WHERE event_count >= 10\n| KEEP time_window, source.ip, event_count\n"
+  leql: |
+    where(url_category IN ["Malicious", "Phishing", "Malware", "Command and Control", "Bot Nets", "Compromised", "Spyware"]) groupby(source_address) calculate(count)
+  crowdstrike: "#type=proxy event_simpleName=*Proxy* \n| UrlCategory in [Malware, Phishing, \"Command and Control\", Botnet, Exploit, \"Malicious\
+    \ Sites\", Spam]\n| bucket(span=5m, field=@timestamp, as=time_bucket)\n| groupBy([SourceIP, time_bucket], function=count(as=event_count))\n\
+    | event_count >= 10\n| table([SourceIP, time_bucket, event_count])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter subtype = "url" and url_category_list in ("malware", "phishing", "command-and-control", "malicious-sites", "grayware")
+    | bin _time span=5m
+    | comp count() as event_count by _time, src_ip
+    | filter event_count >= 10
+    | fields _time, src_ip, event_count
+  lucene: |
+    url.category:("Malware" OR "Phishing" OR "Malicious Sites" OR "Command and Control" OR "Botnet" OR "Exploits" OR "Suspicious")
+  sumo: |
+    _sourceCategory=*Proxy* OR _sourceCategory=*ForwardProxy*
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex field=_raw "\"?url\"?\s*[:=]\s*\"?(?<url>[^\s\"]+)\"?" nodrop
+    | parse regex field=_raw "\"?category\"?\s*[:=]\s*\"?(?<url_category>[^\s\",]+)\"?" nodrop
+    | where url_category in ("Malware", "Phishing", "Command and Control", "C2", "Malicious", "Suspicious", "Botnet", "Exploit", "Hacking")
+    | timeslice 5m
+    | count as event_count by _timeslice, src_ip
+    | where event_count >= 10
+    | fields _timeslice, src_ip, event_count
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -99,7 +100,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '10 Forward Proxy Events
 

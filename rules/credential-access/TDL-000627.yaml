@@ -15,71 +15,68 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=azure sourcetype=azure:audit OperationName="VaultDelete"
+  spl: 'index=azure sourcetype=azure:audit OperationName="VaultDelete"
+
     | table _time, CallerIpAddress, Identity, ResourceId, SubscriptionId, ResultType
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000627 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Key Vault Deleted\"\n    severity = \"HIGH\"\n \
-    \   tactic = \"TA0006\"\n    technique = \"T1485\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n\
-    \    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AzureDiagnostics
+    | where TimeGenerated > ago(1h)
+    | where ResourceType == "VAULTS"
+    | where OperationName == "VaultDelete"
+    | project TimeGenerated, ResourceId, CallerIPAddress, identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s, Resource, SubscriptionId, ResourceGroup
+  aql: |
+    SELECT eventtime, username, sourceip, "Operation Name", "Resource Name", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "Operation Name" = 'VaultDelete'
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_key_vault_deleted {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects deletion of Azure Key Vault"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1485"
+        platform = "Azure"
+        data_source = "Azure Key Vault"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Azure"
+        $e.metadata.event_type = "SYSTEM_AUDIT_LOG_UNCATEGORIZED"
+        $e.metadata.product_event_type = "VaultDelete"
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $vault
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user, $vault over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-azure.auditlogs*
+    | WHERE @timestamp > NOW() - 24 hour AND azure.auditlogs.operation_name == "VaultDelete"
+    | KEEP @timestamp, azure.auditlogs.properties.initiatedBy.user.userPrincipalName, azure.auditlogs.properties.targetResources, azure.resource.name, azure.resource.group, azure.subscription.id
+  leql: |
+    where(source_json.operationName="VaultDelete")
+  crowdstrike: |
+    #type=azure OperationName="VaultDelete"
+    | table([@timestamp, CallerIPAddress, Identity, ResourceId, OperationName])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AZURE" and operation_name = "VaultDelete"
+    | fields _time, cloud_provider, operation_name, actor_user, resource_name, resource_type, cloud_provider_project
+  lucene: |
+    OperationName:"VaultDelete" AND ResourceProvider:"MICROSOFT.KEYVAULT"
+  sumo: |
+    _sourceCategory=*Azure* "VaultDelete"
+    | json field=_raw "operationName" as operation_name
+    | where operation_name = "VaultDelete"
+    | fields _messageTime, _sourceHost, operation_name
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +86,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Azure Audit Event
 

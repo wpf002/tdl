@@ -16,75 +16,91 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1 process_name="spoolsv.exe"
+  spl: 'index=endpoint sourcetype=Sysmon EventCode=1 process_name="spoolsv.exe"
+
     | stats count values(host) as affected_hosts values(user) as users by process_name, parent_process_name, command_line
+
     | where count >= 1
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("spoolsv.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('spoolsv.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000248 {\n  meta:\n    author = \"TDL\"\n    description = \"Printer Port Monitor DLL Injection\"\n    severity =\
-    \ \"MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1574\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(spoolsv.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    Event
+    | where EventID == 1
+    | where Source == "Microsoft-Windows-Sysmon"
+    | extend EventData = parse_xml(EventData)
+    | extend Image = tostring(EventData.DataItem.EventData.Data[4]["#text"])
+    | extend ParentImage = tostring(EventData.DataItem.EventData.Data[20]["#text"])
+    | extend CommandLine = tostring(EventData.DataItem.EventData.Data[10]["#text"])
+    | extend User = tostring(EventData.DataItem.EventData.Data[12]["#text"])
+    | extend ProcessName = tostring(split(Image, '\\')[-1])
+    | extend ParentProcessName = tostring(split(ParentImage, '\\')[-1])
+    | where ProcessName =~ "spoolsv.exe"
+    | summarize Computers = make_set(Computer), Users = make_set(User), Count = count() by ProcessName, ParentProcessName, CommandLine
+    | project ProcessName, ParentProcessName, CommandLine, Computers, Users, Count
+  aql: |
+    SELECT LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Parent Process Name", "Process CommandLine", COUNT(*) AS event_count
+    FROM events
+    WHERE "EventID" = '1' AND "Process Name" ILIKE '%spoolsv.exe%'
+    GROUP BY LOGSOURCENAME(logsourceid), username, "Process Name", "Parent Process Name", "Process CommandLine"
+    LAST 24 HOURS
+  yara_l: |
+    rule hijack_execution_flow_spoolsv {
+      meta:
+        author = "TDL"
+        description = "Detects spoolsv.exe process creation - T1574 Persistence"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1574"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.metadata.product_event_type = "1"
+        re.regex($e.target.process.file.full_path, `(?i)\\spoolsv\.exe$`) nocase
+        $e.target.process.command_line = $cmdline
+        $e.target.process.parent_process.file.full_path = $parent
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $user
 
-    | WHERE event.category == "process" AND process_name IN ("spoolsv.exe")
+      match:
+        $cmdline, $parent over 1h
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 50
+        $host_list = array_distinct($host)
+        $user_list = array_distinct($user)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [spoolsv.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (spoolsv.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("spoolsv.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(spoolsv.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("spoolsv.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint.events.process*, logs-windows.sysmon_operational*
+    | WHERE event.code == "1" AND process.name == "spoolsv.exe"
+    | STATS hosts = COUNT_DISTINCT(host.name), users = COUNT_DISTINCT(user.name) BY process.name, process.parent.name, process.command_line
+    | KEEP process.name, process.parent.name, process.command_line, hosts, users
+  leql: |
+    where(source_json.EventID=1 AND process_name="spoolsv.exe") groupby(process_name, parent_process_name, process_cmd_line, asset, user) calculate(count)
+  crowdstrike: |
+    EventCode=1 FileName=spoolsv.exe
+    | groupBy([FileName, ParentBaseFileName, CommandLine], function=[count(as=instances), count(ComputerName, distinct=true, as=hosts), count(UserName, distinct=true, as=users)])
+    | table([FileName, ParentBaseFileName, CommandLine, instances, hosts, users])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS and action_evtlog_event_id = 1 and lowercase(action_process_image_name) contains "spoolsv.exe"
+    | comp count() as instances, count_distinct(agent_hostname) as hosts, values(agent_hostname) as hostnames, count_distinct(actor_effective_username) as users, values(actor_effective_username) as usernames by action_process_image_name, actor_process_image_name, action_process_image_command_line
+    | fields action_process_image_name, actor_process_image_name, action_process_image_command_line, instances, hosts, hostnames, users, usernames
+  lucene: |
+    EventCode:1 AND process_name:spoolsv.exe
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Sysmon* "1"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Image" as process_name
+    | json field=_raw "ParentImage" as parent_process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "Computer" as host
+    | json field=_raw "User" as user
+    | where event_id = "1" and process_name matches "*spoolsv.exe"
+    | count_distinct(host) as distinct_hosts, count_distinct(user) as distinct_users by process_name, parent_process_name, command_line
+    | fields process_name, parent_process_name, command_line, distinct_hosts, distinct_users
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +110,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 suppression:
   window: 12 hours

@@ -17,74 +17,95 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=windows (EventCode=592 OR EventCode=4688) (ParentImage="*\\wmiprvse.exe" OR ParentImage="*\\services.exe") CommandLine="*cmd.exe*" CommandLine="*/q*" CommandLine="*\\\\127.0.0.1\\\\*" CommandLine="*&1*"
+  spl: 'index=windows (EventCode=592 OR EventCode=4688) (ParentImage="*\\wmiprvse.exe" OR ParentImage="*\\services.exe") CommandLine="*cmd.exe*"
+    CommandLine="*/q*" CommandLine="*\\\\127.0.0.1\\\\*" CommandLine="*&1*"
+
     | table _time, ComputerName, User, ParentImage, Image, CommandLine
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("wmiprvse.exe", "services.exe", "cmd.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('wmiprvse.exe', 'services.exe', 'cmd.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000424 {\n  meta:\n    author = \"TDL\"\n    description = \"Possible Impacket Lateral Movement\"\n    severity =\
-    \ \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1047\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(wmiprvse.exe|services.exe|cmd.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4688
+    | where ParentProcessName has "wmiprvse.exe" or ParentProcessName has "services.exe"
+    | where CommandLine has "cmd.exe" and CommandLine has "/q" and CommandLine has "\\\\127.0.0.1\\\\" and CommandLine has "&1"
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName, NewProcessName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Parent Process Name", "Process Name", "Process CommandLine"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND ("Parent Process Name" ILIKE '%wmiprvse.exe%' OR "Parent Process Name" ILIKE '%services.exe%')
+      AND "Process CommandLine" ILIKE '%cmd.exe%'
+      AND "Process CommandLine" ILIKE '%/q%'
+      AND "Process CommandLine" ILIKE '%\\\\127.0.0.1\\\\%'
+      AND "Process CommandLine" ILIKE '%&1%'
+    LAST 24 HOURS
+  yara_l: |
+    rule wmi_execution_suspicious_command {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects potential WMI execution with suspicious command line patterns - T1047"
+        mitre_attack_technique = "T1047"
+        mitre_attack_tactic = "Execution"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688"
+        )
+        (
+          re.regex($e.principal.process.parent_process.file.full_path, `(?i)wmiprvse\.exe`) or
+          re.regex($e.principal.process.parent_process.file.full_path, `(?i)services\.exe`)
+        )
+        re.regex($e.principal.process.command_line, `(?i)cmd\.exe`)
+        re.regex($e.principal.process.command_line, `/q`)
+        re.regex($e.principal.process.command_line, `\\\\127\.0\.0\.1\\`)
+        re.regex($e.principal.process.command_line, `&1`)
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name IN ("wmiprvse.exe", "services.exe", "cmd.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [wmiprvse.exe, services.exe, cmd.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (wmiprvse.exe, services.exe, cmd.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("wmiprvse.exe", "services.exe", "cmd.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(wmiprvse.exe OR services.exe OR cmd.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("wmiprvse.exe", "services.exe", "cmd.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.* , logs-system.security* , winlogbeat-*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND (event.code == "4688" OR event.code == "592")
+      AND (TO_LOWER(process.parent.name) LIKE "*wmiprvse.exe*" OR TO_LOWER(process.parent.name) LIKE "*services.exe*")
+      AND TO_LOWER(process.command_line) LIKE "*cmd.exe*"
+      AND process.command_line LIKE "*/q*"
+      AND process.command_line LIKE "*\\\\127.0.0.1\\\\*"
+      AND process.command_line LIKE "*&1*"
+    | KEEP @timestamp, host.name, user.name, process.parent.name, process.name, process.command_line, process.executable
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND (parent_process_name ICONTAINS "wmiprvse.exe" OR parent_process_name ICONTAINS "services.exe") AND process_cmd_line ICONTAINS "cmd.exe" AND process_cmd_line ICONTAINS "/q" AND process_cmd_line ICONTAINS "\\\\127.0.0.1\\\\" AND process_cmd_line ICONTAINS "&1")
+  crowdstrike: |
+    EventCode=4688 (ParentProcessName=*wmiprvse.exe* OR ParentProcessName=*services.exe*) CommandLine=*cmd.exe* CommandLine=*/q* CommandLine=*\\\\127.0.0.1\\\\* CommandLine=*&1*
+    | table([@timestamp, ComputerName, UserName, ParentProcessName, ProcessName, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+      and (lowercase(action_parent_process_image_name) contains "wmiprvse.exe" or lowercase(action_parent_process_image_name) contains "services.exe")
+      and lowercase(action_process_image_command_line) contains "cmd.exe"
+      and lowercase(action_process_image_command_line) contains "/q"
+      and lowercase(action_process_image_command_line) contains "\\\\127.0.0.1\\\\"
+      and lowercase(action_process_image_command_line) contains "&1"
+    | fields _time, agent_hostname, actor_effective_username, action_parent_process_image_name, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:(592 OR 4688) AND (process.parent.name:*wmiprvse.exe* OR process.parent.name:*services.exe*) AND process.command_line:(*cmd.exe* AND *\/q* AND *\\\\127.0.0.1\\\\* AND *\&1*)
+  sumo: |
+    _sourceCategory=*Windows* ("4688" OR "592")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ParentProcessName" as parent_process
+    | json field=_raw "CommandLine" as command_line
+    | where event_id in ("4688", "592")
+    | where (parent_process matches "*wmiprvse.exe*" OR parent_process matches "*services.exe*")
+    | where command_line matches "*cmd.exe*" AND command_line matches "*/q*" AND command_line matches "*\\\\127.0.0.1\\\\*" AND command_line matches "*&1*"
+    | fields _messageTime, _sourceHost, event_id, parent_process, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +115,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Process Creation Event
 

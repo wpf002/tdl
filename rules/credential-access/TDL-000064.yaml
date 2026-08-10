@@ -17,77 +17,91 @@ risk_score: 30
 queries:
   spl: "index=proxy \n| lookup high_risk_tlds tld OUTPUT risk_level\n| search risk_level=*\n| bin _time span=2m\n| stats count dc(tld) as unique_tlds\
     \ values(tld) as tlds values(url) as urls by _time, src_ip\n| where count >= 3\n| table _time, src_ip, count, unique_tlds, tlds, urls\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(2m)
+    | where DeviceVendor has "Proxy" or DeviceProduct has "Proxy" or DeviceEventClassID has "Proxy"
+    | extend TLD = extract(@"\.([a-z]{2,})$", 1, tolower(DestinationHostName))
+    | where TLD in ("tk", "ml", "ga", "cf", "gq", "pw", "cc", "top", "xyz", "club", "work", "click", "link", "stream", "download", "loan", "racing", "review", "trade", "cricket", "science", "party", "gdn", "bid", "accountant", "faith", "win", "date")
+    | summarize EventCount = count(), Domains = make_set(DestinationHostName), TLDs = make_set(TLD), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by SourceIP
+    | where EventCount >= 3
+    | where datetime_diff('minute', LastSeen, FirstSeen) <= 2
+    | project SourceIP, EventCount, Domains, TLDs, FirstSeen, LastSeen
+  aql: |
+    SELECT sourceip, destinationip, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_destinations
+    FROM events
+    WHERE categoryname(category) ILIKE '%proxy%'
+      AND (destinationip ILIKE '%.tk' OR destinationip ILIKE '%.ml' OR destinationip ILIKE '%.ga' OR destinationip ILIKE '%.cf' OR destinationip ILIKE '%.gq' OR destinationip ILIKE '%.pw' OR destinationip ILIKE '%.cc' OR destinationip ILIKE '%.to' OR destinationip ILIKE '%.ws' OR destinationip ILIKE '%.top' OR destinationip ILIKE '%.buzz' OR destinationip ILIKE '%.xyz' OR destinationip ILIKE '%.info' OR destinationip ILIKE '%.club')
+    GROUP BY sourceip
+    HAVING event_count >= 3
+    LAST 2 MINUTES
+  yara_l: |
+    rule credential_access_high_risk_tld_proxy {
+      meta:
+        author = "TDL"
+        description = "Detects 3+ forward proxy events to high-risk TLDs from same source IP within 2 minutes"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1056"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.metadata.product_name = "Forward Proxy"
+        (
+          re.regex($e.target.url, `\.tk($|/)`) or
+          re.regex($e.target.url, `\.ml($|/)`) or
+          re.regex($e.target.url, `\.ga($|/)`) or
+          re.regex($e.target.url, `\.cf($|/)`) or
+          re.regex($e.target.url, `\.gq($|/)`) or
+          re.regex($e.target.url, `\.pw($|/)`) or
+          re.regex($e.target.url, `\.top($|/)`) or
+          re.regex($e.target.url, `\.xyz($|/)`) or
+          re.regex($e.target.url, `\.cc($|/)`) or
+          re.regex($e.target.url, `\.su($|/)`)
+        )
+        $e.principal.ip = $source_ip
 
-    | where network.protocol matches regex "tcp"
+      match:
+        $source_ip over 2m
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_ca_000064 {\n  meta:\n    author = \"TDL\"\n    description = \"Traffic to Suspicious Top Level Domain\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0006\"\n    technique = \"T1056\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 3
+    }
+  esql: |
+    FROM logs-network.proxy*
+    | WHERE @timestamp > NOW() - 2 minutes
+      AND url.domain RLIKE ".*\\.(tk|ml|ga|cf|gq|zip|top|work|click|link|xyz|buzz|loan|racing|download|stream|science|party|review|faith|country|webcam|accountant|men|kim|cricket|date|trade)$"
+    | STATS event_count = COUNT(*) BY source.ip, bucket = BUCKET(@timestamp, 2 minutes)
+    | WHERE event_count >= 3
+    | KEEP source.ip, event_count, bucket
+  leql: |
+    where(source_json.top_level_domain IN [".tk", ".ml", ".ga", ".cf", ".gq", ".pw", ".cc", ".ws", ".info", ".biz", ".top", ".xyz", ".club", ".online", ".site", ".win", ".bid", ".trade", ".date", ".download", ".stream", ".racing", ".party", ".review", ".science", ".work", ".click", ".link", ".loan", ".faith", ".cricket", ".accountant", ".men", ".icu", ".buzz", ".space"]) groupby(source_address) calculate(count)
+  crowdstrike: |
+    #type=proxy
+    | top_level_domain IN [".tk", ".ml", ".ga", ".cf", ".gq", ".buzz", ".xyz", ".top", ".win", ".club", ".online", ".site", ".work", ".tech", ".info", ".pw", ".cc", ".ws", ".link", ".loan", ".click", ".racing", ".stream"]
+    | groupBy([src_ip], function=count(as=event_count), span=2m)
+    | event_count >= 3
+    | table([_bucket, src_ip, event_count])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter app = "web-browsing" or app = "ssl"
+    | filter dest_host_name ~= "\\.(?:tk|ml|ga|cf|gq|top|xyz|pw|cc|work|click|link|party|racing|science|stream|trade|webcam|win|review|buzz|loan|download|faith|cricket|bid)$"
+    | bin _time span=2m
+    | comp count() as event_count by _time, src_ip
+    | filter event_count >= 3
+    | fields _time, src_ip, event_count
+  lucene: |
+    proxy.tld:(tk OR ml OR ga OR cf OR gq OR pw OR cc OR buzz OR top OR xyz OR info OR link OR click OR download OR work OR zip OR review OR racing OR science OR date OR stream OR trade OR webcam OR party OR gdn OR kim OR loan OR men OR bid OR faith OR win OR accountant OR host OR online OR cam OR asia OR pro OR club OR live OR site OR us) AND _exists_:source.ip
+  sumo: |
+    _sourceCategory=*Proxy* OR _sourceCategory=*Forward*Proxy*
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?<domain>[a-zA-Z0-9][-a-zA-Z0-9]*[a-zA-Z0-9]*\.[a-zA-Z]{2,})" nodrop
+    | parse regex field=domain "\.(?<tld>[a-zA-Z]{2,})$"
+    | where tld in ("tk", "ml", "ga", "cf", "gq", "pw", "cc", "su", "cn", "ru", "ws", "info", "xyz", "top", "bid", "work", "loan", "download", "racing", "win", "date", "review", "trade", "stream", "party", "science", "cricket")
+    | timeslice 2m
+    | count as event_count by _timeslice, src_ip
+    | where event_count >= 3
+    | fields _timeslice, src_ip, event_count
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -97,7 +111,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '3 Forward Proxy Events
 

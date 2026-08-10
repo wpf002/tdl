@@ -15,71 +15,61 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=slack action="permissions_assigned"
+  spl: 'index=slack action="permissions_assigned"
+
     | table _time, user, action, source, dest, app, permissions, channel, workspace
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000679 {\n  meta:\n    author = \"TDL\"\n    description = \"Permissions Assigned to Role - Slack\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    Slack_CL
+    | where TimeGenerated > ago(24h)
+    | where action_s == "permissions_assigned"
+    | project TimeGenerated, user_s, user_id_s, entity_s, entity_id_s, permissions_s, actor_s, actor_id_s
+  aql: |
+    SELECT eventtime, username, sourceip, CATEGORYNAME(category) AS event_category, QIDNAME(qid) AS event_name, "Action"
+    FROM events
+    WHERE "Action" = 'permissions_assigned'
+    LAST 24 HOURS
+  yara_l: |
+    rule slack_permissions_assigned {
+      meta:
+        author = "TDL"
+        description = "Detects permissions assigned in Slack"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Slack"
+        $e.metadata.product_event_type = "permissions_assigned"
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-slack*
+    | WHERE event.action == "permissions_assigned"
+    | KEEP @timestamp, user.name, user.email, host.name, event.action, event.outcome, source.ip
+  leql: |
+    where(source_json.action="permissions_assigned")
+  crowdstrike: |
+    #type=slack action=permissions_assigned
+    | table([@timestamp, user, team, channel, permissions, actor])
+  xql: |
+    dataset = slack_audit_logs
+    | filter action = "permissions_assigned"
+    | fields _time, actor_user_name, action, entity_type, entity_id, details
+  lucene: |
+    slack.action:"permissions_assigned"
+  sumo: |
+    _sourceCategory=*Slack* "permissions_assigned"
+    | json field=_raw "action" as action
+    | where action = "permissions_assigned"
+    | fields _messageTime, _sourceHost, action, _raw
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +79,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Slack Event
 

@@ -16,74 +16,80 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=email sourcetype=email_security action=permitted event_type="url_click"
+  spl: 'index=email sourcetype=email_security action=permitted event_type="url_click"
+
     | bin _time span=8h
+
     | stats dc(src_user) as unique_users values(src_user) as user_list by _time, url
+
     | where unique_users >= 10
+
     | table _time, url, unique_users, user_list
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000087 {\n  meta:\n    author = \"TDL\"\n    description = \"Successful Click Permitted from Multiple Users\"\n \
-    \   severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1566\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    EmailUrlInfo
+    | where TimeGenerated > ago(8h)
+    | where UrlClickAction == "Allowed" or UrlClickAction == "Permitted"
+    | summarize UniqueUsers = dcount(RecipientEmailAddress), Users = make_set(RecipientEmailAddress) by Url, bin(TimeGenerated, 8h)
+    | where UniqueUsers >= 10
+    | project TimeGenerated, Url, UniqueUsers, Users
+  aql: "SELECT URL, COUNT(*) AS total_clicks, UNIQUECOUNT(username) AS unique_users\nFROM events\nWHERE CATEGORYNAME(category) ILIKE '%email%'\
+    \ \n  AND (QIDNAME(qid) ILIKE '%click%' OR QIDNAME(qid) ILIKE '%url%') \n  AND (QIDNAME(qid) ILIKE '%permit%' OR QIDNAME(qid) ILIKE '%allow%')\n\
+    GROUP BY URL\nHAVING total_clicks >= 10 AND unique_users >= 10\nLAST 8 HOURS\n"
+  yara_l: |
+    rule phishing_campaign_multiple_unique_users_click_same_url {
+      meta:
+        author = "TDL"
+        description = "Detects 10+ unique users clicking same URL within 8 hours - potential phishing campaign"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1566"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.security_result.action = "ALLOW"
+        $e.target.url = $url
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $url over 8h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 75
+        $unique_users = count_distinct($user)
+        $target_url = $url
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #user >= 10
+    }
+  esql: "FROM logs-o365.audit*, logs-google_workspace.alert*, logs-proofpoint.tap*, logs-mimecast.threat_intelligence_feed_malware*, logs-email*\n\
+    | WHERE @timestamp > NOW() - 8 hours \n  AND event.action IN (\"UrlClickPermitted\", \"url_click_permitted\", \"URL Click Permitted\", \"\
+    click_permitted\", \"MessageDelivered\", \"email.link.clicked\")\n| STATS unique_users = COUNT_DISTINCT(source.user.name) BY url.full\n| WHERE\
+    \ unique_users >= 10\n| KEEP url.full, unique_users\n"
+  leql: |
+    where(source_json.action="URL Click Permitted") groupby(source_json.url) calculate(unique:source_json.user)
+  crowdstrike: |
+    #type=EmailSecurity event_simpleName=*URLClickPermitted*
+    | groupBy([URL], function=[count(as=total_clicks), count(SourceUserName, distinct=true, as=unique_users)])
+    | unique_users >= 10
+    | table([URL, total_clicks, unique_users])
+  xql: |
+    dataset = email_security_logs
+    | filter action = "permit" and event_type = "url_click"
+    | bin _time span=8h
+    | comp count_distinct(source_username) as unique_users by _time, url
+    | filter unique_users >= 10
+  lucene: |
+    event.action:"URL Click Permitted" AND url:*
+  sumo: |
+    _sourceCategory=*Email* "URL Click Permitted"
+    | json field=_raw "url" as clicked_url
+    | json field=_raw "username" as source_username
+    | where !isNull(clicked_url) and !isNull(source_username)
+    | timeslice 8h
+    | count_distinct(source_username) as unique_users by _timeslice, clicked_url
+    | where unique_users >= 10
 false_positives:
 - Authorized pen testing
 - Security research
@@ -93,7 +99,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '10 URL Click Permitted Events
 

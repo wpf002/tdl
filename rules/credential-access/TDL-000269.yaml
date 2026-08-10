@@ -15,73 +15,81 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=azure sourcetype=azure:monitor:aad (operationName="SecretGet" OR operationName="KeyGet" OR operationName="VaultGet")
+  spl: 'index=azure sourcetype=azure:monitor:aad (operationName="SecretGet" OR operationName="KeyGet" OR operationName="VaultGet")
+
     | bin _time span=5m
+
     | stats count by _time, callerIpAddress
+
     | where count >= 25
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000269 {\n  meta:\n    author = \"TDL\"\n    description = \"Mass secret retrieval from Azure Key Vault\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1555\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AzureDiagnostics
+    | where TimeGenerated > ago(1h)
+    | where ResourceType == "VAULTS"
+    | where OperationName in ("SecretGet", "KeyGet", "VaultGet")
+    | summarize EventCount = count() by CallerIPAddress, bin(TimeGenerated, 1h)
+    | where EventCount >= 25
+    | project TimeGenerated, CallerIPAddress, EventCount
+  aql: |
+    SELECT sourceip, QIDNAME(qid) AS event_name, COUNT(*) AS event_count
+    FROM events
+    WHERE (QIDNAME(qid) ILIKE '%SecretGet%' OR QIDNAME(qid) ILIKE '%KeyGet%' OR QIDNAME(qid) ILIKE '%VaultGet%')
+      AND (QIDNAME(qid) ILIKE '%Azure%' OR QIDNAME(qid) ILIKE '%Key Vault%' OR LOGSOURCENAME(logsourceid) ILIKE '%Azure%')
+    GROUP BY sourceip, QIDNAME(qid)
+    HAVING event_count >= 25
+    LAST 1 HOURS
+  yara_l: |
+    rule azure_keyvault_credential_access_t1555 {
+      meta:
+        author = "TDL"
+        description = "Detects potential credential access via Azure Key Vault secret enumeration - MITRE T1555"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1555"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Azure Key Vault"
+        (
+          $e.metadata.product_event_type = "SecretGet" or
+          $e.metadata.product_event_type = "KeyGet" or
+          $e.metadata.product_event_type = "VaultGet"
+        )
+        $e.principal.ip = $source_ip
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $source_ip over 10m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 25
+    }
+  esql: "FROM logs-azure.auditlogs*, logs-azure.activitylogs*\n| WHERE @timestamp > NOW() - 1 hour \n  AND azure.activitylogs.operation_name IN\
+    \ (\"SecretGet\", \"KeyGet\", \"VaultGet\")\n| STATS event_count = COUNT(*) BY source.ip\n| WHERE event_count >= 25\n"
+  leql: |
+    where(source_json.operationName IN ["SecretGet", "KeyGet", "VaultGet"]) groupby(source_address) calculate(count)
+  crowdstrike: |
+    #type=azure* (event.action="SecretGet" OR event.action="KeyGet" OR event.action="VaultGet")
+    | groupBy([source.ip], function=count(as=event_count))
+    | event_count >= 25
+    | table([source.ip, event_count])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "Azure" and resource_type = "microsoft.keyvault/vaults"
+    | filter operation_name in ("SecretGet", "KeyGet", "VaultGet")
+    | comp count() as event_count by caller_ip_address
+    | filter event_count >= 25
+    | fields caller_ip_address, event_count
+  lucene: |
+    _exists_:azure.keyvault AND (azure.keyvault.operation_name:(SecretGet OR KeyGet OR VaultGet) OR event.action:(SecretGet OR KeyGet OR VaultGet) OR operationName:(SecretGet OR KeyGet OR VaultGet))
+  sumo: |
+    _sourceCategory=*Azure*KeyVault* (SecretGet OR KeyGet OR VaultGet)
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "callerIpAddress" as source_ip
+    | where operation_name in ("SecretGet", "KeyGet", "VaultGet")
+    | timeslice 1h
+    | count as event_count by _timeslice, source_ip
+    | where event_count >= 25
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +99,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '25 Azure Key Vault Events
 

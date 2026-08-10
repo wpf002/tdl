@@ -18,77 +18,67 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=edr (function_name="BitBlt" OR function_name="PrintWindow" OR function_name="CGWindowListCreateImage")
+  spl: 'index=edr (function_name="BitBlt" OR function_name="PrintWindow" OR function_name="CGWindowListCreateImage")
+
     | bin _time span=60s
+
     | stats count dc(function_name) as unique_functions values(function_name) as functions by _time, process_name, process_id, host
+
     | where count >= 10
+
     | table _time, host, process_name, process_id, count, unique_functions, functions
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000793 {\n  meta:\n    author = \"TDL\"\n    description = \"Repeated BitBlt / CGWindowListCreateImage Calls\"\n \
-    \   severity = \"MEDIUM\"\n    tactic = \"TA0009\"\n    technique = \"T1113\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceEvents
+    | where TimeGenerated > ago(1h)
+    | where ActionType in ("ScreenshotTaken", "WindowCapture", "ImageCaptureApiCall")
+    | extend ApiCall = extractjson("$.ApiName", AdditionalFields, typeof(string))
+    | where ApiCall in ("BitBlt", "PrintWindow", "CGWindowListCreateImage") or ActionType == "ScreenshotTaken"
+    | summarize CallCount = count() by bin(TimeGenerated, 60s), DeviceId, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, AccountName
+    | where CallCount >= 10
+    | project TimeGenerated, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, CallCount
+  aql: |
+    SELECT "Process Name", "Process CommandLine", sourceip, LOGSOURCENAME(logsourceid) AS host, COUNT(*) AS capture_count
+    FROM events
+    WHERE ("Process CommandLine" ILIKE '%BitBlt%' OR "Process CommandLine" ILIKE '%PrintWindow%' OR "Process CommandLine" ILIKE '%CGWindowListCreateImage%')
+    GROUP BY "Process Name", "Process CommandLine", sourceip, LOGSOURCENAME(logsourceid)
+    HAVING capture_count >= 10
+    LAST 1 MINUTES
+  yara_l: "rule t1113_screen_capture_burst {\n  meta:\n    author = \"TDL\"\n    description = \"Detects periodic screen capture via BitBlt, PrintWindow,\
+    \ or CGWindowListCreateImage API calls\"\n    mitre_attack_tactic = \"Collection\"\n    mitre_attack_technique = \"T1113\"\n    severity =\
+    \ \"Medium\"\n  \n  events:\n    $e.metadata.event_type = \"PROCESS_MODULE_LOAD\" or\n    $e.metadata.event_type = \"PROCESS_LAUNCH\" or\n\
+    \    $e.metadata.event_type = \"PROCESS_INJECTION\"\n    \n    (\n      re.regex($e.principal.process.command_line, `(?i)BitBlt`) or\n   \
+    \   re.regex($e.target.process.command_line, `(?i)BitBlt`) or\n      re.regex($e.principal.process.command_line, `(?i)PrintWindow`) or\n \
+    \     re.regex($e.target.process.command_line, `(?i)PrintWindow`) or\n      re.regex($e.principal.process.command_line, `(?i)CGWindowListCreateImage`)\
+    \ or\n      re.regex($e.target.process.command_line, `(?i)CGWindowListCreateImage`)\n    )\n    \n    $e.principal.hostname = $host\n    $e.principal.process.file.full_path\
+    \ = $process\n  \n  match:\n    $host, $process over 60s\n  \n  outcome:\n    $risk_score = 65\n  \n  condition:\n    #e >= 10\n}\n"
+  esql: "FROM logs-endpoint.events.api*\n| WHERE @timestamp > NOW() - 1 hour \n  AND event.category == \"api\" \n  AND api.name IN (\"BitBlt\"\
+    , \"PrintWindow\", \"CGWindowListCreateImage\")\n| STATS call_count = COUNT(*) BY process.executable, process.pid, host.name, window = BUCKET(@timestamp,\
+    \ 60 seconds)\n| WHERE call_count >= 10\n| KEEP @timestamp, host.name, process.executable, process.pid, call_count, window\n"
+  leql: |
+    where(source_json.ImageLoaded ICONTAINS "gdi32.dll" OR source_json.ImageLoaded ICONTAINS "user32.dll" OR source_json.ImageLoaded ICONTAINS "coregraphics" OR process_cmd_line ICONTAINS "BitBlt" OR process_cmd_line ICONTAINS "PrintWindow" OR process_cmd_line ICONTAINS "CGWindowListCreateImage") groupby(asset, process_name, process_hash) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 (CommandLine=*BitBlt* OR CommandLine=*PrintWindow* OR CommandLine=*CGWindowListCreateImage* OR FileName=*screenshot* OR FileName=*screencap*)
+    | bucket(span=60s, field=@timestamp, as=time_bucket)
+    | groupBy([time_bucket, ComputerName, TargetProcessId, FileName], function=count(as=capture_count))
+    | capture_count >= 10
+    | table([time_bucket, ComputerName, TargetProcessId, FileName, capture_count])
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_API_CALL \n  and (action_api_name in (\"BitBlt\", \"PrintWindow\", \"CGWindowListCreateImage\"\
+    ))\n| bin _time span=60s\n| comp count() as api_calls by _time, agent_hostname, actor_process_image_name, actor_process_image_path, actor_effective_username\n\
+    | filter api_calls >= 10\n| fields _time, agent_hostname, actor_effective_username, actor_process_image_name, actor_process_image_path, api_calls\n"
+  lucene: |
+    (event.action:"api_call" OR event.type:"api") AND (api.name:("BitBlt" OR "PrintWindow" OR "CGWindowListCreateImage") OR function.name:("BitBlt" OR "PrintWindow" OR "CGWindowListCreateImage") OR dll.name:("gdi32.dll" OR "user32.dll" OR "CoreGraphics.framework"))
+  sumo: |
+    _sourceCategory=*EDR* (BitBlt OR PrintWindow OR CGWindowListCreateImage)
+    | json field=_raw "process_name" as process_name
+    | json field=_raw "host" as host
+    | json field=_raw "function_name" as function_name
+    | where function_name in ("BitBlt", "PrintWindow", "CGWindowListCreateImage")
+    | timeslice 60s
+    | count as api_calls by _timeslice, host, process_name
+    | where api_calls >= 10
+    | fields _timeslice, host, process_name, api_calls
 pseudo_logic: Process invokes BitBlt / PrintWindow / CGWindowListCreateImage ≥10 times within 60s. Periodic screen capture.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -105,7 +95,7 @@ references:
 - https://attack.mitre.org/techniques/T1113/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'

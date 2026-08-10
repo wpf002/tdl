@@ -21,68 +21,50 @@ queries:
     \ OR type=\"Persistence:Kubernetes/MaliciousIPCaller\" OR type=\"Persistence:Kubernetes/MaliciousIPCaller.Custom\")\n| table _time, type,\
     \ severity, accountId, region, resource.resourceType, service.action.actionType, service.action.kubernetesApiCallAction.remoteIpDetails.ipAddressV4,\
     \ service.action.kubernetesApiCallAction.requestUri, resource.eksClusterDetails.name\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000333 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Kubernetes Activity from Threat Host - GuardDuty\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0007\"\n    technique = \"T1580\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(24h)
+    | where Type in ("CredentialAccess:Kubernetes/MaliciousIPCaller", "CredentialAccess:Kubernetes/MaliciousIPCaller.Custom", "DefenseEvasion:Kubernetes/MaliciousIPCaller", "DefenseEvasion:Kubernetes/MaliciousIPCaller.Custom", "Discovery:Kubernetes/MaliciousIPCaller", "Discovery:Kubernetes/MaliciousIPCaller.Custom", "Impact:Kubernetes/MaliciousIPCaller", "Impact:Kubernetes/MaliciousIPCaller.Custom", "Persistence:Kubernetes/MaliciousIPCaller", "Persistence:Kubernetes/MaliciousIPCaller.Custom")
+    | project TimeGenerated, Type, Title, Description, Severity, AccountId, Region, ResourceType, ServiceName, ActivityType, RemoteIpDetails, ResourceDetails
+  aql: |
+    SELECT eventtime, sourceip, destinationip, LOGSOURCENAME(logsourceid) AS log_source, "Finding Type" AS finding_type, username, QIDNAME(qid) AS event_name
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%GuardDuty%'
+      AND ("Finding Type" IN ('CredentialAccess:Kubernetes/MaliciousIPCaller', 'CredentialAccess:Kubernetes/MaliciousIPCaller.Custom', 'DefenseEvasion:Kubernetes/MaliciousIPCaller', 'DefenseEvasion:Kubernetes/MaliciousIPCaller.Custom', 'Discovery:Kubernetes/MaliciousIPCaller', 'Discovery:Kubernetes/MaliciousIPCaller.Custom', 'Impact:Kubernetes/MaliciousIPCaller', 'Impact:Kubernetes/MaliciousIPCaller.Custom', 'Persistence:Kubernetes/MaliciousIPCaller', 'Persistence:Kubernetes/MaliciousIPCaller.Custom')
+           OR QIDNAME(qid) IN ('CredentialAccess:Kubernetes/MaliciousIPCaller', 'CredentialAccess:Kubernetes/MaliciousIPCaller.Custom', 'DefenseEvasion:Kubernetes/MaliciousIPCaller', 'DefenseEvasion:Kubernetes/MaliciousIPCaller.Custom', 'Discovery:Kubernetes/MaliciousIPCaller', 'Discovery:Kubernetes/MaliciousIPCaller.Custom', 'Impact:Kubernetes/MaliciousIPCaller', 'Impact:Kubernetes/MaliciousIPCaller.Custom', 'Persistence:Kubernetes/MaliciousIPCaller', 'Persistence:Kubernetes/MaliciousIPCaller.Custom'))
+    LAST 1 HOURS
+  yara_l: "rule aws_guardduty_kubernetes_malicious_ip_caller {\n  meta:\n    author = \"TDL\"\n    description = \"Detects AWS GuardDuty findings\
+    \ for Kubernetes API calls from malicious IPs - MITRE T1580 Discovery\"\n    severity = \"HIGH\"\n    mitre_attack_tactic = \"Discovery\"\n\
+    \    mitre_attack_technique = \"T1580\"\n    \n  events:\n    $e.metadata.product_name = \"Amazon GuardDuty\"\n    (\n      $e.metadata.product_event_type\
+    \ = \"CredentialAccess:Kubernetes/MaliciousIPCaller\" or\n      $e.metadata.product_event_type = \"CredentialAccess:Kubernetes/MaliciousIPCaller.Custom\"\
+    \ or\n      $e.metadata.product_event_type = \"DefenseEvasion:Kubernetes/MaliciousIPCaller\" or\n      $e.metadata.product_event_type = \"\
+    DefenseEvasion:Kubernetes/MaliciousIPCaller.Custom\" or\n      $e.metadata.product_event_type = \"Discovery:Kubernetes/MaliciousIPCaller\"\
+    \ or\n      $e.metadata.product_event_type = \"Discovery:Kubernetes/MaliciousIPCaller.Custom\" or\n      $e.metadata.product_event_type =\
+    \ \"Impact:Kubernetes/MaliciousIPCaller\" or\n      $e.metadata.product_event_type = \"Impact:Kubernetes/MaliciousIPCaller.Custom\" or\n \
+    \     $e.metadata.product_event_type = \"Persistence:Kubernetes/MaliciousIPCaller\" or\n      $e.metadata.product_event_type = \"Persistence:Kubernetes/MaliciousIPCaller.Custom\"\
+    \n    )\n    $e.principal.ip = $source_ip\n    \n  match:\n    $source_ip over 5m\n    \n  outcome:\n    $risk_score = max(75)\n    $source_ip_list\
+    \ = array_distinct($e.principal.ip)\n    $finding_types = array_distinct($e.metadata.product_event_type)\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("CredentialAccess:Kubernetes/MaliciousIPCaller", "CredentialAccess:Kubernetes/MaliciousIPCaller.Custom", "DefenseEvasion:Kubernetes/MaliciousIPCaller", "DefenseEvasion:Kubernetes/MaliciousIPCaller.Custom", "Discovery:Kubernetes/MaliciousIPCaller", "Discovery:Kubernetes/MaliciousIPCaller.Custom", "Impact:Kubernetes/MaliciousIPCaller", "Impact:Kubernetes/MaliciousIPCaller.Custom", "Persistence:Kubernetes/MaliciousIPCaller", "Persistence:Kubernetes/MaliciousIPCaller.Custom")
+    | KEEP @timestamp, event.type, cloud.account.id, cloud.region, source.ip, user.name, aws.guardduty.severity, aws.guardduty.resource.eks_cluster_details.name
+  leql: |
+    where(source_json.type IN ["CredentialAccess:Kubernetes/MaliciousIPCaller", "CredentialAccess:Kubernetes/MaliciousIPCaller.Custom", "DefenseEvasion:Kubernetes/MaliciousIPCaller", "DefenseEvasion:Kubernetes/MaliciousIPCaller.Custom", "Discovery:Kubernetes/MaliciousIPCaller", "Discovery:Kubernetes/MaliciousIPCaller.Custom", "Impact:Kubernetes/MaliciousIPCaller", "Impact:Kubernetes/MaliciousIPCaller.Custom", "Persistence:Kubernetes/MaliciousIPCaller", "Persistence:Kubernetes/MaliciousIPCaller.Custom"])
+  crowdstrike: |
+    #repo=guardduty event_simpleName=GuardDutyFinding
+    (finding.type="CredentialAccess:Kubernetes/MaliciousIPCaller" OR finding.type="CredentialAccess:Kubernetes/MaliciousIPCaller.Custom" OR finding.type="DefenseEvasion:Kubernetes/MaliciousIPCaller" OR finding.type="DefenseEvasion:Kubernetes/MaliciousIPCaller.Custom" OR finding.type="Discovery:Kubernetes/MaliciousIPCaller" OR finding.type="Discovery:Kubernetes/MaliciousIPCaller.Custom" OR finding.type="Impact:Kubernetes/MaliciousIPCaller" OR finding.type="Impact:Kubernetes/MaliciousIPCaller.Custom" OR finding.type="Persistence:Kubernetes/MaliciousIPCaller" OR finding.type="Persistence:Kubernetes/MaliciousIPCaller.Custom")
+    | table([@timestamp, finding.type, account.id, region, resource.kubernetesDetails.kubernetesUserDetails.username, service.action.kubernetesApiCallAction.remoteIpDetails.ipAddressV4])
+  xql: "dataset = cloud_audit_logs\n| filter cloud_provider = \"AWS\" and vendor_name = \"AWS\" and event_source = \"guardduty.amazonaws.com\"\
+    \n| filter raw_log contains \"CredentialAccess:Kubernetes/MaliciousIPCaller\" \n    or raw_log contains \"DefenseEvasion:Kubernetes/MaliciousIPCaller\"\
+    \ \n    or raw_log contains \"Discovery:Kubernetes/MaliciousIPCaller\" \n    or raw_log contains \"Impact:Kubernetes/MaliciousIPCaller\" \n\
+    \    or raw_log contains \"Persistence:Kubernetes/MaliciousIPCaller\"\n| fields _time, event_type, event_sub_type, identity_name, cloud_provider_account_id,\
+    \ raw_log\n"
+  lucene: |
+    event.type:guardduty AND finding.type:("CredentialAccess:Kubernetes/MaliciousIPCaller" OR "CredentialAccess:Kubernetes/MaliciousIPCaller.Custom" OR "DefenseEvasion:Kubernetes/MaliciousIPCaller" OR "DefenseEvasion:Kubernetes/MaliciousIPCaller.Custom" OR "Discovery:Kubernetes/MaliciousIPCaller" OR "Discovery:Kubernetes/MaliciousIPCaller.Custom" OR "Impact:Kubernetes/MaliciousIPCaller" OR "Impact:Kubernetes/MaliciousIPCaller.Custom" OR "Persistence:Kubernetes/MaliciousIPCaller" OR "Persistence:Kubernetes/MaliciousIPCaller.Custom")
+  sumo: |
+    _sourceCategory=*GuardDuty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("CredentialAccess:Kubernetes/MaliciousIPCaller", "CredentialAccess:Kubernetes/MaliciousIPCaller.Custom", "DefenseEvasion:Kubernetes/MaliciousIPCaller", "DefenseEvasion:Kubernetes/MaliciousIPCaller.Custom", "Discovery:Kubernetes/MaliciousIPCaller", "Discovery:Kubernetes/MaliciousIPCaller.Custom", "Impact:Kubernetes/MaliciousIPCaller", "Impact:Kubernetes/MaliciousIPCaller.Custom", "Persistence:Kubernetes/MaliciousIPCaller", "Persistence:Kubernetes/MaliciousIPCaller.Custom")
 false_positives:
 - Authorized pen testing
 - Security research
@@ -92,7 +74,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"CredentialAccess:Kubernetes/MaliciousIPCaller\", \"CredentialAccess:Kubernetes/MaliciousIPCaller.Custom\"\
   , \"DefenseEvasion:Kubernetes/MaliciousIPCaller\", \"DefenseEvasion:Kubernetes/MaliciousIPCaller.Custom\", \"Discovery:Kubernetes/MaliciousIPCaller\"\

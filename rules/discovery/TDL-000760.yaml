@@ -16,75 +16,53 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (Image="*\\driverquery.exe" OR (Image="*\\sc.exe" CommandLine="*query*" CommandLine="*type*driver*") OR Image="*\\fltmc.exe")
+  spl: 'index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (Image="*\\driverquery.exe" OR (Image="*\\sc.exe"
+    CommandLine="*query*" CommandLine="*type*driver*") OR Image="*\\fltmc.exe")
+
     | table _time, ComputerName, User, Image, CommandLine, ParentImage
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("driverquery.exe", "sc.exe", "fltmc.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('driverquery.exe', 'sc.exe', 'fltmc.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000760 {\n  meta:\n    author = \"TDL\"\n    description = \"driverquery.exe Executed by Non-Admin Context\"\n   \
-    \ severity = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1652\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n   \
-    \ $e.process_name = /(driverquery.exe|sc.exe|fltmc.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n\
-    \    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("driverquery.exe", "sc.exe", "fltmc.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [driverquery.exe, sc.exe, fltmc.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (driverquery.exe, sc.exe, fltmc.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("driverquery.exe", "sc.exe", "fltmc.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(driverquery.exe OR sc.exe OR fltmc.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("driverquery.exe", "sc.exe", "fltmc.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: "SecurityEvent\n| where TimeGenerated > ago(1h)\n| where EventID == 1\n| where tolower(Process) has_any (\"driverquery.exe\", \"sc.exe\"\
+    , \"fltmc.exe\")\n| where (tolower(Process) endswith \"driverquery.exe\") \n    or (tolower(Process) endswith \"sc.exe\" and tolower(CommandLine)\
+    \ has_all (\"query\", \"type=driver\"))\n    or (tolower(Process) endswith \"fltmc.exe\" and tolower(CommandLine) has \"filters\")\n| project\
+    \ TimeGenerated, Computer, Account, Process, CommandLine, ParentProcess = ParentProcessName\n"
+  aql: "SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, \"Process Name\", \"Process CommandLine\", \"Parent Process\
+    \ Name\"\nFROM events\nWHERE (\"Process Name\" ILIKE '%driverquery.exe%' \n   OR (\"Process Name\" ILIKE '%sc.exe%' AND \"Process CommandLine\"\
+    \ ILIKE '%query%' AND \"Process CommandLine\" ILIKE '%type=driver%')\n   OR \"Process Name\" ILIKE '%fltmc.exe%')\nLAST 1 HOURS\n"
+  yara_l: "rule t1652_device_driver_discovery {\n  meta:\n    author = \"TDL\"\n    description = \"Detects execution of driver enumeration commands\
+    \ (T1652 - Device Driver Discovery)\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1652\"\n    severity = \"\
+    Medium\"\n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      re.regex($e.target.process.file.full_path, `(?i)\\\
+    \\driverquery\\.exe$`) or\n      (\n        re.regex($e.target.process.file.full_path, `(?i)\\\\sc\\.exe$`) and\n        re.regex($e.target.process.command_line,\
+    \ `(?i)query.*type\\s*=\\s*driver`)\n      ) or\n      re.regex($e.target.process.file.full_path, `(?i)\\\\fltmc\\.exe$`)\n    )\n    $e.principal.hostname\
+    \ = $host\n    \n  match:\n    $host over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-windows.sysmon_operational*\n| WHERE winlog.event_id == 1 \n  AND (\n    process.name == \"driverquery.exe\" \n    OR (process.name\
+    \ == \"sc.exe\" AND process.command_line LIKE \"*query*\" AND process.command_line LIKE \"*type=driver*\")\n    OR process.name == \"fltmc.exe\"\
+    \n  )\n| KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.parent.command_line\n"
+  leql: |
+    where((process_name ICONTAINS "driverquery.exe") OR (process_name ICONTAINS "sc.exe" AND process_cmd_line ICONTAINS "query" AND process_cmd_line ICONTAINS "type=driver") OR (process_name ICONTAINS "fltmc.exe")) groupby(asset, user, process_name, process_cmd_line) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 event_platform=Win (FileName=driverquery.exe OR (FileName=sc.exe CommandLine=*query* CommandLine=*type=driver*) OR FileName=fltmc.exe)
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName, ParentCommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+      and (action_process_image_name contains "driverquery.exe"
+           or (action_process_image_name contains "sc.exe" and action_process_image_command_line ~= ".*query.*type\s*=\s*driver.*")
+           or action_process_image_name contains "fltmc.exe")
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_command_line
+  lucene: |
+    (process.name:(driverquery.exe OR sc.exe OR fltmc.exe) OR process.command_line:(*driverquery.exe* OR *sc.exe* OR *fltmc.exe*)) AND (process.command_line:(*query* AND *type\=driver*) OR process.command_line:*filters* OR process.name:driverquery.exe OR process.name:fltmc.exe)
+  sumo: |
+    _sourceCategory=*Sysmon* "1"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Image" as image
+    | json field=_raw "CommandLine" as cmd
+    | json field=_raw "User" as user
+    | where event_id = "1"
+    | where (image matches "*\\driverquery.exe" or image matches "*\\sc.exe" or image matches "*\\fltmc.exe")
+    | where (image matches "*\\driverquery.exe") or (image matches "*\\sc.exe" and cmd matches "*query*" and cmd matches "*type*driver*") or (image matches "*\\fltmc.exe")
+    | where !(user matches "*SYSTEM" or user matches "*LOCAL SERVICE" or user matches "*NETWORK SERVICE")
+    | fields _messageTime, _sourceHost, user, image, cmd
 pseudo_logic: driverquery.exe / sc.exe query type=driver / fltmc.exe filters from a user-context process. Pre-rootkit reconnaissance.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -101,7 +79,7 @@ references:
 - https://attack.mitre.org/techniques/T1652/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

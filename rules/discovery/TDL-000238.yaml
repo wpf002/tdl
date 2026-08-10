@@ -17,77 +17,80 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=* sourcetype=access_* OR sourcetype=iis OR sourcetype=nginx:plus:kv OR sourcetype=apache:access
+  spl: 'index=* sourcetype=access_* OR sourcetype=iis OR sourcetype=nginx:plus:kv OR sourcetype=apache:access
+
     url="*admin*"
+
     | bin _time span=2m
+
     | stats dc(url) as unique_urls values(url) as urls by _time, src_ip
+
     | where unique_urls >= 10
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000238 {\n  meta:\n    author = \"TDL\"\n    description = \"Webserver Admin Portal Scanning\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1083\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    W3CIISLog
+    | where TimeGenerated > ago(2m)
+    | where csUriStem contains "admin"
+    | summarize UniqueURLs = dcount(csUriStem), URLs = make_set(csUriStem) by bin(TimeGenerated, 2m), cIP
+    | where UniqueURLs >= 10
+    | project TimeGenerated, SourceIP = cIP, UniqueURLCount = UniqueURLs, URLs
+  aql: |
+    SELECT sourceip, COUNT(*) AS request_count, UNIQUECOUNT(URL) AS unique_urls, LIST(URL) AS urls
+    FROM events
+    WHERE URL ILIKE '%admin%'
+    GROUP BY sourceip
+    HAVING request_count >= 10 AND unique_urls >= 10
+    LAST 2 MINUTES
+  yara_l: |
+    rule webserver_admin_directory_enumeration {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects rapid enumeration of admin URLs from single source IP"
+        mitre_attack_tactic = "Discovery"
+        mitre_attack_technique = "T1083"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        re.regex($e.target.url, `(?i)admin`)
+        $e.principal.ip = $source_ip
+        $e.target.url = $url
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $source_ip over 2m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        #url >= 10
+    }
+  esql: "FROM logs-*\n| WHERE @timestamp > NOW() - 2 minutes \n  AND url.original LIKE \"*admin*\"\n| STATS unique_urls = COUNT_DISTINCT(url.original),\
+    \ total_requests = COUNT(*) BY source.ip, time_window = BUCKET(@timestamp, 2 minutes)\n| WHERE unique_urls >= 10\n| KEEP time_window, source.ip,\
+    \ unique_urls, total_requests\n"
+  leql: |
+    where(url ICONTAINS "admin") groupby(source_address) calculate(unique:url)
+  crowdstrike: |
+    #type=webserver url=*admin*
+    | groupBy([src_ip], function=[count(url, distinct=true, as=unique_urls), count(as=total_requests)])
+    | unique_urls >= 10
+    | bucket(limit=100, span=2m, function=[count(url, distinct=true, as=unique_urls_2m), count(as=requests_2m)])
+    | unique_urls_2m >= 10
+    | table([src_ip, unique_urls_2m, requests_2m])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter lowercase(http_url) contains "admin"
+    | bin _time span=2m
+    | comp count_distinct(http_url) as unique_urls by _time, source_ip
+    | filter unique_urls >= 10
+  lucene: |
+    url:*admin* AND _exists_:source.ip
+  sumo: |
+    _sourceCategory=*webserver* "admin"
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?<url>[^\s]+)" nodrop
+    | where url matches "*admin*"
+    | timeslice 2m
+    | count_distinct(url) as unique_urls by _timeslice, src_ip
+    | where unique_urls >= 10
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -97,7 +100,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '10 Webserver Request Events
 

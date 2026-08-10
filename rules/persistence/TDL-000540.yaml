@@ -15,71 +15,61 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=github sourcetype=github:audit action="business.add_admin"
+  spl: 'index=github sourcetype=github:audit action="business.add_admin"
+
     | table _time, actor, action, user, org, repo, business
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000540 {\n  meta:\n    author = \"TDL\"\n    description = \"User Added to Enterprise Owner\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0003\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    GitHubAuditLogPolling_CL
+    | where TimeGenerated > ago(90d)
+    | where action_s == "business.add_admin"
+    | project TimeGenerated, actor_s, user_s, org_s, action_s, repo_s, created_at_t
+  aql: |
+    SELECT eventtime, username, sourceip, "action", "actor", "business", QIDNAME(qid), LOGSOURCENAME(logsourceid)
+    FROM events
+    WHERE "action" = 'business.add_admin'
+    LAST 24 HOURS
+  yara_l: |
+    rule github_admin_added_persistence {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects addition of GitHub organization admins - T1098 Persistence"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1098"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "GITHUB"
+        $e.metadata.product_event_type = "business.add_admin"
+        $e.principal.user.userid = $actor
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $actor over 1h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-github.audit*
+    | WHERE event.action == "business.add_admin"
+    | KEEP @timestamp, github.actor, github.org, github.user, github.business, event.action
+  leql: |
+    where(source_json.action="business.add_admin")
+  crowdstrike: |
+    #type=github action=business.add_admin
+    | table([@timestamp, actor, org, user, action])
+  xql: |
+    dataset = github_audit_raw
+    | filter action = "business.add_admin"
+    | fields _time, actor, action, business, user
+  lucene: |
+    actions:"business.add_admin"
+  sumo: |
+    _sourceCategory=*Github* "business.add_admin"
+    | json field=_raw "action" as action
+    | where action = "business.add_admin"
+    | fields _messageTime, _sourceHost, action
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -89,7 +79,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Github event\n   where actions is \"business.add_admin\""
 triage_steps:

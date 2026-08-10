@@ -16,74 +16,84 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security EventCode=4698 (TaskContent="*defendnot*" OR TaskContent="*--from-autorun*" OR TaskContent="*defendnot-loader*" OR TaskContent="*defendnot.dll*") (Message="*defendnot*" OR Message="*autorun*" OR Message="*Loader*")
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security EventCode=4698 (TaskContent="*defendnot*" OR TaskContent="*--from-autorun*" OR TaskContent="*defendnot-loader*"
+    OR TaskContent="*defendnot.dll*") (Message="*defendnot*" OR Message="*autorun*" OR Message="*Loader*")
+
     | table _time, ComputerName, User, TaskContent, Message
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4698")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4698')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000675 {\n  meta:\n    author = \"TDL\"\n    description = \"Defendnot Scheduled Task\"\n    severity = \"HIGH\"\n\
-    \    tactic = \"TA0005\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4698)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4698
+    | where (TaskContent has_any ("defendnot", "--from-autorun", "defendnot-loader", "defendnot.dll"))
+       and (RenderedDescription has_any ("defendnot", "autorun", "Loader") or Activity has_any ("defendnot", "autorun", "Loader"))
+    | project TimeGenerated, Computer, Account, TaskContent, RenderedDescription, Activity, EventData
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsorceid) AS host, "TaskContent", "Message"
+    FROM events
+    WHERE "EventID" = '4698'
+      AND ("TaskContent" ILIKE '%defendnot%' OR "TaskContent" ILIKE '%--from-autorun%' OR "TaskContent" ILIKE '%defendnot-loader%' OR "TaskContent" ILIKE '%defendnot.dll%')
+      AND ("Message" ILIKE '%defendnot%' OR "Message" ILIKE '%autorun%' OR "Message" ILIKE '%Loader%')
+    LAST 24 HOURS
+  yara_l: |
+    rule mitre_t1078_scheduled_task_defendnot {
+      meta:
+        author = "TDL"
+        description = "Detects scheduled task creation with DefendNot-related indicators (T1078 Defense Evasion)"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1078"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_event_type = "4698"
+        $e.metadata.event_type = "SCHEDULED_TASK_CREATION"
+        (
+          re.regex($e.security_result.description, `(?i)defendnot`) or
+          re.regex($e.security_result.description, `(?i)--from-autorun`) or
+          re.regex($e.security_result.description, `(?i)defendnot-loader`) or
+          re.regex($e.security_result.description, `(?i)defendnot\.dll`)
+        )
+        (
+          re.regex($e.security_result.summary, `(?i)defendnot`) or
+          re.regex($e.security_result.summary, `(?i)autorun`) or
+          re.regex($e.security_result.summary, `(?i)Loader`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND event_id IN ("4698")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4698])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4698)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4698")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4698)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4698")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-system.security*, logs-windows.security*, winlogbeat-*\n| WHERE @timestamp > NOW() - 24 hour \n  AND event.code == \"4698\"\
+    \n  AND (\n    TO_LOWER(winlog.event_data.TaskContent) LIKE \"*defendnot*\"\n    OR TO_LOWER(winlog.event_data.TaskContent) LIKE \"*--from-autorun*\"\
+    \n    OR TO_LOWER(winlog.event_data.TaskContent) LIKE \"*defendnot-loader*\"\n    OR TO_LOWER(winlog.event_data.TaskContent) LIKE \"*defendnot.dll*\"\
+    \n  )\n  AND (\n    TO_LOWER(message) LIKE \"*defendnot*\"\n    OR TO_LOWER(message) LIKE \"*autorun*\"\n    OR TO_LOWER(message) LIKE \"\
+    *loader*\"\n  )\n| KEEP @timestamp, host.name, user.name, winlog.event_data.TaskName, winlog.event_data.TaskContent, message\n"
+  leql: |
+    where(source_json.EventID=4698 AND (source_json.TaskContent ICONTAINS "defendnot" OR source_json.TaskContent ICONTAINS "--from-autorun" OR source_json.TaskContent ICONTAINS "defendnot-loader" OR source_json.TaskContent ICONTAINS "defendnot.dll") AND (message ICONTAINS "defendnot" OR message ICONTAINS "autorun" OR message ICONTAINS "Loader"))
+  crowdstrike: |
+    EventCode=4698 (TaskContent=*defendnot* OR TaskContent=*--from-autorun* OR TaskContent=*defendnot-loader* OR TaskContent=*defendnot.dll*) (Message=*defendnot* OR Message=*autorun* OR Message=*Loader*)
+    | table([@timestamp, ComputerName, TaskName, TaskContent, Message])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4698
+    | filter (action_evtlog_message ~= "(?i)defendnot" or action_evtlog_message ~= "(?i)--from-autorun" or action_evtlog_message ~= "(?i)defendnot-loader" or action_evtlog_message ~= "(?i)defendnot\.dll")
+    | filter (action_evtlog_message ~= "(?i)defendnot" or action_evtlog_message ~= "(?i)autorun" or action_evtlog_message ~= "(?i)Loader")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_message
+  lucene: |
+    event.code:4698 AND (TaskContent:(*defendnot* OR *--from-autorun* OR *defendnot-loader* OR *defendnot.dll*)) AND (message:(*defendnot* OR *autorun* OR *Loader*))
+  sumo: |
+    _sourceCategory=*Windows* "4698"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TaskContent" as task_content
+    | json field=_raw "Message" as message
+    | where event_id = "4698"
+    | where (task_content matches "*defendnot*" OR task_content matches "*--from-autorun*" OR task_content matches "*defendnot-loader*" OR task_content matches "*defendnot.dll*")
+    | where (message matches "*defendnot*" OR message matches "*autorun*" OR message matches "*Loader*")
+    | fields _messageTime, _sourceHost, task_content, message
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +103,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows event ID 4698
 

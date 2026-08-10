@@ -20,68 +20,65 @@ queries:
   spl: "index=aws sourcetype=aws:cloudtrail eventType=AwsApiCall userIdentity.type=IAMUser \n| lookup terminated_ad_users.csv user_name AS userIdentity.userName\
     \ OUTPUT status \n| where status=\"terminated\" \n| table _time, userIdentity.userName, eventName, sourceIPAddress, userAgent, requestParameters,\
     \ responseElements, errorCode, errorMessage\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000192 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS API Call from Terminated AD Account\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(24h)
+    | where EventTypeName == "AwsApiCall"
+    | where UserIdentityType == "IAMUser"
+    | where UserIdentityPrincipalid has "IAMUser"
+    | join kind=inner (
+        IdentityInfo
+        | where TimeGenerated > ago(24h)
+        | where AccountEnabled == false or DeletedDateTime != ""
+        | distinct AccountUPN
+    ) on $left.UserIdentityUserName == $right.AccountUPN
+    | project TimeGenerated, EventName, UserIdentityUserName, UserIdentityPrincipalid, SourceIpAddress, UserAgent, RequestParameters, ResponseElements, AWSRegion
+  aql: |
+    SELECT username, sourceip, eventtime, LOGSOURCENAME(logsourceid) AS log_source, "Event Name" AS event_name, "User Type" AS user_type
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%cloudtrail%'
+      AND "Event Type" = 'AwsApiCall'
+      AND "User Type" = 'IAMUser'
+      AND username IN (REFERENCESET('terminated_ad_users'))
+    LAST 24 HOURS
+  yara_l: "rule terminated_user_aws_api_call {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects AWS API calls from terminated\
+    \ IAM users - T1098 Initial Access\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1098\"\n    severity =\
+    \ \"HIGH\"\n    \n  events:\n    $e.metadata.vendor_name = \"AMAZON\"\n    $e.metadata.product_name = \"AWS CloudTrail\"\n    $e.metadata.event_type\
+    \ = \"NETWORK_HTTP\"\n    $e.metadata.product_event_type = \"AwsApiCall\"\n    $e.principal.user.user_display_name = $user\n    $e.target.resource.attribute.labels[\"\
+    userIdentity.type\"] = \"IAMUser\"\n    \n  match:\n    $user over 5m\n    \n  outcome:\n    $risk_score = 85\n    \n  condition:\n    $e\
+    \ and #user in %terminated_ad_users\n}\n"
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.action == "AwsApiCall"
+      AND user.type == "IAMUser"
+    | EVAL terminated_users = ["terminated_user1", "terminated_user2", "terminated_user3"]
+    | WHERE user.name IN (terminated_users)
+    | KEEP @timestamp, event.action, user.name, user.type, source.ip, aws.cloudtrail.user_identity.arn, event.outcome
+  leql: |
+    where(source_json.eventType=AwsApiCall AND source_json.userIdentity.type=IAMUser AND source_json.userIdentity.userName IN [TERMINATED_USER_LIST])
+  crowdstrike: |
+    #type=cloudtrail eventType=AwsApiCall userIdentity.type=IAMUser
+    | lookup(file="terminated_ad_users.csv", field=userIdentity.userName, include=[terminated_user])
+    | terminated_user=*
+    | table([@timestamp, eventName, userIdentity.userName, sourceIPAddress, userAgent, requestParameters, responseElements, awsRegion, errorCode])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and action_cloud_audit_event_type = "AwsApiCall" and cloud_identity_type = "IAMUser"
+    | alter aws_user = lowercase(cloud_identity_user_name)
+    | filter aws_user in ("terminated_user1", "terminated_user2", "terminated_user3")
+    | fields _time, cloud_provider, cloud_identity_user_name, action_cloud_audit_operation_name, cloud_resource_id, cloud_ip_address
+  lucene: |
+    eventType:AwsApiCall AND userIdentity.type:IAMUser AND userIdentity.principalId:("terminated_user_1" OR "terminated_user_2" OR "terminated_user_3")
+  sumo: |
+    _sourceCategory=*CloudTrail* eventType="AwsApiCall"
+    | json field=_raw "userIdentity.type" as user_identity_type
+    | json field=_raw "userIdentity.userName" as user_name
+    | json field=_raw "eventType" as event_type
+    | where event_type = "AwsApiCall" and user_identity_type = "IAMUser"
+    | lookup terminated_users from shared/terminated_ad_users on user_name=username
+    | where !isNull(terminated_users)
+    | fields _messageTime, user_name, eventName, sourceIPAddress, userAgent, requestParameters
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +88,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 AWS CloudTrail Event
 

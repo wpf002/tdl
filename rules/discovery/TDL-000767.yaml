@@ -16,74 +16,69 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 35
 queries:
-  spl: |
-    index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 Image="*\\reg.exe" (CommandLine="*query*HKLM\\SAM*" OR CommandLine="*query*HKLM\\SECURITY*" OR CommandLine="*query*HKLM\\System\\CurrentControlSet\\Control\\Lsa*" OR CommandLine="*query*HKLM\\Software\\Microsoft\\Windows Defender*")
+  spl: 'index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 Image="*\\reg.exe" (CommandLine="*query*HKLM\\SAM*"
+    OR CommandLine="*query*HKLM\\SECURITY*" OR CommandLine="*query*HKLM\\System\\CurrentControlSet\\Control\\Lsa*" OR CommandLine="*query*HKLM\\Software\\Microsoft\\Windows
+    Defender*")
+
     | table _time, ComputerName, User, ParentImage, CommandLine
-  kql: 'DeviceRegistryEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where registry_key matches regex ".+"
-
-    | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Registry Key\", \"Registry Value Name\", \"Registry Value Data\", \"Process Name\"\nFROM events\nWHERE\
-    \ LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n  AND \"EventID\" IN ('12','13','14')\n  AND \"registry_key\" LIKE '%.+%'\n\
-    LAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000767 {\n  meta:\n    author = \"TDL\"\n    description = \"reg query of Sensitive Registry Hives\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1012\"\n  events:\n    $e.metadata.event_type = \"REGISTRY_MODIFICATION\"\n    $e.registry_key\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "registry" AND registry_key LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/.+/)
-
-    groupby(asset, registry_key, registry_value)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*.+*
-
-    | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
-
-    | sort -changes
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.REGISTRY AND registry_key ~= ".+"
-
-    | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
-
-    | sort desc changes
-
-    '
-  lucene: 'event.category:"registry" AND registry_key:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id IN ("12","13","14") AND registry_key matches "*.+*"
-
-    | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 1
+    | where Process has_any ("reg.exe", "REG.EXE")
+    | where CommandLine has "query"
+    | where CommandLine has_any ("HKLM\\SAM", "HKLM\\SECURITY", "HKLM\\System\\CurrentControlSet\\Control\\Lsa", "HKLM\\Software\\Microsoft\\Windows Defender")
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Parent Process Name"
+    FROM events
+    WHERE "Process Name" ILIKE '%reg.exe%'
+      AND ("Process CommandLine" ILIKE '%query%HKLM\\SAM%'
+           OR "Process CommandLine" ILIKE '%query%HKLM\\SECURITY%'
+           OR "Process CommandLine" ILIKE '%query%HKLM\\System\\CurrentControlSet\\Control\\Lsa%'
+           OR "Process CommandLine" ILIKE '%query%HKLM\\Software\\Microsoft\\Windows Defender%')
+    LAST 1 HOURS
+  yara_l: "rule registry_query_discovery_t1012 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects reg.exe querying sensitive registry\
+    \ hives for discovery (T1012)\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1012\"\n    severity = \"Medium\"\
+    \n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    re.regex($e.target.process.file.full_path, `(?i)\\\\reg\\.exe$`)\n\
+    \    re.regex($e.target.process.command_line, `(?i)query`)\n    (\n      re.regex($e.target.process.command_line, `(?i)HKLM\\\\SAM`) or\n\
+    \      re.regex($e.target.process.command_line, `(?i)HKLM\\\\SECURITY`) or\n      re.regex($e.target.process.command_line, `(?i)HKLM\\\\System\\\
+    \\CurrentControlSet\\\\Control\\\\Lsa`) or\n      re.regex($e.target.process.command_line, `(?i)HKLM\\\\Software\\\\Microsoft\\\\Windows Defender`)\n\
+    \    )\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-windows.sysmon_operational*\n| WHERE winlog.event_id == \"1\" \n  AND TO_LOWER(process.name) == \"reg.exe\" \n  AND process.command_line\
+    \ LIKE \"*query*\"\n  AND (\n    TO_LOWER(process.command_line) LIKE \"*hklm\\\\sam*\"\n    OR TO_LOWER(process.command_line) LIKE \"*hklm\\\
+    \\security*\"\n    OR TO_LOWER(process.command_line) LIKE \"*hklm\\\\system\\\\currentcontrolset\\\\control\\\\lsa*\"\n    OR TO_LOWER(process.command_line)\
+    \ LIKE \"*hklm\\\\software\\\\microsoft\\\\windows defender*\"\n  )\n| KEEP @timestamp, host.name, user.name, process.command_line, process.parent.name,\
+    \ process.parent.command_line\n"
+  leql: |
+    where(process_name ICONTAINS "reg.exe" AND process_cmd_line ICONTAINS "query" AND (process_cmd_line ICONTAINS "HKLM\\SAM" OR process_cmd_line ICONTAINS "HKLM\\SECURITY" OR process_cmd_line ICONTAINS "HKLM\\System\\CurrentControlSet\\Control\\Lsa" OR process_cmd_line ICONTAINS "HKLM\\Software\\Microsoft\\Windows Defender"))
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 FileName=reg.exe (CommandLine=*HKLM\\SAM* OR CommandLine=*HKLM\\SECURITY* OR CommandLine=*HKLM\\System\\CurrentControlSet\\Control\\Lsa* OR CommandLine=*HKLM\\Software\\Microsoft\\Windows?Defender*)
+    | table([@timestamp, ComputerName, UserName, ParentBaseFileName, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+      and lowercase(action_process_image_name) contains "reg.exe"
+      and (
+        action_process_image_command_line ~= "(?i)query.*HKLM\\\\SAM"
+        or action_process_image_command_line ~= "(?i)query.*HKLM\\\\SECURITY"
+        or action_process_image_command_line ~= "(?i)query.*HKLM\\\\System\\\\CurrentControlSet\\\\Control\\\\Lsa"
+        or action_process_image_command_line ~= "(?i)query.*HKLM\\\\Software\\\\Microsoft\\\\Windows\\s+Defender"
+      )
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, actor_process_image_name
+  lucene: |
+    (process.name:reg.exe OR process.parent.name:reg.exe) AND process.command_line:*query* AND (process.command_line:*HKLM\\SAM* OR process.command_line:*HKLM\\SECURITY* OR process.command_line:*HKLM\\System\\CurrentControlSet\\Control\\Lsa* OR process.command_line:*HKLM\\Software\\Microsoft\\Windows?Defender*)
+  sumo: |
+    _sourceCategory=*Sysmon* "1"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Image" as image
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "Computer" as computer
+    | where event_id = "1" and image matches "*reg.exe"
+    | where command_line matches "*query*" and (command_line matches "*HKLM\\SAM*" or command_line matches "*HKLM\\SECURITY*" or command_line matches "*HKLM\\System\\CurrentControlSet\\Control\\Lsa*" or command_line matches "*HKLM\\Software\\Microsoft\\Windows Defender*")
+    | fields _messageTime, computer, image, command_line
 pseudo_logic: reg.exe query against HKLM\SAM, HKLM\SECURITY, HKLM\System\CurrentControlSet\Control\Lsa, or HKLM\Software\Microsoft\Windows Defender.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -100,7 +95,7 @@ references:
 - https://attack.mitre.org/techniques/T1012/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

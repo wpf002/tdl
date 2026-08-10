@@ -16,71 +16,73 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=kubernetes eventtype=kubernetes_audit verb=create objectRef.resource=secrets responseStatus.code=200
+  spl: 'index=kubernetes eventtype=kubernetes_audit verb=create objectRef.resource=secrets responseStatus.code=200
+
     | table _time, user.username, objectRef.namespace, objectRef.name, sourceIPs{}, userAgent, verb, objectRef.resource, responseStatus.code
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000561 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubernetes Secrets Created\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0006\"\n    technique = \"T1552\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    KubernetesEvent
+    | where TimeGenerated > ago(24h)
+    | where Verb =~ "create"
+    | where ObjectRef has "secrets"
+    | where ResponseCode == 200
+    | project TimeGenerated, Verb, ObjectRef, ResponseCode, User, SourceIPs, UserAgent, Namespace, RequestURI
+  aql: |
+    SELECT eventtime, username, sourceip, QIDNAME(qid), "Verb", "Resource", "Response Code"
+    FROM events
+    WHERE "Verb" = 'create'
+      AND "Resource" = 'secrets'
+      AND "Response Code" = '200'
+    LAST 24 HOURS
+  yara_l: |
+    rule kubernetes_secret_creation {
+      meta:
+        author = "TDL"
+        description = "Detects creation of Kubernetes secrets - T1552 Credential Access"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1552"
+        severity = "Medium"
 
+      events:
+        $k.metadata.event_type = "RESOURCE_CREATION"
+        $k.target.resource.attribute.labels["verb"] = "create"
+        $k.target.resource.type = "secrets"
+        $k.security_result.action = "ALLOW"
+        re.regex($k.metadata.description, `200`)
+        $k.principal.user.userid = $user
+
+      match:
+        $user over 5m
+
+      condition:
+        $k
+    }
+  esql: |
+    FROM logs-kubernetes.audit*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      AND kubernetes.audit.verb == "create"
+      AND kubernetes.audit.objectRef.resource == "secrets"
+      AND kubernetes.audit.responseStatus.code == 200
+    | KEEP @timestamp, kubernetes.audit.user.username, kubernetes.audit.objectRef.namespace, kubernetes.audit.objectRef.name, kubernetes.audit.sourceIPs, kubernetes.audit.userAgent
+  leql: |
+    where(source_json.verb="create" AND source_json.objectRef.resource="secrets" AND source_json.responseStatus.code=200)
+  crowdstrike: |
+    #repo=kubernetes event_simpleName=KubernetesApiAuditLog verb=create objectRef.resource=secrets responseStatus.code=200
+    | table([@timestamp, user.username, sourceIPs, objectRef.namespace, objectRef.name, responseStatus.code])
+  xql: |
+    dataset = k8s_audit_logs
+    | filter verb = "create" and objectRef.resource = "secrets" and responseStatus.code = 200
+    | fields _time, user.username, sourceIPs, objectRef.namespace, objectRef.name, verb, objectRef.resource, responseStatus.code
+  lucene: |
+    verb:"create" AND resource:"secrets" AND responseCode:200
+  sumo: |
+    _sourceCategory=*kubernetes* OR _sourceCategory=*k8s*
+    | json field=_raw "verb" as verb
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "responseStatus.code" as response_code
+    | where verb = "create" and resource = "secrets" and response_code = "200"
+    | fields _messageTime, verb, resource, response_code, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +92,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere Verb is \"create\"\nWhere Resource is \"secrets\"\nWhere the Response Code is 200"
 triage_steps:

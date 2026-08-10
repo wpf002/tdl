@@ -16,71 +16,69 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail eventType=AwsApiCall (eventName=DeleteTrail OR eventName=StopLogging)
+  spl: 'index=aws sourcetype=aws:cloudtrail eventType=AwsApiCall (eventName=DeleteTrail OR eventName=StopLogging)
+
     | table _time, userIdentity.principalId, userIdentity.arn, eventName, requestParameters.name, sourceIPAddress, userAgent, errorCode, errorMessage
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000130 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Logging Stopped\"\n    severity = \"HIGH\"\n    tactic\
-    \ = \"TA0005\"\n    technique = \"T1489\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n   \
-    \ $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(1h)
+    | where EventTypeName == "AwsApiCall"
+    | where EventName in ("DeleteTrail", "StopLogging")
+    | project TimeGenerated, UserIdentityArn, EventName, EventSource, SourceIpAddress, UserAgent, AwsRegion, RequestParameters, ResponseElements, ErrorCode, ErrorMessage
+  aql: |
+    SELECT eventtime, username, sourceip, "eventName" AS event_name, "requestParameters" AS request_params, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%CloudTrail%'
+      AND "eventName" IN ('DeleteTrail', 'StopLogging')
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_cloudtrail_disabled {
+      meta:
+        author = "TDL"
+        description = "Detects attempts to disable AWS CloudTrail logging via DeleteTrail or StopLogging API calls"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1489"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_event_type = "AwsApiCall"
+        (
+          $e.metadata.product_log_id = "DeleteTrail" or
+          $e.metadata.product_log_id = "StopLogging"
+        )
+        $e.principal.user.userid = $user
+        $e.principal.ip = $ip
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE event.action IN ("DeleteTrail", "StopLogging") AND event.type == "AwsApiCall"
+    | KEEP @timestamp, cloud.account.id, cloud.region, user.name, source.ip, event.action, aws.cloudtrail.request_parameters
+  leql: |
+    where(source_json.eventType="AwsApiCall" AND source_json.eventName IN [DeleteTrail, StopLogging])
+  crowdstrike: |
+    #type=cloudtrail eventType=AwsApiCall (eventName=DeleteTrail OR eventName=StopLogging)
+    | table([@timestamp, userIdentity.principalId, eventName, requestParameters, sourceIPAddress, userAgent, awsRegion])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = ENUM.CLOUD_PROVIDER_AWS and action_event_type = "AwsApiCall" and action_operation in ("DeleteTrail", "StopLogging")
+    | fields _time, actor_effective_username, action_operation, action_resource_name, cloud_resource_identifier, cloud_account_id
+  lucene: |
+    eventType:AwsApiCall AND eventName:(DeleteTrail OR StopLogging)
+  sumo: |
+    _sourceCategory=*CloudTrail*
+    | json field=_raw "eventType" as event_type
+    | json field=_raw "eventName" as event_name
+    | where event_type = "AwsApiCall"
+    | where event_name in ("DeleteTrail", "StopLogging")
+    | fields _messageTime, _sourceHost, event_name, event_type
 false_positives:
 - Security software
 - Authorized admin tools
@@ -90,7 +88,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 AWS CloudTrail Event
 

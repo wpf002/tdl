@@ -23,68 +23,105 @@ queries:
     ,\"*obs32.exe\",\"*obs.exe\",\"*Skype.exe\",\"*Discord.exe\",\"*Chrome.exe\",\"*firefox.exe\",\"*Safari.app*\",\"*FaceTime.app*\",\"*WebexTeams.exe\"\
     ,\"*slack.exe\")) \n| stats count earliest(_time) as first_seen latest(_time) as last_seen values(process_name) as process values(CommandLine)\
     \ as cmdline values(user) as user by host \n| where count > 0\n| table first_seen last_seen host user process cmdline count\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    DeviceEvents
+    | where TimeGenerated > ago(1h)
+    | where ActionType in ("CameraStreamAccessed", "CameraStarted")
+    | where InitiatingProcessFileName !in~ ("Teams.exe", "Zoom.exe", "obs64.exe", "obs32.exe", "Skype.exe", "WebexHost.exe", "Slack.exe", "Chrome.exe", "msedge.exe", "firefox.exe", "Safari", "FaceTime")
+    | project TimeGenerated, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessFolderPath, ActionType
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Image Path", COUNT(*) AS access_count
+    FROM events
+    WHERE (("Device Type" ILIKE '%webcam%' OR "Device Type" ILIKE '%camera%' OR "Device Name" ILIKE '%camera%' OR "Device Name" ILIKE '%webcam%')
+       OR ("Image Loaded" ILIKE '%mf.dll%' OR "Image Loaded" ILIKE '%mfplat.dll%' OR "Image Loaded" ILIKE '%avfoundation%')
+       OR ("API Called" ILIKE '%AVCaptureDevice%' OR "API Called" ILIKE '%MFCreateSourceReaderFromMediaSource%'))
+       AND "Process Name" NOT ILIKE '%teams.exe%'
+       AND "Process Name" NOT ILIKE '%zoom.exe%'
+       AND "Process Name" NOT ILIKE '%obs%'
+       AND "Process Name" NOT ILIKE '%skype.exe%'
+       AND "Process Name" NOT ILIKE '%webex%'
+       AND "Process Name" NOT ILIKE '%slack.exe%'
+       AND "Process Name" NOT ILIKE '%discord.exe%'
+       AND "Image Path" NOT ILIKE '%teams%'
+       AND "Image Path" NOT ILIKE '%zoom%'
+       AND "Image Path" NOT ILIKE '%obs%'
+    GROUP BY eventtime, LOGSOURCENAME(logsourceid), username, "Process Name", "Process CommandLine", "Image Path"
+    LAST 1 HOURS
+  yara_l: |
+    rule webcam_access_non_conferencing_tool {
+      meta:
+        author = "TDL"
+        description = "Detects webcam access by processes outside of approved conferencing/streaming applications (MITRE T1125)"
+        severity = "MEDIUM"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1125"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "RESOURCE_READ"
+        (
+          re.regex($e.target.resource.name, `(?i)(video|camera|webcam|capture)`) or
+          re.regex($e.target.file.full_path, `(?i)(mf|mediafoundation|avfoundation|directshow|coremedia)`) or
+          re.regex($e.principal.process.command_line, `(?i)(avfoundation|mediafoundation|videocapture)`)
+        )
+        not re.regex($e.principal.process.file.full_path, `(?i)(teams\.exe|zoom\.exe|skype\.exe|slack\.exe|obs64\.exe|obs\.exe|obs-studio\.exe|webex\.exe|gotomeeting\.exe|chime\.exe|discord\.exe|facetime|google\smeet|chrome\.exe|msedge\.exe|firefox\.exe|safari)$`)
+        $e.principal.hostname = $host
+        $e.principal.process.file.full_path = $proc
 
-    | where eventName matches regex ".+"
+      match:
+        $host, $proc over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000794 {\n  meta:\n    author = \"TDL\"\n    description = \"Camera Device Activated by Non-Conferencing Process\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0009\"\n    technique = \"T1125\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint.events.file*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      AND (
+        (event.category == "driver" AND event.action IN ("load", "start") AND file.path LIKE "*videoinput*")
+        OR (process.name IN ("AVFoundation", "CoreMediaIO") AND event.action == "start")
+        OR (file.path LIKE "*MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID*")
+        OR (event.action == "device_open" AND device.type == "camera")
+      )
+      AND NOT process.name IN ("Teams.exe", "Zoom.exe", "obs64.exe", "obs.exe", "Skype.exe", "chrome.exe", "firefox.exe", "msedge.exe", "safari", "FaceTime.app")
+    | STATS camera_access = COUNT(*) BY host.name, process.name, process.executable, user.name
+    | WHERE camera_access > 0
+    | KEEP @timestamp, host.name, user.name, process.name, process.executable, camera_access
+  leql: |
+    where((source_json.EventID=11 AND source_json.TargetFilename ICONTAINS "\Microsoft\Windows\Media Foundation") OR (process_cmd_line ICONTAINS "AVCaptureDevice" OR process_cmd_line ICONTAINS "AVFoundation") OR (source_json.EventID=1 AND (process_cmd_line ICONTAINS "mfreadwrite.dll" OR process_cmd_line ICONTAINS "AVFoundation"))) AND NOT (process_name ICONTAINS "teams.exe" OR process_name ICONTAINS "zoom.exe" OR process_name ICONTAINS "obs64.exe" OR process_name ICONTAINS "obs32.exe" OR process_name ICONTAINS "skype.exe" OR process_name ICONTAINS "slack.exe" OR process_name ICONTAINS "webex.exe") groupby(asset, process_name, user) calculate(count)
+  crowdstrike: |
+    event_simpleName=MediaFoundationCameraLaunch OR event_simpleName=AVFoundationCameraLaunch
+    | !in(field=FileName, values=["Teams.exe", "Zoom.exe", "obs64.exe", "obs.exe", "Skype.exe", "chrome.exe", "firefox.exe", "msedge.exe", "Safari", "FaceTime"])
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName, SHA256HashData])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_LOAD_IMAGE
+      and (
+        (lowercase(action_module_path) contains "mfplat.dll" or lowercase(action_module_path) contains "mf.dll")
+        or (lowercase(action_module_path) contains "avfoundation")
+      )
+    | filter not (
+        lowercase(actor_process_image_name) contains "teams"
+        or lowercase(actor_process_image_name) contains "zoom"
+        or lowercase(actor_process_image_name) contains "obs"
+        or lowercase(actor_process_image_name) contains "skype"
+        or lowercase(actor_process_image_name) contains "webex"
+      )
+    | fields _time, agent_hostname, actor_process_image_name, actor_process_image_path, actor_process_image_command_line, action_module_path, actor_effective_username
+  lucene: |
+    (event.action:"camera-accessed" OR event.action:"device-accessed" OR winlog.event_data.DeviceDescription:*webcam* OR winlog.event_data.DeviceDescription:*camera* OR process.command_line:*AVFoundation* OR process.command_line:*AVCaptureDevice* OR process.command_line:*MFCreateSourceReaderFromMediaSource* OR process.command_line:*IMFActivate* OR registry.path:*SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\webcam* OR file.path:*CoreMediaIO.framework* OR file.path:*AVFoundation.framework*) AND NOT (process.name:(teams.exe OR zoom.exe OR obs64.exe OR obs.exe OR skype.exe OR slack.exe OR webexmta.exe OR discord.exe OR chrome.exe OR firefox.exe OR msedge.exe OR safari OR "Microsoft Teams.app" OR "Zoom.app" OR "OBS.app" OR "Skype.app" OR "Slack.app" OR "Discord.app" OR "Google Chrome.app" OR "Firefox.app" OR "Safari.app"))
+  sumo: |
+    _sourceCategory=*EDR* OR _sourceCategory=*Windows* OR _sourceCategory=*macOS*
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "process_name" as process_name
+    | json field=_raw "process_path" as process_path
+    | json field=_raw "command_line" as command_line
+    | json field=_raw "library_loaded" as library_loaded
+    | json field=_raw "framework" as framework
+    | json field=_raw "host" as host
+    | json field=_raw "user" as user
+    | where (library_loaded matches "*mf.dll*" or library_loaded matches "*mfreadwrite.dll*" or library_loaded matches "*AVFoundation*" or framework matches "*AVFoundation*" or command_line matches "*AVFoundation*" or command_line matches "*MediaFoundation*")
+    | where !(process_name matches "*teams*" or process_name matches "*zoom*" or process_name matches "*obs*" or process_name matches "*skype*" or process_name matches "*webex*" or process_name matches "*slack*" or process_name matches "*discord*" or process_name matches "*chrome*" or process_name matches "*firefox*" or process_name matches "*safari*" or process_name matches "*edge*")
+    | fields _messageTime, host, user, process_name, process_path, command_line, library_loaded, framework
 pseudo_logic: Webcam opened via Media Foundation / AVFoundation by a process not in the conferencing/streaming allowlist (Teams, Zoom, OBS).
 false_positives:
 - Sanctioned admin or engineering activity
@@ -101,7 +138,7 @@ references:
 - https://attack.mitre.org/techniques/T1125/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'

@@ -17,73 +17,70 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=528 OR EventCode=540 OR EventCode=4624) Logon_Type=9 Authentication_Package="Negotiate" Logon_Process="seclogo"
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=528 OR EventCode=540 OR EventCode=4624) Logon_Type=9 Authentication_Package="Negotiate"
+    Logon_Process="seclogo"
+
     | table _time, ComputerName, Account_Name, TargetUserName, Logon_Type, Authentication_Package, Logon_Process, Source_Network_Address, Workstation_Name
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4624")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4624')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000257 {\n  meta:\n    author = \"TDL\"\n    description = \"Potential Pass the Hash Attack Activity\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0005\"\n    technique = \"T1550\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id =\
-    \ /(4624)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("4624")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4624])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4624)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4624")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4624)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4624")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4624
+    | where LogonType == 9
+    | where AuthenticationPackageName =~ "Negotiate"
+    | where LogonProcessName =~ "seclogo"
+    | project TimeGenerated, Computer, Account, TargetAccount, TargetUserName, IpAddress, WorkstationName, LogonType, AuthenticationPackageName, LogonProcessName
+  aql: |
+    SELECT eventtime, username, sourceip, destinationip, LOGSOURCENAME(logsourceid) AS host, "Logon Type", "Authentication Package", "Logon Process"
+    FROM events
+    WHERE "EventID" IN ('528', '540', '4624')
+      AND "Logon Type" = '9'
+      AND "Authentication Package" ILIKE '%Negotiate%'
+      AND "Logon Process" ILIKE '%seclogo%'
+    LAST 24 HOURS
+  yara_l: "rule mitre_t1550_pass_the_hash_token_detection {\n  meta:\n    author = \"TDL\"\n    description = \"Detects Pass the Hash or Pass\
+    \ the Token activity via logon type 9 with Negotiate authentication\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique\
+    \ = \"T1550\"\n    severity = \"High\"\n    \n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.metadata.product_event_type =\
+    \ \"4624\"\n    $e.security_result.action = \"ALLOW\"\n    $e.target.user.userid = $user\n    $e.principal.hostname = $host\n    re.regex($e.additional.fields.value.string_value,\
+    \ `(?i)LogonType.*9`)\n    re.regex($e.additional.fields.value.string_value, `(?i)AuthenticationPackage.*Negotiate`)\n    re.regex($e.additional.fields.value.string_value,\
+    \ `(?i)LogonProcess.*seclogo`)\n    \n  match:\n    $host, $user over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-system.security*, logs-windows.security*, winlogbeat-*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.code IN ("528", "540", "4624")
+      AND winlog.event_data.LogonType == "9"
+      AND TO_LOWER(winlog.event_data.AuthenticationPackageName) == "negotiate"
+      AND TO_LOWER(winlog.event_data.LogonProcessName) == "seclogo"
+    | KEEP @timestamp, host.name, user.name, source.ip, winlog.event_data.TargetUserName, winlog.event_data.WorkstationName, winlog.event_data.IpAddress
+  leql: |
+    where(source_json.EventID=4624 AND source_json.LogonType=9 AND source_json.AuthenticationPackageName="Negotiate" AND source_json.LogonProcessName="seclogo")
+  crowdstrike: |
+    EventCode=4624 LogonType=9 AuthenticationPackageName=Negotiate LogonProcessName=seclogo
+    | table([@timestamp, ComputerName, TargetUserName, IpAddress, WorkstationName, SubjectUserName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4624
+    | filter action_evtlog_event_data_LogonType = "9"
+    | filter action_evtlog_event_data_AuthenticationPackageName = "Negotiate"
+    | filter action_evtlog_event_data_LogonProcessName = "seclogo"
+    | fields _time, agent_hostname, action_evtlog_event_data_TargetUserName, action_evtlog_event_data_IpAddress, action_evtlog_event_data_WorkstationName
+  lucene: |
+    event.code:4624 AND winlog.event_data.LogonType:9 AND winlog.event_data.AuthenticationPackageName:Negotiate AND winlog.event_data.LogonProcessName:seclogo
+  sumo: |
+    _sourceCategory=*Windows*Security* "4624"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "LogonType" as logon_type
+    | json field=_raw "AuthenticationPackageName" as auth_package
+    | json field=_raw "LogonProcessName" as logon_process
+    | json field=_raw "TargetUserName" as target_user
+    | json field=_raw "Computer" as computer
+    | json field=_raw "IpAddress" as ip_address
+    | where event_id in ("528", "540", "4624")
+    | where logon_type = "9"
+    | where auth_package = "Negotiate"
+    | where logon_process = "seclogo"
+    | fields _messageTime, computer, target_user, ip_address, logon_type, auth_package, logon_process
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +90,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Authentication Success Event
 

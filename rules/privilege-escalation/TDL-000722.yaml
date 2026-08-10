@@ -19,79 +19,122 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=7
+  spl: 'index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=7
+
     | eval ImageLower=lower(Image), ImageLoadedLower=lower(ImageLoaded)
-    | search ImageLower IN ("*\\system32\\*", "*\\syswow64\\*", "*\\program files*") ImageLoadedLower IN ("*\\appdata\\*", "*\\programdata\\*", "*\\users\\*", "*\\temp\\*")
-    | where Signed="true" AND (SignedStatus="Valid" OR SignedStatus="Trusted") AND (ImageSignedStatus!="Valid" OR ImageSignedStatus="false" OR ImageSignedStatus="Unsigned" OR isnull(ImageSignedStatus))
+
+    | search ImageLower IN ("*\\system32\\*", "*\\syswow64\\*", "*\\program files*") ImageLoadedLower IN ("*\\appdata\\*", "*\\programdata\\*",
+    "*\\users\\*", "*\\temp\\*")
+
+    | where Signed="true" AND (SignedStatus="Valid" OR SignedStatus="Trusted") AND (ImageSignedStatus!="Valid" OR ImageSignedStatus="false" OR
+    ImageSignedStatus="Unsigned" OR isnull(ImageSignedStatus))
+
     | stats count values(ImageLoaded) as loaded_dlls values(Signature) as signer by ComputerName, Image, User
+
     | where count > 0
+
     | table _time, ComputerName, User, Image, signer, loaded_dlls, count
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_pe_000722 {\n  meta:\n    author = \"TDL\"\n    description = \"Trusted Binary Loading DLL from Application Directory\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0004\"\n    technique = \"T1574\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    DeviceImageLoadEvents
+    | where TimeGenerated > ago(1h)
+    | where InitiatingProcessVersionInfoOriginalFileName has_any ("microsoft", "windows") or InitiatingProcessPublisher startswith "Microsoft"
+    | where FileName !endswith ".mui" and FileName !endswith ".mun"
+    | where FolderPath has_any ("\\appdata\\", InitiatingProcessFolderPath)
+    | where not(FolderPath has_any ("\\windows\\", "\\program files\\", "\\program files (x86)\\"))
+    | where InitiatingProcessSHA1 != SHA1
+    | project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessFolderPath, InitiatingProcessPublisher, FileName, FolderPath, SHA1, InitiatingProcessCommandLine
+  aql: |
+    SELECT sourceip, "Image" AS signed_binary, "ImageLoaded" AS unsigned_dll, "Process CommandLine", COUNT(*) AS load_count
+    FROM events
+    WHERE "EventID" = '7'
+      AND "Signed" = 'true'
+      AND "SignatureStatus" = 'Valid'
+      AND ("Signature" ILIKE '%Microsoft%' OR "Signature" ILIKE '%Windows%')
+      AND ("ImageSignatureStatus" = 'Unsigned' OR "ImageSignatureStatus" IS NULL OR "ImageSignatureStatus" = 'Invalid')
+      AND ("ImageLoaded" ILIKE '%\AppData\%' OR "ImageLoaded" ILIKE '%Application Data\%' OR "ImageLoaded" MATCHES '.*\\[^\\]+\\[^\\]+\.dll$')
+    GROUP BY sourceip, "Image", "ImageLoaded", "Process CommandLine"
+    LAST 1 HOURS
+  yara_l: |
+    rule dll_sideloading_hijack {
+      meta:
+        author = "TDL"
+        description = "Detects Microsoft-signed binaries loading unsigned DLLs from application directory or APPDATA - T1574 DLL Search Order Hijacking"
+        mitre_attack_tactic = "Privilege Escalation"
+        mitre_attack_technique = "T1574"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "FILE_OPEN" or $e.metadata.event_type = "PROCESS_MODULE_LOAD"
+        $e.principal.process.file.signature_info.signer = /Microsoft/
+        $e.principal.process.file.signature_info.verified = true
+        $e.target.file.signature_info.verified = false or not $e.target.file.signature_info.verified
+        (
+          re.regex($e.target.file.full_path, `(?i)\\appdata\\`) or
+          re.regex($e.target.file.full_path, `(?i)\.dll$`) and not re.regex($e.target.file.full_path, `(?i)\\windows\\system32\\`) and not re.regex($e.target.file.full_path, `(?i)\\windows\\syswow64\\`) and not re.regex($e.target.file.full_path, `(?i)\\program files\\`)
+        )
+        re.regex($e.target.file.full_path, `(?i)\.dll$`)
+        $e.principal.hostname = $host
+        $e.principal.process.file.full_path = $process
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host, $process over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.library*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND (winlog.event_id == 7 OR event.category == "library")
+      AND process.code_signature.trusted == true
+      AND process.code_signature.subject_name LIKE "*Microsoft*"
+      AND (dll.code_signature.trusted == false OR dll.code_signature.exists == false)
+      AND (dll.path LIKE "*\\AppData\\*" OR STARTS_WITH(dll.path, process.executable))
+    | STATS load_count = COUNT(*) BY host.name, process.name, process.executable, dll.name, dll.path, user.name
+    | WHERE load_count > 0
+    | KEEP @timestamp, host.name, user.name, process.name, process.executable, dll.name, dll.path, load_count
+  leql: |
+    where(source_json.EventID=7 AND source_json.Signed="false" AND source_json.SignatureStatus!="Valid" AND (source_json.ImageLoaded ICONTAINS "\\AppData\\" OR source_json.ImageLoaded=/\\[^\\]+\.exe\\./) AND source_json.Image=/.*\\(Windows|Program Files).*\.exe$/i) groupby(asset, source_json.Image, source_json.ImageLoaded) calculate(count)
+  crowdstrike: |
+    (event_simpleName=ImageLoad OR EventCode=7)
+    (ImageLoaded=*.dll OR TargetFilename=*.dll)
+    (ImageLoaded=*AppData* OR ImageLoaded=*ProgramData* OR TargetFilename=*AppData* OR TargetFilename=*ProgramData*)
+    | case {
+        event_simpleName=ImageLoad | ImagePath := Image | DllPath := ImageLoaded;
+        EventCode=7 | ImagePath := Image | DllPath := TargetFilename;
+        * | ImagePath := "" | DllPath := "";
+      }
+    | regex("(?i).*\\\\(Microsoft|Windows|System32|SysWOW64)\\\\.*\\.exe$", field=ImagePath, strict=false)
+    | !regex("(?i).*\\\\(Microsoft|Windows|System32|SysWOW64)\\\\.*\\.dll$", field=DllPath, strict=false)
+    | table([@timestamp, ComputerName, ImagePath, DllPath, event_simpleName])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_LOAD_IMAGE
+    | filter action_module_signature_status = UNSIGNED or action_module_signature_status = null
+    | filter actor_process_signature_vendor = "Microsoft Corporation" or actor_process_signature_vendor contains "Microsoft"
+    | filter action_module_path ~= "(?i).*\\\\appdata\\\\.*" or action_module_path ~= "(?i).*" + actor_process_image_path + ".*"
+    | fields _time, agent_hostname, actor_process_image_name, actor_process_image_path, actor_process_signature_vendor, action_module_path, action_module_signature_status, action_module_md5
+  lucene: |
+    event.code:7 AND process.code_signature.status:trusted AND process.code_signature.subject_name:*Microsoft* AND dll.code_signature.status:(invalid OR untrusted OR unsigned) AND (dll.path:*\\AppData\\* OR dll.path:*\\Application\\*)
+  sumo: |
+    _sourceCategory=*Sysmon* "7"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ImageLoaded" as image_loaded
+    | json field=_raw "Image" as image
+    | json field=_raw "Signed" as signed
+    | json field=_raw "SignatureStatus" as signature_status
+    | where event_id = "7"
+    | where (signed = "true" or signature_status matches "*Microsoft*") and image_loaded matches "*.dll"
+    | where (image_loaded matches "*\\AppData\\*" or (image_loaded matches "*:\\Program Files*" and not image_loaded matches "*\\system32\\*" and not image_loaded matches "*\\SysWOW64\\*"))
+    | parse regex field=image_loaded "(?<dll_directory>.+\\).+\.dll$"
+    | parse regex field=image "(?<exe_directory>.+\\).+\.exe$"
+    | where dll_directory = exe_directory or image_loaded matches "*\\AppData\\*"
+    | fields _messageTime, _sourceHost, image, image_loaded, signed, signature_status
 pseudo_logic: Microsoft-signed binary loads an unsigned DLL from its application directory or %APPDATA%. Side-load / search-order hijack pattern.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -109,7 +152,7 @@ references:
 - https://attack.mitre.org/techniques/T1574/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, source user, and (if visible) the resulting privileged context.'

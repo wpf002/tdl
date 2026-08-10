@@ -24,71 +24,133 @@ queries:
     *(primaryGroupID=515)*\" OR AdditionalFields=\"*(userAccountControl:1.2.840.113556.1.4.803:=8192)*\" OR AdditionalFields=\"*ms-MCS-AdmPwd*\"\
     ) \n| search NOT (AdditionalFields=\"*(domainSid=)*\" OR AdditionalFields=\"*(objectSid=)*\") \n| table _time, DeviceName, InitiatingProcessAccountName,\
     \ InitiatingProcessFileName, InitiatingProcessCommandLine, SearchFilter, SearchScope, AdditionalFields\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000639 {\n  meta:\n    author = \"TDL\"\n    description = \"LDAP System Recon - Defender\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0007\"\n    technique = \"T1018\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceEvents
+    | where TimeGenerated > ago(1h)
+    | where ActionType == "LdapSearch"
+    | where AdditionalFields != "[]"
+    | extend AdditionalFieldsParsed = parse_json(AdditionalFields)
+    | extend SearchFilter = tostring(AdditionalFieldsParsed.SearchFilter)
+    | extend SearchScope = tostring(AdditionalFieldsParsed.SearchScope)
+    | where SearchScope != "Base"
+    | where (
+        SearchFilter contains "(sAMAccountType=805306369)"
+        or SearchFilter contains "(objectCategory=Computer)"
+        or SearchFilter contains "(objectCategory=nTDSDSA)"
+        or SearchFilter contains "(objectCategory=server)"
+        or SearchFilter contains "(objectClass=computer)"
+        or SearchFilter contains "(objectClass=server)"
+        or SearchFilter contains "(primaryGroupID=521)"
+        or SearchFilter contains "(primaryGroupID=516)"
+        or SearchFilter contains "(primaryGroupID=515)"
+        or SearchFilter contains "(userAccountControl:1.2.840.113556.1.4.803:=8192)"
+        or SearchFilter contains "ms-MCS-AdmPwd"
+    )
+    | where SearchFilter !contains "(domainSid=)" and SearchFilter !contains "(objectSid=)"
+    | project TimeGenerated, DeviceName, AccountName, ActionType, SearchFilter, SearchScope, InitiatingProcessFileName, InitiatingProcessCommandLine, AdditionalFields
+  aql: |
+    SELECT username, sourceip, LOGSOURCENAME(logsourceid) AS host, "AdditionalFields", COUNT(*) AS ldap_searches
+    FROM events
+    WHERE LOGSOURCETYPE(logsourceid) ILIKE '%Microsoft Defender%'
+      AND categoryname(category) ILIKE '%AdvancedHunting%'
+      AND "ActionType" = 'LdapSearch'
+      AND "Tags" != '[ ]'
+      AND "SearchScope" != 'Base'
+      AND (
+        "AdditionalFields" ILIKE '%(sAMAccountType=805306369)%'
+        OR "AdditionalFields" ILIKE '%(objectCategory=Computer)%'
+        OR "AdditionalFields" ILIKE '%(objectCategory=nTDSDSA)%'
+        OR "AdditionalFields" ILIKE '%(objectCategory=server)%'
+        OR "AdditionalFields" ILIKE '%(objectClass=computer)%'
+        OR "AdditionalFields" ILIKE '%(objectClass=server)%'
+        OR "AdditionalFields" ILIKE '%(primaryGroupID=521)%'
+        OR "AdditionalFields" ILIKE '%(primaryGroupID=516)%'
+        OR "AdditionalFields" ILIKE '%(primaryGroupID=515)%'
+        OR "AdditionalFields" ILIKE '%(userAccountControl:1.2.840.113556.1.4.803:=8192)%'
+        OR "AdditionalFields" ILIKE '%ms-MCS-AdmPwd%'
+      )
+      AND "AdditionalFields" NOT ILIKE '%(domainSid=)%'
+      AND "AdditionalFields" NOT ILIKE '%(objectSid=)%'
+    GROUP BY username, sourceip, LOGSOURCENAME(logsourceid), "AdditionalFields"
+    LAST 24 HOURS
+  yara_l: "rule mitre_t1018_remote_system_discovery_ldap {\n  meta:\n    author = \"TDL\"\n    description = \"Detects LDAP queries commonly used\
+    \ for remote system discovery via T1018\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1018\"\n    mitre_attack_technique_name\
+    \ = \"Remote System Discovery\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.product_event_type = \"LdapSearch\"\n    $e.metadata.vendor_name\
+    \ = \"Microsoft\"\n    $e.metadata.product_name = \"Microsoft Defender\"\n    \n    not $e.additional.fields[\"Tags\"] = \"[ ]\"\n    not\
+    \ $e.additional.fields[\"SearchScope\"] = \"Base\"\n    \n    (\n      re.regex($e.additional.fields[\"SearchFilter\"], `\\(sAMAccountType=805306369\\\
+    )`) or\n      re.regex($e.additional.fields[\"SearchFilter\"], `\\(objectCategory=Computer\\)`) or\n      re.regex($e.additional.fields[\"\
+    SearchFilter\"], `\\(objectCategory=nTDSDSA\\)`) or\n      re.regex($e.additional.fields[\"SearchFilter\"], `\\(objectCategory=server\\)`)\
+    \ or\n      re.regex($e.additional.fields[\"SearchFilter\"], `\\(objectClass=computer\\)`) or\n      re.regex($e.additional.fields[\"SearchFilter\"\
+    ], `\\(objectClass=server\\)`) or\n      re.regex($e.additional.fields[\"SearchFilter\"], `\\(primaryGroupID=521\\)`) or\n      re.regex($e.additional.fields[\"\
+    SearchFilter\"], `\\(primaryGroupID=516\\)`) or\n      re.regex($e.additional.fields[\"SearchFilter\"], `\\(primaryGroupID=515\\)`) or\n \
+    \     re.regex($e.additional.fields[\"SearchFilter\"], `\\(userAccountControl:1\\.2\\.840\\.113556\\.1\\.4\\.803:=8192\\)`) or\n      re.regex($e.additional.fields[\"\
+    SearchFilter\"], `ms-MCS-AdmPwd`)\n    )\n    \n    not re.regex($e.additional.fields[\"SearchFilter\"], `\\(domainSid=\\)`)\n    not re.regex($e.additional.fields[\"\
+    SearchFilter\"], `\\(objectSid=\\)`)\n    \n    $e.principal.hostname = $host\n    $e.principal.user.userid = $user\n\n  match:\n    $host,\
+    \ $user over 5m\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-m365_defender.event*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.category == "AdvancedHunting-DeviceEvents"
+      AND event.type == "LdapSearch"
+      AND tags != "[ ]"
+      AND microsoft.defender.additional_fields NOT LIKE "*scope=Base*"
+      AND (
+        microsoft.defender.additional_fields LIKE "*(sAMAccountType=805306369)*"
+        OR microsoft.defender.additional_fields LIKE "*(objectCategory=Computer)*"
+        OR microsoft.defender.additional_fields LIKE "*(objectCategory=nTDSDSA)*"
+        OR microsoft.defender.additional_fields LIKE "*(objectCategory=server)*"
+        OR microsoft.defender.additional_fields LIKE "*(objectClass=computer)*"
+        OR microsoft.defender.additional_fields LIKE "*(objectClass=server)*"
+        OR microsoft.defender.additional_fields LIKE "*(primaryGroupID=521)*"
+        OR microsoft.defender.additional_fields LIKE "*(primaryGroupID=516)*"
+        OR microsoft.defender.additional_fields LIKE "*(primaryGroupID=515)*"
+        OR microsoft.defender.additional_fields LIKE "*(userAccountControl:1.2.840.113556.1.4.803:=8192)*"
+        OR microsoft.defender.additional_fields LIKE "*ms-MCS-AdmPwd*"
+      )
+      AND NOT microsoft.defender.additional_fields LIKE "*(domainSid=)*"
+      AND NOT microsoft.defender.additional_fields LIKE "*(objectSid=)*"
+    | KEEP @timestamp, host.name, user.name, event.type, microsoft.defender.additional_fields, process.name, process.command_line
+  leql: |
+    where(source_json.event_category="AdvancedHunting-DeviceEvents" AND source_json.event_type="LdapSearch" AND source_json.tags!="[ ]" AND source_json.scope!="Base" AND (source_json.additional_fields ICONTAINS "(sAMAccountType=805306369)" OR source_json.additional_fields ICONTAINS "(objectCategory=Computer)" OR source_json.additional_fields ICONTAINS "(objectCategory=nTDSDSA)" OR source_json.additional_fields ICONTAINS "(objectCategory=server)" OR source_json.additional_fields ICONTAINS "(objectClass=computer)" OR source_json.additional_fields ICONTAINS "(objectClass=server)" OR source_json.additional_fields ICONTAINS "(primaryGroupID=521)" OR source_json.additional_fields ICONTAINS "(primaryGroupID=516)" OR source_json.additional_fields ICONTAINS "(primaryGroupID=515)" OR source_json.additional_fields ICONTAINS "(userAccountControl:1.2.840.113556.1.4.803:=8192)" OR source_json.additional_fields ICONTAINS "ms-MCS-AdmPwd") AND NOT (source_json.additional_fields ICONTAINS "(domainSid=)" OR source_json.additional_fields ICONTAINS "(objectSid=)"))
+  crowdstrike: |
+    event_category="AdvancedHunting-DeviceEvents" event_type="LdapSearch" tags!=[ ] scope!=Base
+    | test(additional_fields=="*(sAMAccountType=805306369)*" OR additional_fields=="*(objectCategory=Computer)*" OR additional_fields=="*(objectCategory=nTDSDSA)*" OR additional_fields=="*(objectCategory=server)*" OR additional_fields=="*(objectClass=computer)*" OR additional_fields=="*(objectClass=server)*" OR additional_fields=="*(primaryGroupID=521)*" OR additional_fields=="*(primaryGroupID=516)*" OR additional_fields=="*(primaryGroupID=515)*" OR additional_fields=="*(userAccountControl:1.2.840.113556.1.4.803:=8192)*" OR additional_fields=="*ms-MCS-AdmPwd*")
+    | additional_fields!=*"(domainSid=)"* additional_fields!=*"(objectSid=)"*
+    | table([@timestamp, ComputerName, event_type, additional_fields, scope, tags])
+  xql: |
+    dataset = msft_defender_events
+    | filter event_type = "LdapSearch"
+    | filter tags != "[ ]"
+    | filter additional_fields !~= "scope[\"']?\s*:\s*[\"']?Base"
+    | filter (
+        additional_fields contains "(sAMAccountType=805306369)"
+        or additional_fields contains "(objectCategory=Computer)"
+        or additional_fields contains "(objectCategory=nTDSDSA)"
+        or additional_fields contains "(objectCategory=server)"
+        or additional_fields contains "(objectClass=computer)"
+        or additional_fields contains "(objectClass=server)"
+        or additional_fields contains "(primaryGroupID=521)"
+        or additional_fields contains "(primaryGroupID=516)"
+        or additional_fields contains "(primaryGroupID=515)"
+        or additional_fields contains "(userAccountControl:1.2.840.113556.1.4.803:=8192)"
+        or additional_fields contains "ms-MCS-AdmPwd"
+    )
+    | filter additional_fields !~= "\(domainSid\s*="
+    | filter additional_fields !~= "\(objectSid\s*="
+    | fields _time, agent_hostname, actor_effective_username, additional_fields, tags
+  lucene: |
+    event_category:"AdvancedHunting-DeviceEvents" AND event_type:"LdapSearch" AND _exists_:tags AND NOT tags:"[ ]" AND NOT scope:"Base" AND (additional_fields:*\(sAMAccountType\=805306369\)* OR additional_fields:*\(objectCategory\=Computer\)* OR additional_fields:*\(objectCategory\=nTDSDSA\)* OR additional_fields:*\(objectCategory\=server\)* OR additional_fields:*\(objectClass\=computer\)* OR additional_fields:*\(objectClass\=server\)* OR additional_fields:*\(primaryGroupID\=521\)* OR additional_fields:*\(primaryGroupID\=516\)* OR additional_fields:*\(primaryGroupID\=515\)* OR additional_fields:*\(userAccountControl\:1.2.840.113556.1.4.803\:\=8192\)* OR additional_fields:*ms\-MCS\-AdmPwd*) AND NOT additional_fields:*\(domainSid\=\)* AND NOT additional_fields:*\(objectSid\=\)*
+  sumo: "_sourceCategory=*Defender* OR _sourceCategory=*AdvancedHunting* \"DeviceEvents\" \"LdapSearch\"\n| json field=_raw \"ActionType\" as\
+    \ action_type\n| json field=_raw \"AdditionalFields\" as additional_fields\n| json field=_raw \"DeviceName\" as device_name\n| json field=_raw\
+    \ \"InitiatingProcessAccountName\" as initiating_account\n| json field=_raw \"InitiatingProcessFileName\" as initiating_process\n| json field=_raw\
+    \ \"InitiatingProcessCommandLine\" as command_line\n| where action_type = \"LdapSearch\"\n| where !(additional_fields = \"[ ]\" or additional_fields\
+    \ = \"[]\" or additional_fields = \"\")\n| where !(additional_fields matches \"*\\\"Scope\\\":\\\"Base\\\"*\")\n| where (additional_fields\
+    \ matches \"*(sAMAccountType=805306369)*\" \n    or additional_fields matches \"*(objectCategory=Computer)*\" \n    or additional_fields matches\
+    \ \"*(objectCategory=nTDSDSA)*\" \n    or additional_fields matches \"*(objectCategory=server)*\" \n    or additional_fields matches \"*(objectClass=computer)*\"\
+    \ \n    or additional_fields matches \"*(objectClass=server)*\" \n    or additional_fields matches \"*(primaryGroupID=521)*\" \n    or additional_fields\
+    \ matches \"*(primaryGroupID=516)*\" \n    or additional_fields matches \"*(primaryGroupID=515)*\" \n    or additional_fields matches \"*(userAccountControl:1.2.840.113556.1.4.803:=8192)*\"\
+    \ \n    or additional_fields matches \"*ms-MCS-AdmPwd*\")\n| where !(additional_fields matches \"*(domainSid=)*\") and !(additional_fields\
+    \ matches \"*(objectSid=)*\")\n| fields _messageTime, device_name, initiating_account, initiating_process, command_line, additional_fields\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -98,7 +160,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 AdvancedHunting Device Event\nWhere event_category = \"AdvancedHunting-DeviceEvents\"\nWhere event_type = \"LdapSearch\"\nWhere\
   \ tags != \"[ ]\"\nWhere scope!=\"Base\"\n\nWhere (\n    additional_fields contains \"(sAMAccountType=805306369)\"\n    OR additional_fields\

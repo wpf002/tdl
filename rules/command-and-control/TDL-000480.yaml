@@ -15,85 +15,67 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=firewall action=allowed direction=inbound (dest_port=53 OR app=dns)
+  spl: 'index=firewall action=allowed direction=inbound (dest_port=53 OR app=dns)
+
     | bin _time span=30d as baseline_window
+
     | eval is_baseline=if(_time < relative_time(now(), "-30d"), 1, 0)
+
     | eval is_detection=if(_time >= relative_time(now(), "-30d"), 1, 0)
+
     | stats values(is_baseline) as seen_baseline values(is_detection) as seen_detection by src_ip, dest_ip
+
     | where seen_detection=1 AND (isnull(seen_baseline) OR seen_baseline=0)
+
     | table src_ip, dest_ip
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where application matches regex "dns"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "application" LIKE ''%dns%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000480 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Allowed Inbound DNS Traffic\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0011\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.application\
-    \ = /dns/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND application LIKE "%dns%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND application=/dns/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*dns*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND application ~= "dns"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND application:*dns*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where application matches "*dns*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: "let baseline_period = 90d;\nlet learning_period = 30d;\nlet detection_period = 1h;\nlet baseline_ips = \n    CommonSecurityLog\n    |\
+    \ where TimeGenerated between (ago(baseline_period) .. ago(learning_period))\n    | where DeviceDirection == \"Inbound\"\n    | where DeviceAction\
+    \ == \"Allowed\" or (DestinationPort == 53 and ApplicationProtocol =~ \"dns\")\n    | where isnotempty(SourceIP) and isnotempty(DestinationIP)\n\
+    \    | where not(ipv4_is_private(SourceIP))\n    | where ipv4_is_private(DestinationIP)\n    | distinct SourceIP;\nCommonSecurityLog\n| where\
+    \ TimeGenerated > ago(detection_period)\n| where DeviceDirection == \"Inbound\"\n| where DeviceAction == \"Allowed\" or (DestinationPort ==\
+    \ 53 and ApplicationProtocol =~ \"dns\")\n| where isnotempty(SourceIP) and isnotempty(DestinationIP)\n| where not(ipv4_is_private(SourceIP))\n\
+    | where ipv4_is_private(DestinationIP)\n| where SourceIP !in (baseline_ips)\n| summarize FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),\
+    \ ConnectionCount = count(), DestinationIPs = make_set(DestinationIP), DestinationPorts = make_set(DestinationPort) by SourceIP, DeviceAction,\
+    \ ApplicationProtocol\n| project FirstSeen, LastSeen, SourceIP, DestinationIPs, DestinationPorts, ConnectionCount, DeviceAction, ApplicationProtocol\n"
+  aql: "SELECT sourceip, destinationip, destinationport, application, COUNT(*) AS event_count\nFROM events\nWHERE (category IN (SELECT category\
+    \ FROM categories WHERE low_level_category_id = 6000)) \n  AND sourceip NOT IN (SELECT sourceip FROM events WHERE (category IN (SELECT category\
+    \ FROM categories WHERE low_level_category_id = 6000)) START '1970-01-01 00:00:00' STOP (NOW() - 2592000000) AND sourceip IS NOT NULL)\n \
+    \ AND (destinationip IN (SELECT sourceip FROM events WHERE (category IN (SELECT category FROM categories WHERE low_level_category_id = 6000))\
+    \ LAST 30 DAYS GROUP BY sourceip))\n  AND ((QIDNAME(qid) ILIKE '%allow%' OR QIDNAME(qid) ILIKE '%accept%' OR QIDNAME(qid) ILIKE '%permit%')\
+    \ OR (destinationport = 53) OR (application ILIKE '%dns%'))\nGROUP BY sourceip, destinationip, destinationport, application\nLAST 90 DAYS\n"
+  yara_l: "rule dns_c2_new_external_source {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects new external source\
+    \ IPs communicating with internal destinations via DNS (C2 - T1071)\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique\
+    \ = \"T1071\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.direction =\
+    \ \"INBOUND\"\n    (\n      $e.security_result.action = \"ALLOW\"\n      or\n      (\n        $e.target.port = 53\n        or\n        $e.network.application_protocol\
+    \ = \"DNS\"\n      )\n    )\n    $e.principal.ip = $source_ip\n    $e.target.ip = $dest_ip\n    \n  match:\n    $source_ip, $dest_ip over\
+    \ 1h\n    \n  outcome:\n    $risk_score = 50\n    $first_seen_source = min($e.metadata.event_timestamp.seconds)\n    \n  condition:\n    $e\
+    \ and #source_ip > 0\n}\n"
+  esql: |
+    FROM logs-network.firewall*
+    | WHERE @timestamp > NOW() - 90 days
+      AND network.direction == "inbound"
+      AND source.ip IS NOT NULL
+      AND destination.ip IS NOT NULL
+      AND (event.action == "allowed" OR destination.port == 53 OR network.application == "dns")
+    | EVAL baseline_period = CASE(@timestamp < NOW() - 30 days, "baseline", "detection")
+    | STATS first_seen = MIN(@timestamp), last_seen = MAX(@timestamp), event_count = COUNT(*), baseline_events = COUNT(*) WHERE baseline_period == "baseline", detection_events = COUNT(*) WHERE baseline_period == "detection" BY source.ip, destination.ip
+    | WHERE baseline_events == 0 AND detection_events > 0
+    | KEEP source.ip, destination.ip, first_seen, last_seen, event_count
+  leql: |
+    where(direction=INBOUND AND action=ALLOW AND (destination_port=53 OR application="dns")) groupby(source_address) calculate(count)
+  crowdstrike: "#type=firewall \n(Action=Allowed OR DestinationPort=53 OR Application=dns)\ndirection=inbound\n| groupBy([SourceIP, DestinationIP],\
+    \ function=count(as=events))\n| table([SourceIP, DestinationIP, events])\n"
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter action_total = ENUM.ACTION_TOTAL_ALLOW \n  and dest_port = 53 \n  and dest_location = ENUM.IP_LOCATION_INTERNAL\
+    \ \n  and source_location = ENUM.IP_LOCATION_EXTERNAL\n  and app = \"dns\"\n| comp count() as conn_count by source_ip, dest_ip\n| filter conn_count\
+    \ > 0\n"
+  lucene: |
+    (action:allowed OR destination.port:53 OR application:dns) AND direction:inbound AND source.ip:* AND destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND NOT source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)
+  sumo: "_sourceCategory=*Firewall* \n| json field=_raw \"direction\" as direction, \"action\" as action, \"dest_port\" as dest_port, \"application\"\
+    \ as application, \"src_ip\" as src_ip, \"dest_ip\" as dest_ip\n| where direction = \"inbound\" and (action = \"allowed\" or dest_port = \"\
+    53\" or application = \"dns\")\n| where !isPrivateIP(src_ip) and isPrivateIP(dest_ip)\n| timeslice 1d\n| count_distinct(_timeslice) as days_seen\
+    \ by src_ip\n| where days_seen <= 1\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -103,7 +85,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Firewall Event \nFrom one external source to one internal destination (Inbound)\nWhere the Action is Allowed\nOR\n    Where the\
   \ Destination Port is \"53\"\n\n    Where the Application is \"dns\"\n\nBaseline Learning: 30 Days\nRetention: 90 Days\n\nNew Value: Source\

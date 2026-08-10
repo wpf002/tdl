@@ -26,68 +26,92 @@ queries:
     \ sort 0 event_time\n| streamstats current=f window=1 last(is_failure) as prev_failure last(src_ip) as prev_src_ip last(dest_user) as prev_dest_user\
     \ last(event_time) as prev_event_time by src_ip, dest_user\n| where is_success=1 AND prev_failure=1 AND src_ip=prev_src_ip AND dest_user=prev_dest_user\
     \ AND (event_time - prev_event_time) <= 900\n| table _time, src_ip, dest_user, prev_event_time, event_time, status\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000287 {\n  meta:\n    author = \"TDL\"\n    description = \"Successful Remote Password Spray\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "let TimeFrame = 15m;\nlet PasswordSprayEvents = \n    SigninLogs\n    | where TimeGenerated > ago(TimeFrame)\n    | where ResultType !=\
+    \ 0\n    | where ResultType in (50126, 50053, 50055, 50056, 50057, 50074, 50076, 50079, 50105, 50126, 50132, 50133, 50134, 50144, 50158)\n\
+    \    | extend SourceIP = IPAddress, DestinationUser = UserPrincipalName\n    | project SprayTime = TimeGenerated, SourceIP, DestinationUser;\n\
+    let SuccessfulLogins = \n    SigninLogs\n    | where TimeGenerated > ago(TimeFrame)\n    | where ResultType == 0\n    | extend SourceIP =\
+    \ IPAddress, DestinationUser = UserPrincipalName\n    | project SuccessTime = TimeGenerated, SourceIP, DestinationUser;\nPasswordSprayEvents\n\
+    | join kind=inner (\n    SuccessfulLogins\n) on SourceIP, DestinationUser\n| where SuccessTime > SprayTime and SuccessTime <= SprayTime +\
+    \ TimeFrame\n| project SprayTime, SuccessTime, SourceIP, DestinationUser\n"
+  aql: "SELECT \n    t1.sourceip,\n    t1.username,\n    t1.eventtime AS spray_time,\n    t2.eventtime AS success_time,\n    (t2.eventtime - t1.eventtime)\
+    \ / 60000 AS minutes_between\nFROM events t1\nJOIN events t2 \n    ON t1.sourceip = t2.sourceip \n    AND t1.username = t2.username\nWHERE\
+    \ t1.qidname(t1.qid) ILIKE '%fail%' \n    AND (t1.qidname(t1.qid) ILIKE '%login%' OR t1.qidname(t1.qid) ILIKE '%logon%' OR t1.qidname(t1.qid)\
+    \ ILIKE '%authentication%')\n    AND t2.qidname(t2.qid) NOT ILIKE '%fail%'\n    AND (t2.qidname(t2.qid) ILIKE '%login%' OR t2.qidname(t2.qid)\
+    \ ILIKE '%logon%' OR t2.qidname(t2.qid) ILIKE '%authentication%' OR t2.qidname(t2.qid) ILIKE '%success%')\n    AND t2.eventtime > t1.eventtime\n\
+    \    AND t2.eventtime <= t1.eventtime + 900000\n    AND (t1.logsourcetypename(t1.devicetype) ILIKE '%azure%' OR t1.logsourcetypename(t1.devicetype)\
+    \ ILIKE '%office%' OR t1.logsourcetypename(t1.devicetype) ILIKE '%vpn%' OR t1.logsourcetypename(t1.devicetype) ILIKE '%o365%')\nLAST 24 HOURS\n"
+  yara_l: "rule remote_password_spray_followed_by_success {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects password\
+    \ spraying followed by successful login from same source IP to same user within 15 minutes\"\n    mitre_attack_tactic = \"Initial Access\"\
+    \n    mitre_attack_technique = \"T1078\"\n    \n  events:\n    $spray.metadata.event_type = \"USER_LOGIN\"\n    $spray.security_result.action\
+    \ = \"BLOCK\"\n    $spray.principal.ip = $source_ip\n    $spray.target.user.userid = $user\n    \n    $success.metadata.event_type = \"USER_LOGIN\"\
+    \n    $success.security_result.action = \"ALLOW\"\n    $success.principal.ip = $source_ip\n    $success.target.user.userid = $user\n    \n\
+    \    $spray.metadata.event_timestamp.seconds <= $success.metadata.event_timestamp.seconds\n    \n  match:\n    $source_ip, $user over 15m\n\
+    \    \n  outcome:\n    $risk_score = 75\n    \n  condition:\n    $spray and $success\n}\n"
+  esql: "FROM logs-o365* metadata _id, _index\n| WHERE @timestamp > NOW() - 1 hour\n| EVAL event_type = CASE(\n    event.action == \"UserLoginFailed\"\
+    \ AND event.outcome == \"failure\", \"failed\",\n    event.action == \"UserLoggedIn\" AND event.outcome == \"success\", \"success\",\n   \
+    \ null\n  )\n| WHERE event_type IS NOT NULL\n| KEEP @timestamp, source.ip, user.name, event_type, _id\n| SORT source.ip, user.name, @timestamp\n\
+    | STATS \n    failed_time = MIN(@timestamp) BY source.ip, user.name\n| ENRICH logs-o365* ON source.ip, user.name WITH success_time = @timestamp\n\
+    | WHERE success_time IS NOT NULL \n  AND success_time > failed_time \n  AND success_time <= failed_time + 15 minutes\n| KEEP source.ip, user.name,\
+    \ failed_time, success_time\n```\n\nWait, let me reconsider this. ES|QL doesn't support self-joins or temporal correlation in that way. Let\
+    \ me write a query that detects the pattern correctly:\n\n```\nFROM logs-o365*, logs-azure*\n| WHERE @timestamp > NOW() - 1 hour\n| EVAL event_category\
+    \ = CASE(\n    (event.action IN (\"UserLoginFailed\", \"50126\") OR (event.outcome == \"failure\" AND event.category == \"authentication\"\
+    )), \"spray\",\n    (event.action IN (\"UserLoggedIn\", \"50140\") OR (event.outcome == \"success\" AND event.category == \"authentication\"\
+    )), \"success\",\n    null\n  )\n| WHERE event_category IS NOT NULL\n| STATS \n    spray_count = COUNT(*) WHERE event_category == \"spray\"\
+    ,\n    success_count = COUNT(*) WHERE event_category == \"success\",\n    first_spray = MIN(@timestamp) WHERE event_category == \"spray\"\
+    ,\n    first_success = MIN(@timestamp) WHERE event_category == \"success\",\n    time_window = BUCKET(@timestamp, 15 minutes)\n  BY source.ip,\
+    \ user.name, time_window\n| WHERE spray_count >= 1 AND success_count >= 1 AND first_success > first_spray\n| KEEP source.ip, user.name, time_window,\
+    \ spray_count, success_count, first_spray, first_success\n"
+  leql: |
+    where(result=FAILED_BAD_PASSWORD) groupby(source_address, user) calculate(count) | where(result=SUCCESS AND source_address IN previous.source_address AND user IN previous.user AND time <= previous.time + 900)
+  crowdstrike: |
+    #type=vpn OR #type=azuread OR #type=office365
+    | case {
+        #type=vpn AND event_simpleName=UserAuthentication* AND Outcome=failure |
+          SourceIP=* UserName=* | timestamp := @timestamp | event_type := "failed" ;
+        #type=azuread AND event_simpleName=*SignIn* AND Status=failure |
+          SourceIP=IPAddress UserName=UserPrincipalName | timestamp := @timestamp | event_type := "failed" ;
+        #type=office365 AND Operation=UserLoginFailed |
+          SourceIP=ClientIP UserName=UserId | timestamp := @timestamp | event_type := "failed" ;
+        #type=vpn AND event_simpleName=UserAuthentication* AND Outcome=success |
+          SourceIP=* UserName=* | timestamp := @timestamp | event_type := "success" ;
+        #type=azuread AND event_simpleName=*SignIn* AND Status=success |
+          SourceIP=IPAddress UserName=UserPrincipalName | timestamp := @timestamp | event_type := "success" ;
+        #type=office365 AND Operation=UserLoggedIn |
+          SourceIP=ClientIP UserName=UserId | timestamp := @timestamp | event_type := "success" ;
+        * | event_type := "other"
+      }
+    | event_type!=other
+    | groupBy([SourceIP, UserName], function=([selectLast(timestamp, as=last_ts), selectLast(event_type, as=last_event), collect([timestamp, event_type])]))
+    | test(in(field=collect, values=["failed", "success"]))
+    | selfJoinFilter(field=[SourceIP, UserName], where=[{event_type="failed"}, {event_type="success"}], window=15m, prefilter=true)
+    | table([SourceIP, UserName, timestamp, event_type, last_ts])
+  xql: "dataset = cloud_audit_logs\n| filter cloud_provider = \"AZURE\" and event_type in (\"UserLoginFailed\", \"UserLoginSuccess\")\n| alter\
+    \ \n    is_failure = if(event_type = \"UserLoginFailed\", 1, 0),\n    is_success = if(event_type = \"UserLoginSuccess\", 1, 0)\n| sort _time\
+    \ asc\n| fields _time, identity_name, identity_sub_type, source_ip_address, is_failure, is_success\n| arrayexpand by source_ip_address, identity_name\n\
+    | alter time_bucket = to_epoch(_time, \"MILLIS\")\n| comp \n    min(if(is_failure = 1, time_bucket, null)) as first_failure_time,\n    min(if(is_success\
+    \ = 1, time_bucket, null)) as first_success_time\n    by source_ip_address, identity_name\n| filter first_failure_time != null and first_success_time\
+    \ != null\n| alter time_diff_minutes = (first_success_time - first_failure_time) / 60000\n| filter time_diff_minutes >= 0 and time_diff_minutes\
+    \ <= 15\n| fields source_ip_address, identity_name, first_failure_time, first_success_time, time_diff_minutes\n"
+  lucene: |
+    (event.action:"user-login-failed" OR event.action:"UserLoginFailed" OR event.outcome:"failure") AND (event.category:"authentication" OR event.type:"authentication") AND _exists_:source.ip AND _exists_:user.name
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*Office* OR _sourceCategory=*O365* OR _sourceCategory=*VPN*
+    | json field=_raw "ResultType" as result_type
+    | json field=_raw "ResultDescription" as result_desc
+    | json field=_raw "IPAddress" as src_ip
+    | json field=_raw "UserPrincipalName" as user
+    | json field=_raw "Status" as status
+    | json field=_raw "Operation" as operation
+    | where (result_type = "50126" OR result_desc matches "*password*" OR result_desc matches "*authentication*fail*" OR status matches "*fail*") OR (result_type = "0" OR result_type = "50055" OR status matches "*success*" OR operation = "UserLoggedIn")
+    | parseDate(_messageTime, "yyyy-MM-dd'T'HH:mm:ss") as event_time
+    | where !isEmpty(src_ip) and !isEmpty(user)
+    | sort by user, src_ip, event_time
+    | sessionize user, src_ip max=15m as session_id
+    | where event_time > (now() - 30m)
+    | first(result_type) as first_result, last(result_type) as last_result, first(event_time) as first_time, last(event_time) as last_time by session_id, user, src_ip
+    | where (first_result = "50126" OR first_result != "0") AND (last_result = "0" OR last_result = "50055")
+    | where (last_time - first_time) <= 900000
+    | fields first_time, last_time, user, src_ip, first_result, last_result
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -97,7 +121,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Remote Password Spraying Event
 

@@ -20,68 +20,76 @@ queries:
     UnauthorizedAccess:Runtime/TorClient\" OR type=\"UnauthorizedAccess:Runtime/TorRelay\" OR type=\"UnauthorizedAccess:Lambda/TorClient\" OR\
     \ type=\"UnauthorizedAccess:Lambda/TorRelay\")\n| table _time, type, accountId, region, resource.instanceDetails.instanceId, resource.resourceType,\
     \ severity, title, description\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where Type in ("UnauthorizedAccess:EC2/TorClient", "UnauthorizedAccess:EC2/TorRelay", "UnauthorizedAccess:Runtime/TorClient", "UnauthorizedAccess:Runtime/TorRelay", "UnauthorizedAccess:Lambda/TorClient", "UnauthorizedAccess:Lambda/TorRelay")
+    | project TimeGenerated, Type, Title, Description, AccountId, Region, Resource = tostring(parse_json(AdditionalData).Resource), Severity
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS source, qidname(qid) AS event_type, \"instanceId\" AS instance_id, \"resource.resourceType\"\
+    \ AS resource_type, sourceip, destinationip, username\nFROM events\nWHERE (qidname(qid) ILIKE '%UnauthorizedAccess:EC2/TorClient%' \n   OR\
+    \ qidname(qid) ILIKE '%UnauthorizedAccess:EC2/TorRelay%'\n   OR qidname(qid) ILIKE '%UnauthorizedAccess:Runtime/TorClient%'\n   OR qidname(qid)\
+    \ ILIKE '%UnauthorizedAccess:Runtime/TorRelay%'\n   OR qidname(qid) ILIKE '%UnauthorizedAccess:Lambda/TorClient%'\n   OR qidname(qid) ILIKE\
+    \ '%UnauthorizedAccess:Lambda/TorRelay%')\n  AND LOGSOURCENAME(logsourceid) ILIKE '%GuardDuty%'\nLAST 24 HOURS\n"
+  yara_l: |
+    rule aws_guardduty_tor_proxy_usage {
+      meta:
+        author = "TDL"
+        description = "Detects AWS resources communicating via Tor network based on GuardDuty findings - T1090 Command and Control"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1090"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $guardduty.metadata.product_name = "Amazon GuardDuty"
+        (
+          $guardduty.metadata.product_event_type = "UnauthorizedAccess:EC2/TorClient" or
+          $guardduty.metadata.product_event_type = "UnauthorizedAccess:EC2/TorRelay" or
+          $guardduty.metadata.product_event_type = "UnauthorizedAccess:Runtime/TorClient" or
+          $guardduty.metadata.product_event_type = "UnauthorizedAccess:Runtime/TorRelay" or
+          $guardduty.metadata.product_event_type = "UnauthorizedAccess:Lambda/TorClient" or
+          $guardduty.metadata.product_event_type = "UnauthorizedAccess:Lambda/TorRelay"
+        )
+        $guardduty.principal.resource.name = $resource
 
-    | where eventName matches regex "GuardDuty"
+      match:
+        $resource over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+      outcome:
+        $risk_score = max(75)
+        $resource_name = array_distinct($guardduty.principal.resource.name)
+        $event_types = array_distinct($guardduty.metadata.product_event_type)
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000334 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS TOR Network Activity - GuardDuty\"\n    severity =\
-    \ \"LOW\"\n    tactic = \"TA0011\"\n    technique = \"T1090\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $guardduty
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("UnauthorizedAccess:EC2/TorClient", "UnauthorizedAccess:EC2/TorRelay", "UnauthorizedAccess:Runtime/TorClient", "UnauthorizedAccess:Runtime/TorRelay", "UnauthorizedAccess:Lambda/TorClient", "UnauthorizedAccess:Lambda/TorRelay")
+    | KEEP @timestamp, cloud.account.id, cloud.region, event.type, event.id, event.severity, aws.guardduty.resource.instance_details.instance_id, aws.guardduty.resource.lambda_details.function_name, source.ip, destination.ip
+  leql: |
+    where(source_json.type IN ["UnauthorizedAccess:EC2/TorClient", "UnauthorizedAccess:EC2/TorRelay", "UnauthorizedAccess:Runtime/TorClient", "UnauthorizedAccess:Runtime/TorRelay", "UnauthorizedAccess:Lambda/TorClient", "UnauthorizedAccess:Lambda/TorRelay"])
+  crowdstrike: "#repo=guardduty \n| detail.type in [\"UnauthorizedAccess:EC2/TorClient\", \"UnauthorizedAccess:EC2/TorRelay\", \"UnauthorizedAccess:Runtime/TorClient\"\
+    , \"UnauthorizedAccess:Runtime/TorRelay\", \"UnauthorizedAccess:Lambda/TorClient\", \"UnauthorizedAccess:Lambda/TorRelay\"]\n| table([@timestamp,\
+    \ detail.type, detail.resource.resourceType, detail.resource.instanceDetails.instanceId, detail.resource.lambdaDetails.functionName, detail.service.action.networkConnectionAction.remoteIpDetails.ipAddressV4,\
+    \ detail.severity, detail.accountId, detail.region])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and vendor = "AWS" and source = "guardduty"
+    | filter event_type in ("UnauthorizedAccess:EC2/TorClient", "UnauthorizedAccess:EC2/TorRelay", "UnauthorizedAccess:Runtime/TorClient", "UnauthorizedAccess:Runtime/TorRelay", "UnauthorizedAccess:Lambda/TorClient", "UnauthorizedAccess:Lambda/TorRelay")
+    | fields _time, event_type, resource_sub_type, identity_name, cloud_provider_account_id, raw_log
+  lucene: |
+    aws.guardduty.finding.type:("UnauthorizedAccess:EC2/TorClient" OR "UnauthorizedAccess:EC2/TorRelay" OR "UnauthorizedAccess:Runtime/TorClient" OR "UnauthorizedAccess:Runtime/TorRelay" OR "UnauthorizedAccess:Lambda/TorClient" OR "UnauthorizedAccess:Lambda/TorRelay")
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("UnauthorizedAccess:EC2/TorClient", "UnauthorizedAccess:EC2/TorRelay", "UnauthorizedAccess:Runtime/TorClient", "UnauthorizedAccess:Runtime/TorRelay", "UnauthorizedAccess:Lambda/TorClient", "UnauthorizedAccess:Lambda/TorRelay")
+    | json field=_raw "id" as finding_id
+    | json field=_raw "severity" as severity
+    | json field=_raw "region" as region
+    | json field=_raw "resource.instanceDetails.instanceId" as instance_id
+    | json field=_raw "resource.resourceType" as resource_type
+    | json field=_raw "accountId" as account_id
+    | fields _messageTime, event_type, finding_id, severity, region, instance_id, resource_type, account_id
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -91,7 +99,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"UnauthorizedAccess:EC2/TorClient\", \"UnauthorizedAccess:EC2/TorRelay\", \"\
   UnauthorizedAccess:Runtime/TorClient\", \"UnauthorizedAccess:Runtime/TorRelay\", \"UnauthorizedAccess:Lambda/TorClient\", \"UnauthorizedAccess:Lambda/TorRelay\"\

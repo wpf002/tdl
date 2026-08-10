@@ -17,68 +17,58 @@ risk_score: 55
 queries:
   spl: "index=slack action=\"cli_login\" \n| search NOT [| inputlookup slack_admins.csv | fields user | rename user as source_user]\n| table _time,\
     \ source_user, action, src_ip, user_agent\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    Slack_CL
+    | where TimeGenerated > ago(24h)
+    | where Action_s == "cli_login"
+    | where SourceUser_s !in (datatable(admin:string)["admin1@company.com","admin2@company.com"])
+    | project TimeGenerated, SourceUser_s, Action_s, ClientIP_s, UserAgent_s, DeviceId_s
+  aql: |
+    SELECT "Source User", "Action", eventtime, sourceip, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "Action" = 'cli_login'
+      AND "Source User" NOT IN ('admin1@company.com', 'admin2@company.com', 'admin3@company.com')
+    LAST 24 HOURS
+  yara_l: "rule slack_cli_login_non_admin {\n  meta:\n    author = \"TDL\"\n    description = \"Detects Slack CLI login from non-admin users -\
+    \ T1059\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1059\"\n    severity = \"Medium\"\n    \n  events:\n \
+    \   $e.metadata.product_name = \"Slack\"\n    $e.metadata.product_event_type = \"cli_login\"\n    $e.principal.user.userid = $user\n    not\
+    \ $e.principal.user.attribute.roles.type = \"ADMINISTRATOR\"\n    \n  match:\n    $user over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-slack*
+    | WHERE event.action == "cli_login" AND user.name NOT IN ("admin1", "admin2", "admin3")
+    | KEEP @timestamp, user.name, source.ip, event.action, host.name
+  leql: |
+    where(source_json.action="cli_login" AND source_user NOT IN slack_admins_list)
+  crowdstrike: |
+    #type=slack action="cli_login"
+    | in(field=user, values=[slack_admins_list], negate=true)
+    | table([@timestamp, user, action, source_ip, user_agent])
+  xql: |
+    dataset = slack_audit_logs
+    | filter action = "cli_login"
+    | alter is_admin = array_contains(actor_user_roles, "admin")
+    | filter is_admin = false
+    | fields _time, actor_user_email, actor_user_name, action, entity_name, context_ip_address, context_ua
+  lucene: |
+    action:"cli_login" AND NOT source_user:(admin1 OR admin2 OR admin3)
+    ```
 
-    | where TimeGenerated > ago(1d)
+    Note: Since Slack admin list is dynamic and environment-specific, you'll need to replace `(admin1 OR admin2 OR admin3)` with your actual admin usernames, or use a lookup list/field if your SIEM supports it. For a production query without knowing specific admins:
 
-    | where eventName matches regex ".+"
+    ```
+    action:"cli_login"
+    ```
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000692 {\n  meta:\n    author = \"TDL\"\n    description = \"Slack CLI Accessed by Unauthorized User\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1059\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    Then configure the exclusion list in your alerting rule's condition/filter settings rather than hardcoding usernames in the query.
+  sumo: |
+    _sourceCategory=*Slack* "cli_login"
+    | json field=_raw "action" as action
+    | json field=_raw "user.email" as user_email
+    | json field=_raw "user.name" as user_name
+    | where action = "cli_login"
+    | lookup email from shared://slack_admins on user_email = email nodrop
+    | where isNull(email)
+    | fields _messageTime, user_email, user_name, action
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -88,7 +78,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Slack Event
 

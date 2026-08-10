@@ -16,73 +16,110 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=windows EventCode=4688 (CommandLine="*dumpcreds*" OR CommandLine="*mimikatz*" OR CommandLine="*sekurlsa::*" OR CommandLine="*rpc::*" OR CommandLine="*token::*" OR CommandLine="*crypto::*" OR CommandLine="*dpapi::*" OR CommandLine="*kerberos::*" OR CommandLine="*lsadump::*" OR CommandLine="*privilege::*" OR CommandLine="*process::*" OR CommandLine="*vault::*")
+  spl: 'index=windows EventCode=4688 (CommandLine="*dumpcreds*" OR CommandLine="*mimikatz*" OR CommandLine="*sekurlsa::*" OR CommandLine="*rpc::*"
+    OR CommandLine="*token::*" OR CommandLine="*crypto::*" OR CommandLine="*dpapi::*" OR CommandLine="*kerberos::*" OR CommandLine="*lsadump::*"
+    OR CommandLine="*privilege::*" OR CommandLine="*process::*" OR CommandLine="*vault::*")
+
     | table _time, ComputerName, User, Process_Name, CommandLine, Parent_Process_Name
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4688")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000425 {\n  meta:\n    author = \"TDL\"\n    description = \"Mimikatz Module Use\"\n    severity = \"HIGH\"\n    tactic\
-    \ = \"TA0006\"\n    technique = \"T1003\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(4688)/\n    $user =\
-    \ $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4688
+    | where CommandLine has_any ("dumpcreds","mimikatz","sekurlsa::","rpc::","token::","crypto::","dpapi::","kerberos::","lsadump::","privilege::","process::","vault::")
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName, EventID
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Parent Process Name"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND ("Process CommandLine" ILIKE '%dumpcreds%'
+        OR "Process CommandLine" ILIKE '%mimikatz%'
+        OR "Process CommandLine" ILIKE '%sekurlsa::%'
+        OR "Process CommandLine" ILIKE '%rpc::%'
+        OR "Process CommandLine" ILIKE '%token::%'
+        OR "Process CommandLine" ILIKE '%crypto::%'
+        OR "Process CommandLine" ILIKE '%dpapi::%'
+        OR "Process CommandLine" ILIKE '%kerberos::%'
+        OR "Process CommandLine" ILIKE '%lsadump::%'
+        OR "Process CommandLine" ILIKE '%privilege::%'
+        OR "Process CommandLine" ILIKE '%process::%'
+        OR "Process CommandLine" ILIKE '%vault::%')
+    LAST 1 HOURS
+  yara_l: |
+    rule credential_access_known_tools {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects known credential dumping tool commands in process creation events"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1003"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 day
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688"
+        )
+        (
+          re.regex($e.principal.process.command_line, `(?i)dumpcreds`) or
+          re.regex($e.principal.process.command_line, `(?i)mimikatz`) or
+          re.regex($e.principal.process.command_line, `(?i)sekurlsa::`) or
+          re.regex($e.principal.process.command_line, `(?i)rpc::`) or
+          re.regex($e.principal.process.command_line, `(?i)token::`) or
+          re.regex($e.principal.process.command_line, `(?i)crypto::`) or
+          re.regex($e.principal.process.command_line, `(?i)dpapi::`) or
+          re.regex($e.principal.process.command_line, `(?i)kerberos::`) or
+          re.regex($e.principal.process.command_line, `(?i)lsadump::`) or
+          re.regex($e.principal.process.command_line, `(?i)privilege::`) or
+          re.regex($e.principal.process.command_line, `(?i)process::`) or
+          re.regex($e.principal.process.command_line, `(?i)vault::`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "authentication" AND event_id IN ("4688")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4688])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4688)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4688")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4688)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4688")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-system.security*, winlogbeat-*, logs-endpoint.events.process*
+    | WHERE (winlog.event_id IN (592, 4688) OR event.code IN ("592", "4688"))
+      AND (
+        process.command_line LIKE "*dumpcreds*" OR
+        process.command_line LIKE "*mimikatz*" OR
+        process.command_line LIKE "*sekurlsa::*" OR
+        process.command_line LIKE "*rpc::*" OR
+        process.command_line LIKE "*token::*" OR
+        process.command_line LIKE "*crypto::*" OR
+        process.command_line LIKE "*dpapi::*" OR
+        process.command_line LIKE "*kerberos::*" OR
+        process.command_line LIKE "*lsadump::*" OR
+        process.command_line LIKE "*privilege::*" OR
+        process.command_line LIKE "*process::*" OR
+        process.command_line LIKE "*vault::*"
+      )
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, winlog.event_id, event.code
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND (process_cmd_line ICONTAINS "dumpcreds" OR process_cmd_line ICONTAINS "mimikatz" OR process_cmd_line ICONTAINS "sekurlsa::" OR process_cmd_line ICONTAINS "rpc::" OR process_cmd_line ICONTAINS "token::" OR process_cmd_line ICONTAINS "crypto::" OR process_cmd_line ICONTAINS "dpapi::" OR process_cmd_line ICONTAINS "kerberos::" OR process_cmd_line ICONTAINS "lsadump::" OR process_cmd_line ICONTAINS "privilege::" OR process_cmd_line ICONTAINS "process::" OR process_cmd_line ICONTAINS "vault::"))
+  crowdstrike: |
+    EventCode=4688 (CommandLine=*dumpcreds* OR CommandLine=*mimikatz* OR CommandLine=*sekurlsa::* OR CommandLine=*rpc::* OR CommandLine=*token::* OR CommandLine=*crypto::* OR CommandLine=*dpapi::* OR CommandLine=*kerberos::* OR CommandLine=*lsadump::* OR CommandLine=*privilege::* OR CommandLine=*process::* OR CommandLine=*vault::*)
+    | table([@timestamp, ComputerName, UserName, ParentProcessName, ProcessName, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+      and (action_process_image_command_line ~= "(?i)(dumpcreds|mimikatz|sekurlsa::|rpc::|token::|crypto::|dpapi::|kerberos::|lsadump::|privilege::|process::|vault::)")
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:(592 OR 4688) AND process.command_line:(*dumpcreds* OR *mimikatz* OR *sekurlsa\:\:* OR *rpc\:\:* OR *token\:\:* OR *crypto\:\:* OR *dpapi\:\:* OR *kerberos\:\:* OR *lsadump\:\:* OR *privilege\:\:* OR *process\:\:* OR *vault\:\:*)
+  sumo: |
+    _sourceCategory=*Windows* (592 OR 4688) (dumpcreds OR mimikatz OR "sekurlsa::" OR "rpc::" OR "token::" OR "crypto::" OR "dpapi::" OR "kerberos::" OR "lsadump::" OR "privilege::" OR "process::" OR "vault::")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as command_line
+    | where event_id in ("592", "4688")
+    | where command_line matches "*dumpcreds*" or command_line matches "*mimikatz*" or command_line matches "*sekurlsa::*" or command_line matches "*rpc::*" or command_line matches "*token::*" or command_line matches "*crypto::*" or command_line matches "*dpapi::*" or command_line matches "*kerberos::*" or command_line matches "*lsadump::*" or command_line matches "*privilege::*" or command_line matches "*process::*" or command_line matches "*vault::*"
+    | fields _messageTime, _sourceHost, event_id, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -92,7 +129,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Process Creation Event
 

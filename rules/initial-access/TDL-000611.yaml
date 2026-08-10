@@ -15,88 +15,99 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=firewall action=allowed (src_ip=10.* OR src_ip=172.16.* OR src_ip=172.17.* OR src_ip=172.18.* OR src_ip=172.19.* OR src_ip=172.20.* OR src_ip=172.21.* OR src_ip=172.22.* OR src_ip=172.23.* OR src_ip=172.24.* OR src_ip=172.25.* OR src_ip=172.26.* OR src_ip=172.27.* OR src_ip=172.28.* OR src_ip=172.29.* OR src_ip=172.30.* OR src_ip=172.31.* OR src_ip=192.168.*) NOT (dest_ip=10.* OR dest_ip=172.16.* OR dest_ip=172.17.* OR dest_ip=172.18.* OR dest_ip=172.19.* OR dest_ip=172.20.* OR dest_ip=172.21.* OR dest_ip=172.22.* OR dest_ip=172.23.* OR dest_ip=172.24.* OR dest_ip=172.25.* OR dest_ip=172.26.* OR dest_ip=172.27.* OR dest_ip=172.28.* OR dest_ip=172.29.* OR dest_ip=172.30.* OR dest_ip=172.31.* OR dest_ip=192.168.*) (dest_port=3389 OR app=rdp OR application=rdp) earliest=-90d
+  spl: 'index=firewall action=allowed (src_ip=10.* OR src_ip=172.16.* OR src_ip=172.17.* OR src_ip=172.18.* OR src_ip=172.19.* OR src_ip=172.20.*
+    OR src_ip=172.21.* OR src_ip=172.22.* OR src_ip=172.23.* OR src_ip=172.24.* OR src_ip=172.25.* OR src_ip=172.26.* OR src_ip=172.27.* OR src_ip=172.28.*
+    OR src_ip=172.29.* OR src_ip=172.30.* OR src_ip=172.31.* OR src_ip=192.168.*) NOT (dest_ip=10.* OR dest_ip=172.16.* OR dest_ip=172.17.* OR
+    dest_ip=172.18.* OR dest_ip=172.19.* OR dest_ip=172.20.* OR dest_ip=172.21.* OR dest_ip=172.22.* OR dest_ip=172.23.* OR dest_ip=172.24.* OR
+    dest_ip=172.25.* OR dest_ip=172.26.* OR dest_ip=172.27.* OR dest_ip=172.28.* OR dest_ip=172.29.* OR dest_ip=172.30.* OR dest_ip=172.31.* OR
+    dest_ip=192.168.*) (dest_port=3389 OR app=rdp OR application=rdp) earliest=-90d
+
     | eval baseline_start=relative_time(now(), "-90d")
+
     | eval baseline_end=relative_time(now(), "-30d")
+
     | eval is_baseline=if(_time >= baseline_start AND _time < baseline_end, 1, 0)
+
     | eval is_detection_window=if(_time >= baseline_end, 1, 0)
+
     | eventstats values(dest_ip) as baseline_dest_ips by src_ip, is_baseline
+
     | where is_detection_window=1
+
     | eval is_new=if(NOT match(baseline_dest_ips, dest_ip), 1, 0)
+
     | where is_new=1
+
     | table _time, src_ip, dest_ip, dest_port, app, application, action
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where application matches regex "rdp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "application" LIKE ''%rdp%''
-
+  kql: "let LookbackPeriod = 90d;\nlet LearningPeriod = 30d;\nlet MonitoringWindow = 1d;\nCommonSecurityLog\n| where TimeGenerated between (ago(LookbackPeriod)\
+    \ .. now())\n| where DeviceDirection == \"Outbound\"\n| where DeviceAction in (\"Allow\", \"Allowed\", \"accept\")\n| where (DestinationPort\
+    \ == 3389 or ApplicationProtocol =~ \"rdp\")\n| where not(ipv4_is_private(DestinationIP))\n| extend IsBaseline = iff(TimeGenerated < ago(MonitoringWindow\
+    \ + LearningPeriod), 1, 0)\n| extend IsMonitoring = iff(TimeGenerated >= ago(MonitoringWindow), 1, 0)\n| summarize \n    BaselineDestinations\
+    \ = make_set_if(DestinationIP, IsBaseline == 1),\n    MonitoringDestinations = make_set_if(DestinationIP, IsMonitoring == 1),\n    FirstSeen\
+    \ = min(TimeGenerated),\n    LastSeen = max(TimeGenerated)\n    by SourceIP\n| mv-expand MonitoringDestination = MonitoringDestinations to\
+    \ typeof(string)\n| where not(set_has_element(BaselineDestinations, MonitoringDestination))\n| project SourceIP, NewDestinationIP = MonitoringDestination,\
+    \ FirstSeen, LastSeen\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count
+    FROM events
+    WHERE (destinationip NOT IN (SELECT destinationip FROM events WHERE sourceip = sourceip LAST 30 DAYS) OR destinationip NOT IN (SELECT DISTINCT destinationip FROM events WHERE sourceip = sourceip START (CURRENT_TIMESTAMP - 2592000000) STOP (CURRENT_TIMESTAMP - 86400000)))
+      AND (INOFFENSE(sourceip) = 'false' OR INCIDR(sourceip, '10.0.0.0/8') OR INCIDR(sourceip, '172.16.0.0/12') OR INCIDR(sourceip, '192.168.0.0/16'))
+      AND NOT (INCIDR(destinationip, '10.0.0.0/8') OR INCIDR(destinationip, '172.16.0.0/12') OR INCIDR(destinationip, '192.168.0.0/16'))
+      AND (CATEGORYNAME(category) ILIKE '%firewall%' OR CATEGORYNAME(category) ILIKE '%permit%' OR CATEGORYNAME(category) ILIKE '%allow%' OR destinationport = 3389 OR "Application" ILIKE '%rdp%')
     GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000611 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Allowed Outbound RDP Traffic\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1021\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.application\
-    \ = /rdp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND application LIKE "%rdp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND application=/rdp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*rdp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND application ~= "rdp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND application:*rdp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where application matches "*rdp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    LAST 90 DAYS
+  yara_l: "rule outbound_rdp_new_destination {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects outbound RDP connections\
+    \ to new external destinations\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1021\"\n    severity = \"\
+    Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.direction = \"OUTBOUND\"\n    $e.security_result.action\
+    \ = \"ALLOW\"\n    (\n      $e.target.port = 3389 or\n      $e.network.application_protocol = \"RDP\"\n    )\n    net.ip_in_range_cidr($e.principal.ip,\
+    \ \"10.0.0.0/8\") or\n    net.ip_in_range_cidr($e.principal.ip, \"172.16.0.0/12\") or\n    net.ip_in_range_cidr($e.principal.ip, \"192.168.0.0/16\"\
+    )\n    not net.ip_in_range_cidr($e.target.ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($e.target.ip, \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($e.target.ip,\
+    \ \"192.168.0.0/16\")\n    $e.principal.ip = $src_ip\n    $e.target.ip = $dst_ip\n    \n  match:\n    $src_ip over 1h\n    \n  outcome:\n\
+    \    $risk_score = 35\n    $dst_ips = array_distinct($dst_ip)\n    \n  condition:\n    $e and #dst_ip > 0\n}\n"
+  esql: |
+    FROM logs-network.firewall*
+    | WHERE @timestamp > NOW() - 90 days
+      AND network.direction == "outbound"
+      AND source.ip RLIKE "^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)"
+      AND NOT destination.ip RLIKE "^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)"
+      AND (event.action == "allowed" OR destination.port == 3389 OR network.application == "rdp")
+    | EVAL baseline_period = CASE(@timestamp <= NOW() - 60 days, "baseline", @timestamp > NOW() - 60 days AND @timestamp <= NOW() - 30 days, "baseline", "detection")
+    | STATS baseline_count = COUNT(*) BY destination.ip, source.ip, baseline_period
+    | WHERE baseline_period == "detection"
+    | STATS detection_hosts = COUNT(*) BY destination.ip
+    | WHERE detection_hosts > 0
+    | EVAL new_in_last_30_days = true
+    | KEEP destination.ip, source.ip
+  leql: |
+    where(source_address=PRIVATE AND destination_address!=PRIVATE AND (action=allowed OR destination_port=3389 OR application ICONTAINS "rdp")) groupby(destination_address) calculate(count)
+  crowdstrike: |
+    #type=firewall action=allowed (DestinationPort=3389 OR Application=rdp) Direction=outbound
+    | groupBy([SourceIP, DestinationIP], function=[count(as=events), min(@timestamp, as=firstSeen)])
+    | firstSeen > (now() - 30d)
+    | table([SourceIP, DestinationIP, events, firstSeen])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_outcome = OUTCOME_ALLOWED
+       and dest_port = 3389
+       and app = "rdp"
+       and (dest_ip_class = IP_CLASS_EXTERNAL or dest_ip_type = DESTINATION_IP_TYPE_EXTERNAL or not incidr(dest_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+       and (src_ip_class = IP_CLASS_INTERNAL or incidr(src_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+    | alter days_back = timestamp_diff(_time, current_time(), "DAY")
+    | filter days_back >= -90
+    | comp count() as conn_count by src_ip, dest_ip
+    | alter first_seen_window = if(days_back >= -30, "baseline", "recent")
+    | comp values(first_seen_window) as periods by dest_ip
+    | filter periods = array_distinct(array("recent")) or (arraylen(periods) = 1 and periods[0] = "recent")
+    | fields dest_ip, conn_count
+  lucene: |
+    (firewall.action:allowed OR firewall.action:permit OR firewall.action:accept) AND (destination.port:3389 OR application:rdp OR app:rdp) AND (source.ip:10.0.0.0/8 OR source.ip:172.16.0.0/12 OR source.ip:192.168.0.0/16) AND NOT (destination.ip:10.0.0.0/8 OR destination.ip:172.16.0.0/12 OR destination.ip:192.168.0.0/16)
+  sumo: "_sourceCategory=*Firewall* \n| parse regex \"(?<src_ip>\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\" nodrop\n| parse regex \"(?<dest_ip>\\\
+    d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\" nodrop\n| parse regex \"(?i)(?<action>allow|permitted|accept)\" nodrop\n| parse regex \"(?i)port[:\\\
+    s]+(?<dest_port>\\d+)\" nodrop\n| parse regex \"(?i)app[lication]*[:\\s]+(?<application>[^\\s,]+)\" nodrop\n| where (action matches \"*allow*\"\
+    \ or action matches \"*permit*\" or action matches \"*accept*\") or dest_port = \"3389\" or application matches \"*rdp*\"\n| where !isPrivateIP(dest_ip)\n\
+    | timeslice 1d\n| count_distinct(_timeslice) as days_seen by dest_ip, src_ip\n| where days_seen = 1\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -106,7 +117,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Firewall Event \nFrom one internal source to one external destination (Outbound)\nWhere the Action is Allowed\nOR\n    Where\
   \ the Destination Port is \"3389\"\n\n    Where the Application is \"rdp\"\n\nBaseline Learning: 30 Days\nRetention: 90 Days\n\nNew Value: Destination\

@@ -16,71 +16,47 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=google_workspace sourcetype=google:gws:admin events.name IN ("REMOVE_APPLICATION", "REMOVE_APPLICATION_FROM_WHITELIST")
+  spl: 'index=google_workspace sourcetype=google:gws:admin events.name IN ("REMOVE_APPLICATION", "REMOVE_APPLICATION_FROM_WHITELIST")
+
     | table _time, user, events.name, ipAddress, actor.email, events.parameters.APPLICATION_NAME
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_000299 {\n  meta:\n    author = \"TDL\"\n    description = \"Google Workspace Application Removed\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0040\"\n    technique = \"T1489\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    GWorkspaceActivityReports
+    | where TimeGenerated > ago(1h)
+    | where EventName in ("REMOVE_APPLICATION", "REMOVE_APPLICATION_FROM_WHITELIST")
+    | project TimeGenerated, ActorEmail, EventName, OrganizationUnitPath, IPAddress, ActorType, Parameters
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS log_source, "Event Name", "Application Name", QIDNAME(qid) AS event_name
+    FROM events
+    WHERE ("Event Name" = 'REMOVE_APPLICATION' OR "Event Name" = 'REMOVE_APPLICATION_FROM_WHITELIST')
+      AND LOGSOURCENAME(logsourceid) ILIKE '%Google Workspace%'
+    LAST 24 HOURS
+  yara_l: "rule gws_service_stop_remove_application {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects removal of\
+    \ applications in Google Workspace - MITRE T1489\"\n    mitre_attack_tactic = \"Impact\"\n    mitre_attack_technique = \"T1489\"\n    severity\
+    \ = \"Medium\"\n    \n  events:\n    $e.metadata.product_name = \"Google Workspace\"\n    (\n      $e.metadata.product_event_type = \"REMOVE_APPLICATION\"\
+    \ or\n      $e.metadata.product_event_type = \"REMOVE_APPLICATION_FROM_WHITELIST\"\n    )\n    $e.principal.user.userid = $user\n    \n  match:\n\
+    \    $user over 1h\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-google_workspace*
+    | WHERE event.action IN ("REMOVE_APPLICATION", "REMOVE_APPLICATION_FROM_WHITELIST")
+    | KEEP @timestamp, user.email, event.action, source.ip, google_workspace.admin.application.name, google_workspace.organization.domain
+  leql: |
+    where(source_json.events.name IN ["REMOVE_APPLICATION", "REMOVE_APPLICATION_FROM_WHITELIST"])
+  crowdstrike: |
+    #type=google_workspace events.name IN ["REMOVE_APPLICATION", "REMOVE_APPLICATION_FROM_WHITELIST"]
+    | table([@timestamp, actor.email, events.name, events.parameters.APPLICATION_NAME, ipAddress])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "GCP" and event_type = "GOOGLE_WORKSPACE" and events.name in ("REMOVE_APPLICATION", "REMOVE_APPLICATION_FROM_WHITELIST")
+    | fields _time, actor_user, events.name, events.parameters, cloud_resource
+  lucene: |
+    events.name:(REMOVE_APPLICATION OR REMOVE_APPLICATION_FROM_WHITELIST)
+  sumo: |
+    _sourceCategory=*Google*Workspace*
+    | json field=_raw "events[*].name" as event_name
+    | where event_name in ("REMOVE_APPLICATION", "REMOVE_APPLICATION_FROM_WHITELIST")
+    | fields _messageTime, _sourceHost, event_name
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +66,7 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Google Workspace Event
 

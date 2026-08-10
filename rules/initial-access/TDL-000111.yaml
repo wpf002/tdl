@@ -18,71 +18,78 @@ risk_score: 55
 queries:
   spl: "index=windows sourcetype=WinEventLog:Security (EventCode=644 OR EventCode=4740) \n| lookup high_value_users.csv username as TargetUserName\
     \ OUTPUT username as hvt_user \n| where isnotnull(hvt_user) \n| table _time, ComputerName, EventCode, TargetUserName, Account_Name, Caller_Computer_Name\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (644, 4740)
+    | where TargetUserName in ("Administrator", "Domain Admin", "Enterprise Admin", "KRBTGT", "Schema Admin")
+    | project TimeGenerated, Computer, EventID, TargetUserName, Account, SubjectUserName, Activity
+  aql: |
+    SELECT username, "Target Username", sourceip, LOGSOURCENAME(logsourceid) AS host, eventtime, COUNT(*) AS lockout_count
+    FROM events
+    WHERE "EventID" IN ('644', '4740')
+      AND "Target Username" IN ('Administrator', 'admin', 'Domain Admin', 'Enterprise Admin', 'krbtgt', 'svc_admin', 'backup_admin')
+    LAST 1 HOURS
+  yara_l: |
+    rule high_value_account_lockout {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects account lockout events for high value target users - MITRE T1531 Initial Access"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1531"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
+        ($e.metadata.product_event_type = "644" or $e.metadata.product_event_type = "4740")
+        $e.target.user.userid = $user
+        // High value target users - modify this list based on your environment
+        $user in [
+          "administrator",
+          "domain admin",
+          "enterprise admin",
+          "schema admin",
+          "backup operators",
+          "account operators",
+          "server operators",
+          "print operators",
+          "domain admins",
+          "enterprise admins"
+        ]
+        $e.principal.hostname = $host
 
-    | where event_id in ("4740")
+      match:
+        $user, $host over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      outcome:
+        $risk_score = 75
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4740')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000111 {\n  meta:\n    author = \"TDL\"\n    description = \"HVT User Account Lockout\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1531\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4740)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND event_id IN ("4740")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4740])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4740)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4740")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4740)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4740")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-system.security*, winlogbeat-*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.code IN (\"644\", \"4740\") \n  AND user.name\
+    \ IN (\"Administrator\", \"Domain Admins\", \"Enterprise Admins\", \"krbtgt\", \"backup_admin\", \"sql_service\", \"sharepoint_admin\")\n\
+    | STATS lockouts = COUNT(*) BY user.name, host.name, bucket = BUCKET(@timestamp, 1 hour)\n| WHERE lockouts >= 1\n| KEEP bucket, host.name,\
+    \ user.name, lockouts\n| SORT bucket DESC\n"
+  leql: |
+    where(source_json.EventID IN [644, 4740] AND destination_user IN ["<high_value_target_user_1>", "<high_value_target_user_2>"])
+  crowdstrike: "EventCode=4740 \n| TargetUserName in [\"Administrator\", \"Domain Admin\", \"Enterprise Admin\", \"Schema Admin\", \"Backup Operator\"\
+    , \"Account Operator\", \"Server Operator\", \"Print Operator\", \"KRBTGT\"]\n| table([@timestamp, ComputerName, TargetUserName, SubjectUserName,\
+    \ SubjectDomainName])\n"
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (644, 4740)
+    | filter action_evtlog_event_data_TargetUserName in ("Administrator", "Domain Admin", "Enterprise Admin", "krbtgt", "KRBTGT")
+    | fields _time, agent_hostname, action_evtlog_event_data_TargetUserName, action_evtlog_event_id, action_evtlog_message
+  lucene: |
+    event.code:(644 OR 4740) AND user.target.name:("Administrator" OR "Domain Admin" OR "Enterprise Admin" OR "krbtgt" OR "KRBTGT")
+  sumo: |
+    _sourceCategory=*Windows*Security* ("644" OR "4740")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetUserName" as target_user
+    | where event_id in ("644", "4740")
+    | where target_user in ("Administrator", "Domain Admin", "Enterprise Admin", "Schema Admin", "Backup Operator", "Account Operator", "krbtgt", "KRBTGT")
+    | fields _messageTime, _sourceHost, event_id, target_user
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -92,7 +99,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Windows Account Locked Out Event
 

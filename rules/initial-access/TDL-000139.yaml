@@ -16,78 +16,71 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=626 OR EventCode=4722)
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=626 OR EventCode=4722)
+
     | lookup company_ad_domains.csv domain AS TargetUserName OUTPUT domain AS is_company_domain
+
     | where isnotnull(is_company_domain)
+
     | lookup authorized_user_admins.csv user AS Account_Name OUTPUT user AS is_authorized
+
     | where isnull(is_authorized)
+
     | table _time, ComputerName, EventCode, Account_Name, TargetUserName, TargetDomainName
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4722")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4722')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000139 {\n  meta:\n    author = \"TDL\"\n    description = \"Domain Account Enabled by Unauthorized User\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id\
-    \ = /(4722)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND event_id IN ("4722")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4722])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4722)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4722")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4722)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4722")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (626, 4722)
+    | where TargetAccount has "@" or Computer has "."
+    | where SubjectUserName !in~ ("admin", "svc_account", "authorized_user")
+    | project TimeGenerated, Computer, EventID, SubjectUserName, SubjectDomainName, TargetAccount, TargetDomainName, Activity
+  aql: |
+    SELECT eventtime, sourceip, username AS source_user, "Destination User Domain", "Destination Username", LOGSOURCENAME(logsourceid) AS host
+    FROM events
+    WHERE "EventID" IN ('626', '4722')
+      AND "Destination User Domain" IN ('corp.company.com', 'company.local')
+      AND username NOT IN ('admin_account1', 'admin_account2', 'service_account')
+    LAST 24 HOURS
+  yara_l: "rule windows_user_account_enabled_unauthorized {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects unauthorized\
+    \ user account enabled events (MITRE T1098 - Account Manipulation)\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1098\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"USER_CREATION\"\n    $e.metadata.product_event_type\
+    \ = \"4722\"\n    $e.target.user.userid = $dest_user\n    $e.principal.user.userid = $source_user\n    $e.principal.hostname = $host\n   \
+    \ \n    // Company AD Domains - adjust these to your environment\n    (\n      re.regex($e.target.user.userid, `(?i)@(company\\.com|corp\\\
+    .company\\.com|internal\\.company\\.com)$`) or\n      re.regex($e.target.user.userid, `(?i)^(company|corp)\\\\`)\n    )\n    \n    // Exclude\
+    \ authorized users - adjust these to your environment\n    not re.regex($e.principal.user.userid, `(?i)^(svc_admin|domain_admin|user_provisioning|ad_automation)`)\n\
+    \    \n  match:\n    $host, $source_user over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-system.security*, logs-windows.security*, winlogbeat-*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.code IN ("626", "4722")
+      AND winlog.event_data.TargetDomainName IN ("CORP", "INTERNAL", "DOMAIN")
+      AND winlog.event_data.SubjectUserName NOT IN ("admin", "svcadmin", "domainadmin", "helpdesk")
+    | STATS event_count = COUNT(*) BY host.name, winlog.event_data.SubjectUserName, winlog.event_data.TargetUserName, winlog.event_data.TargetDomainName, @timestamp
+    | KEEP @timestamp, host.name, winlog.event_data.SubjectUserName, winlog.event_data.TargetUserName, winlog.event_data.TargetDomainName, event_count
+  leql: |
+    where(source_json.EventID IN [626, 4722] AND source_json.TargetDomainName IN ["CORP", "DOMAIN"] AND NOT(source_json.SubjectUserName IN ["admin1", "admin2", "svcaccount"]))
+  crowdstrike: "EventCode=4722 \n| NOT (SourceUserName IN [\"authorized_user1\", \"authorized_user2\", \"authorized_service_account\"])\n| TargetDomainName\
+    \ IN [\"corp.company.com\", \"company.local\", \"company.com\"]\n| table([@timestamp, ComputerName, SourceUserName, TargetUserName, TargetDomainName,\
+    \ EventCode])\n"
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (626, 4722)
+    | filter action_evtlog_event_data_TargetDomainName in ("corp.local", "domain.local")
+    | filter actor_effective_username not in ("admin_svc", "hr_admin", "it_admin")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_data_TargetUserName, action_evtlog_event_data_TargetDomainName, action_evtlog_event_id
+  lucene: |
+    event.code:4722 AND winlog.event_data.TargetDomainName:(domain1.local OR domain2.local OR domain3.local) AND NOT winlog.event_data.SubjectUserName:(authorized_user1 OR authorized_user2 OR authorized_user3)
+  sumo: |
+    _sourceCategory=*Windows*Security* ("626" OR "4722")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetDomainName" as dest_domain
+    | json field=_raw "SubjectUserName" as source_user
+    | where event_id in ("626", "4722")
+    | where dest_domain in ("corp.company.com", "company.local", "company.com")
+    | where !(source_user in ("admin_svc", "provisioning_account", "hr_automation"))
+    | fields _messageTime, _sourceHost, event_id, source_user, dest_domain
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -97,7 +90,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Windows User Created Event
 

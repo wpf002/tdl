@@ -17,82 +17,98 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=4728 OR EventCode=4732 OR EventCode=4756)
-    | search Group_Name IN ("Group Policy Creator Owners", "Administrators", "DHCP Administrators", "DnsAdmins", "Domain Admins", "Enterprise Admins", "Enterprise Key Admins", "Hyper-V Administrators", "Key Admins", "Schema Admins", "Storage Replica Administrators")
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=4728 OR EventCode=4732 OR EventCode=4756)
+
+    | search Group_Name IN ("Group Policy Creator Owners", "Administrators", "DHCP Administrators", "DnsAdmins", "Domain Admins", "Enterprise
+    Admins", "Enterprise Key Admins", "Hyper-V Administrators", "Key Admins", "Schema Admins", "Storage Replica Administrators")
+
     | search NOT SubjectUserName IN ("authorized_user1", "authorized_user2", "authorized_user3")
+
     | table _time, ComputerName, SubjectUserName, TargetUserName, Group_Name, EventCode
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (632, 4728, 636, 4732, 660, 4756)
+    | extend GroupName = TargetUserName
+    | where GroupName in ("Group Policy Creator Owners", "Administrators", "DHCP Administrators", "DnsAdmins", "Domain Admins", "Enterprise Admins", "Enterprise Key Admins", "Hyper-V Administrators", "Key Admins", "Schema Admins", "Storage Replica Administrators")
+    | extend SourceUser = SubjectUserName
+    | where SourceUser !in ("", "SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE")
+    | project TimeGenerated, Computer, EventID, SourceUser, GroupName, TargetAccount, SubjectDomainName, TargetDomainName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, "EventID", "Group Name", "Target Username" AS added_user, username AS source_user
+    FROM events
+    WHERE "EventID" IN ('632', '4728', '636', '4732', '660', '4756')
+      AND "Group Name" IN ('Group Policy Creator Owners', 'Administrators', 'DHCP Administrators', 'DnsAdmins', 'Domain Admins', 'Enterprise Admins', 'Enterprise Key Admins', 'Hyper-V Administrators', 'Key Admins', 'Schema Admins', 'Storage Replica Administrators')
+      AND username NOT IN ('authorized_user1', 'authorized_user2')
+    LAST 24 HOURS
+  yara_l: |
+    rule windows_user_added_to_privileged_group {
+      meta:
+        author = "TDL"
+        description = "Detects user additions to high-value security groups by unauthorized accounts"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "GROUP_MODIFICATION"
+        (
+          $e.metadata.product_event_type = "632" or
+          $e.metadata.product_event_type = "4728" or
+          $e.metadata.product_event_type = "636" or
+          $e.metadata.product_event_type = "4732" or
+          $e.metadata.product_event_type = "660" or
+          $e.metadata.product_event_type = "4756"
+        )
+        (
+          re.regex($e.target.group.group_display_name, `(?i)(Group Policy Creator Owners|Administrators|DHCP Administrators|DnsAdmins|Domain Admins|Enterprise Admins|Enterprise Key Admins|Hyper-V Administrators|Key Admins|Schema Admins|Storage Replica Administrators)`) or
+          re.regex($e.security_result.about.group.group_display_name, `(?i)(Group Policy Creator Owners|Administrators|DHCP Administrators|DnsAdmins|Domain Admins|Enterprise Admins|Enterprise Key Admins|Hyper-V Administrators|Key Admins|Schema Admins|Storage Replica Administrators)`)
+        )
+        not re.regex($e.principal.user.userid, `(?i)(authorized_admin1|authorized_admin2|service_account)`)
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $actor
 
-    WHERE "network.protocol" LIKE ''%tcp%''
+      match:
+        $host, $actor over 5m
 
-    GROUP BY sourceip, destinationip, destinationport
+      outcome:
+        $risk_score = 75
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000014 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized Addition to HVT Group\"\n    severity =\
-    \ \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*
+    | WHERE event.code IN ("632", "4728", "636", "4732", "660", "4756")
+      AND winlog.event_data.TargetUserName IN ("Group Policy Creator Owners", "Administrators", "DHCP Administrators", "DnsAdmins", "Domain Admins", "Enterprise Admins", "Enterprise Key Admins", "Hyper-V Administrators", "Key Admins", "Schema Admins", "Storage Replica Administrators")
+      AND user.name IS NOT NULL
+    | KEEP @timestamp, host.name, user.name, winlog.event_data.TargetUserName, winlog.event_data.MemberName, event.code
+  leql: |
+    where(source_json.EventID IN [632, 4728, 636, 4732, 660, 4756] AND source_json.TargetUserName IN ["Group Policy Creator Owners", "Administrators", "DHCP Administrators", "DnsAdmins", "Domain Admins", "Enterprise Admins", "Enterprise Key Admins", "Hyper-V Administrators", "Key Admins", "Schema Admins", "Storage Replica Administrators"] AND source_json.SubjectUserName NOT IN []) groupby(source_json.SubjectUserName, source_json.TargetUserName, asset) calculate(count)
+  crowdstrike: "(EventCode=4728 OR EventCode=4732 OR EventCode=4756) \n(TargetUserName=\"Group Policy Creator Owners\" OR TargetUserName=\"Administrators\"\
+    \ OR TargetUserName=\"DHCP Administrators\" OR TargetUserName=\"DnsAdmins\" OR TargetUserName=\"Domain Admins\" OR TargetUserName=\"Enterprise\
+    \ Admins\" OR TargetUserName=\"Enterprise Key Admins\" OR TargetUserName=\"Hyper-V Administrators\" OR TargetUserName=\"Key Admins\" OR TargetUserName=\"\
+    Schema Admins\" OR TargetUserName=\"Storage Replica Administrators\")\n| table([@timestamp, ComputerName, SubjectUserName, TargetUserName,\
+    \ MemberName, EventCode])\n"
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (632, 4728, 636, 4732, 660, 4756)
+    | filter action_evtlog_event_data_TargetUserName in ("Group Policy Creator Owners", "Administrators", "DHCP Administrators", "DnsAdmins", "Domain Admins", "Enterprise Admins", "Enterprise Key Admins", "Hyper-V Administrators", "Key Admins", "Schema Admins", "Storage Replica Administrators")
+    | filter action_evtlog_event_data_SubjectUserName != ""
+    | fields _time, agent_hostname, action_evtlog_event_id, action_evtlog_event_data_SubjectUserName, action_evtlog_event_data_TargetUserName, action_evtlog_event_data_MemberName
+  lucene: |
+    event.code:(632 OR 4728 OR 636 OR 4732 OR 660 OR 4756) AND winlog.event_data.TargetUserName:("Group Policy Creator Owners" OR "Administrators" OR "DHCP Administrators" OR "DnsAdmins" OR "Domain Admins" OR "Enterprise Admins" OR "Enterprise Key Admins" OR "Hyper-V Administrators" OR "Key Admins" OR "Schema Admins" OR "Storage Replica Administrators") AND NOT winlog.event_data.SubjectUserName:([authorized_user_list])
+  sumo: |
+    _sourceCategory=*Windows* (*4728* OR *4732* OR *4756* OR *632* OR *636* OR *660*)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetUserName" as group_name
+    | json field=_raw "SubjectUserName" as source_user
+    | where event_id in ("632", "4728", "636", "4732", "660", "4756")
+    | where group_name in ("Group Policy Creator Owners", "Administrators", "DHCP Administrators", "DnsAdmins", "Domain Admins", "Enterprise Admins", "Enterprise Key Admins", "Hyper-V Administrators", "Key Admins", "Schema Admins", "Storage Replica Administrators")
+    | where !(source_user matches "*svc*" OR source_user matches "*admin*")
+    | fields _messageTime, _sourceHost, event_id, group_name, source_user
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -102,7 +118,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows User Added to Security Group Event\nWhere the Event ID is in [632, 4728, 636, 4732, 660, 4756]\nOR\n          Where the\
   \ Group Name is in the High Value Target Groups List\n\n          Where Group Name is in [Group Policy Creator Owners, Administrators, DHCP\

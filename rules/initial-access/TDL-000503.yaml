@@ -16,80 +16,73 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=* (sourcetype=waf OR sourcetype=network OR sourcetype=ids OR sourcetype=ips) action=blocked Signature="*log4j*"
+  spl: 'index=* (sourcetype=waf OR sourcetype=network OR sourcetype=ids OR sourcetype=ips) action=blocked Signature="*log4j*"
+
     | table _time, src, dest, Signature, action, http_method, url, user_agent
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceAction =~ "Blocked"
+    | where Message has "log4j" or DeviceCustomString1 has "log4j" or DeviceCustomString2 has "log4j" or DeviceCustomString3 has "log4j" or DeviceCustomString4 has "log4j" or DeviceCustomString5 has "log4j" or DeviceCustomString6 has "log4j" or AdditionalExtensions has "log4j" or Activity has "log4j"
+    | project TimeGenerated, DeviceVendor, DeviceProduct, DeviceAction, SourceIP, DestinationIP, RequestURL, Message, Activity, DeviceCustomString1, DeviceCustomString2, DeviceCustomString3, DeviceCustomString4, DeviceCustomString5, DeviceCustomString6, AdditionalExtensions
+  aql: |
+    SELECT sourceip, destinationip, LOGSOURCENAME(logsourceid) AS waf_device, qidname(qid) AS signature, COUNT(*) AS blocked_attempts
+    FROM events
+    WHERE categoryname(category) ILIKE '%firewall%'
+      AND (qidname(qid) ILIKE '%blocked%' OR qidname(qid) ILIKE '%deny%' OR qidname(qid) ILIKE '%drop%')
+      AND qidname(qid) ILIKE '%log4j%'
+    GROUP BY sourceip, destinationip, LOGSOURCENAME(logsourceid), qidname(qid)
     LAST 1 HOURS
+  yara_l: |
+    rule log4j_exploit_attempt_blocked {
+      meta:
+        author = "TDL"
+        description = "Detects blocked Log4j exploitation attempts (T1190 - Exploit Public-Facing Application)"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1190"
+        severity = "HIGH"
 
-    '
-  yara_l: "rule tdl_tdl_auth_000503 {\n  meta:\n    author = \"TDL\"\n    description = \"Blocked Log4J Exploit Signature Detection\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.security_result.action = "BLOCK"
+        re.regex($e.security_result.detection_fields.value, `(?i)log4j`)
+        $e.target.ip = $target_ip
 
-    | WHERE @timestamp > NOW() - 1 hour
+      match:
+        $target_ip over 5m
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-waf-* \n| WHERE action == \"blocked\" AND TO_LOWER(signature) LIKE \"*log4j*\"\n| KEEP @timestamp, source.ip, destination.ip,\
+    \ destination.port, signature, action, url.path, http.request.method\n"
+  leql: |
+    where(action=BLOCKED AND signature ICONTAINS "log4j")
+  crowdstrike: |
+    #type=waf action=blocked signature=*log4j*
+    | table([@timestamp, src_ip, dest_ip, signature, uri, action])
+  xql: |
+    dataset = firewall_waf_raw
+    | filter action_firewall_rule_action = "blocked" and lowercase(action_firewall_signature_name) contains "log4j"
+    | fields _time, agent_hostname, action_source, action_destination, action_source_ip, action_destination_ip, action_firewall_signature_name, action_firewall_rule_action
+  lucene: |
+    event.category:"web" AND action:blocked AND signature:*log4j*
+  sumo: |
+    _sourceCategory=*WAF* OR _sourceCategory=*IDS* OR _sourceCategory=*IPS* OR _sourceCategory=*firewall*
+    | parse regex "(?i)action[=:\s]+(?<action>\w+)" nodrop
+    | parse regex "(?i)signature[=:\s\"']+(?<signature>[^\"'\n]+)" nodrop
+    | json field=_raw "action" as action_json nodrop
+    | json field=_raw "signature" as signature_json nodrop
+    | json field=_raw "rule" as rule_json nodrop
+    | json field=_raw "message" as message_json nodrop
+    | if(isNull(action), action_json, action) as action
+    | if(isNull(signature), signature_json, signature) as signature
+    | if(isNull(signature), rule_json, signature) as signature
+    | if(isNull(signature), message_json, signature) as signature
+    | where action matches "*block*" and signature matches "*log4j*"
+    | fields _messageTime, _sourceHost, action, signature
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -99,7 +92,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Web Application Firewall Event
 

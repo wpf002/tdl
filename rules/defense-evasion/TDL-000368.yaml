@@ -23,68 +23,95 @@ queries:
     NOT (userIdentity.arn=\"*:assumed-role/admin*\" OR userIdentity.arn=\"*:assumed-role/*ServiceRole*\" OR userIdentity.arn=\"*:role/aws-service-role/*\"\
     )\n| eval resource_arn=mvindex('resources{}.ARN', 0)\n| stats count by userIdentity.arn, eventName, resource_arn\n| where count >= 1\n| sort\
     \ - count\n| table userIdentity.arn, eventName, resource_arn, count\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(90d)
+    | where EventName has_any ("CreateKeyPair", "ImportKeyPair", "ModifyInstanceAttribute", "CreateAccessKey", "UpdateAccessKey")
+    | extend UserArn = tostring(UserIdentityArn)
+    | extend ResourceArn = tostring(parse_json(tostring(Resources))[0].ARN)
+    | where UserArn !has "admin" and UserArn !has "service-account"
+    | summarize EventCount = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by UserArn, EventName, ResourceArn, SourceIpAddress, UserAgent
+    | where EventCount >= 1
+    | sort by EventCount desc
+    | project TimeGenerated = LastSeen, UserArn, EventName, ResourceArn, EventCount, FirstSeen, SourceIpAddress, UserAgent
+  aql: |
+    SELECT useridentity.arn AS user_arn, eventName, resources{}.ARN AS resource_arn, COUNT(*) AS event_count
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%cloudtrail%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%aws%')
+      AND eventName MATCHES '.*[Kk]ey.*'
+      AND (eventName ILIKE '%Create%' OR eventName ILIKE '%Modify%' OR eventName ILIKE '%Update%' OR eventName ILIKE '%Put%')
+      AND eventName NOT ILIKE '%Describe%'
+      AND eventName NOT ILIKE '%List%'
+      AND eventName NOT ILIKE '%Get%'
+      AND useridentity.arn NOT ILIKE '%service-account%'
+      AND useridentity.arn NOT ILIKE '%admin-automation%'
+    GROUP BY useridentity.arn, eventName, resources{}.ARN
+    HAVING event_count >= 1
+    ORDER BY event_count DESC
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_ec2_key_creation_modification {
+      meta:
+        author = "TDL"
+        description = "Detects AWS CloudTrail events for EC2 key creation or modification - MITRE T1578"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1578"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.product_name = "AWS CloudTrail"
+        $e.metadata.vendor_name = "AMAZON"
+        (
+          re.regex($e.metadata.product_event_type, `.*CreateKeyPair.*`) or
+          re.regex($e.metadata.product_event_type, `.*ImportKeyPair.*`) or
+          re.regex($e.metadata.product_event_type, `.*DeleteKeyPair.*`) or
+          re.regex($e.metadata.product_event_type, `.*ModifyInstanceAttribute.*`) or
+          re.regex($e.metadata.product_event_type, `.*ReplaceIamInstanceProfileAssociation.*`)
+        )
+        not re.regex($e.security_result.summary, `(?i)(authorized|admin|service[-_]account|automation)`)
+        not re.regex($e.principal.user.userid, `(?i)(admin|service[-_]account|system)`)
+        $e.principal.user.userid = $user_arn
+        $e.metadata.product_event_type = $event_name
+        $e.target.resource.name = $resource_arn
 
-    | where eventName matches regex ".+"
+      match:
+        $user_arn, $event_name, $resource_arn over 24h
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000368 {\n  meta:\n    author = \"TDL\"\n    description = \"Suspicious EC2 Access Key Detected - AWS\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0005\"\n    technique = \"T1578\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: "FROM logs-aws.cloudtrail*\n| WHERE @timestamp > NOW() - 24 hour \n  AND event.action RLIKE \".*(CreateAccessKey|DeleteAccessKey|UpdateAccessKey|CreateKeyPair|DeleteKeyPair|ImportKeyPair|ModifyInstanceAttribute|CreateSecurityGroup|AuthorizeSecurityGroupIngress|AuthorizeSecurityGroupEgress|RevokeSecurityGroupIngress|RevokeSecurityGroupEgress).*\"\
+    \n  AND NOT (user.name IN (\"admin\", \"terraform\", \"cloudformation\", \"service-account\") OR aws.cloudtrail.user_identity.type == \"AWSService\"\
+    )\n| STATS event_count = COUNT(*) BY user_arn = aws.cloudtrail.user_identity.arn, event_name = event.action, resource_arn = TO_STRING(aws.cloudtrail.resources)\n\
+    | WHERE event_count >= 1\n| SORT event_count DESC\n| KEEP user_arn, event_name, resource_arn, event_count\n"
+  leql: |
+    where(source_json.eventSource="ec2.amazonaws.com" AND (source_json.eventName ICONTAINS "CreateKeyPair" OR source_json.eventName ICONTAINS "ImportKeyPair" OR source_json.eventName ICONTAINS "ModifyInstanceAttribute" OR source_json.eventName ICONTAINS "RunInstances" OR source_json.eventName ICONTAINS "CreateImage" OR source_json.eventName ICONTAINS "ModifyImageAttribute" OR source_json.eventName ICONTAINS "ModifySnapshotAttribute")) groupby(source_json.userIdentity.arn, source_json.eventName, source_json.requestParameters.resourcesSet.items.resourceId) calculate(count)
+  crowdstrike: "#repo=cloud (sourcetype=aws:cloudtrail OR sourcetype=\"aws:cloudtrail\") eventName=/.*Key.*/ \n| not (userIdentity.principalId=*AWSServiceRole*\
+    \ OR userIdentity.type=AWSService)\n| groupBy([userIdentity.arn, eventName, resources{}.ARN], function=count(as=event_count))\n| event_count\
+    \ >= 1\n| sort(event_count, reverse=true)\n| table([userIdentity.arn, eventName, resources{}.ARN, event_count])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and operation_type ~= ".*(?:CreateAccessKey|DeleteAccessKey|UpdateAccessKey|CreateKeyPair|DeleteKeyPair|ImportKeyPair|ModifyInstanceAttribute|CreateNetworkInterface|DeleteNetworkInterface|ModifyNetworkInterfaceAttribute).*"
+    | alter user_arn = json_extract_scalar(actor, "$.userIdentity.arn")
+    | alter resource_arn = json_extract_scalar(target, "$.resources[0].ARN")
+    | filter user_arn not in ("arn:aws:iam::*:role/AdminRole", "arn:aws:iam::*:role/ServiceRole", "arn:aws:iam::*:user/admin")
+    | comp count() as event_count by user_arn, operation_type, resource_arn
+    | filter event_count >= 1
+    | sort desc event_count
+    | fields _time, user_arn, operation_type, resource_arn, event_count
+  lucene: |
+    eventName:(*CreateAccessKey* OR *UpdateAccessKey* OR *ModifyInstanceAttribute* OR *CreateKeyPair* OR *ImportKeyPair* OR *ModifySnapshotAttribute* OR *ModifyImageAttribute* OR *ModifyVolumeAttribute*) AND eventSource:ec2.amazonaws.com AND NOT userIdentity.arn:(*admin* OR *service-account* OR *terraform* OR *cloudformation*)
+  sumo: |
+    _sourceCategory=*CloudTrail*
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "userIdentity.arn" as user_arn
+    | json field=_raw "requestParameters.instanceId" as instance_id
+    | json field=_raw "resources[0].ARN" as resource_arn
+    | where event_name matches "*CreateKey*" or event_name matches "*ModifyInstanceAttribute*" or event_name matches "*ModifyInstanceMetadataOptions*"
+    | where !(user_arn matches "*admin*" or user_arn matches "*service*")
+    | count as event_count by user_arn, event_name, resource_arn
+    | where event_count >= 1
+    | sort by event_count desc
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -94,7 +121,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 suppression:
   window: 24 hours

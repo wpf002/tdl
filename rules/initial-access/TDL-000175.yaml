@@ -16,83 +16,115 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=windows (EventCode=592 OR EventCode=4688 OR process_name="tscon.exe" OR Image="*\\tscon.exe")
+  spl: "index=windows (EventCode=592 OR EventCode=4688 OR process_name=\"tscon.exe\" OR Image=\"*\\\\tscon.exe\")\n(\n  (CommandLine=\"*cmd.exe*\"\
+    \ CommandLine=\"*tscon*\")\n  OR\n  (CommandLine=\"*/k*\" CommandLine=\"*tscon*\")\n  OR\n  (CommandLine=\"*/c*\" CommandLine=\"*tscon*\"\
+    )\n  OR\n  (CommandLine=\"*tscon*\" CommandLine=\"*dest:rdp-*\")\n)\n| table _time, ComputerName, User, Image, process_name, CommandLine,\
+    \ ParentImage, EventCode\n"
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where (EventID in (592, 4688) and Process endswith "\\tscon.exe")
+        or (Process endswith "\\cmd.exe" and CommandLine has "tscon" and (CommandLine has "/k" or CommandLine has "/c"))
+        or (CommandLine has "tscon" and CommandLine has "dest:rdp-")
+    | project TimeGenerated, Computer, Account, Process, CommandLine, EventID
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Parent Process Name", "EventID"
+    FROM events
+    WHERE ("EventID" IN ('592', '4688') OR "Process Name" ILIKE '%tscon.exe%')
+      AND (
+        ("Process CommandLine" ILIKE '%cmd.exe%' AND "Process CommandLine" ILIKE '%tscon%')
+        OR ("Process CommandLine" ILIKE '%/k%' AND "Process CommandLine" ILIKE '%tscon%')
+        OR ("Process CommandLine" ILIKE '%/c%' AND "Process CommandLine" ILIKE '%tscon%')
+        OR ("Process CommandLine" ILIKE '%tscon%' AND "Process CommandLine" ILIKE '%dest:rdp-%')
+      )
+    LAST 24 HOURS
+  yara_l: |
+    rule t1563_session_hijacking_tscon {
+      meta:
+        author = "TDL"
+        description = "Detects potential RDP session hijacking via tscon.exe execution patterns"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1563"
+        severity = "HIGH"
+
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688" or
+          re.regex($e.target.process.file.full_path, `(?i)\\tscon\.exe$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)\\tscon\.exe$`)
+        )
+        (
+          (
+            re.regex($e.target.process.command_line, `(?i)cmd\.exe`) and
+            re.regex($e.target.process.command_line, `(?i)tscon`) and
+            (
+              re.regex($e.target.process.command_line, `(?i)/k`) or
+              re.regex($e.target.process.command_line, `(?i)/c`)
+            )
+          ) or
+          (
+            re.regex($e.target.process.command_line, `(?i)tscon`) and
+            re.regex($e.target.process.command_line, `(?i)dest:rdp-`)
+          )
+        )
+        $e.principal.hostname = $host
+
+      match:
+        $host over 5m
+
+      outcome:
+        $risk_score = 75
+
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.*, logs-system.security*, logs-endpoint.events.process*, winlogbeat-*
+    | WHERE (event.code IN ("592", "4688") OR process.name == "tscon.exe")
+      AND (
+        (process.command_line LIKE "*cmd.exe*" AND process.command_line LIKE "*tscon*" AND (process.command_line LIKE "*/k*" OR process.command_line LIKE "*/c*"))
+        OR
+        (process.command_line LIKE "*tscon*" AND process.command_line LIKE "*dest:rdp-*")
+      )
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, event.code
+  leql: |
+    where((source_json.EventID IN [592, 4688] OR process_name ICONTAINS "tscon.exe") AND ((process_cmd_line ICONTAINS "cmd.exe" AND process_cmd_line ICONTAINS "tscon") OR (process_cmd_line ICONTAINS "/k" AND process_cmd_line ICONTAINS "/c") OR (process_cmd_line ICONTAINS "tscon" AND process_cmd_line ICONTAINS "dest:rdp-")))
+  crowdstrike: |
+    (EventCode=592 OR EventCode=4688 OR event_simpleName=ProcessRollup2)
+    (FileName=*tscon.exe OR CommandLine=*tscon*)
     (
-      (CommandLine="*cmd.exe*" CommandLine="*tscon*")
+      (CommandLine=*cmd.exe* CommandLine=*tscon*)
       OR
-      (CommandLine="*/k*" CommandLine="*tscon*")
+      (CommandLine=*/k* CommandLine=*/c*)
       OR
-      (CommandLine="*/c*" CommandLine="*tscon*")
-      OR
-      (CommandLine="*tscon*" CommandLine="*dest:rdp-*")
+      (CommandLine=*tscon* CommandLine=*dest:rdp-*)
     )
-    | table _time, ComputerName, User, Image, process_name, CommandLine, ParentImage, EventCode
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("tscon.exe", "cmd.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('tscon.exe', 'cmd.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000175 {\n  meta:\n    author = \"TDL\"\n    description = \"Possible RDP Hijacking\"\n    severity = \"MEDIUM\"\n\
-    \    tactic = \"TA0001\"\n    technique = \"T1563\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(tscon.exe|cmd.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("tscon.exe", "cmd.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [tscon.exe, cmd.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (tscon.exe, cmd.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("tscon.exe", "cmd.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(tscon.exe OR cmd.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("tscon.exe", "cmd.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter (action_evtlog_event_id in (592, 4688))
+       or (lowercase(action_process_image_name) contains "tscon.exe"
+           and ((lowercase(action_process_image_command_line) contains "cmd.exe"
+                 and lowercase(action_process_image_command_line) contains "tscon")
+                or (lowercase(action_process_image_command_line) contains "/k"
+                    and lowercase(action_process_image_command_line) contains "/c")))
+       or (lowercase(action_process_image_command_line) contains "tscon"
+           and lowercase(action_process_image_command_line) contains "dest:rdp-")
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, action_evtlog_event_id
+  lucene: |
+    (event.code:(592 OR 4688) AND process.name:tscon.exe AND process.command_line:*cmd.exe* AND process.command_line:*tscon* AND (process.command_line:*/k* OR process.command_line:*/c*)) OR (process.command_line:*tscon* AND process.command_line:*dest\:rdp\-*)
+  sumo: |
+    _sourceCategory=*Windows* (EventID=592 OR EventID=4688 OR tscon.exe)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "ProcessName" as process_name_alt
+    | where (event_id in ("592", "4688")) OR (process_name matches "*tscon.exe*" OR process_name_alt matches "*tscon.exe*")
+    | where (command_line matches "*cmd.exe*" AND command_line matches "*tscon*") OR (command_line matches "*/k*" AND command_line matches "*/c*") OR (command_line matches "*tscon*" AND command_line matches "*dest:rdp-*")
+    | fields _messageTime, _sourceHost, event_id, process_name, process_name_alt, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -102,7 +134,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nOR\n\tWhere the process is tscon.exe\n\t\n\tWhere Command\
   \ contains \"cmd.exe\"\n               Where Command contains \"tscon\"\n\tOR\n\t\tWhere the Command contains \"/k\"\n\t\t\n\t\tWhere the Command\

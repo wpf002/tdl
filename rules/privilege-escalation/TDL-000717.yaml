@@ -20,80 +20,115 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=* (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13) OR (sourcetype=WinEventLog:Security EventCode=4657) OR (sourcetype=edr* event_type=registry*)
+  spl: 'index=* (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13) OR (sourcetype=WinEventLog:Security EventCode=4657)
+    OR (sourcetype=edr* event_type=registry*)
+
     (TargetObject="*\\Microsoft\\Windows\\CurrentVersion\\Run\\*" OR registry_path="*\\Microsoft\\Windows\\CurrentVersion\\Run\\*" OR RegistryKeyPath="*\\Microsoft\\Windows\\CurrentVersion\\Run\\*")
-    (Details="*\\AppData\\*" OR Details="*\\Temp\\*" OR Details="*\\Public\\*" OR registry_value="*\\AppData\\*" OR registry_value="*\\Temp\\*" OR registry_value="*\\Public\\*" OR value_data="*\\AppData\\*" OR value_data="*\\Temp\\*" OR value_data="*\\Public\\*")
+
+    (Details="*\\AppData\\*" OR Details="*\\Temp\\*" OR Details="*\\Public\\*" OR registry_value="*\\AppData\\*" OR registry_value="*\\Temp\\*"
+    OR registry_value="*\\Public\\*" OR value_data="*\\AppData\\*" OR value_data="*\\Temp\\*" OR value_data="*\\Public\\*")
+
     | eval registry_path=coalesce(TargetObject, registry_path, RegistryKeyPath)
+
     | eval registry_value=coalesce(Details, registry_value, value_data)
+
     | where match(registry_path, "(?i)(HKLM|HKCU|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER).*\\\\Run")
+
     | where match(registry_value, "(?i)(\\\\AppData\\\\|\\\\Temp\\\\|\\\\Public\\\\)")
+
     | table _time, ComputerName, host, registry_path, registry_value, User, Image, ProcessId
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_pe_000717 {\n  meta:\n    author = \"TDL\"\n    description = \"Run Key Modified Pointing to User-Writable Path\"\n  \
-    \  severity = \"HIGH\"\n    tactic = \"TA0004\"\n    technique = \"T1547\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n \
-    \   $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 13
+    | where RegistryKey has_any ("\\Microsoft\\Windows\\CurrentVersion\\Run", "\\Microsoft\\Windows\\CurrentVersion\\RunOnce")
+    | where RegistryValueData has_any ("\\Temp\\", "\\AppData\\", "\\Public\\")
+    | where RegistryKey has_any ("HKLM", "HKCU", "HKEY_LOCAL_MACHINE", "HKEY_CURRENT_USER")
+    | project TimeGenerated, Computer, Account, RegistryKey, RegistryValueName, RegistryValueData, Process
+  aql: |
+    SELECT eventtime, username, LOGSOURCENAME(logsourceid) AS host, "Registry Path" AS registry_key, "Registry Value" AS value_name, "Registry Value Data" AS executable_path, "Process Name" AS process
+    FROM events
+    WHERE ("Registry Path" ILIKE '%\Microsoft\Windows\CurrentVersion\Run%' OR "Registry Path" ILIKE '%\Microsoft\Windows\CurrentVersion\RunOnce%')
+      AND "Event Type" IN ('Registry value set', 'RegistryEvent')
+      AND ("Registry Value Data" ILIKE '%\Temp\%' OR "Registry Value Data" ILIKE '%\AppData\%' OR "Registry Value Data" ILIKE '%\Public\%')
+      AND ("Registry Value Data" ILIKE '%.exe%' OR "Registry Value Data" ILIKE '%.dll%' OR "Registry Value Data" ILIKE '%.bat%' OR "Registry Value Data" ILIKE '%.ps1%')
+    LAST 24 HOURS
+  yara_l: |
+    rule registry_run_key_temp_executable {
+      meta:
+        author = "TDL"
+        description = "Detects registry Run key persistence pointing to executables in suspicious temp locations"
+        mitre_attack_tactic = "Privilege Escalation"
+        mitre_attack_technique = "T1547"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "REGISTRY_MODIFICATION"
+        (
+          re.regex($e.target.registry.registry_key, `(?i)\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\`)
+        )
+        (
+          re.regex($e.target.registry.registry_value_data, `(?i)\\temp\\`) or
+          re.regex($e.target.registry.registry_value_data, `(?i)\\appdata\\`) or
+          re.regex($e.target.registry.registry_value_data, `(?i)\\public\\`)
+        )
+        (
+          re.regex($e.target.registry.registry_value_data, `(?i)\.exe`) or
+          re.regex($e.target.registry.registry_value_data, `(?i)\.dll`) or
+          re.regex($e.target.registry.registry_value_data, `(?i)\.bat`) or
+          re.regex($e.target.registry.registry_value_data, `(?i)\.cmd`) or
+          re.regex($e.target.registry.registry_value_data, `(?i)\.vbs`) or
+          re.regex($e.target.registry.registry_value_data, `(?i)\.ps1`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.registry*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.category == "registry"
+      AND event.type IN ("creation", "change")
+      AND (
+        registry.path RLIKE ".*\\\\(Microsoft\\\\Windows\\\\CurrentVersion\\\\Run|Microsoft\\\\Windows\\\\CurrentVersion\\\\RunOnce)\\\\.*"
+      )
+      AND (
+        TO_LOWER(registry.data.strings) LIKE "*\\temp\\*"
+        OR TO_LOWER(registry.data.strings) LIKE "*\\appdata\\*"
+        OR TO_LOWER(registry.data.strings) LIKE "*\\users\\public\\*"
+      )
+    | KEEP @timestamp, host.name, user.name, registry.path, registry.data.strings, process.name, process.executable
+  leql: |
+    where(source_json.EventID=13 AND (source_json.TargetObject ICONTAINS "\Microsoft\Windows\CurrentVersion\Run" OR source_json.TargetObject ICONTAINS "\Microsoft\Windows\CurrentVersion\RunOnce") AND (source_json.Details ICONTAINS "\Temp\" OR source_json.Details ICONTAINS "\AppData\" OR source_json.Details ICONTAINS "\Public\"))
+  crowdstrike: |
+    (event_simpleName=AsepValueUpdate OR EventCode=13)
+    (RegistryPath=*\\Microsoft\\Windows\\CurrentVersion\\Run* OR RegistryKey=*\\Microsoft\\Windows\\CurrentVersion\\Run*)
+    (RegistryValueData=*\\Temp\\* OR RegistryValueData=*\\AppData\\* OR RegistryValueData=*\\Public\\*)
+    | table([@timestamp, ComputerName, UserName, RegistryPath, RegistryKey, RegistryValueName, RegistryValueData])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_REGISTRY and action_registry_key_name ~= "(?i).*\\(Software\\Microsoft\\Windows\\CurrentVersion\\Run|Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce).*" and (action_registry_value_name != null and action_registry_value_name != "") and action_registry_data != null and (lowercase(action_registry_data) contains "\\temp\\" or lowercase(action_registry_data) contains "\\appdata\\" or lowercase(action_registry_data) contains "\\public\\")
+    | fields _time, agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name, action_registry_data, actor_process_image_name
+  lucene: |
+    (event.code:(13 OR 4657) OR winlog.event_id:13) AND (registry.path:(*\\Microsoft\\Windows\\CurrentVersion\\Run* OR *\\Microsoft\\Windows\\CurrentVersion\\RunOnce*) OR TargetObject:(*\\Microsoft\\Windows\\CurrentVersion\\Run* OR *\\Microsoft\\Windows\\CurrentVersion\\RunOnce*)) AND (registry.data.strings:(*\\Temp\\* OR *\\AppData\\* OR *\\Public\\*) OR Details:(*\\Temp\\* OR *\\AppData\\* OR *\\Public\\*))
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Sysmon* (EventID=13 OR EventID=12 OR event_id=13 OR event_id=12 OR "RegistryEvent")
+    | json field=_raw "EventID" as event_id nodrop
+    | json field=_raw "TargetObject" as target_object nodrop
+    | json field=_raw "Details" as details nodrop
+    | json field=_raw "Image" as image nodrop
+    | where (event_id="13" OR event_id="12") AND (target_object matches "*\\Microsoft\\Windows\\CurrentVersion\\Run\\*" OR target_object matches "*\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\*") AND (details matches "*\\Temp\\*" OR details matches "*\\AppData\\*" OR details matches "*\\Public\\*") AND details matches "*.exe*"
+    | fields _messageTime, _sourceHost, event_id, target_object, details, image
 pseudo_logic: HKLM\...\Run or HKCU\...\Run value set to an executable in %TEMP%/%APPDATA%/Public. Re-launches malicious binary at boot/logon with
   that user's context.
 false_positives:
@@ -112,7 +147,7 @@ references:
 - https://attack.mitre.org/techniques/T1547/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, source user, and (if visible) the resulting privileged context.'

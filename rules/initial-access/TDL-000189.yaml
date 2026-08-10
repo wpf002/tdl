@@ -26,68 +26,89 @@ queries:
     \ OR ResultStatusDetail=*MFA*)\n     (status=success OR ResultStatus=Success)\n    | eval mfa_time=_time, user=coalesce(user, UserPrincipalName,\
     \ username, identity)\n    | fields mfa_time user]\n| eval time_diff=abs(login_time - mfa_time)\n| where (isnull(mfa_time) OR time_diff >\
     \ 300)\n| table _time user src_ip dest host mfa_time time_diff\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000189 {\n  meta:\n    author = \"TDL\"\n    description = \"Remote Login Without MFA\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "let timeframe = 1h;\nlet mfa_window = 5m;\nlet successful_logins = \n    SigninLogs\n    | where TimeGenerated > ago(timeframe)\n    |\
+    \ where ResultType == 0\n    | where NetworkLocationDetails has \"trustedNamedLocation\" == false or isempty(NetworkLocationDetails)\n   \
+    \ | where AppDisplayName !in~ (\"Windows Sign In\", \"Windows Cloud Shell\")\n    | project LoginTime = TimeGenerated, UserPrincipalName,\
+    \ IPAddress, AppDisplayName, CorrelationId, Location;\nlet mfa_events =\n    SigninLogs\n    | where TimeGenerated > ago(timeframe + mfa_window)\n\
+    \    | where ResultType == 0\n    | where AuthenticationRequirement == \"multiFactorAuthentication\" or MfaDetail.authMethod != \"\"\n   \
+    \ | project MfaTime = TimeGenerated, UserPrincipalName, MfaCorrelationId = CorrelationId;\nsuccessful_logins\n| join kind=leftanti (\n   \
+    \ mfa_events\n    | extend UserPrincipalName = UserPrincipalName\n) on UserPrincipalName\n| where not(\n    successful_logins\n    | join\
+    \ kind=inner (mfa_events) on UserPrincipalName\n    | where abs(datetime_diff('minute', LoginTime, MfaTime)) <= 5\n    | project UserPrincipalName,\
+    \ LoginTime\n    | summarize by UserPrincipalName, LoginTime\n)\n| summarize SourceIPs = make_set(IPAddress), Apps = make_set(AppDisplayName),\
+    \ LoginTimes = make_set(LoginTime), Locations = make_set(Location) by UserPrincipalName\n| extend TotalLogins = array_length(LoginTimes)\n"
+  aql: "SELECT username, sourceip, eventtime, QIDNAME(qid) AS event_name\nFROM events\nWHERE (qid IN (SELECT qid FROM events WHERE categoryname(category)\
+    \ ILIKE '%authentication%' AND categoryname(category) ILIKE '%success%') \n       OR LOGSOURCETYPENAME(devicetype) ILIKE '%Azure%' \n    \
+    \   OR LOGSOURCETYPENAME(devicetype) ILIKE '%Office 365%'\n       OR LOGSOURCETYPENAME(devicetype) ILIKE '%VPN%')\n  AND username IS NOT NULL\n\
+    \  AND NOT EXISTS (\n    SELECT 1 FROM events AS mfa\n    WHERE mfa.username = events.username\n      AND (mfa.qidname(mfa.qid) ILIKE '%MFA%'\
+    \ \n           OR mfa.qidname(mfa.qid) ILIKE '%multi%factor%'\n           OR mfa.categoryname(mfa.category) ILIKE '%MFA%'\n           OR mfa.categoryname(mfa.category)\
+    \ ILIKE '%multi%factor%')\n      AND ABS(mfa.eventtime - events.eventtime) <= 300000\n      AND mfa.qidname(mfa.qid) ILIKE '%success%'\n \
+    \ )\nLAST 1 HOURS\n"
+  yara_l: "rule successful_login_without_mfa {\n  meta:\n    author = \"TDL\"\n    description = \"Detects successful remote login without corresponding\
+    \ MFA event within 5 minutes\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"HIGH\"\
+    \n\n  events:\n    $login.metadata.event_type = \"USER_LOGIN\"\n    $login.security_result.action = \"ALLOW\"\n    $login.target.user.userid\
+    \ = $user\n    $login.principal.ip = $source_ip\n    \n    $mfa.metadata.event_type = \"USER_LOGIN\"\n    $mfa.security_result.summary = \"\
+    MFA_SUCCESS\" or \n    re.regex($mfa.metadata.product_event_type, \"(?i)mfa|multifactor|duo|okta_verify\")\n    $mfa.target.user.userid =\
+    \ $user\n\n  match:\n    $user over 10m\n\n  outcome:\n    $risk_score = 75\n    $source_ip = array_distinct($login.principal.ip)\n    $username\
+    \ = $user\n\n  condition:\n    $login and not $mfa\n}\n"
+  esql: "FROM logs-azure.signinlogs*, logs-o365.audit*\n| WHERE @timestamp > NOW() - 6 hours\n  AND event.outcome == \"success\"\n  AND (source.ip\
+    \ NOT RLIKE \"^(10\\\\.|172\\\\.(1[6-9]|2[0-9]|3[01])\\\\.|192\\\\.168\\\\.)\" OR source.ip IS NOT NULL)\n| EVAL login_time = @timestamp,\
+    \ login_user = user.name, login_ip = source.ip\n| EVAL event_type = CASE(\n    event.action LIKE \"*mfa*\" OR event.action LIKE \"*multifactor*\"\
+    \ OR event.action == \"UserLoginSucceeded\" AND event.dataset LIKE \"*mfa*\", \"mfa\",\n    event.action LIKE \"*sign*\" OR event.action LIKE\
+    \ \"*login*\" OR event.category == \"authentication\", \"login\",\n    \"other\"\n  )\n| STATS \n    login_count = COUNT(*) WHERE event_type\
+    \ == \"login\",\n    mfa_count = COUNT(*) WHERE event_type == \"mfa\",\n    earliest = MIN(@timestamp),\n    latest = MAX(@timestamp)\n  BY\
+    \ user.name, source.ip, window = BUCKET(@timestamp, 5 minutes)\n| WHERE login_count >= 1 AND mfa_count == 0\n| KEEP window, user.name, source.ip,\
+    \ login_count, earliest, latest\n"
+  leql: |
+    where(result=SUCCESS AND source_address!=NULL AND NOT source_address STARTS-WITH "10." AND NOT source_address STARTS-WITH "172.16." AND NOT source_address STARTS-WITH "192.168." AND authentication_type!="Multi-Factor")
+  crowdstrike: |
+    event_simpleName IN (UserLogon, AwsConsoleLogin, AzureActiveDirectorySignInLogs, O365AuditLog)
+    | case {
+        event_simpleName=UserLogon AND LogonType=10 | RemoteIP=* | UserName := UserName | LoginTime := @timestamp | SourceIP := RemoteIP | LoginEventId := _id;
+        event_simpleName=AzureActiveDirectorySignInLogs | UserName := userPrincipalName | LoginTime := @timestamp | SourceIP := ipAddress | LoginEventId := _id;
+        event_simpleName=O365AuditLog Operation="UserLoggedIn" | UserName := UserId | LoginTime := @timestamp | SourceIP := ClientIP | LoginEventId := _id;
+        * | drop();
+      }
+    | SourceIP != /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+    | selfJoin(field=[UserName], where=[{SourceIP=SourceIP}, {LoginTime=LoginTime}], prefilter=true, into=login)
+    | login_UserName := UserName
+    | login_LoginTime := LoginTime
+    | login_LoginEventId := LoginEventId
+    | join({
+        event_simpleName IN (UserLogon, AzureActiveDirectorySignInLogs, O365AuditLog, MfaEvent)
+        | case {
+            event_simpleName=UserLogon AND MfaUsed=true | UserName := UserName | MfaTime := @timestamp;
+            event_simpleName=AzureActiveDirectorySignInLogs authenticationDetails=*multiFactorAuthentication* | UserName := userPrincipalName | MfaTime := @timestamp;
+            event_simpleName=O365AuditLog Operation IN ("UserLoginSuccess", "MfaAuthentication") | UserName := UserId | MfaTime := @timestamp;
+            event_simpleName=MfaEvent | UserName := UserName | MfaTime := @timestamp;
+            * | drop();
+          }
+      }, field=[UserName], key=login_UserName, mode=left, include=[MfaTime])
+    | test(((login_LoginTime - MfaTime) <= 300000000000) OR ((MfaTime - login_LoginTime) <= 300000000000))
+    | isNull(field=MfaTime)
+    | table([login_LoginTime, login_UserName, SourceIP, LoginEventId])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter outcome = "success" and event_type = "sign_in" and incidr(src_ip, "10.0.0.0/8") = false and incidr(src_ip, "172.16.0.0/12") = false and incidr(src_ip, "192.168.0.0/16") = false
+    | alter login_time = _time, login_user = actor_user
+    | join type=left (
+        dataset = cloud_audit_logs
+        | filter outcome = "success" and (operation contains "mfa" or operation contains "MFA" or event_type contains "mfa" or event_type contains "MFA")
+        | alter mfa_time = _time, mfa_user = actor_user
+    ) as mfa_events login_user = mfa_events.mfa_user and (mfa_events.mfa_time >= login_time - 300000 and mfa_events.mfa_time <= login_time + 300000)
+    | filter mfa_events.mfa_user = null
+    | fields _time, login_user, src_ip, outcome, event_type, operation
+  lucene: |
+    (event.action:"UserLoggedIn" OR event.action:"UserLoginSuccess" OR event.category:"authentication" AND event.outcome:"success") AND event.category:"authentication" AND (source.ip:* AND NOT source.ip:10.0.0.0/8 AND NOT source.ip:172.16.0.0/12 AND NOT source.ip:192.168.0.0/16) AND NOT event.action:(*MFA* OR *MultiFactor* OR *2FA*)
+  sumo: "_sourceCategory=*Azure* OR _sourceCategory=*Office* OR _sourceCategory=*O365* OR _sourceCategory=*VPN*\n| json field=_raw \"ResultType\"\
+    \ as result_type\n| json field=_raw \"Status\" as status\n| json field=_raw \"UserPrincipalName\" as user\n| json field=_raw \"IPAddress\"\
+    \ as ip\n| json field=_raw \"AuthenticationRequirement\" as auth_req\n| json field=_raw \"Category\" as category\n| json field=_raw \"Operation\"\
+    \ as operation\n| where (result_type = \"0\" OR status matches \"*success*\" OR operation matches \"*UserLoggedIn*\") \n| where ip != \"\"\
+    \ AND NOT (ip matches \"10.*\" OR ip matches \"172.16.*\" OR ip matches \"192.168.*\")\n| timeslice 1m\n| count as login_count by _timeslice,\
+    \ user, ip\n| join (\n    _sourceCategory=*Azure* OR _sourceCategory=*Office* OR _sourceCategory=*O365*\n    | json field=_raw \"UserPrincipalName\"\
+    \ as user\n    | json field=_raw \"AuthenticationRequirement\" as auth_req\n    | json field=_raw \"AuthenticationMethod\" as auth_method\n\
+    \    | json field=_raw \"Category\" as category\n    | where auth_req = \"multiFactorAuthentication\" OR auth_method matches \"*MFA*\" OR\
+    \ category = \"MFAAuthentication\"\n    | timeslice 1m\n    | count as mfa_count by _timeslice, user\n) as mfa on user=mfa.user\n| where isNull(mfa_count)\
+    \ OR abs(_timeslice - mfa._timeslice) > 300000\n| fields _timeslice, user, ip, login_count\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -97,7 +118,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Successful Remote Login Event \nFrom one external source\n\nNOT Followed or Preceded By\n\n1 Successful MFA Event\nWith the Same\
   \ Destination Username\nWithin 5 minutes"

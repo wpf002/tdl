@@ -18,77 +18,64 @@ risk_score: 55
 queries:
   spl: "index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp \n| lookup botnet_list src_ip OUTPUT is_botnet \n| search is_botnet=true\
     \ \n| stats count sum(bytes_out) as bytes_out dc(dest_ip) as unique_dests by src_ip, dest_ip, dest_port \n| where count >= 1 \n| sort - bytes_out\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: "let BotnetIPs = dynamic([\"192.0.2.1\", \"198.51.100.1\", \"203.0.113.1\"]); // Replace with actual threat intelligence feed or watchlist\n\
+    CommonSecurityLog\n| where DeviceVendor in~ (\"Palo Alto Networks\", \"Fortinet\", \"Cisco\", \"Check Point\") or DeviceProduct has_any (\"\
+    Firewall\", \"IDS\", \"IPS\")\n| where Protocol =~ \"TCP\"\n| where SourceIP in (BotnetIPs)\n| where NetworkDirection =~ \"Inbound\" or (isnotempty(DestinationIP)\
+    \ and ipv4_is_private(DestinationIP))\n| summarize \n    count_ = count(),\n    unique_dests = dcount(DestinationIP),\n    bytes_out = sum(SentBytes)\n\
+    \    by SourceIP, DestinationIP, DestinationPort\n| where count_ >= 1\n| sort by bytes_out desc\n| project TimeGenerated = now(), SourceIP,\
+    \ DestinationIP, DestinationPort, count_, unique_dests, bytes_out\n"
+  aql: |
+    SELECT sourceip AS src_ip, destinationip AS dest_ip, destinationport AS dest_port, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_dests, SUM(destinationbytes) AS bytes_out
     FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+    WHERE protocolid = '6' AND direction = 'R2L' AND REFERENCESETCONTAINS('Botnet_IPs', sourceip)
     GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exe_000476 {\n  meta:\n    author = \"TDL\"\n    description = \"Known Botnet Communication - Inbound\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
+    HAVING event_count >= 1
+    ORDER BY bytes_out DESC
+    LAST 24 HOURS
+  yara_l: "rule botnet_inbound_tcp_traffic {\n  meta:\n    author = \"TDL\"\n    description = \"Detects inbound TCP traffic from known Botnet\
+    \ hosts\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"HIGH\"\n    \n  events:\n   \
+    \ $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    (\n      $e.metadata.product_name = \"firewall\" or\n      $e.metadata.product_name\
+    \ = \"ids\" or\n      $e.metadata.product_name = \"ips\"\n    )\n    $e.network.ip_protocol = \"TCP\"\n    $e.network.direction = \"INBOUND\"\
+    \n    $e.principal.ip = $src_ip\n    $e.target.ip = $dest_ip\n    $e.target.port = $dest_port\n    \n    // Threat intelligence match for\
+    \ known Botnet IPs\n    $e.graph.metadata.threat.category = \"BOTNET\"\n    \n  match:\n    $src_ip, $dest_ip, $dest_port over 24h\n    \n\
+    \  outcome:\n    $risk_score = max(75)\n    $total_events = count_distinct($e.metadata.id)\n    $unique_dests = count_distinct($e.target.ip)\n\
+    \    $total_bytes_out = sum($e.network.sent_bytes)\n    \n  condition:\n    #e >= 1\n}\n"
+  esql: |
+    FROM logs-network.firewall*, logs-network.ids*
+    | WHERE network.transport == "tcp" AND network.direction == "inbound"
+    | EVAL is_botnet = CASE(
+        source.ip == "1.2.3.4" OR source.ip == "5.6.7.8", 1,
+        0
+      )
+    | WHERE is_botnet == 1
+    | STATS total_events = COUNT(*), unique_dests = COUNT_DISTINCT(destination.ip), total_bytes_out = SUM(source.bytes) BY source.ip, destination.ip, destination.port
+    | WHERE total_events >= 1
+    | SORT total_bytes_out DESC
+    | KEEP source.ip, destination.ip, destination.port, total_events, unique_dests, total_bytes_out
+  leql: |
+    where(source_json.protocol=tcp AND source_json.src_ip IN threat_intel.botnet_ips AND source_json.direction=inbound) groupby(source_json.src_ip, source_json.dest_ip, source_json.dest_port) calculate(count, unique:source_json.dest_ip, sum:source_json.bytes_out)
+  crowdstrike: |
+    (#type=firewall OR #type=ids) network.protocol=tcp direction=inbound src_ip IN (KNOWN_BOTNET_IPS)
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=count), count(dest_ip, distinct=true, as=unique_dests), sum(bytes_out, as=total_bytes_out)])
+    | count >= 1
+    | sort(total_bytes_out, order=desc)
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_network_protocol = "tcp" and action_country_code in ("Botnet") or threat_name contains "botnet" or threat_category contains "botnet"
+    | comp count() as event_count, count_distinct(action_destination_translated_ip) as unique_dests, sum(action_total_download) as bytes_out by action_source_translated_ip, action_destination_translated_ip, action_destination_translated_port
+    | filter event_count >= 1
     | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    | fields action_source_translated_ip, action_destination_translated_ip, action_destination_translated_port, event_count, unique_dests, bytes_out
+  lucene: |
+    network.protocol:tcp AND tags:"botnet_source" AND network.direction:inbound
+  sumo: |
+    _sourceCategory=*network* OR _sourceCategory=*firewall* OR _sourceCategory=*ids*
+    | where protocol matches "*tcp*" OR protocol matches "*TCP*"
+    | where src_ip matches "botnet" OR threat_category matches "*botnet*" OR threat_name matches "*botnet*" OR reputation matches "*botnet*" OR threat_type matches "*botnet*"
+    | sum(bytes_out) as total_bytes_out, count as event_count, count_distinct(dest_ip) as unique_dests by src_ip, dest_ip, dest_port
+    | where event_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, event_count, unique_dests, total_bytes_out
 false_positives:
 - Authorized pen testing
 - Security research
@@ -98,7 +85,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'

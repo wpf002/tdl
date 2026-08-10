@@ -15,74 +15,94 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit) eventName="*GuardDuty*" severity=High
+  spl: 'index=cloud (sourcetype=aws:cloudtrail OR sourcetype=azure:auditlogs OR sourcetype=gcp:audit) eventName="*GuardDuty*" severity=High
+
     | search NOT (userAgent="*SecOps*" OR userAgent="*CrowdStrike*" OR userAgent="*SentinelOne*" OR userAgent="*AWS Systems Manager*")
+
     | stats count values(sourceIPAddress) as sourceIPAddresses by userIdentity.arn, eventName, resources{}.ARN
+
     | where count >= 1
+
     | sort - count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000616 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS GuardDuty High Alert\"\n    severity = \"HIGH\"\n\
-    \    tactic = \"TA0005\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "AWSCloudTrail\n| where TimeGenerated > ago(90d)\n| where EventName has \"GuardDuty\"\n| extend Severity = tostring(parse_json(AdditionalEventData).severity)\n\
+    | where Severity == \"High\" or Severity == \"8\"\n| extend UserArn = tostring(UserIdentityArn)\n| extend ResourceArn = tostring(parse_json(Resources)[0].ARN)\n\
+    | where UserArn !has \"security-tool\" and UserArn !has \"authorized-admin\"\n| summarize \n    EventCount = count(),\n    SourceIPs = make_set(SourceIpAddress),\n\
+    \    FirstSeen = min(TimeGenerated),\n    LastSeen = max(TimeGenerated)\n    by UserArn, EventName, ResourceArn\n| where EventCount >= 1\n\
+    | sort by EventCount desc\n| project UserArn, EventName, ResourceArn, EventCount, SourceIPs, FirstSeen, LastSeen\n"
+  aql: |
+    SELECT useridentity, eventname, COUNT(*) AS event_count, UNIQUECOUNT(sourceip) AS unique_sources, LIST(sourceip) AS source_ips
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%guardduty%' OR QIDNAME(qid) ILIKE '%guardduty%' OR categoryname(category) ILIKE '%guardduty%')
+      AND severity >= 8
+    GROUP BY useridentity, eventname
+    HAVING event_count >= 1
+    ORDER BY event_count DESC
+    LAST 24 HOURS
+  yara_l: "rule aws_guardduty_high_severity_unmapped_alert {\n  meta:\n    author = \"TDL\"\n    description = \"Detects AWS GuardDuty High severity\
+    \ alerts not mapped to existing TDL detections\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1078\"\n\
+    \    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.product_name = \"AWS GuardDuty\"\n    $e.metadata.vendor_name = \"Amazon\"\n  \
+    \  $e.security_result.severity = \"HIGH\"\n    $e.metadata.event_type = \"GENERIC_EVENT\"\n    re.regex($e.metadata.product_event_type, `(?i)GuardDuty`)\n\
+    \    \n    $e.principal.user.userid = $user_arn\n    $e.metadata.product_event_type = $event_name\n    $e.target.resource.name = $resource_arn\n\
+    \    $e.principal.ip = $source_ip\n    $e.principal.hostname = $hostname\n    \n    not re.regex($e.security_result.detection_fields[\"tool\"\
+    ], `(?i)(security|admin|authorized)`)\n    not re.regex($e.principal.process.file.full_path, `(?i)(security|monitoring|backup)`)\n    \n \
+    \ match:\n    $user_arn, $event_name, $resource_arn over 24h\n    \n  outcome:\n    $risk_score = max(85)\n    $source_ips = array_distinct($source_ip)\n\
+    \    $event_count = count_distinct($e.metadata.id)\n    \n  condition:\n    #e >= 1\n}\n"
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND event.action LIKE "*GuardDuty*"
+      AND event.severity == "high"
+    | STATS event_count = COUNT(*), source_ips = VALUES(source.ip) BY user.id, event.action, cloud.resource.id
+    | WHERE event_count >= 1
+    | SORT event_count DESC
+    | KEEP user.id, event.action, cloud.resource.id, event_count, source_ips
+  leql: |
+    where(source_json.eventName ICONTAINS "guardduty" AND source_json.severity="High") groupby(source_json.userIdentity.arn, source_json.eventName, source_json.resources{}.ARN) calculate(count)
+  crowdstrike: |
+    #repo=cloud (sourcetype="aws:cloudtrail" OR sourcetype="guardduty") eventName=*GuardDuty* severity=High
+    | groupBy([userIdentity.arn, eventName, resources{}.ARN], function=[count(as=event_count), collect(sourceIPAddress)])
+    | event_count >= 1
+    | sort(event_count, order=desc)
+    | table([userIdentity.arn, eventName, resources{}.ARN, sourceIPAddress, event_count])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and event_type = "GuardDuty"
+    | filter json_extract_scalar(raw_log, "$.detail.severity") >= 7
+    | filter json_extract_scalar(raw_log, "$.detail.type") ~= ".*"
+    | alter guardduty_type = json_extract_scalar(raw_log, "$.detail.type"),
+            guardduty_title = json_extract_scalar(raw_log, "$.detail.title"),
+            severity = json_extract_scalar(raw_log, "$.detail.severity"),
+            user_arn = json_extract_scalar(raw_log, "$.detail.resource.accessKeyDetails.userArn"),
+            resource_arn = json_extract_scalar(raw_log, "$.detail.resource.instanceDetails.instanceId"),
+            source_ip = json_extract_scalar(raw_log, "$.detail.service.action.awsApiCallAction.remoteIpDetails.ipAddressV4")
+    | filter guardduty_type not contains "Security" and guardduty_type not contains "Authorized"
+    | comp count() as alert_count, values(source_ip) as source_ips by user_arn, guardduty_type, resource_arn
+    | filter alert_count >= 1
+    | sort desc alert_count
+    | fields user_arn, guardduty_type, resource_arn, alert_count, source_ips
+  lucene: |
+    sourcetype:"aws:cloudtrail" AND eventName:*GuardDuty* AND severity:High AND NOT (userAgent:(*security* OR *scanner* OR *authorized*))
+  sumo: |
+    _sourceCategory=*aws* OR _sourceCategory=*cloudtrail* OR _sourceCategory=*guardduty*
+    | json field=_raw "detail.severity" as severity
+    | json field=_raw "detail.type" as finding_type
+    | json field=_raw "detail.service.action.actionType" as action_type
+    | json field=_raw "detail.resource.accessKeyDetails.userName" as user_name
+    | json field=_raw "detail.resource.instanceDetails.instanceId" as instance_id
+    | json field=_raw "detail.service.action.awsApiCallAction.remoteIpDetails.ipAddressV4" as source_ip
+    | json field=_raw "detail.resource.resourceType" as resource_type
+    | json field=_raw "detail.arn" as finding_arn
+    | json field=_raw "userIdentity.arn" as user_arn
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "resources[0].ARN" as resource_arn
+    | where (finding_type matches "*GuardDuty*" OR event_name matches "*GuardDuty*") AND (severity >= 7 OR severity = "High")
+    | where !(user_name matches "*security-tool*" OR user_name matches "*admin-automation*" OR finding_type matches "*authorized*")
+    | count as event_count by user_arn, event_name, resource_arn, source_ip
+    | where event_count >= 1
+    | sort by event_count desc
+    | fields user_arn, event_name, resource_arn, source_ip, event_count
 false_positives:
 - Security software
 - Authorized admin tools
@@ -92,7 +112,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

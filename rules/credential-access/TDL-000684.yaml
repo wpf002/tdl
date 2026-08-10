@@ -15,71 +15,61 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=slack action="app_installed" entity.is_directory_approved=false
+  spl: 'index=slack action="app_installed" entity.is_directory_approved=false
+
     | table _time, user, app_name, entity.is_directory_approved, action
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000684 {\n  meta:\n    author = \"TDL\"\n    description = \"Unapproved App installed - Slack\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    SlackAuditLogs
+    | where TimeGenerated > ago(24h)
+    | where Action == "app_installed"
+    | extend is_directory_approved = tostring(parse_json(tostring(Entity)).is_directory_approved)
+    | where is_directory_approved == "false"
+    | project TimeGenerated, Action, User, Entity, AppName = tostring(parse_json(tostring(Entity)).name), is_directory_approved
+  aql: "SELECT eventtime, username, sourceip, \"Action\", \"entity.is_directory_approved\", \"entity.app_name\"\nFROM events\nWHERE \"Action\"\
+    \ = 'app_installed' \n  AND \"entity.is_directory_approved\" = 'false'\nLAST 24 HOURS\n"
+  yara_l: |
+    rule slack_unapproved_app_installed {
+      meta:
+        author = "TDL"
+        description = "Detects installation of unapproved Slack applications (T1078 - Valid Accounts)"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Slack"
+        $e.metadata.product_event_type = "app_installed"
+        $e.security_result.about.labels["entity.is_directory_approved"] = "false"
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-slack.audit*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.action == \"app_installed\" \n  AND slack.audit.entity.is_directory_approved\
+    \ == false\n| KEEP @timestamp, user.name, user.email, event.action, slack.audit.app.name, slack.audit.app.id, slack.audit.entity.is_directory_approved,\
+    \ host.name\n"
+  leql: |
+    where(source_json.action="app_installed" AND source_json.entity.is_directory_approved=false)
+  crowdstrike: |
+    #type=slack action=app_installed entity.is_directory_approved=false
+    | table([@timestamp, user.name, user.email, app.name, app.id, entity.is_directory_approved, ComputerName])
+  xql: |
+    dataset = slack_audit_logs
+    | filter action = "app_installed" and entity_is_directory_approved = false
+    | fields _time, actor_user_email, actor_user_name, entity_app_name, entity_app_id, action, entity_is_directory_approved
+  lucene: |
+    action:app_installed AND entity.is_directory_approved:false
+  sumo: |
+    _sourceCategory=*Slack* "app_installed"
+    | json field=_raw "action" as action
+    | json field=_raw "entity.is_directory_approved" as is_directory_approved
+    | where action = "app_installed" and is_directory_approved = "false"
+    | fields _messageTime, _sourceHost, action, is_directory_approved
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +79,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Slack Event
 

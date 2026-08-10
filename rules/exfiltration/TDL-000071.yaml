@@ -19,77 +19,53 @@ queries:
   spl: "index=windows (sourcetype=WinEventLog:Security OR sourcetype=firewall) ((EventCode=5156) OR (dest_port=53)) \n| eval bytes_out_mb=bytes_out/1024/1024\
     \ \n| where bytes_out_mb > 10 \n| stats count values(bytes_out_mb) as bytes_out_mb values(dest_port) as dest_port values(dest_ip) as dest_ip\
     \ by _time, ComputerName, src_ip, process_name \n| table _time, ComputerName, src_ip, dest_ip, dest_port, bytes_out_mb, process_name\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where destination_port in ("53")
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "destination_port" IN (''53'')
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (5156, 5158)
+    | where DestinationPort == 53
+    | extend BytesOut = tolong(BytesSent)
+    | where BytesOut > 10485760
+    | project TimeGenerated, Computer, SourceAddress, DestinationAddress, DestinationPort, BytesOut, Process, Account
+  aql: |
+    SELECT sourceip, destinationip, username, LOGSOURCENAME(logsourceid) AS host, SUM(bytesout) AS total_bytes_out, COUNT(*) AS event_count
+    FROM events
+    WHERE (categoryname(category) ILIKE '%DNS%' OR destinationport = 53)
+      AND bytesout > 10485760
+    GROUP BY sourceip, destinationip, username, logsourceid
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exf_000071 {\n  meta:\n    author = \"TDL\"\n    description = \"DNS Tunneling - Outbound\"\n    severity = \"HIGH\"\n\
-    \    tactic = \"TA0010\"\n    technique = \"T1030\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.destination_port\
-    \ = /(53)/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND destination_port IN ("53")
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND destination_port IN [53])
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND destination_port IN (53)
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND destination_port in ("53")
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND destination_port:(53)
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where destination_port IN ("53")
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  yara_l: "rule dns_exfiltration_large_bytes {\n  meta:\n    author = \"TDL\"\n    description = \"Detects potential DNS exfiltration via large\
+    \ outbound data transfers (T1030)\"\n    mitre_attack_tactic = \"Exfiltration\"\n    mitre_attack_technique = \"T1030\"\n    severity = \"\
+    HIGH\"\n\n  events:\n    $dns.metadata.event_type = \"NETWORK_DNS\"\n    $dns.network.sent_bytes > 10485760\n    $dns.principal.hostname =\
+    \ $host\n    \n    or\n    \n    $fw.metadata.event_type = \"NETWORK_CONNECTION\"\n    $fw.target.port = 53\n    $fw.network.sent_bytes >\
+    \ 10485760\n    $fw.principal.hostname = $host\n\n  match:\n    $host over 5m\n\n  outcome:\n    $risk_score = 75\n\n  condition:\n    $dns\
+    \ or $fw\n}\n"
+  esql: "FROM logs-system.security*, logs-windows.*, winlogbeat-*, logs-network.*, logs-firewall.*\n| WHERE @timestamp > NOW() - 24 hour\n  AND\
+    \ (\n    (event.action LIKE \"*dns*\" OR event.category == \"dns\" OR destination.port == 53)\n    AND (network.bytes > 10485760 OR source.bytes\
+    \ > 10485760 OR destination.bytes > 10485760)\n  )\n| STATS total_bytes = SUM(COALESCE(network.bytes, source.bytes, destination.bytes, 0)),\
+    \ \n        event_count = COUNT(*) \n  BY host.name, source.ip, destination.ip, destination.port, process.name, user.name\n| WHERE total_bytes\
+    \ > 10485760\n| KEEP @timestamp, host.name, source.ip, destination.ip, destination.port, process.name, user.name, total_bytes, event_count\n"
+  leql: |
+    where(source_json.EventID=5156 AND destination_port=53 AND bytes_out>10485760)
+  crowdstrike: |
+    (EventCode=2 OR EventCode=5156) DestinationPort=53 BytesSent>10485760
+    | table([@timestamp, ComputerName, SourceAddress, DestinationAddress, DestinationPort, BytesSent, QueryName])
+  xql: |
+    dataset = xdr_data
+    | filter (event_type = ENUM.EVENT_TYPE_NETWORK and action_network_protocol = "DNS" and action_network_creation_bytes > 10485760)
+       or (event_type = ENUM.EVENT_TYPE_NETWORK and action_remote_port = 53 and action_network_creation_bytes > 10485760)
+    | fields _time, agent_hostname, actor_effective_username, action_remote_ip, action_remote_port, action_network_creation_bytes, action_network_protocol
+  lucene: |
+    (event.code:22 AND bytes_out:>10485760) OR (destination.port:53 AND bytes_out:>10485760)
+  sumo: |
+    _sourceCategory=*Windows*Security* OR _sourceCategory=*DNS* OR _sourceCategory=*Firewall*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "DestinationPort" as dest_port
+    | json field=_raw "BytesOut" as bytes_out
+    | json field=_raw "QueryName" as query_name
+    | where (event_id matches "*DNS*" or query_name != "") or (dest_port = "53")
+    | where num(bytes_out) > 10485760
+    | fields _messageTime, _sourceHost, event_id, dest_port, bytes_out, query_name
 false_positives:
 - Authorized pen testing
 - Security research
@@ -99,7 +75,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 DNS Request Event\nWhere the Bytes Out is greater than 10 MB\n\n----------------------------------------------------------------------------------\n\
   \n1 Firewall Event \nWhere the Destination Port is 53\nWhere the Bytes Out is greater than 10 MB"

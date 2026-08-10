@@ -18,68 +18,58 @@ queries:
   spl: "index=email_security (action=clicked OR action=permitted) \n| eval suspicious=if(match(dest_domain, \"(?i)(malicious|phishing|threat)\"\
     ) OR match(url, \"(?i)(malicious|phishing|threat)\") OR in(dest_domain, lookup(\"threat_intel_domains\")) OR in(url, lookup(\"threat_intel_urls\"\
     )), 1, 0)\n| where suspicious=1\n| table _time, user, src, dest_domain, url, action, subject\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000046 {\n  meta:\n    author = \"TDL\"\n    description = \"User Click Permitted to High Risk URL\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1566\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "union \n(EmailUrlInfo\n| where TimeGenerated > ago(1h)\n| where UrlClickPermissionLevel =~ \"Permitted\"\n| join kind=inner (ThreatIntelligenceIndicator\n\
+    \    | where TimeGenerated > ago(14d)\n    | where isnotempty(DomainName)\n    | project DomainName, ThreatType, Description) \n    on $left.UrlDomain\
+    \ == $right.DomainName\n| project TimeGenerated, NetworkMessageId, RecipientEmailAddress, Url, UrlDomain, UrlClickPermissionLevel, ThreatType,\
+    \ Description),\n(EmailUrlInfo\n| where TimeGenerated > ago(1h)\n| where UrlClickPermissionLevel =~ \"Permitted\"\n| join kind=inner (ThreatIntelligenceIndicator\n\
+    \    | where TimeGenerated > ago(14d)\n    | where isnotempty(Url)\n    | project Url, ThreatType, Description) \n    on Url\n| project TimeGenerated,\
+    \ NetworkMessageId, RecipientEmailAddress, Url, UrlDomain, UrlClickPermissionLevel, ThreatType, Description)\n"
+  aql: |
+    SELECT sourceip, destinationip, username, url, QIDNAME(qid) AS event_name, COUNT(*) AS event_count
+    FROM events
+    WHERE (CATEGORYNAME(category) ILIKE '%email%' OR CATEGORYNAME(category) ILIKE '%web%' OR CATEGORYNAME(category) ILIKE '%proxy%')
+      AND (QIDNAME(qid) ILIKE '%url%click%' OR QIDNAME(qid) ILIKE '%link%click%' OR QIDNAME(qid) ILIKE '%permitted%')
+      AND url IS NOT NULL
+    GROUP BY sourceip, destinationip, username, url, QIDNAME(qid)
+    LAST 24 HOURS
+  yara_l: "rule phishing_url_click_threat_intel {\n  meta:\n    author = \"TDL\"\n    description = \"Detects URL clicks to domains or URLs on\
+    \ threat intelligence lists - T1566 Phishing\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1566\"\n   \
+    \ platform = \"Windows\"\n    data_source = \"Email Security\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.metadata.product_event_type\
+    \ = \"URL_CLICK\" or\n    $e.metadata.product_event_type = \"EMAIL_URL_CLICK\" or\n    $e.security_result.action = \"ALLOW\"\n    \n    (\n\
+    \      $e.target.hostname = $domain or\n      $e.target.url = $url\n    )\n    \n    (\n      // Domain on threat intel list\n      (\n  \
+    \      graph.entity.hostname = $domain and\n        graph.entity.threat.category != \"\" and\n        graph.entity.threat.category != \"UNKNOWN\"\
+    \n      ) or\n      // URL on threat intel list\n      (\n        graph.entity.url = $url and\n        graph.entity.threat.category != \"\"\
+    \ and\n        graph.entity.threat.category != \"UNKNOWN\"\n      )\n    )\n    \n    $e.principal.user.userid = $user\n\n  match:\n    $user\
+    \ over 5m\n\n  outcome:\n    $risk_score = max(35)\n    $domain_list = array_distinct($domain)\n    $url_list = array_distinct($url)\n\n \
+    \ condition:\n    $e\n}\n"
+  esql: "FROM logs-o365.audit*, logs-email*, logs-exchange.audit*\n| WHERE event.action IN (\"UrlClickEvent\", \"SafeLinks\", \"url_click\") \n\
+    \  OR (event.category == \"email\" AND event.type == \"info\" AND url.full != null)\n| WHERE threat.indicator.type IN (\"url\", \"domain\"\
+    ) \n  OR TO_LOWER(destination.domain) IN (\n    SELECT domain FROM threat_intelligence WHERE type == \"domain\"\n  )\n  OR TO_LOWER(url.full)\
+    \ IN (\n    SELECT indicator FROM threat_intelligence WHERE type == \"url\"\n  )\n| KEEP @timestamp, user.email, user.name, host.name, url.full,\
+    \ url.domain, destination.domain, source.ip, threat.indicator.type, threat.indicator.name, event.action\n"
+  leql: |
+    where(source_json.action="url_click_permitted" OR (destination_domain IN threat_list OR url IN threat_list))
+  crowdstrike: |
+    #type=EmailSecurity (event_simpleName=EmailUrlClick OR event_simpleName=UrlClickPermitted)
+    (ThreatIntelMatch=true OR DestinationDomainThreatMatch=true OR UrlThreatMatch=true OR DestinationDomain IN file="threat_intel_domains.csv" OR Url IN file="threat_intel_urls.csv")
+    | table([@timestamp, ComputerName, UserName, Url, DestinationDomain, event_simpleName, ThreatIntelMatch])
+  xql: "dataset = email_security_logs\n| filter (action_email_url_click = \"permitted\" or action = \"URL_CLICK_PERMITTED\") \n   and (action_threat_intelligence_verdict\
+    \ in (\"MALICIOUS\", \"SUSPICIOUS\") \n        or action_destination_threat_intelligence_verdict in (\"MALICIOUS\", \"SUSPICIOUS\")\n    \
+    \    or action_url_threat_intelligence_verdict in (\"MALICIOUS\", \"SUSPICIOUS\")\n        or dst_threat_intelligence_verdict in (\"MALICIOUS\"\
+    , \"SUSPICIOUS\"))\n| fields _time, action_email_sender, action_email_recipient, action_destination_domain, action_url, action_threat_intelligence_verdict\n"
+  lucene: |
+    (event.category:email AND event.action:"url click" AND event.outcome:allowed) OR (event.category:email AND event.action:"url click" AND (destination.domain:* AND threat.indicator.type:domain)) OR (event.category:email AND event.action:"url click" AND (url.full:* AND threat.indicator.type:url))
+  sumo: |
+    _sourceCategory=*Email* OR _sourceCategory=*email* OR _sourceCategory=*EmailSecurity* OR _sourceCategory=*email_security*
+    | where _raw matches "*click*" OR _raw matches "*URL*" OR _raw matches "*link*" OR _raw matches "*permitted*"
+    | parse regex "(?<action>permitted|allowed|clicked)" nodrop
+    | parse regex "(?<url>https?://[^\s]+)" nodrop
+    | parse regex "(?<domain>[a-zA-Z0-9\-]+\.[a-zA-Z0-9\-\.]+)" nodrop
+    | where action matches "*permit*" OR action matches "*allow*" OR action matches "*click*"
+    | lookup type, malicious_confidence, description from shared://threat/cs_iptyped on threat=url
+    | lookup type as domain_type, malicious_confidence as domain_confidence from shared://threat/cs_iptyped on threat=domain
+    | where (isNotNull(malicious_confidence) AND malicious_confidence != "unverified") OR (isNotNull(domain_confidence) AND domain_confidence != "unverified")
+    | fields _messageTime, _sourceHost, action, url, domain, malicious_confidence, domain_confidence
 false_positives:
 - Authorized pen testing
 - Security research
@@ -89,7 +79,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 URL Click Permitted Event\nOR\n\tWhere the Destination Domain is on a Threat Intelligence List\n\t\n\tWhere the URL is on a Threat\
   \ Intelligence List"

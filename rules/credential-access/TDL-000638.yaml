@@ -16,75 +16,94 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=* sourcetype="MicrosoftDefender:AdvancedHunting" OR sourcetype="microsoft:defender:advancedhunting" OR source="*AdvancedHunting*" ActionType="LdapSearch"
+  spl: 'index=* sourcetype="MicrosoftDefender:AdvancedHunting" OR sourcetype="microsoft:defender:advancedhunting" OR source="*AdvancedHunting*"
+    ActionType="LdapSearch"
+
     | search AdditionalFields!="[ ]" SearchFilter!="*scope=Base*"
-    | search (AdditionalFields="*(userAccountControl:1.2.840.113556.1.4.803:=4194304)*" OR AdditionalFields="*(userAccountControl:1.2.840.113556.1.4.803:=2097152)*" OR AdditionalFields="*!(userAccountControl:1.2.840.113556.1.4.803:=1048574)*" OR AdditionalFields="*(userAccountControl:1.2.840.113556.1.4.803:=524288)*" OR AdditionalFields="*msDS-AllowedToActOnBehalfOfOtherIdentity*" OR AdditionalFields="*msDS-AllowedToDelegateTo*")
+
+    | search (AdditionalFields="*(userAccountControl:1.2.840.113556.1.4.803:=4194304)*" OR AdditionalFields="*(userAccountControl:1.2.840.113556.1.4.803:=2097152)*"
+    OR AdditionalFields="*!(userAccountControl:1.2.840.113556.1.4.803:=1048574)*" OR AdditionalFields="*(userAccountControl:1.2.840.113556.1.4.803:=524288)*"
+    OR AdditionalFields="*msDS-AllowedToActOnBehalfOfOtherIdentity*" OR AdditionalFields="*msDS-AllowedToDelegateTo*")
+
     | table _time, DeviceName, InitiatingProcessAccountName, InitiatingProcessCommandLine, SearchFilter, AdditionalFields
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4624", "4625", "4768", "4769", "4776")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4624', '4625', '4768', '4769', '4776')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000638 {\n  meta:\n    author = \"TDL\"\n    description = \"LDAP Kerberos Recon - Defender\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0006\"\n    technique = \"T1558\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(4624|4625|4768|4769|4776)/\n\
-    \    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("4624", "4625", "4768", "4769", "4776")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4624, 4625, 4768, 4769, 4776])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4624, 4625, 4768, 4769, 4776)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4624", "4625", "4768", "4769", "4776")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4624 OR 4625 OR 4768 OR 4769 OR 4776)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4624", "4625", "4768", "4769", "4776")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceEvents
+    | where TimeGenerated > ago(1h)
+    | where ActionType == "LdapSearch"
+    | where AdditionalFields != "[]"
+    | extend parsedFields = parse_json(AdditionalFields)
+    | extend Scope = tostring(parsedFields.Scope)
+    | where Scope != "Base"
+    | where AdditionalFields has_any (
+        "(userAccountControl:1.2.840.113556.1.4.803:=4194304)",
+        "(userAccountControl:1.2.840.113556.1.4.803:=2097152)",
+        "!(userAccountControl:1.2.840.113556.1.4.803:=1048574)",
+        "(userAccountControl:1.2.840.113556.1.4.803:=524288)",
+        "msDS-AllowedToActOnBehalfOfOtherIdentity",
+        "msDS-AllowedToDelegateTo"
+    )
+    | project TimeGenerated, DeviceName, AccountName, ActionType, AdditionalFields, InitiatingProcessFileName, InitiatingProcessCommandLine
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS device, username, "ActionType", "AdditionalFields", "SearchFilter", "SearchScope", sourceip
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%Defender%'
+      AND "ActionType" = 'LdapSearch'
+      AND "SearchScope" != 'Base'
+      AND (
+        "AdditionalFields" ILIKE '%userAccountControl:1.2.840.113556.1.4.803:=4194304%'
+        OR "AdditionalFields" ILIKE '%userAccountControl:1.2.840.113556.1.4.803:=2097152%'
+        OR "AdditionalFields" ILIKE '%!(userAccountControl:1.2.840.113556.1.4.803:=1048574)%'
+        OR "AdditionalFields" ILIKE '%userAccountControl:1.2.840.113556.1.4.803:=524288%'
+        OR "AdditionalFields" ILIKE '%msDS-AllowedToActOnBehalfOfOtherIdentity%'
+        OR "AdditionalFields" ILIKE '%msDS-AllowedToDelegateTo%'
+      )
+    LAST 24 HOURS
+  yara_l: "rule ldap_kerberos_delegation_enumeration {\n  meta:\n    author = \"TDL\"\n    description = \"Detects LDAP searches for Kerberos\
+    \ delegation attributes (T1558 - Steal or Forge Kerberos Tickets)\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique\
+    \ = \"T1558\"\n    severity = \"High\"\n    \n  events:\n    $e.metadata.product_name = \"Microsoft Defender for Endpoint\"\n    $e.metadata.product_event_type\
+    \ = \"LdapSearch\"\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    \n    not arrays.contains($e.target.labels.value, \"[ ]\")\n\
+    \    \n    $e.security_result.detection_fields.value != \"Base\"\n    \n    (\n      re.regex($e.security_result.summary, `userAccountControl:1\\\
+    .2\\.840\\.113556\\.1\\.4\\.803:=4194304`) or\n      re.regex($e.security_result.summary, `userAccountControl:1\\.2\\.840\\.113556\\.1\\.4\\\
+    .803:=2097152`) or\n      re.regex($e.security_result.summary, `!\\(userAccountControl:1\\.2\\.840\\.113556\\.1\\.4\\.803:=1048574\\)`) or\n\
+    \      re.regex($e.security_result.summary, `userAccountControl:1\\.2\\.840\\.113556\\.1\\.4\\.803:=524288`) or\n      re.regex($e.security_result.summary,\
+    \ `msDS-AllowedToActOnBehalfOfOtherIdentity`) or\n      re.regex($e.security_result.summary, `msDS-AllowedToDelegateTo`)\n    )\n    \n  \
+    \  $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n  outcome:\n    $risk_score = 75\n    \n  condition:\n    $e\n\
+    }\n"
+  esql: "FROM logs-microsoft_defender*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.category == \"AdvancedHunting-DeviceEvents\"\n  AND\
+    \ event.type == \"LdapSearch\"\n  AND tags != \"[ ]\"\n  AND event.action != \"Base\"\n  AND (\n    TO_LOWER(message) LIKE \"*(useraccountcontrol:1.2.840.113556.1.4.803:=4194304)*\"\
+    \n    OR TO_LOWER(message) LIKE \"*(useraccountcontrol:1.2.840.113556.1.4.803:=2097152)*\"\n    OR TO_LOWER(message) LIKE \"*!(useraccountcontrol:1.2.840.113556.1.4.803:=1048574)*\"\
+    \n    OR TO_LOWER(message) LIKE \"*(useraccountcontrol:1.2.840.113556.1.4.803:=524288)*\"\n    OR TO_LOWER(message) LIKE \"*msds-allowedtoactonbehalfofotheridentity*\"\
+    \n    OR TO_LOWER(message) LIKE \"*msds-allowedtodelegateto*\"\n  )\n| KEEP @timestamp, host.name, user.name, event.type, event.action, message,\
+    \ tags\n"
+  leql: |
+    where(source_json.event_category="AdvancedHunting-DeviceEvents" AND source_json.event_type="LdapSearch" AND source_json.tags!="[ ]" AND source_json.scope!="Base" AND (source_json.additional_fields ICONTAINS "(userAccountControl:1.2.840.113556.1.4.803:=4194304)" OR source_json.additional_fields ICONTAINS "(userAccountControl:1.2.840.113556.1.4.803:=2097152)" OR source_json.additional_fields ICONTAINS "!(userAccountControl:1.2.840.113556.1.4.803:=1048574)" OR source_json.additional_fields ICONTAINS "(userAccountControl:1.2.840.113556.1.4.803:=524288)" OR source_json.additional_fields ICONTAINS "msDS-AllowedToActOnBehalfOfOtherIdentity" OR source_json.additional_fields ICONTAINS "msDS-AllowedToDelegateTo"))
+  crowdstrike: |
+    event_category="AdvancedHunting-DeviceEvents" event_type="LdapSearch" tags!=*[?]*  scope!=Base (additional_fields=*userAccountControl:1.2.840.113556.1.4.803:=4194304* OR additional_fields=*userAccountControl:1.2.840.113556.1.4.803:=2097152* OR additional_fields=*!?userAccountControl:1.2.840.113556.1.4.803:=1048574?* OR additional_fields=*userAccountControl:1.2.840.113556.1.4.803:=524288* OR additional_fields=*msDS-AllowedToActOnBehalfOfOtherIdentity* OR additional_fields=*msDS-AllowedToDelegateTo*)
+    | table([@timestamp, ComputerName, additional_fields, scope, tags])
+  xql: |
+    dataset = msft_defender_raw
+    | filter event_category = "AdvancedHunting-DeviceEvents"
+    | filter event_type = "LdapSearch"
+    | filter tags != "[ ]"
+    | filter scope != "Base"
+    | filter additional_fields contains "(userAccountControl:1.2.840.113556.1.4.803:=4194304)"
+        or additional_fields contains "(userAccountControl:1.2.840.113556.1.4.803:=2097152)"
+        or additional_fields contains "!(userAccountControl:1.2.840.113556.1.4.803:=1048574)"
+        or additional_fields contains "(userAccountControl:1.2.840.113556.1.4.803:=524288)"
+        or additional_fields contains "msDS-AllowedToActOnBehalfOfOtherIdentity"
+        or additional_fields contains "msDS-AllowedToDelegateTo"
+    | fields _time, agent_hostname, actor_effective_username, additional_fields, scope, tags
+  lucene: |
+    event_category:"AdvancedHunting-DeviceEvents" AND event_type:"LdapSearch" AND _exists_:tags AND NOT tags:"[ ]" AND NOT scope:"Base" AND (additional_fields:*userAccountControl\:1.2.840.113556.1.4.803\:\=4194304* OR additional_fields:*userAccountControl\:1.2.840.113556.1.4.803\:\=2097152* OR additional_fields:*\!userAccountControl\:1.2.840.113556.1.4.803\:\=1048574* OR additional_fields:*userAccountControl\:1.2.840.113556.1.4.803\:\=524288* OR additional_fields:*msDS-AllowedToActOnBehalfOfOtherIdentity* OR additional_fields:*msDS-AllowedToDelegateTo*)
+  sumo: "_sourceCategory=*Defender* OR _sourceCategory=*AdvancedHunting* \"DeviceEvents\" \"LdapSearch\"\n| json field=_raw \"ActionType\" as\
+    \ event_type\n| json field=_raw \"AdditionalFields\" as additional_fields\n| json field=_raw \"RemoteUrl\" as scope\n| json field=_raw \"\
+    Tags\" as tags\n| where event_type = \"LdapSearch\"\n| where tags != \"[ ]\" and tags != \"[]\"\n| where scope != \"Base\"\n| where additional_fields\
+    \ matches \"*userAccountControl:1.2.840.113556.1.4.803:=4194304*\" \n    or additional_fields matches \"*userAccountControl:1.2.840.113556.1.4.803:=2097152*\"\
+    \n    or additional_fields matches \"*!(userAccountControl:1.2.840.113556.1.4.803:=1048574)*\"\n    or additional_fields matches \"*userAccountControl:1.2.840.113556.1.4.803:=524288*\"\
+    \n    or additional_fields matches \"*msDS-AllowedToActOnBehalfOfOtherIdentity*\"\n    or additional_fields matches \"*msDS-AllowedToDelegateTo*\"\
+    \n| fields _messageTime, event_type, additional_fields, scope, tags\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +113,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 AdvancedHunting Device Event\nWhere event_category = \"AdvancedHunting-DeviceEvents\"\nWhere event_type = \"LdapSearch\"\nWhere\
   \ tags != \"[ ]\"\nWhere scope!=\"Base\"\n\nWhere (\n    additional_fields contains \"(userAccountControl:1.2.840.113556.1.4.803:=4194304)\"\

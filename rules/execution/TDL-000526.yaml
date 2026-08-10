@@ -17,74 +17,96 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=windows (EventCode=592 OR EventCode=4688) CommandLine="*ScreenConnect*" CommandLine="*e=Access&*" CommandLine="*y=Guest&*" CommandLine="*&p=*" CommandLine="*&c=*" CommandLine="*&k=*"
+  spl: 'index=windows (EventCode=592 OR EventCode=4688) CommandLine="*ScreenConnect*" CommandLine="*e=Access&*" CommandLine="*y=Guest&*" CommandLine="*&p=*"
+    CommandLine="*&c=*" CommandLine="*&k=*"
+
     | table _time, ComputerName, User, Image, CommandLine, ParentImage
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4688", "4104")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4688', '4104')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000526 {\n  meta:\n    author = \"TDL\"\n    description = \"ScreenConnect Remote Access Detection\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id\
-    \ = /(4688|4104)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (592, 4688)
+    | where CommandLine has "ScreenConnect"
+    | where CommandLine has "e=Access&"
+    | where CommandLine has "y=Guest&"
+    | where CommandLine has "&p="
+    | where CommandLine has "&c="
+    | where CommandLine has "&k="
+    | project TimeGenerated, Computer, Account, Process, CommandLine, EventID
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", sourceip
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Process CommandLine" ILIKE '%ScreenConnect%'
+      AND "Process CommandLine" ILIKE '%e=Access&%'
+      AND "Process CommandLine" ILIKE '%y=Guest&%'
+      AND "Process CommandLine" ILIKE '%&p=%'
+      AND "Process CommandLine" ILIKE '%&c=%'
+      AND "Process CommandLine" ILIKE '%&k=%'
+    LAST 24 HOURS
+  yara_l: |
+    rule screenconnect_guest_access_execution {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects ScreenConnect guest access execution via command line parameters - MITRE T1204"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688"
+        )
+        re.regex($e.principal.process.command_line, `(?i)ScreenConnect`)
+        re.regex($e.principal.process.command_line, `e=Access&`)
+        re.regex($e.principal.process.command_line, `y=Guest&`)
+        re.regex($e.principal.process.command_line, `&p=`)
+        re.regex($e.principal.process.command_line, `&c=`)
+        re.regex($e.principal.process.command_line, `&k=`)
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND event_id IN ("4688", "4104")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4688, 4104])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4688, 4104)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4688", "4104")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4688 OR 4104)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4688", "4104")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-windows.*, logs-system.security*, winlogbeat-*\n| WHERE event.code IN (\"592\", \"4688\") \n  AND process.command_line LIKE\
+    \ \"*ScreenConnect*\"\n  AND process.command_line LIKE \"*e=Access&*\"\n  AND process.command_line LIKE \"*y=Guest&*\"\n  AND process.command_line\
+    \ LIKE \"*&p=*\"\n  AND process.command_line LIKE \"*&c=*\"\n  AND process.command_line LIKE \"*&k=*\"\n| KEEP @timestamp, host.name, user.name,\
+    \ process.name, process.command_line, process.parent.name, process.executable\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND process_cmd_line ICONTAINS "ScreenConnect" AND process_cmd_line ICONTAINS "e=Access&" AND process_cmd_line ICONTAINS "y=Guest&" AND process_cmd_line ICONTAINS "&p=" AND process_cmd_line ICONTAINS "&c=" AND process_cmd_line ICONTAINS "&k=")
+  crowdstrike: |
+    EventCode=4688 CommandLine=*ScreenConnect* CommandLine=*e=Access&* CommandLine=*y=Guest&* CommandLine=*&p=* CommandLine=*&c=* CommandLine=*&k=*
+    | table([@timestamp, ComputerName, UserName, CommandLine, ParentProcessName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter action_process_image_command_line contains "ScreenConnect"
+      and action_process_image_command_line contains "e=Access&"
+      and action_process_image_command_line contains "y=Guest&"
+      and action_process_image_command_line contains "&p="
+      and action_process_image_command_line contains "&c="
+      and action_process_image_command_line contains "&k="
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:(592 OR 4688) AND process.command_line:*ScreenConnect* AND process.command_line:*e=Access&* AND process.command_line:*y=Guest&* AND process.command_line:*&p=* AND process.command_line:*&c=* AND process.command_line:*&k=*
+  sumo: |
+    _sourceCategory=*Windows* (EventID=4688 OR EventID=592)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as command_line
+    | where event_id in ("4688", "592")
+    | where command_line matches "*ScreenConnect*"
+    | where command_line matches "*e=Access&*"
+    | where command_line matches "*y=Guest&*"
+    | where command_line matches "*&p=*"
+    | where command_line matches "*&c=*"
+    | where command_line matches "*&k=*"
+    | fields _messageTime, _sourceHost, event_id, command_line
 false_positives:
 - 'ref: https://www.huntandhackett.com/blog/revil-the-usage-of-legitimate-remote-admin-tooling'
 tuning_guidance: Tune per environment baseline.
@@ -93,7 +115,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Command Line contains \"ScreenConnect\"\nWhere\
   \ the Command Line contains \"e=Access&\"\nWhere the Command Line contains \"y=Guest&\"\nWhere the Command Line contains \"&p=\"\nWhere the\

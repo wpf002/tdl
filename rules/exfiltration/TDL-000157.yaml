@@ -19,71 +19,87 @@ queries:
     Online Storage\" OR application_category=\"Cloud Storage\")\nNOT [| inputlookup authorized_online_storage_apps.csv | fields application]\n\
     | stats count by _time, src, dest, user, application, application_category, action\n| table _time, src, dest, user, application, application_category,\
     \ action, count\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    AppControlCodeIntegrityEvents
+    | where TimeGenerated > ago(24h)
+    | where ApplicationCategory in~ ("Online Storage", "Cloud Storage")
+    | where Application !in~ ("OneDrive.exe", "Dropbox.exe", "Box.exe", "GoogleDrive.exe", "iCloudDrive.exe")
+    | project TimeGenerated, DeviceName, Application, ApplicationCategory, FileName, FolderPath, SHA256, InitiatingProcessFileName, InitiatingProcessCommandLine, ActionType
+  aql: |
+    SELECT sourceip, destinationip, username, "Application Name", "Application Category", COUNT(*) AS event_count
+    FROM events
+    WHERE "Application Category" IN ('Online Storage', 'Cloud Storage')
+      AND "Application Name" NOT IN ('Dropbox', 'OneDrive', 'Google Drive', 'Box')
+    GROUP BY sourceip, destinationip, username, "Application Name", "Application Category"
+    LAST 24 HOURS
+  yara_l: |
+    rule exfiltration_unauthorized_cloud_storage {
+      meta:
+        author = "TDL"
+        description = "Detects usage of unauthorized online/cloud storage applications - MITRE T1567 Exfiltration to Cloud Storage"
+        mitre_attack_tactic = "Exfiltration"
+        mitre_attack_technique = "T1567"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        (
+          $e.target.application = "Online Storage" or
+          $e.target.application = "Cloud Storage"
+        )
+        not (
+          $e.target.url = "onedrive.live.com" or
+          $e.target.url = "sharepoint.com" or
+          re.regex($e.target.url, `dropbox\.com`) or
+          re.regex($e.target.url, `box\.com`) or
+          re.regex($e.target.url, `drive\.google\.com`)
+        )
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $user
 
-    | where process_name matches regex ".+"
+      match:
+        $host, $user over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      outcome:
+        $risk_score = 65
+        $app = array_distinct($e.target.application)
+        $url = array_distinct($e.target.url)
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exf_000157 {\n  meta:\n    author = \"TDL\"\n    description = \"Traffic to Unauthorized Online Storage Application\"\n\
-    \    severity = \"LOW\"\n    tactic = \"TA0010\"\n    technique = \"T1567\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-endpoint.events.file*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.category == \"file\" \n  AND (process.name IS NOT\
+    \ NULL OR file.name IS NOT NULL)\n  AND (\n    TO_LOWER(process.name) IN (\"dropbox.exe\", \"onedrive.exe\", \"googledrivesync.exe\", \"box.exe\"\
+    , \"sync.exe\", \"mega.exe\", \"pcloud.exe\", \"tresorit.exe\", \"syncplicity.exe\", \"sharefile.exe\", \"egnyte.exe\", \"sugarsync.exe\"\
+    , \"idrive.exe\", \"carbonite.exe\", \"backblaze.exe\", \"crashplan.exe\", \"jungle.exe\", \"acronis.exe\")\n    OR TO_LOWER(file.path) LIKE\
+    \ \"*\\\\dropbox\\\\*\"\n    OR TO_LOWER(file.path) LIKE \"*\\\\onedrive\\\\*\"\n    OR TO_LOWER(file.path) LIKE \"*\\\\google drive\\\\*\"\
+    \n    OR TO_LOWER(file.path) LIKE \"*\\\\box sync\\\\*\"\n    OR TO_LOWER(file.path) LIKE \"*\\\\mega\\\\*\"\n  )\n  AND NOT (\n    TO_LOWER(process.name)\
+    \ IN (\"onedrive.exe\", \"googledrivesync.exe\", \"dropbox.exe\")\n    OR TO_LOWER(process.executable) LIKE \"*\\\\microsoft\\\\onedrive\\\
+    \\*\"\n    OR TO_LOWER(process.executable) LIKE \"*\\\\google\\\\drive\\\\*\"\n  )\n| STATS event_count = COUNT(*) BY host.name, user.name,\
+    \ process.name, process.executable, file.path\n| WHERE event_count >= 1\n| KEEP host.name, user.name, process.name, process.executable, file.path,\
+    \ event_count\n"
+  leql: |
+    where(source_json.application_category IN ["Online Storage", "Cloud Storage"] AND NOT source_json.application IN ["OneDrive", "Google Drive", "Dropbox", "Box", "SharePoint"])
+  crowdstrike: |
+    #type=ApplicationControlEvent event_simpleName=ApplicationControlEvent
+    | in(field=ApplicationCategory, values=["Online Storage", "Cloud Storage"])
+    | !in(field=ApplicationName, values=["OneDrive", "Dropbox Business", "Box", "Google Drive", "SharePoint"])
+    | table([@timestamp, ComputerName, UserName, ApplicationName, ApplicationCategory, FileName, FilePath])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_APPLICATION_CONTROL
+    | filter action_app_id_category in ("Online Storage", "Cloud Storage")
+    | filter action_app_id_name not in ("Dropbox Business", "Box", "Google Drive", "Microsoft OneDrive for Business", "SharePoint Online")
+    | fields _time, agent_hostname, actor_effective_username, action_app_id_name, action_app_id_category, action_remote_ip, action_remote_port
+  lucene: |
+    _exists_:application.category AND application.category:("Online Storage" OR "Cloud Storage") AND NOT application.name:(Dropbox OR "Google Drive" OR OneDrive OR Box OR "Microsoft OneDrive" OR "SharePoint Online")
+  sumo: |
+    _sourceCategory=*Application*Control*
+    | json field=_raw "ApplicationCategory" as app_category
+    | json field=_raw "Application" as application
+    | where app_category in ("Online Storage", "Cloud Storage")
+    | where !(application in ("OneDrive", "Google Drive", "Dropbox", "Box", "SharePoint"))
+    | fields _messageTime, _sourceHost, application, app_category
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -93,7 +109,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Application Control Event
 

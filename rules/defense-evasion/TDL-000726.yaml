@@ -17,80 +17,130 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=wineventlog (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (Image="*\\bitsadmin.exe" OR (Image="*\\powershell.exe" (CommandLine="*Start-BitsTransfer*" OR CommandLine="*Add-BitsFile*")))) OR (sourcetype=WinEventLog:Security EventCode=4688 (New_Process_Name="*\\bitsadmin.exe" OR (New_Process_Name="*\\powershell.exe" (Process_Command_Line="*Start-BitsTransfer*" OR Process_Command_Line="*Add-BitsFile*"))))
-    (CommandLine="*.exe*" OR CommandLine="*.dll*" OR CommandLine="*.bin*" OR Process_Command_Line="*.exe*" OR Process_Command_Line="*.dll*" OR Process_Command_Line="*.bin*")
-    NOT (CommandLine="*microsoft.com*" OR CommandLine="*windowsupdate.com*" OR CommandLine="*download.windowsupdate.com*" OR Process_Command_Line="*microsoft.com*" OR Process_Command_Line="*windowsupdate.com*" OR Process_Command_Line="*download.windowsupdate.com*")
+  spl: 'index=wineventlog (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (Image="*\\bitsadmin.exe" OR (Image="*\\powershell.exe"
+    (CommandLine="*Start-BitsTransfer*" OR CommandLine="*Add-BitsFile*")))) OR (sourcetype=WinEventLog:Security EventCode=4688 (New_Process_Name="*\\bitsadmin.exe"
+    OR (New_Process_Name="*\\powershell.exe" (Process_Command_Line="*Start-BitsTransfer*" OR Process_Command_Line="*Add-BitsFile*"))))
+
+    (CommandLine="*.exe*" OR CommandLine="*.dll*" OR CommandLine="*.bin*" OR Process_Command_Line="*.exe*" OR Process_Command_Line="*.dll*" OR
+    Process_Command_Line="*.bin*")
+
+    NOT (CommandLine="*microsoft.com*" OR CommandLine="*windowsupdate.com*" OR CommandLine="*download.windowsupdate.com*" OR Process_Command_Line="*microsoft.com*"
+    OR Process_Command_Line="*windowsupdate.com*" OR Process_Command_Line="*download.windowsupdate.com*")
+
     | eval command_line=coalesce(CommandLine, Process_Command_Line)
+
     | eval process_name=coalesce(Image, New_Process_Name)
+
     | rex field=command_line "(?i)https?://(?<download_host>[^/:\s]+)"
+
     | where isnotnull(download_host)
+
     | table _time, ComputerName, User, process_name, command_line, download_host
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000726 {\n  meta:\n    author = \"TDL\"\n    description = \"BITS Used to Download Executable from Unusual Host\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1197\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
-    \n    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 1
+    | where (ProcessCommandLine has "bitsadmin" and ProcessCommandLine has_any ("transfer", "/transfer", "/download", "download") and ProcessCommandLine has_any (".exe", ".dll", ".bin"))
+        or (ProcessCommandLine has "Start-BitsTransfer" and ProcessCommandLine has_any (".exe", ".dll", ".bin"))
+    | extend URL = extract(@"(http[s]?://[^\s]+)", 1, ProcessCommandLine)
+    | where isnotempty(URL)
+    | extend Domain = extract(@"http[s]?://([^/\s:]+)", 1, URL)
+    | where Domain !in~ ("download.microsoft.com", "windowsupdate.com", "update.microsoft.com", "delivery.mp.microsoft.com")
+    | project TimeGenerated, Computer, Account, ProcessCommandLine, URL, Domain
+  aql: |
+    SELECT eventtime, sourceip, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Image"
+    FROM events
+    WHERE (
+        ("Process Name" ILIKE '%bitsadmin.exe%' AND "Process CommandLine" MATCHES '.*(/transfer|/addfile).*\.(exe|dll|bin).*')
+        OR
+        ("Process Name" ILIKE '%powershell.exe%' AND "Process CommandLine" MATCHES '.*(Start-BitsTransfer|Add-BitsFile).*\.(exe|dll|bin).*')
+    )
+    AND "Process CommandLine" NOT ILIKE '%microsoft.com%'
+    AND "Process CommandLine" NOT ILIKE '%windowsupdate.com%'
+    AND "Process CommandLine" NOT ILIKE '%download.microsoft.com%'
+    LAST 1 HOURS
+  yara_l: |
+    rule bitsadmin_suspicious_download {
+      meta:
+        author = "TDL"
+        description = "T1197 - BITS Jobs downloading executable content from non-approved sources"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1197"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        (
+          $e.metadata.event_type = "PROCESS_LAUNCH"
+          (
+            re.regex($e.principal.process.file.full_path, `(?i)\\bitsadmin\.exe$`) or
+            (
+              re.regex($e.principal.process.file.full_path, `(?i)\\powershell\.exe$`) and
+              re.regex($e.principal.process.command_line, `(?i)Start-BitsTransfer|Add-BitsFile|BITS\.Manager`)
+            )
+          )
+          re.regex($e.principal.process.command_line, `(?i)\.(exe|dll|bin)`)
+          not re.regex($e.principal.process.command_line, `(?i)(windowsupdate\.microsoft\.com|download\.microsoft\.com|wsus\.|update\.|patch\.)`)
+          $e.principal.hostname = $host
+          $e.principal.user.userid = $user
+        )
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host, $user over 10m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 65
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.*, winlogbeat-*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (process.name == "bitsadmin.exe" AND process.command_line LIKE "*transfer*")
+        OR (process.name == "powershell.exe" AND (process.command_line LIKE "*Start-BitsTransfer*" OR process.command_line LIKE "*Add-BitsFile*"))
+        OR (winlog.event_id == 59 OR winlog.event_id == 60 OR winlog.event_id == 61)
+      )
+      AND (
+        process.command_line LIKE "*.exe*"
+        OR process.command_line LIKE "*.dll*"
+        OR process.command_line LIKE "*.bin*"
+        OR winlog.event_data.RemoteName LIKE "*.exe*"
+        OR winlog.event_data.RemoteName LIKE "*.dll*"
+        OR winlog.event_data.RemoteName LIKE "*.bin*"
+      )
+      AND NOT (
+        process.command_line LIKE "*windowsupdate.com*"
+        OR process.command_line LIKE "*microsoft.com*"
+        OR process.command_line LIKE "*download.windowsupdate.com*"
+        OR winlog.event_data.RemoteName LIKE "*windowsupdate.com*"
+        OR winlog.event_data.RemoteName LIKE "*microsoft.com*"
+        OR winlog.event_data.RemoteName LIKE "*download.windowsupdate.com*"
+      )
+    | EVAL remote_url = COALESCE(winlog.event_data.RemoteName, process.command_line)
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, remote_url, winlog.event_id
+  leql: |
+    where((process_name ICONTAINS "bitsadmin.exe" OR process_cmd_line ICONTAINS "Start-BitsTransfer") AND (process_cmd_line ICONTAINS ".exe" OR process_cmd_line ICONTAINS ".dll" OR process_cmd_line ICONTAINS ".bin")) groupby(asset, process_cmd_line, user) calculate(count)
+  crowdstrike: |
+    (event_simpleName=ProcessRollup2 OR EventCode=1) (FileName=*bitsadmin.exe OR CommandLine=*Start-BitsTransfer* OR CommandLine=*Add-BitsFile*)
+    (CommandLine=*.exe* OR CommandLine=*.dll* OR CommandLine=*.bin*)
+    | regex("(?i)(?<downloaded_file>https?://[^\\s]+\\.(?:exe|dll|bin))", field=CommandLine)
+    | regex("(?i)https?://(?<remote_host>[^/\\s:]+)", field=CommandLine)
+    | not (remote_host IN ["update.microsoft.com", "download.microsoft.com", "windowsupdate.com", "*.s3.amazonaws.com", "*.blob.core.windows.net"])
+    | table([@timestamp, ComputerName, UserName, FileName, ParentBaseFileName, CommandLine, remote_host, downloaded_file])
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_PROCESS\n  and (actor_process_image_name ~= \"(?i)bitsadmin\\.exe$\" \n    \
+    \   or (actor_process_image_name ~= \"(?i)powershell\\.exe$\" \n           and action_process_image_command_line ~= \"(?i)(Start-BitsTransfer|BITS\\\
+    .Manager)\"))\n  and action_process_image_command_line ~= \"(?i)\\.(exe|dll|bin)\"\n| fields _time, agent_hostname, actor_effective_username,\
+    \ actor_process_image_name, action_process_image_command_line\n"
+  lucene: |
+    (process.name:bitsadmin.exe OR (process.name:powershell.exe AND process.command_line:*Start-BitsTransfer*)) AND (process.command_line:(*.exe OR *.dll OR *.bin)) AND NOT (process.command_line:(*microsoft.com* OR *windows.com* OR *windowsupdate.com*))
+  sumo: "_sourceCategory=*Windows* (bitsadmin OR \"Start-BitsTransfer\")\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"CommandLine\"\
+    \ as command_line\n| json field=_raw \"Image\" as image\n| json field=_raw \"Computer\" as host\n| where (image matches \"*bitsadmin.exe\"\
+    \ OR command_line matches \"*Start-BitsTransfer*\") \n  AND (command_line matches \"*.exe*\" OR command_line matches \"*.dll*\" OR command_line\
+    \ matches \"*.bin*\")\n  AND NOT (command_line matches \"*microsoft.com*\" OR command_line matches \"*windowsupdate.com*\" OR command_line\
+    \ matches \"*update.microsoft.com*\")\n| fields _messageTime, host, image, command_line\n"
 pseudo_logic: bitsadmin or BITS-via-PowerShell downloads .exe / .dll / .bin from a host outside your software-delivery allowlist. Living-off-the-land
   transfer.
 false_positives:
@@ -109,7 +159,7 @@ references:
 - https://attack.mitre.org/techniques/T1197/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

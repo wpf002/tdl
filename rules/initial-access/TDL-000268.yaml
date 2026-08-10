@@ -15,71 +15,65 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=azure sourcetype="azure:security:center" EventName="Login from a principal user not seen in 60 days"
+  spl: 'index=azure sourcetype="azure:security:center" EventName="Login from a principal user not seen in 60 days"
+
     | table _time, user, src_ip, dest, action, result, EventName
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
 
+    '
+  kql: |
+    SecurityAlert
     | where TimeGenerated > ago(1d)
+    | where AlertName == "Login from a principal user not seen in 60 days"
+    | where ProductName == "Azure Security Center"
+    | project TimeGenerated, AlertName, AlertSeverity, CompromisedEntity, Entities, ExtendedProperties, Description, RemediationSteps
+  aql: |
+    SELECT sourceip, username, QIDNAME(qid), LOGSOURCENAME(logsourceid), eventtime
+    FROM events
+    WHERE QIDNAME(qid) = 'Login from a principal user not seen in 60 days'
+      AND LOGSOURCENAME(logsourceid) ILIKE '%Azure%'
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_principal_user_login_not_seen_60_days {
+      meta:
+        author = "TDL"
+        description = "Detects Azure login from principal user not seen in 60 days"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        platform = "Azure"
+        data_source = "Azure Security Center"
 
-    | where eventName matches regex ".+"
+      events:
+        $e.metadata.vendor_name = "Microsoft"
+        $e.metadata.product_name = "Azure"
+        $e.security_result.summary = "Login from a principal user not seen in 60 days"
+        $e.principal.user.userid = $user
+        $e.principal.hostname = $host
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+      match:
+        $user over 5m
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000268 {\n  meta:\n    author = \"TDL\"\n    description = \"Login from a principal user not seen in 60 days\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-azure.activitylogs*, logs-azure.signinlogs*, logs-azure.auditlogs*\n| WHERE @timestamp > NOW() - 1 hour \n  AND event.action\
+    \ == \"Login from a principal user not seen in 60 days\"\n| KEEP @timestamp, host.name, user.name, source.ip, event.action, event.outcome,\
+    \ cloud.account.id, azure.activitylogs.operation_name, azure.signinlogs.properties.user_principal_name\n"
+  leql: |
+    where(source_json.operationName="Login from a principal user not seen in 60 days")
+  crowdstrike: |
+    #type=azure #source=SecurityCenter event.name="Login from a principal user not seen in 60 days"
+    | table([@timestamp, ComputerName, user.name, sourceIPAddress, event.name, event.outcome])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Azure" and event_type = "SecurityEvent" and operation = "Login from a principal user not seen in 60 days"
+    | fields _time, cloud_provider_account, actor_effective_username, operation, outcome
+  lucene: |
+    azure.activitylogs.operationName:"Login from a principal user not seen in 60 days"
+  sumo: |
+    _sourceCategory=*Azure*Security* "Login from a principal user not seen in 60 days"
+    | json field=_raw "EventName" as event_name
+    | where event_name = "Login from a principal user not seen in 60 days"
+    | fields _messageTime, _sourceHost, event_name
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +83,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure Security Event
 

@@ -15,71 +15,67 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=cloudtrail eventSource=ec2.amazonaws.com eventName=CreateInstanceExportTask
+  spl: 'index=cloudtrail eventSource=ec2.amazonaws.com eventName=CreateInstanceExportTask
+
     | table _time, userIdentity.principalId, userIdentity.arn, sourceIPAddress, awsRegion, requestParameters.instanceId, responseElements.exportTask.exportTaskId
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000427 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS EC2 VM Export Attempt\"\n    severity = \"LOW\"\n\
-    \    tactic = \"TA0009\"\n    technique = \"T1005\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(90d)
+    | where EventSource == "ec2.amazonaws.com"
+    | where EventName == "CreateInstanceExportTask"
+    | project TimeGenerated, UserIdentityArn, UserIdentityType, SourceIpAddress, EventName, EventSource, AwsRegion, ErrorCode, ErrorMessage, RequestParameters, ResponseElements
+  aql: |
+    SELECT eventtime, username, sourceip, "Application" AS application, "Event" AS event_name, "Request Parameters" AS request_params, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "Application" = 'ec2.amazonaws.com'
+      AND "Event" = 'CreateInstanceExportTask'
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_ec2_data_exfiltration_via_export_task {
+      meta:
+        author = "TDL"
+        description = "Detects potential data collection via EC2 instance export task creation"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1005"
+        platform = "AWS"
+        data_source = "AWS CloudTrail"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "AMAZON"
+        $e.metadata.product_name = "AWS CloudTrail"
+        $e.metadata.product_event_type = "CreateInstanceExportTask"
+        $e.target.application = "ec2.amazonaws.com"
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE event.provider == "ec2.amazonaws.com" AND event.action == "CreateInstanceExportTask"
+    | KEEP @timestamp, cloud.account.id, cloud.region, user.name, aws.cloudtrail.user_identity.arn, source.ip, event.outcome
+  leql: |
+    where(source_json.eventSource=ec2.amazonaws.com AND source_json.eventName=CreateInstanceExportTask)
+  crowdstrike: |
+    #repo=* event_platform=aws eventSource=ec2.amazonaws.com eventName=CreateInstanceExportTask
+    | table([@timestamp, userIdentity.principalId, sourceIPAddress, awsRegion, requestParameters.instanceId, responseElements.exportTask.exportTaskId])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and cloud_provider_event_source = "ec2.amazonaws.com" and cloud_provider_event_operation = "CreateInstanceExportTask"
+    | fields _time, actor_user, cloud_provider_event_operation, cloud_provider_event_source, cloud_resource_attributes
+  lucene: |
+    eventSource:ec2.amazonaws.com AND eventName:CreateInstanceExportTask
+  sumo: |
+    _sourceCategory=*cloudtrail* "CreateInstanceExportTask"
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "eventSource" as event_source
+    | where event_source = "ec2.amazonaws.com" and event_name = "CreateInstanceExportTask"
+    | fields _messageTime, event_name, event_source, userIdentity.principalId, sourceIPAddress, awsRegion
 false_positives:
 - 'False positives could be dev instances. Rule could be tuned to look for failures or successes.
 
@@ -91,7 +87,7 @@ tags:
 - collection
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 AWS CloudTrail Event
 

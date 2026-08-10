@@ -16,71 +16,73 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=azure sourcetype=azure:activity operationName="MICROSOFT.AUTOMATION/AUTOMATIONACCOUNTS/WRITE" status=Success
+  spl: 'index=azure sourcetype=azure:activity operationName="MICROSOFT.AUTOMATION/AUTOMATIONACCOUNTS/WRITE" status=Success
+
     | table _time, user, operationName, resourceId, subscriptionId, resourceGroupName, status
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000652 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Automation Account Created\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0002\"\n    technique = \"T1059\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AzureActivity
+    | where TimeGenerated > ago(1h)
+    | where OperationNameValue =~ "MICROSOFT.AUTOMATION/AUTOMATIONACCOUNTS/WRITE"
+    | where ActivityStatusValue =~ "Success"
+    | project TimeGenerated, Caller, OperationNameValue, ActivityStatusValue, ResourceGroup, SubscriptionId, ResourceId, CallerIpAddress, Properties
+  aql: |
+    SELECT sourceip, username, qidname(qid), LOGSOURCENAME(logsourceid), eventtime, "Operation", "Resource"
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%Azure%'
+      AND categoryname(category) ILIKE '%Administrative%'
+      AND "Operation" = 'MICROSOFT.AUTOMATION/AUTOMATIONACCOUNTS/WRITE'
+      AND (qidname(qid) ILIKE '%success%' OR categoryname(category) ILIKE '%success%')
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_automation_account_creation {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects creation or modification of Azure Automation Accounts (T1059 - Command and Scripting Interpreter)"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1059"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "SYSTEM_AUDIT_LOG_UNCATEGORIZED"
+        $e.metadata.product_name = "Azure"
+        $e.target.resource.attribute.labels["operationName"] = /MICROSOFT\.AUTOMATION\/AUTOMATIONACCOUNTS\/WRITE/i
+        $e.security_result.action = "ALLOW"
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $resource
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-azure.activitylogs*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.outcome == "success"
+      AND TO_UPPER(azure.activitylogs.operation_name) == "MICROSOFT.AUTOMATION/AUTOMATIONACCOUNTS/WRITE"
+    | KEEP @timestamp, azure.activitylogs.operation_name, azure.activitylogs.identity.claims.name, azure.resource.group, azure.resource.name, cloud.account.id, event.outcome
+  leql: |
+    where(source_json.operationName="MICROSOFT.AUTOMATION/AUTOMATIONACCOUNTS/WRITE" AND source_json.status="Success")
+  crowdstrike: |
+    #type=azure:activity operationName="MICROSOFT.AUTOMATION/AUTOMATIONACCOUNTS/WRITE" resultType=Success
+    | table([@timestamp, callerIpAddress, caller, operationName, resourceId, resultType])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = ENUM.CLOUD_PROVIDER_AZURE
+      and operation_name in ("MICROSOFT.AUTOMATION/AUTOMATIONACCOUNTS/WRITE")
+      and outcome = ENUM.AUDIT_RESULT_SUCCESS
+    | fields _time, cloud_provider, operation_name, outcome, actor_user, resource_name, resource_sub_type, cloud_resource_identifier
+  lucene: |
+    azure.activitylogs.operation_name:"MICROSOFT.AUTOMATION/AUTOMATIONACCOUNTS/WRITE" AND azure.activitylogs.result_type:"Success"
+  sumo: |
+    _sourceCategory=*Azure*Activity*
+    | json field=_raw "operationName" as operation
+    | json field=_raw "status.value" as status
+    | where operation matches "*MICROSOFT.AUTOMATION/AUTOMATIONACCOUNTS/WRITE*" and status = "Success"
+    | fields _messageTime, _sourceHost, operation, status
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +92,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure Administrative Activity Event
 

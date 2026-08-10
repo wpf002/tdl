@@ -15,84 +15,121 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp signature="*MOVEit*exploit*" action=allowed
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp signature="*MOVEit*exploit*" action=allowed
+
     | search NOT (src_ip IN ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
-    | stats count sum(bytes_out) as total_bytes_out values(signature) as signatures earliest(_time) as first_seen latest(_time) as last_seen by src_ip dest_ip dest_port
+
+    | stats count sum(bytes_out) as total_bytes_out values(signature) as signatures earliest(_time) as first_seen latest(_time) as last_seen by
+    src_ip dest_ip dest_port
+
     | where count >= 1
+
     | sort - total_bytes_out
+
     | table src_ip dest_ip dest_port count total_bytes_out signatures first_seen last_seen
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: |
+    CommonSecurityLog
+    | where DeviceVendor has_any ("Palo Alto", "Fortinet", "Cisco", "Check Point", "Snort", "Suricata", "Zeek", "IDS", "IPS", "Firewall")
+    | where DeviceAction in~ ("allowed", "permit", "accept")
+    | where ApplicationProtocol =~ "tcp" or Protocol =~ "tcp"
+    | where (DeviceEventClassID has "MOVEit" or Message has "MOVEit" or AdditionalExtensions has "MOVEit" or Activity has "MOVEit")
+    | where CommunicationDirection =~ "inbound" or (isnotempty(DestinationIP) and isnotempty(SourceIP))
+    | where SourceIP !in ("10.0.0.50", "10.0.0.51", "192.168.1.100", "172.16.0.10")
+    | summarize event_count = count(), total_bytes_out = sum(SentBytes) by SourceIP, DestinationIP, DestinationPort
+    | where event_count >= 1
+    | sort by total_bytes_out desc
+    | project SourceIP, DestinationIP, DestinationPort, event_count, total_bytes_out
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(bytesout) AS total_bytes_out, COUNT(*) AS event_count, qidname(qid) AS signature_name, LOGSOURCENAME(logsourceid) AS device
+    FROM events
+    WHERE (LOGSOURCENAME(logsourceid) ILIKE '%firewall%' OR LOGSOURCENAME(logsourceid) ILIKE '%ids%' OR LOGSOURCENAME(logsourceid) ILIKE '%ips%' OR categoryname(category) ILIKE '%intrusion%' OR categoryname(category) ILIKE '%ids%')
+      AND (qidname(qid) ILIKE '%moveit%' OR qidname(qid) ILIKE '%cve-2023-34362%' OR qidname(qid) ILIKE '%cve-2023-35036%' OR qidname(qid) ILIKE '%cve-2023-35708%')
+      AND (categoryname(category) NOT ILIKE '%denied%' AND categoryname(category) NOT ILIKE '%blocked%' AND qidname(qid) NOT ILIKE '%blocked%' AND qidname(qid) NOT ILIKE '%denied%')
+      AND protocolid = '6'
+      AND sourceip NOT IN ('10.0.0.100', '192.168.1.50', '172.16.0.200')
+    GROUP BY sourceip, destinationip, destinationport, qidname(qid), LOGSOURCENAME(logsourceid)
+    HAVING event_count >= 1
+    ORDER BY total_bytes_out DESC
+    LAST 7 DAYS
+  yara_l: |
+    rule moveit_exploit_allowed_inbound {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects allowed MOVEit exploit signatures on inbound IDS/IPS traffic"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.ip_protocol = "TCP"
+        $e.network.direction = "INBOUND"
+        $e.security_result.action = "ALLOW"
+        re.regex($e.security_result.summary, `(?i)moveit`)
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dest_ip
+        $e.target.port = $dest_port
+        not net.ip_in_range_cidr($src_ip, "10.0.0.0/8")
+        not net.ip_in_range_cidr($src_ip, "172.16.0.0/12")
+        not net.ip_in_range_cidr($src_ip, "192.168.0.0/16")
 
-    WHERE "network.protocol" LIKE ''%tcp%''
+      match:
+        $src_ip, $dest_ip, $dest_port over 24h
 
-    GROUP BY sourceip, destinationip, destinationport
+      outcome:
+        $risk_score = max(75)
+        $total_bytes_out = sum($e.network.sent_bytes)
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000471 {\n  meta:\n    author = \"TDL\"\n    description = \"Allowed MOVEit Exploit Signature Detection - Inbound\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
+      condition:
+        #e >= 1
+    }
+  esql: "FROM logs-network.ids*, logs-network.firewall*\n| WHERE network.protocol == \"tcp\" \n  AND (event.action == \"allowed\" OR action ==\
+    \ \"allowed\")\n  AND (message LIKE \"*MOVEit*\" OR signature LIKE \"*MOVEit*\" OR rule.name LIKE \"*MOVEit*\")\n  AND network.direction ==\
+    \ \"inbound\"\n  AND source.ip NOT IN (\"10.0.0.100\", \"10.0.0.101\", \"192.168.1.50\")\n| STATS total_events = COUNT(*), total_bytes_out\
+    \ = SUM(destination.bytes) BY source.ip, destination.ip, destination.port\n| WHERE total_events >= 1\n| SORT total_bytes_out DESC\n| KEEP\
+    \ source.ip, destination.ip, destination.port, total_events, total_bytes_out\n"
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp" AND (source_json.signature ICONTAINS "moveit" OR source_json.alert ICONTAINS "moveit" OR source_json.rule_name ICONTAINS "moveit") AND source_json.action IN ["allowed", "permit", "accept"] AND NOT source_address IN ["10.0.0.100", "10.0.0.101", "192.168.1.50"]) groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    #repo=network (sourcetype=firewall OR sourcetype=ids) network.protocol=*tcp* (signature=*MOVEit* OR signature=*moveit*) action=allowed direction=inbound
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=event_count), sum(bytes_out, as=total_bytes_out)])
+    | event_count >= 1
+    | !in(src_ip, values=["10.0.0.100", "10.0.0.101", "192.168.1.50"])
+    | sort(field=total_bytes_out, order=desc, limit=1000)
+    | table([@timestamp, src_ip, dest_ip, dest_port, event_count, total_bytes_out, signature, action])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_network_protocol = "tcp" and action_firewall_rule_action in ("allow", "allowed")
+    | filter action_firewall_app_name contains "moveit" or action_firewall_threat_name contains "moveit" or action_firewall_threat_name ~= "(?i)moveit.*exploit"
+    | filter action_traffic_direction = "inbound" or dst_action_network_nat_type = "external-to-internal"
+    | filter action_source_ip not in ("10.0.0.100", "10.0.0.101", "192.168.1.50")
+    | comp count() as event_count, sum(action_network_bytes_out) as total_bytes_out by action_source_ip, action_destination_ip, action_destination_port
+    | filter event_count >= 1
+    | sort desc total_bytes_out
+    | fields action_source_ip, action_destination_ip, action_destination_port, event_count, total_bytes_out
+  lucene: |
+    (sourcetype:(firewall OR ids) OR event.dataset:(firewall OR ids OR ips)) AND network.protocol:tcp AND (signature:*MOVEit* OR alert.signature:*MOVEit* OR event.action:*MOVEit* OR message:*MOVEit*) AND (action:allowed OR event.outcome:success OR disposition:allowed) AND (direction:inbound OR network.direction:inbound OR traffic_direction:inbound) AND NOT (source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) OR src_ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16))
+  sumo: |
+    _sourceCategory=*network* (*firewall* OR *ids* OR *IPS*)
+    | json field=_raw "protocol" as protocol
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "signature" as signature
+    | json field=_raw "action" as action
+    | json field=_raw "direction" as direction
+    | json field=_raw "bytes_out" as bytes_out
+    | where protocol matches "*tcp*"
+    | where signature matches "*MOVEit*" and signature matches "*exploit*"
+    | where action matches "*allow*" or action matches "*permit*"
+    | where direction matches "*inbound*" or direction matches "*in*"
+    | where !(src_ip in ("10.0.0.100", "192.168.1.50", "172.16.0.10"))
+    | count as event_count by src_ip, dest_ip, dest_port
+    | where event_count >= 1
     | sort by bytes_out desc
-
-    '
+    | fields src_ip, dest_ip, dest_port, event_count, bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -102,7 +139,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

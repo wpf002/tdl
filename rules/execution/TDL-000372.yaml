@@ -18,68 +18,69 @@ queries:
   spl: "index=aws sourcetype=aws:cloudtrail eventName=StartSession eventType=AwsApiCall \n| iplocation sourceIPAddress \n| search Country IN (\"\
     CN\", \"RU\", \"KP\", \"IR\", \"SY\", \"CU\", \"BY\")\n| table _time, userIdentity.principalId, userIdentity.userName, sourceIPAddress, Country,\
     \ awsRegion, requestParameters.target, responseElements.sessionId\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(24h)
+    | where EventTypeName == "AwsApiCall"
+    | where EventName == "StartSession"
+    | extend SourceCountry = tostring(parse_json(tostring(ResponseElements)).sourceCountry)
+    | where SourceCountry in ("CN", "RU", "KP", "IR", "SY", "CU", "VE")
+    | project TimeGenerated, UserIdentityArn, EventName, SourceIPAddress, SourceCountry, AWSRegion, UserAgent, RequestParameters, ResponseElements
+  aql: |
+    SELECT sourceip, username, "Country" AS source_country, "Event Name", "User Agent", COUNT(*) AS session_starts
+    FROM events
+    WHERE "Event Name" = 'StartSession'
+      AND "Event Type" = 'AwsApiCall'
+      AND "Country" IN ('CN', 'RU', 'KP', 'IR', 'SY', 'CU', 'VE', 'BY')
+    GROUP BY sourceip, username, "Country", "Event Name", "User Agent"
+    LAST 24 HOURS
+  yara_l: "rule aws_ssm_start_session_from_high_risk_country {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects AWS\
+    \ SSM StartSession API calls from high risk or unauthorized countries - MITRE T1651\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique\
+    \ = \"T1651\"\n    severity = \"High\"\n    \n  events:\n    $e.metadata.vendor_name = \"AMAZON\"\n    $e.metadata.product_name = \"AWS CloudTrail\"\
+    \n    $e.metadata.product_event_type = \"AwsApiCall\"\n    $e.target.resource.name = \"StartSession\"\n    \n    // High risk countries -\
+    \ adjust list based on organizational policy\n    (\n      $e.principal.location.country_or_region = \"CN\" or\n      $e.principal.location.country_or_region\
+    \ = \"RU\" or\n      $e.principal.location.country_or_region = \"KP\" or\n      $e.principal.location.country_or_region = \"IR\" or\n    \
+    \  $e.principal.location.country_or_region = \"SY\" or\n      $e.principal.location.country_or_region = \"CU\"\n    )\n    \n    $e.principal.user.userid\
+    \ = $user\n    $e.principal.location.country_or_region = $country\n    \n  match:\n    $user over 5m\n    \n  outcome:\n    $risk_score =\
+    \ 75\n    $country_code = array_distinct($country)\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-aws.cloudtrail*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.action == \"StartSession\" \n  AND event.type == \"AwsApiCall\"\
+    \n  AND source.geo.country_iso_code IN (\"CN\", \"RU\", \"KP\", \"IR\", \"SY\", \"CU\", \"VE\", \"BY\")\n| STATS session_count = COUNT(*)\
+    \ BY user.name, source.ip, source.geo.country_name, cloud.account.id\n| KEEP @timestamp, user.name, source.ip, source.geo.country_name, cloud.account.id,\
+    \ session_count\n"
+  leql: |
+    where(source_json.eventType="AwsApiCall" AND source_json.eventName="StartSession" AND source_json.sourceIPAddress.country IN ["CN", "RU", "KP", "IR", "SY", "CU", "VE", "BY"])
+  crowdstrike: "#type=cloudtrail eventType=AwsApiCall eventName=StartSession \n| table([@timestamp, userIdentity.principalId, userIdentity.arn,\
+    \ sourceIPAddress, awsRegion, requestParameters.target, recipientAccountId, userAgent, errorCode])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and event_type = "AwsApiCall" and operation = "StartSession"
+    | filter source_location_country in ("CN", "RU", "KP", "IR", "SY", "CU", "VE", "BY")
+    | fields _time, identity_name, source_location_country, source_ipaddress, resource_name, cloud_provider_event_id
+  lucene: |
+    eventName:StartSession AND eventType:AwsApiCall AND (sourceIPAddress.country:"RU" OR sourceIPAddress.country:"CN" OR sourceIPAddress.country:"KP" OR sourceIPAddress.country:"IR" OR sourceIPAddress.country:"SY" OR userIdentity.principalId.sessionContext.attributes.mfaAuthenticated:"false")
+    ```
 
-    | where TimeGenerated > ago(1d)
+    However, since country data is typically enriched and stored differently in CloudTrail/OpenSearch deployments, here's a more practical version that can be adapted:
 
-    | where eventName matches regex ".+"
+    ```
+    eventName:StartSession AND eventType:AwsApiCall
+    ```
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+    Note: Country-based filtering typically requires GeoIP enrichment configured in your pipeline. The actual field name depends on your OpenSearch/Graylog GeoIP configuration (commonly `source.geo.country_iso_code` or `sourceIPAddress.geo.country_code` with ECS). Replace with your actual enriched field:
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000372 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS CLI Session from Unauthorized Country\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1651\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    ```
+    eventName:StartSession AND eventType:AwsApiCall AND source.geo.country_iso_code:(RU OR CN OR KP OR IR OR SY OR VE OR CU)
+  sumo: |
+    _sourceCategory=*cloudtrail* "StartSession"
+    | json field=_raw "eventType" as event_type
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "sourceIPAddress" as source_ip
+    | json field=_raw "userIdentity.principalId" as principal_id
+    | json field=_raw "awsRegion" as aws_region
+    | where event_type = "AwsApiCall" and event_name = "StartSession"
+    | lookup latitude, longitude, country_code, country_name from geo://location on ip=source_ip
+    | where !(country_code in ("US", "CA", "GB", "DE", "FR", "AU", "NZ", "JP", "SE", "NO", "DK", "FI", "NL", "BE", "CH", "AT", "IE", "IT", "ES"))
+    | fields _messageTime, principal_id, source_ip, country_name, country_code, aws_region, event_name
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +90,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 AWS CloudTrail Event
 

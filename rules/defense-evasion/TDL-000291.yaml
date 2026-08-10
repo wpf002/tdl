@@ -19,68 +19,62 @@ queries:
     | spath input=authDetails path=key output=authKey\n| spath input=authDetails path=value output=authValue\n| search authKey=\"Legacy TLS (TLS\
     \ 1.0, 1.2, 3DES)\" authValue=\"True\"\n| table _time, properties.userPrincipalName, properties.ipAddress, properties.appDisplayName, properties.location.city,\
     \ properties.location.countryOrRegion, authKey, authValue\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    SigninLogs
+    | where TimeGenerated > ago(1h)
+    | where AuthenticationProcessingDetails has_cs "Legacy TLS (TLS 1.0, 1.2, 3DES)"
+    | mv-expand AuthDetail = AuthenticationProcessingDetails
+    | where AuthDetail.key =~ "Legacy TLS (TLS 1.0, 1.2, 3DES)" and AuthDetail.value =~ "True"
+    | project TimeGenerated, UserPrincipalName, AppDisplayName, IPAddress, Location, DeviceDetail, AuthDetail
+  aql: |
+    SELECT sourceip, username, QIDNAME(qid), CATEGORYNAME(category), "Authentication Process Details", eventtime
+    FROM events
+    WHERE "Authentication Process Details" ILIKE '%Legacy TLS (TLS 1.0, 1.2, 3DES)%True%'
+       OR ("Authentication Process Details" ILIKE '%Legacy TLS (TLS 1.0, 1.2, 3DES)%' AND "Authentication Process Details" ILIKE '%True%')
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_legacy_tls_authentication {
+      meta:
+        author = "TDL"
+        description = "Detects authentication using legacy TLS protocols (TLS 1.0, 1.2, 3DES) in Azure"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1562"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.vendor_name = "Microsoft"
+        $e.metadata.product_name = "Azure"
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.security_result.detection_fields.key = "Legacy TLS (TLS 1.0, 1.2, 3DES)"
+        $e.security_result.detection_fields.value = "True"
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $resource
 
-    | where eventName matches regex ".+"
+      match:
+        $user, $resource over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000291 {\n  meta:\n    author = \"TDL\"\n    description = \"TLS Downgrade\"\n    severity = \"MEDIUM\"\n    tactic\
-    \ = \"TA0005\"\n    technique = \"T1562\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n   \
-    \ $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-azure*
+    | WHERE azure.signinlogs.properties.authentication_processing_details.key == "Legacy TLS (TLS 1.0, 1.2, 3DES)" AND azure.signinlogs.properties.authentication_processing_details.value == "True"
+    | KEEP @timestamp, azure.signinlogs.properties.user_principal_name, azure.signinlogs.properties.ip_address, azure.signinlogs.properties.location, azure.signinlogs.properties.app_display_name, azure.signinlogs.properties.authentication_processing_details.key, azure.signinlogs.properties.authentication_processing_details.value
+  leql: |
+    where(source_json.authenticationProcessingDetails.key="Legacy TLS (TLS 1.0, 1.2, 3DES)" AND source_json.authenticationProcessingDetails.value="True")
+  crowdstrike: |
+    #type=azure* "Legacy TLS (TLS 1.0, 1.2, 3DES)"=True
+    | table([@timestamp, ComputerName, UserName, event_simpleName])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Azure" and observer_name = "Azure Active Directory"
+    | arrayexpand additional_fields
+    | filter additional_fields.key = "Authentication Process Details" and additional_fields.value contains "Legacy TLS" and additional_fields.value contains "True"
+    | fields _time, actor_user, action_name, resource_name, additional_fields
+  lucene: |
+    event.dataset:"azure.auditlogs" AND azure.auditlogs.properties.authentication_processing_details.key:"Legacy TLS (TLS 1.0, 1.2, 3DES)" AND azure.auditlogs.properties.authentication_processing_details.value:"True"
+  sumo: "_sourceCategory=*Azure* \n| json field=_raw \"properties.authenticationProcessingDetails\" as auth_details\n| where auth_details matches\
+    \ \"*Legacy TLS*\" and auth_details matches \"*True*\"\n| fields _messageTime, _sourceHost, auth_details\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +84,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: 1 Azure Event Where the Authentication Process Details key is "Legacy TLS (TLS 1.0, 1.2, 3DES)" AND the Authentication Process Details
   value is "True"

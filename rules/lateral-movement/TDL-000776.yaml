@@ -19,85 +19,126 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=email OR index=saas_audit (sourcetype=email_gateway OR sourcetype=o365_audit OR sourcetype=gsuite_audit)
+  spl: 'index=email OR index=saas_audit (sourcetype=email_gateway OR sourcetype=o365_audit OR sourcetype=gsuite_audit)
+
     | eval is_email_sent=if(match(sourcetype, "email_gateway") AND action="sent", 1, 0)
-    | eval is_pwd_reset=if((sourcetype="o365_audit" AND Operation="UserPasswordChanged") OR (sourcetype="gsuite_audit" AND event_name="password_change"), 1, 0)
-    | eval is_new_device=if((sourcetype="o365_audit" AND Operation="UserLoggedIn" AND IsNewDevice="true") OR (sourcetype="gsuite_audit" AND event_name="login" AND new_device="true"), 1, 0)
+
+    | eval is_pwd_reset=if((sourcetype="o365_audit" AND Operation="UserPasswordChanged") OR (sourcetype="gsuite_audit" AND event_name="password_change"),
+    1, 0)
+
+    | eval is_new_device=if((sourcetype="o365_audit" AND Operation="UserLoggedIn" AND IsNewDevice="true") OR (sourcetype="gsuite_audit" AND event_name="login"
+    AND new_device="true"), 1, 0)
+
     | eval suspicious_event_time=if(is_pwd_reset=1 OR is_new_device=1, _time, null())
+
     | eventstats earliest(suspicious_event_time) as first_suspicious_event by user
+
     | eval time_since_suspicious=_time - first_suspicious_event
+
     | where is_email_sent=1 AND (isnull(first_suspicious_event) OR time_since_suspicious <= 86400)
+
     | rex field=body "(?i)https?://[^\s]+"
+
     | where isnotnull(body) AND match(body, "(?i)https?://")
+
     | eval internal_recipient=if(match(recipient_domain, "(?i)(company\.com|internal\.domain)"), 1, 0)
+
     | where internal_recipient=1
+
     | bin _time span=30m
-    | stats count as msg_count, values(recipient) as recipients, earliest(_time) as window_start, latest(_time) as window_end, values(suspicious_event_time) as recent_compromise_indicators by _time, user, sender
+
+    | stats count as msg_count, values(recipient) as recipients, earliest(_time) as window_start, latest(_time) as window_end, values(suspicious_event_time)
+    as recent_compromise_indicators by _time, user, sender
+
     | where msg_count >= 20
+
     | table _time, user, sender, msg_count, recipients, window_start, window_end, recent_compromise_indicators
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_lm_000776 {\n  meta:\n    author = \"TDL\"\n    description = \"Single Internal Sender Mailing ≥20 Internal Recipients\
-    \ With Link\"\n    severity = \"HIGH\"\n    tactic = \"TA0008\"\n    technique = \"T1534\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    OfficeActivity
+    | where TimeGenerated > ago(30m)
+    | where Operation == "Send"
+    | where RecordType == 2
+    | extend SenderDomain = tostring(split(UserId, "@")[1])
+    | extend RecipientDomain = tostring(split(Recipients, "@")[1])
+    | where SenderDomain == RecipientDomain
+    | where Item contains "http://" or Item contains "https://"
+    | summarize MessageCount = dcount(Item), RecipientsCount = dcount(Recipients), FirstSend = min(TimeGenerated), LastSend = max(TimeGenerated) by UserId, SenderDomain, ClientIP
+    | where MessageCount >= 20
+    | join kind=leftouter (
+        SigninLogs
+        | where TimeGenerated > ago(24h)
+        | where ResultType == 0
+        | summarize RecentPasswordReset = countif(AuthenticationDetails has "password"), NewDeviceSignin = dcountif(DeviceDetail.deviceId, isnotempty(DeviceDetail.deviceId)) by UserPrincipalName
+        | where RecentPasswordReset > 0 or NewDeviceSignin > 1
+    ) on $left.UserId == $right.UserPrincipalName
+    | project TimeGenerated = FirstSend, UserId, SenderDomain, MessageCount, RecipientsCount, ClientIP, FirstSend, LastSend, RecentPasswordReset, NewDeviceSignin
+  aql: "SELECT username, sourceip, COUNT(*) AS message_count, UNIQUECOUNT(destinationip) AS unique_recipients, FIRST(eventtime) AS first_message,\
+    \ LAST(eventtime) AS last_message\nFROM events\nWHERE category IN (SELECT category FROM categories WHERE low_level_category_id = 25000) \n\
+    \  AND \"Message Direction\" = 'Internal'\n  AND \"Contains URL\" = 'true'\n  AND username IS NOT NULL\n  AND username NOT IN (SELECT username\
+    \ FROM events WHERE (\"Event Type\" ILIKE '%service%' OR \"Event Type\" ILIKE '%automated%') LAST 30 MINUTES)\nGROUP BY username, sourceip\n\
+    HAVING message_count >= 20\nLAST 30 MINUTES\n"
+  yara_l: "rule internal_mass_phish_post_compromise {\n  meta:\n    author = \"TDL\"\n    description = \"Internal account sends >=20 messages\
+    \ with URLs to internal recipients within 30m, indicating potential account takeover and internal phishing\"\n    mitre_attack_tactic = \"\
+    Lateral Movement\"\n    mitre_attack_technique = \"T1534\"\n    severity = \"HIGH\"\n\n  events:\n    $email.metadata.event_type = \"EMAIL_TRANSACTION\"\
+    \n    $email.network.email.from = $sender\n    $email.network.email.to = $recipient\n    re.regex($email.network.email.subject, `.+`) or $email.network.email.subject\
+    \ != \"\"\n    (\n      re.regex($email.about.labels.value, `(?i)url`) or\n      re.regex($email.about.labels.value, `(?i)link`) or\n    \
+    \  re.regex($email.network.email.text, `(?i)https?://`) or\n      re.regex($email.network.email.text, `(?i)http://`)\n    )\n    $sender =\
+    \ $recipient_domain\n    \n  match:\n    $sender over 30m\n\n  condition:\n    #email >= 20\n\n  outcome:\n    $risk_score = 85\n    $sender_address\
+    \ = array_distinct($email.network.email.from)\n    $recipient_count = count_distinct($email.network.email.to)\n    $subject_samples = array_distinct($email.network.email.subject)\n\
+    }\n"
+  esql: "FROM logs-o365.audit*, logs-google_workspace.admin*, logs-email.gateway*\n| WHERE @timestamp > NOW() - 30 minutes\n  AND (event.action\
+    \ IN (\"Send\", \"MessageSend\", \"mail_delivered\") OR event.category == \"email\")\n  AND email.direction == \"internal\"\n  AND email.to.address\
+    \ RLIKE \".*@(company\\\\.com|internal\\\\.domain).*\"\n  AND email.from.address RLIKE \".*@(company\\\\.com|internal\\\\.domain).*\"\n  AND\
+    \ (email.body RLIKE \"https?://.*\" OR email.html_body RLIKE \"https?://.*\" OR url.full IS NOT NULL)\n| STATS \n    msg_count = COUNT(*),\n\
+    \    recipients = COUNT_DISTINCT(email.to.address),\n    recent_pwd_reset = MAX(CASE(event.action IN (\"PasswordReset\", \"password_change\"\
+    , \"account_password_reset\"), 1, 0)),\n    recent_new_device = MAX(CASE(event.action IN (\"UserLoggedIn\", \"login\") AND (event.reason LIKE\
+    \ \"*new device*\" OR related.user_agent IS NOT NULL), 1, 0))\n  BY email.from.address, user.name, source.ip, window = BUCKET(@timestamp,\
+    \ 30 minutes)\n| WHERE msg_count >= 20\n| KEEP @timestamp, window, email.from.address, user.name, source.ip, msg_count, recipients, recent_pwd_reset,\
+    \ recent_new_device\n"
+  leql: |
+    where(source_user CONTAINS "@" AND destination_user CONTAINS "@" AND (message_body ICONTAINS "http://" OR message_body ICONTAINS "https://")) groupby(source_user) calculate(count) HAVING count >= 20
+  crowdstrike: |
+    (#type=email OR #type=saas_audit OR event_simpleName=EmailEvent OR event_simpleName=SaasAuditEvent)
+    (action=sent OR event_type=sent OR activity=sent OR eventType=MessageSend)
+    (sender_domain=*@*.internal OR sender_domain=*@yourcompany.com OR recipient_domain=*@*.internal OR recipient_domain=*@yourcompany.com)
+    (url_count>=1 OR has_url=true OR body=*http* OR body=*https*)
+    | bucket(span=30m, field=@timestamp)
+    | groupBy([_bucket, sender_email, sender_user], function=count(as=msg_count))
+    | msg_count >= 20
+    | table([_bucket, sender_email, sender_user, msg_count])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter logon.application_name in ("Microsoft 365", "Google Workspace")
+      and logon.identity_sub_type = "Internal"
+      and logon.event_type = "MESSAGE_SENT"
+      and logon.recipient_domain in (arrayexpand(logon.sender_domain))
+      and logon.message_body ~= "https?://|http://"
+    | bin _time span=30m
+    | comp count() as message_count by _time, logon.identity_name, logon.sender_email
+    | filter message_count >= 20
+    | fields _time, logon.identity_name, logon.sender_email, message_count
+  lucene: |
+    event.action:"email.sent" AND sender.type:"internal" AND recipient.type:"internal" AND email.has_links:true AND (user.event_history:(password_reset OR new_device_login))
+  sumo: |
+    _sourceCategory=*Email* OR _sourceCategory=*M365* OR _sourceCategory=*Google*Workspace* OR _sourceCategory=*SaaS*
+    | json field=_raw "sender" as sender
+    | json field=_raw "recipient" as recipient
+    | json field=_raw "subject" as subject
+    | json field=_raw "body" as body
+    | json field=_raw "url_count" as url_count
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "action" as action
+    | where (event_type matches "*mail*" OR event_type matches "*email*" OR action matches "*send*") AND (body matches "*http://*" OR body matches "*https://*" OR url_count > 0)
+    | where sender matches "*@*" AND recipient matches "*@*"
+    | parse regex field=sender "(?<sender_domain>@[^@]+)$"
+    | parse regex field=recipient "(?<recipient_domain>@[^@]+)$"
+    | where sender_domain = recipient_domain
+    | timeslice 30m
+    | count as msg_count by _timeslice, sender
+    | where msg_count >= 20
+    | fields _timeslice, sender, msg_count
 pseudo_logic: Internal account sends ≥20 messages with a clickable URL to internal recipients within 30m, especially after a recent password reset
   or new-device sign-in. Account-takeover-driven internal phish.
 false_positives:
@@ -116,7 +157,7 @@ references:
 - https://attack.mitre.org/techniques/T1534/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, target host, and the protocol / credential used.'

@@ -15,74 +15,83 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=* sourcetype=*application*control* OR sourcetype=*applocker* OR sourcetype=*firewall* Application_Category="P2P" NOT [| inputlookup authorized_p2p_apps.csv | fields Application]
+  spl: 'index=* sourcetype=*application*control* OR sourcetype=*applocker* OR sourcetype=*firewall* Application_Category="P2P" NOT [| inputlookup
+    authorized_p2p_apps.csv | fields Application]
+
     | table _time, host, Application, Application_Category, user, src, dest, action
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000156 {\n  meta:\n    author = \"TDL\"\n    description = \"Traffic To Unauthorized P2P Application\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0002\"\n    technique = \"T1021\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    AppControlEvents
+    | where TimeGenerated > ago(24h)
+    | where ApplicationCategory == "P2P"
+    | where Application !in~ ("AuthorizedP2PApp1", "AuthorizedP2PApp2", "AuthorizedP2PApp3")
+    | project TimeGenerated, DeviceName, Application, ApplicationCategory, UserName, FileName, FolderPath, SHA256, InitiatingProcessFileName, InitiatingProcessCommandLine
+  aql: |
+    SELECT sourceip, destinationip, destinationport, username, QIDNAME(qid) AS event_name, CATEGORYNAME(category) AS category_name, "Application Name", "Application Category", COUNT(*) AS event_count
+    FROM events
+    WHERE "Application Category" = 'P2P'
+      AND "Application Name" NOT IN ('Authorized_P2P_App1', 'Authorized_P2P_App2', 'Authorized_P2P_App3')
+    GROUP BY sourceip, destinationip, destinationport, username, qid, category, "Application Name", "Application Category"
+    LAST 24 HOURS
+  yara_l: |
+    rule p2p_application_unauthorized_execution {
+      meta:
+        author = "Chronicle Detection Engineering"
+        description = "Detects execution of unauthorized P2P applications via Application Control events - MITRE T1021 Execution"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1021"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.target.application = "P2P"
+        not (
+          $e.principal.process.file.full_path = "C:\\Program Files\\AuthorizedP2P\\app.exe" or
+          $e.principal.process.file.full_path = "C:\\Program Files\\Teams\\app.exe" or
+          $e.principal.process.file.full_path = "C:\\Program Files\\Zoom\\app.exe" or
+          $e.principal.process.file.full_path = "C:\\Program Files\\Webex\\app.exe"
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-endpoint.events.file*, logs-windows.applocker*, logs-endpoint.events.network*\n| WHERE @timestamp > NOW() - 24 hours \n  AND\
+    \ event.category == \"network\" \n  AND network.application.category == \"P2P\"\n  AND network.application.name NOT IN (\"BitTorrent Sync\"\
+    , \"Resilio Sync\", \"Syncthing\")\n| STATS event_count = COUNT(*) BY host.name, user.name, network.application.name, source.ip, destination.ip\n\
+    | WHERE event_count >= 1\n| KEEP @timestamp, host.name, user.name, network.application.name, network.application.category, source.ip, destination.ip,\
+    \ event_count\n"
+  leql: |
+    where(source_json.ApplicationCategory="P2P" AND source_json.Application NOT IN ["BitTorrent", "uTorrent", "qBittorrent", "Transmission", "Vuze", "Deluge", "FrostWire"])
+  crowdstrike: |
+    event_simpleName=ApplicationControl* ApplicationCategory=P2P
+    | NOT (Application IN [
+        "Zoom",
+        "Microsoft Teams",
+        "Skype",
+        "WebEx",
+        "Slack",
+        "Discord"
+    ])
+    | table([@timestamp, ComputerName, UserName, Application, ApplicationCategory, FileName, FilePath, SHA256HashData])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter app_category = "peer-to-peer"
+    | filter app not in ("authorized-bittorrent", "authorized-skype", "authorized-zoom")
+    | fields _time, source_ip, destination_ip, source_user, app, app_category, action, bytes_sent, bytes_received, device_name
+  lucene: |
+    event.category:"application_control" AND application.category:"P2P" AND NOT application.name:("AuthorizedP2PApp1" OR "AuthorizedP2PApp2" OR "AuthorizedP2PApp3")
+  sumo: |
+    _sourceCategory=*Application*Control* OR _sourceCategory=*AppControl*
+    | json field=_raw "ApplicationCategory" as app_category
+    | json field=_raw "Application" as application
+    | where app_category = "P2P"
+    | where !(application in ("BitTorrent Sync", "Resilio Sync", "Syncthing"))
+    | fields _messageTime, _sourceHost, application, app_category
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -92,7 +101,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Application Control Event
 

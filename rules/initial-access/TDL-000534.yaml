@@ -22,68 +22,67 @@ queries:
     \ userIdentity.principalId=\"*scanner*\" OR userIdentity.principalId=\"*monitor*\") \n| eval resource_arn=mvindex('resources{}.ARN', 0) \n\
     | dedup userIdentity.arn, eventName, resource_arn, sourceIPAddress \n| table _time, sourceIPAddress, userIdentity.arn, eventName, resource_arn,\
     \ requestParameters, userAgent\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000534 {\n  meta:\n    author = \"TDL\"\n    description = \"Server-Side Code Injection in URL\"\n    severity =\
-    \ \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(90d)
+    | where EventName matches regex @".*[\$`;&|<>(){}[\]\\].+.*"
+    | where SourceIpAddress !in ("10.0.0.1", "192.168.1.1")
+    | where UserIdentityArn !has "monitoring-agent" and UserIdentityArn !has "scanner"
+    | extend ResourceArn = tostring(parse_json(Resources)[0].ARN)
+    | summarize FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), SourceIPs = make_set(SourceIpAddress) by UserIdentityArn, EventName, ResourceArn
+    | where array_length(SourceIPs) >= 1
+    | project FirstSeen, LastSeen, UserIdentityArn, EventName, ResourceArn, SourceIPs
+  aql: |
+    SELECT sourceip, username, CATEGORYNAME(category) AS event_category, qidname(qid) AS event_name, UTF8(payload) AS request_details, COUNT(*) AS injection_attempts
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%AWS%ELB%'
+      AND (UTF8(payload) ILIKE '%$(%)%' OR UTF8(payload) ILIKE '%`%' OR UTF8(payload) ILIKE '%${%}%' OR UTF8(payload) ILIKE '%|%' OR UTF8(payload) ILIKE '%;%' OR UTF8(payload) ILIKE '%&&%' OR UTF8(payload) MATCHES '.*[<>$`|;&].+.*')
+      AND sourceip NOT IN ('10.0.0.1', '192.168.1.100')
+    GROUP BY sourceip, username, category, qid, UTF8(payload)
+    LAST 1 HOURS
+  yara_l: "rule cloud_server_side_code_injection_attempt {\n  meta:\n    author = \"TDL\"\n    description = \"Detects server-side code injection\
+    \ attempts in URLs targeting cloud-facing applications via ELB logs\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1190\"\n    severity = \"HIGH\"\n\n  events:\n    $e.metadata.vendor_name = \"AMAZON\"\n    $e.metadata.product_name = \"AWS ELB\"\n\
+    \    (\n      re.regex($e.network.http.parsed_user_agent, `.*[\\$\\`\\;\\|\\&\\(\\)\\{\\}].*`) or\n      re.regex($e.target.url, `.*[\\$\\\
+    `\\;\\|\\&\\(\\)\\{\\}].*`) or\n      re.regex($e.network.http.referral_url, `.*[\\$\\`\\;\\|\\&\\(\\)\\{\\}].*`) or\n      re.regex($e.target.resource.name,\
+    \ `.*[\\$\\`\\;\\|\\&\\(\\)\\{\\}].*`)\n    )\n    not re.regex($e.principal.ip, `^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)`) \n\
+    \    not $e.principal.user.userid = /^(scanner|monitor|healthcheck|probe)/\n    $e.principal.ip = $src_ip\n    $e.principal.user.userid =\
+    \ $user_arn\n    $e.target.resource.name = $resource_arn\n    $e.metadata.product_event_type = $event_name\n\n  match:\n    $src_ip, $user_arn,\
+    \ $event_name, $resource_arn over 5m\n\n  condition:\n    $e\n}\n"
+  esql: "FROM logs-aws.elb_logs*\n| WHERE @timestamp > NOW() - 24 hour\n  AND (http.request.method IN (\"GET\", \"POST\", \"PUT\") OR url.original\
+    \ RLIKE \".+\")\n  AND (\n    url.original RLIKE \".*[;&|`$(){}\\\\[\\\\]<>].+.*\"\n    OR url.original RLIKE \".*(%3B|%26|%7C|%60|%24|%28|%29).+.*\"\
+    \n    OR url.original LIKE \"*$((*\"\n    OR url.original LIKE \"*`*`*\"\n    OR url.original LIKE \"*;*;*\"\n    OR url.original LIKE \"\
+    *|*|*\"\n    OR url.original LIKE \"*&&*\"\n    OR url.original LIKE \"*||*\"\n  )\n  AND NOT (\n    source.ip IN (\"10.0.0.0/8\", \"172.16.0.0/12\"\
+    , \"192.168.0.0/16\")\n    OR user_agent.original LIKE \"*Nessus*\"\n    OR user_agent.original LIKE \"*Qualys*\"\n    OR user_agent.original\
+    \ LIKE \"*OpenVAS*\"\n    OR user_agent.original LIKE \"*Burp*\"\n    OR user_agent.original LIKE \"*scanner*\"\n    OR user_agent.original\
+    \ LIKE \"*monitor*\"\n  )\n| STATS \n    first_seen = MIN(@timestamp),\n    last_seen = MAX(@timestamp),\n    attempt_count = COUNT(*),\n\
+    \    unique_ips = COUNT_DISTINCT(source.ip)\n  BY url.original, http.request.method, destination.ip\n| WHERE attempt_count >= 1\n| KEEP first_seen,\
+    \ last_seen, url.original, http.request.method, destination.ip, attempt_count, unique_ips\n| SORT first_seen DESC\n"
+  leql: |
+    where(source_json.eventSource="elasticloadbalancing.amazonaws.com" AND (source_json.requestParameters.loadBalancerName ICONTAINS "${" OR source_json.requestParameters.loadBalancerName=/\$\{.*\}/ OR source_json.requestParameters.targetGroupArn=/\$\{.*\}/ OR source_json.requestParameters.targetGroupArn ICONTAINS "${" OR source_json.userAgent=/\$\{.*\}/ OR source_json.userAgent ICONTAINS "${" OR source_json.requestParameters=/.*;.*/ OR source_json.requestParameters ICONTAINS "|" OR source_json.requestParameters ICONTAINS "`" OR source_json.requestParameters=/&&/ OR source_json.eventName=/.*\$\{.*\}.*/)) groupby(source_json.userIdentity.arn, source_json.eventName, source_json.sourceIPAddress) calculate(count)
+  crowdstrike: "#repo=cloud #type=aws:elb \n(request=*$(* OR request=*`* OR request=*;* OR request=*|* OR request=*&* OR request=*%24%28* OR request=*%60*\
+    \ OR request=*%3B* OR request=*%7C* OR request=*%26*)\nNOT (client_ip IN [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16] OR user_agent=*scanner*\
+    \ OR user_agent=*monitor* OR user_agent=*Pingdom* OR user_agent=*StatusCake*)\n| groupBy([client_ip, elb, target_ip], function=count(as=attempts))\n\
+    | attempts >= 1\n| table([@timestamp, client_ip, elb, target_ip, request, user_agent, attempts])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and resource_type = "elb"
+    | filter (request_uri ~= ".*[\$`;&|<>].*" or request_uri ~= ".*\$\(.*\).*" or request_uri ~= ".*`.*`.*")
+    | filter not (source_ip in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16") or identity_name contains "scanner" or identity_name contains "monitor")
+    | dedup source_ip, identity_name, operation, resource_id
+    | fields _time, source_ip, identity_name, operation, resource_id, request_uri
+  lucene: |
+    sourcetype:(aws\:cloudtrail OR azure\:auditlogs OR gcp\:audit) AND eventName:/.*(;|\||&|`|\$\(|<|>|%0a|%0d).*/
+  sumo: |
+    _sourceCategory=*ELB* OR _sourceCategory=*elb* OR _sourceCategory=*AWS*
+    | json field=_raw "request" as request
+    | json field=_raw "client_ip" as source_ip
+    | json field=_raw "elb_status_code" as status_code
+    | json field=_raw "target_status_code" as target_status_code
+    | where request matches "*%00*" OR request matches "*%0a*" OR request matches "*%0d*" OR request matches "*$((*" OR request matches "*`*" OR request matches "*;*" OR request matches "*|*" OR request matches "*&&*" OR request matches "*%3b*" OR request matches "*%7c*" OR request matches "*${*" OR request matches "*<(*" OR request matches "*eval(*" OR request matches "*exec(*"
+    | where !(source_ip in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16") OR source_ip matches "*scanner*" OR source_ip matches "*monitor*")
+    | dedup source_ip, request
+    | fields _messageTime, source_ip, request, status_code, target_status_code
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -93,7 +92,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

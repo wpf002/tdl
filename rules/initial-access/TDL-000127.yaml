@@ -20,68 +20,96 @@ queries:
   spl: "index=aws sourcetype=aws:cloudtrail eventName=CreateGroup \n| eval isAdminGroup=if(match(requestParameters.groupName, \"(?i)(admin|root|superuser|privileged)\"\
     ), 1, 0)\n| where isAdminGroup=1\n| lookup authorized_group_modifiers.csv userIdentity.userName OUTPUT authorized\n| where isnull(authorized)\
     \ OR authorized!=1\n| table _time, userIdentity.userName, requestParameters.groupName, sourceIPAddress, userAgent, awsRegion\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(1h)
+    | where EventName == "CreateGroup"
+    | extend GroupName = tostring(parse_json(RequestParameters).groupName)
+    | where GroupName has_any ("Admin", "admin", "Administrator", "administrator", "Root", "root", "Privileged", "privileged")
+    | extend SourceUser = tostring(UserIdentityPrincipalid)
+    | where SourceUser !in ("authorized-admin-user1", "authorized-admin-user2", "authorized-service-account")
+    | project TimeGenerated, EventName, GroupName, SourceUser, SourceIPAddress, UserAgent, AWSRegion, RequestParameters, ResponseElements
+  aql: |
+    SELECT sourceip, username AS source_user, "AWS Account ID", "Group Name", "Request Parameters", eventtime, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%cloudtrail%'
+      AND ("Event Name" = 'CreateGroup' OR "eventName" = 'CreateGroup')
+      AND ("Group Name" ILIKE '%admin%' OR "Group Name" ILIKE '%administrator%' OR "groupName" ILIKE '%admin%' OR "groupName" ILIKE '%administrator%')
+      AND username NOT IN ('authorized_user1', 'authorized_user2', 'authorized_admin')
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_unauthorized_admin_group_creation {
+      meta:
+        author = "TDL"
+        description = "Detects creation of AWS admin groups by unauthorized users - T1098 Initial Access"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1098"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.vendor_name = "AMAZON"
+        $e.metadata.product_name = "AWS CloudTrail"
+        $e.metadata.event_type = "USER_RESOURCE_CREATION"
+        (
+          $e.metadata.product_event_type = "CreateGroup" or
+          $e.security_result.detection_fields["eventName"] = "CreateGroup"
+        )
+        (
+          re.regex($e.target.resource.name, `(?i)(admin|administrator|root|super|privileged)`) or
+          re.regex($e.security_result.detection_fields["groupName"], `(?i)(admin|administrator|root|super|privileged)`)
+        )
+        $e.principal.user.userid = $source_user
+        not (
+          $source_user = "authorized-admin-1@example.com" or
+          $source_user = "authorized-admin-2@example.com" or
+          $source_user = "iam-automation-service"
+        )
+        $e.target.resource.name = $group_name
 
-    | where eventName matches regex ".+"
+      match:
+        $source_user over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+      outcome:
+        $risk_score = 85
+        $group_created = $group_name
+        $unauthorized_user = $source_user
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000127 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Admin Group Created by Unauthorized User\"\n   \
-    \ severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-aws.cloudtrail*\n| WHERE @timestamp > NOW() - 1 hour \n  AND event.dataset == \"aws.cloudtrail\" \n  AND event.action == \"\
+    CreateGroup\"\n  AND (\n    TO_LOWER(aws.cloudtrail.request_parameters) LIKE \"*admin*\"\n    OR TO_LOWER(aws.cloudtrail.request_parameters)\
+    \ LIKE \"*administrator*\"\n    OR TO_LOWER(aws.cloudtrail.request_parameters) LIKE \"*poweruser*\"\n  )\n  AND user.name NOT IN (\"authorized_admin_user1\"\
+    , \"authorized_admin_user2\", \"terraform_service_account\", \"cloudformation_service_account\")\n| KEEP @timestamp, cloud.account.id, user.name,\
+    \ aws.cloudtrail.user_identity.arn, event.action, aws.cloudtrail.request_parameters, source.ip, user_agent.original\n"
+  leql: |
+    where(source_json.eventName="CreateGroup" AND source_json.requestParameters.groupName ICONTAINS "admin" AND source_json.userIdentity.principalId NOT IN ["AUTHORIZED_USER_1", "AUTHORIZED_USER_2", "AUTHORIZED_USER_3"])
+  crowdstrike: |
+    #repo=aws #type=cloudtrail eventName=CreateGroup
+    | in(field="responseElements.group.groupName", values=["Admin*", "*Administrator*", "*admin*"], ignoreCase=true)
+    | !in(field="userIdentity.principalId", values=["AUTHORIZED_USER_1", "AUTHORIZED_USER_2", "AUTHORIZED_SERVICE_ACCOUNT"])
+    | table([@timestamp, userIdentity.principalId, userIdentity.arn, sourceIPAddress, responseElements.group.groupName, responseElements.group.arn, userAgent, awsRegion])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and operation_name = "CreateGroup"
+    | alter is_admin_group = if(json_extract_scalar(resource, "$.groupName") ~= "(?i).*(admin|root|privilege|elevated).*", true, false)
+    | filter is_admin_group = true
+    | alter source_user = json_extract_scalar(identity, "$.principalId")
+    | alter authorized_users = arraystring(["authorized-user-1", "authorized-user-2", "authorized-user-3"], ",")
+    | filter source_user != null and source_user not in (authorized_users)
+    | fields _time, cloud_provider, project, source_user, operation_name, resource, identity, caller_ip_address
+  lucene: |
+    eventName:CreateGroup AND (userIdentity.arn:*Admin* OR requestParameters.groupName:*Admin* OR requestParameters.groupName:*Administrator*) AND NOT userIdentity.principalId:(AIDAI* OR service-role* OR AWSServiceRoleFor*)
+  sumo: |
+    _sourceCategory=*cloudtrail* eventName=CreateGroup
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "userIdentity.userName" as source_user
+    | json field=_raw "requestParameters.groupName" as group_name
+    | json field=_raw "responseElements.group.groupName" as response_group_name
+    | where event_name = "CreateGroup"
+    | where (group_name matches "*Admin*" or group_name matches "*admin*" or response_group_name matches "*Admin*" or response_group_name matches "*admin*")
+    | where !(source_user in ("authorized_user1", "authorized_user2", "authorized_user3"))
+    | fields _messageTime, source_user, group_name, response_group_name, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +119,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 AWS CloudTrail Group Created
 

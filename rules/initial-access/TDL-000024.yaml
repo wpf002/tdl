@@ -18,76 +18,102 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=o365 OR index=azure (sourcetype=o365:management:activity OR sourcetype=azure:aad:audit OR sourcetype=vpn) Operation IN ("UserLoggedIn", "UserLoginSuccess") OR action IN ("success", "allowed") ResultStatus="Success" OR result="success"
+  spl: 'index=o365 OR index=azure (sourcetype=o365:management:activity OR sourcetype=azure:aad:audit OR sourcetype=vpn) Operation IN ("UserLoggedIn",
+    "UserLoginSuccess") OR action IN ("success", "allowed") ResultStatus="Success" OR result="success"
+
     | eval src_ip=coalesce(ClientIP, src_ip, src, IPAddress)
+
     | lookup threat_intel_list ip as src_ip OUTPUT threat_category
+
     | where isnotnull(threat_category) AND NOT match(src_ip, "^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)")
-    | stats count values(Operation) as operations values(action) as actions values(threat_category) as threat_categories by _time, user, src_ip, UserAgent, app
+
+    | stats count values(Operation) as operations values(action) as actions values(threat_category) as threat_categories by _time, user, src_ip,
+    UserAgent, app
+
     | where count >= 1
+
     | table _time, user, src_ip, operations, actions, threat_categories, UserAgent, app, count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000024 {\n  meta:\n    author = \"TDL\"\n    description = \"Remote Login from Threat Host\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    let ThreatIntelIPs = ThreatIntelligenceIndicator
+    | where TimeGenerated > ago(14d)
+    | where isnotempty(NetworkIP)
+    | distinct NetworkIP;
+    union
+    (SigninLogs
+    | where TimeGenerated > ago(1h)
+    | where ResultType == 0
+    | where NetworkLocationDetails.networkType == "namedNetwork" or IPAddress !startswith "10." and IPAddress !startswith "172.16." and IPAddress !startswith "192.168."
+    | where IPAddress in (ThreatIntelIPs)
+    | extend SourceIP = IPAddress
+    | project TimeGenerated, UserPrincipalName, SourceIP, Location, AppDisplayName, DeviceDetail.operatingSystem, ResultType),
+    (OfficeActivity
+    | where TimeGenerated > ago(1h)
+    | where Operation in ("UserLoggedIn", "MailboxLogin")
+    | where ClientIP !startswith "10." and ClientIP !startswith "172.16." and ClientIP !startswith "192.168."
+    | where ClientIP in (ThreatIntelIPs)
+    | extend SourceIP = ClientIP
+    | project TimeGenerated, UserId, SourceIP, Operation, ClientInfoString)
+    | summarize count() by TimeGenerated, SourceIP, UserPrincipalName=coalesce(UserPrincipalName, UserId)
+  aql: |
+    SELECT sourceip, username, LOGSOURCENAME(logsourceid) AS source, eventtime, qidname(qid) AS event_name, COUNT(*) AS login_count
+    FROM events
+    WHERE (qidname(qid) ILIKE '%successful%login%' OR qidname(qid) ILIKE '%logon%success%' OR categoryname(category) ILIKE '%authentication%success%')
+      AND (LOGSOURCENAME(logsourceid) ILIKE '%azure%' OR LOGSOURCENAME(logsourceid) ILIKE '%office%365%' OR LOGSOURCENAME(logsourceid) ILIKE '%VPN%')
+      AND sourceip IN (SELECT sourceip FROM events WHERE categoryname(category) ILIKE '%threat%' OR qidname(qid) ILIKE '%threat%intel%')
+    GROUP BY sourceip, username, LOGSOURCENAME(logsourceid), eventtime, qidname(qid)
+    LAST 24 HOURS
+  yara_l: "rule compromised_credential_login_from_threat_ip {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects successful\
+    \ remote login from external IP on threat intelligence list - MITRE T1078\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1078\"\n    severity = \"HIGH\"\n\n  events:\n    $login.metadata.event_type = \"USER_LOGIN\"\n    $login.security_result.action =\
+    \ \"ALLOW\"\n    $login.principal.ip = $source_ip\n    $login.target.user.userid = $user\n    \n    $threat.graph.metadata.entity_type = \"\
+    IP_ADDRESS\"\n    $threat.graph.metadata.threat.severity != \"LOW\"\n    $threat.graph.entity.ip = $source_ip\n    \n    not net.ip_in_range_cidr($source_ip,\
+    \ \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($source_ip, \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($source_ip, \"192.168.0.0/16\"\
+    )\n\n  match:\n    $source_ip, $user over 5m\n\n  outcome:\n    $risk_score = max(75)\n    $source_ip_out = $source_ip\n    $user_out = $user\n\
+    \    $threat_severity = $threat.graph.metadata.threat.severity\n\n  condition:\n    $login and $threat\n}\n"
+  esql: "FROM logs-azure.signinlogs*, logs-o365.audit*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.outcome == \"success\"\n  AND (event.category\
+    \ == \"authentication\" OR event.action LIKE \"*UserLoggedIn*\")\n  AND source.ip IS NOT NULL\n  AND NOT CIDR_MATCH(source.ip, \"10.0.0.0/8\"\
+    , \"172.16.0.0/12\", \"192.168.0.0/16\")\n| ENRICH threatintel_ip ON source.ip\n| WHERE threatintel.indicator.ip IS NOT NULL\n| STATS login_count\
+    \ = COUNT(*) BY user.name, source.ip, source.geo.country_name, threatintel.indicator.type, host.name\n| WHERE login_count >= 1\n| KEEP @timestamp,\
+    \ user.name, source.ip, source.geo.country_name, threatintel.indicator.type, host.name, login_count\n"
+  leql: |
+    where(result=SUCCESS AND source_address_on_watchlist=true AND source_address NOT IN [RFC1918]) groupby(source_address, user) calculate(count)
+  crowdstrike: |
+    (event_simpleName=UserLogon* OR event_simpleName=AuthActivityAuditEvent OR #type=json @rawstring=*SignInLogs*)
+    event_platform=/azure|o365|office365/i
+    LogonType!=2
+    | case {
+        event_simpleName=UserLogon* | RemoteIP=* | eval(src_ip=RemoteIP);
+        event_simpleName=AuthActivityAuditEvent | IPAddress=* | eval(src_ip=IPAddress);
+        * | ipAddress=* | eval(src_ip=ipAddress);
+      }
+    | src_ip!=10.* src_ip!=172.16.* src_ip!=172.17.* src_ip!=172.18.* src_ip!=172.19.* src_ip!=172.20.* src_ip!=172.21.* src_ip!=172.22.* src_ip!=172.23.* src_ip!=172.24.* src_ip!=172.25.* src_ip!=172.26.* src_ip!=172.27.* src_ip!=172.28.* src_ip!=172.29.* src_ip!=172.30.* src_ip!=172.31.* src_ip!=192.168.*
+    | lookup(src_ip, repo=threatevent, include=[threatType, confidence], field=ip)
+    | threatType=*
+    | groupBy([UserName, src_ip], function=count(as=logins))
+    | logins >= 1
+    | table([UserName, src_ip, threatType, confidence, logins])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AZURE" and event_type = "signin" and outcome = "success" and incidr(src_ip, "0.0.0.0/0") = FALSE and incidr(src_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16") = FALSE
+    | alter is_threat_ip = arrayindex(regextract(to_json_string(external_enrichment_data), "\"verdict\":\"(MALICIOUS|SUSPICIOUS)\""), 0)
+    | filter is_threat_ip != null
+    | fields _time, actor_primary_username, src_ip, cloud_provider, outcome, dst_host_name, is_threat_ip
+  lucene: |
+    event.category:authentication AND event.outcome:success AND (event.action:"User logged in" OR event.action:UserLoggedIn OR azure.signinlogs.properties.authentication_processing_details.key:"Login Type" OR event.type:start) AND NOT source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND threat.indicator.ip:* AND (_exists_:source.ip AND source.ip:*)
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*Office* OR _sourceCategory=*365* OR _sourceCategory=*VPN*
+    | json field=_raw "ResultType" as result_type
+    | json field=_raw "Operation" as operation
+    | json field=_raw "IPAddress" as source_ip
+    | json field=_raw "UserId" as user_id
+    | json field=_raw "UserPrincipalName" as upn
+    | json field=_raw "status" as status
+    | where (result_type = "0" OR operation matches "*UserLoggedIn*" OR operation matches "*Login*" OR status matches "*success*")
+    | lookup type, actor, raw, threatlevel as threat_level from sumo://threat/cs on threat=source_ip
+    | where !isNull(threat_level)
+    | fields _messageTime, source_ip, user_id, upn, operation, threat_level, actor, type, _sourceHost
 false_positives:
 - Authorized pen testing
 - Security research
@@ -97,7 +123,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Successful Remote Login Event \nFrom one external source\nWhere the Source IP is on a Threat Intelligence List"
 suppression:

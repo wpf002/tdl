@@ -19,75 +19,116 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 35
 queries:
-  spl: |
-    index=cloud_audit (action="resourcegroups.ListResources" OR action="billing.GetCostAndUsage" OR action="resources.cloudresourcemanager.projects.list" OR action="compute.projects.get" OR action="Microsoft.Resources/subscriptions/resourceGroups/read" OR action="Microsoft.CostManagement/query/action")
+  spl: 'index=cloud_audit (action="resourcegroups.ListResources" OR action="billing.GetCostAndUsage" OR action="resources.cloudresourcemanager.projects.list"
+    OR action="compute.projects.get" OR action="Microsoft.Resources/subscriptions/resourceGroups/read" OR action="Microsoft.CostManagement/query/action")
+
     | eval identity=coalesce(user, user_name, userIdentity.principalId, actor.user.email, userIdentity.arn)
+
     | eval service_action=coalesce(action, eventName, operation.name, operationName)
+
     | streamstats earliest(_time) as first_seen by identity, service_action
+
     | where _time = first_seen
+
     | table _time, identity, service_action, src, cloud_provider, account_id
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "ListServices"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%ListServices%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000756 {\n  meta:\n    author = \"TDL\"\n    description = \"Wide-Scope ListServices / GetServices Without Prior Use\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1526\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /ListServices/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    let lookback = 14d;
+    let detection_window = 1h;
+    let baseline = union isfuzzy=true AWSCloudTrail, AzureActivity, GCPAuditLogs
+    | where TimeGenerated between (ago(lookback) .. ago(detection_window))
+    | where (EventName has_any ("ListResources", "GetCostAndUsage") or OperationName has_any ("resourcegroups/resources/list", "Microsoft.CostManagement/query") or MethodName has_any ("v1.compute.instances.aggregatedList", "cloudbilling.services.list"))
+    | extend Identity = coalesce(UserIdentityPrincipalid, UserPrincipalName, CallerIpAddress, tostring(parse_json(AuthenticationContext).principal))
+    | summarize by Identity;
+    union isfuzzy=true AWSCloudTrail, AzureActivity, GCPAuditLogs
+    | where TimeGenerated > ago(detection_window)
+    | where (EventName has_any ("ListResources", "GetCostAndUsage") or OperationName has_any ("resourcegroups/resources/list", "Microsoft.CostManagement/query") or MethodName has_any ("v1.compute.instances.aggregatedList", "cloudbilling.services.list"))
+    | extend Identity = coalesce(UserIdentityPrincipalid, UserPrincipalName, CallerIpAddress, tostring(parse_json(AuthenticationContext).principal))
+    | where isnotempty(Identity)
+    | join kind=leftanti baseline on Identity
+    | project TimeGenerated, Identity, EventName, OperationName, MethodName, SourceSystem, CallerIpAddress, UserAgent
+  aql: |
+    SELECT username, sourceip, QIDNAME(qid) AS api_call, LOGSOURCENAME(logsourceid) AS cloud_provider, COUNT(*) AS call_count
+    FROM events
+    WHERE (QIDNAME(qid) ILIKE '%ListResources%' OR QIDNAME(qid) ILIKE '%GetCostAndUsage%' OR QIDNAME(qid) ILIKE '%resourcegroups%' OR QIDNAME(qid) ILIKE '%billing%')
+      AND categoryname(category) ILIKE '%cloud%'
+    GROUP BY username, sourceip, QIDNAME(qid), LOGSOURCENAME(logsourceid)
+    HAVING call_count >= 1
+    LAST 24 HOURS
+  yara_l: |
+    rule cloud_service_discovery_first_seen {
+      meta:
+        author = "TDL"
+        description = "Detects first-time invocation of cloud service enumeration APIs by an identity"
+        mitre_attack_tactic = "Discovery"
+        mitre_attack_technique = "T1526"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "GENERIC_EVENT"
+        $e.metadata.product_log_id = "cloudaudit.googleapis.com"
+        (
+          re.regex($e.target.resource.name, `resourcegroups\.ListResources`) or
+          re.regex($e.target.resource.name, `billing\.GetCostAndUsage`) or
+          re.regex($e.metadata.product_event_type, `(?i)ListResources`) or
+          re.regex($e.metadata.product_event_type, `(?i)GetCostAndUsage`) or
+          re.regex($e.target.resource.attribute.labels.value, `(?i)resourcegroups.*list`) or
+          re.regex($e.target.resource.attribute.labels.value, `(?i)billing.*cost`)
+        )
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%ListServices%"
+      match:
+        $user over 24h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 50
+        $user_list = array_distinct($user)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/ListServices/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*ListServices*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "ListServices"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*ListServices*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*ListServices*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-aws.cloudtrail*, logs-azure.activitylogs*, logs-gcp.audit*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND (
+        event.action IN ("ListResources", "GetCostAndUsage", "resourcegroups:ListResources", "ce:GetCostAndUsage", "Microsoft.Resources/subscriptions/resourceGroups/read", "Microsoft.Consumption/usageDetails/read", "cloudasset.assets.searchAllResources", "cloudbilling.services.list")
+        OR event.action LIKE "*ListResources*"
+        OR event.action LIKE "*GetCostAndUsage*"
+        OR event.action LIKE "*resourceGroups/read*"
+        OR event.action LIKE "*usageDetails/read*"
+        OR event.action LIKE "*searchAllResources*"
+        OR event.action LIKE "*billing*list*"
+      )
+    | STATS first_seen = MIN(@timestamp), action_count = COUNT(*), actions = VALUES(event.action) BY user.name, user.id, cloud.account.id, cloud.provider
+    | WHERE action_count >= 1
+    | EVAL is_first_occurrence = CASE(first_seen > NOW() - 1 hour, 1, 0)
+    | WHERE is_first_occurrence == 1
+    | KEEP first_seen, user.name, user.id, cloud.account.id, cloud.provider, actions, action_count
+  leql: |
+    where(source_json.eventName IN ["ListResources", "GetCostAndUsage"] OR source_json.operationName ICONTAINS "resourcegroups" OR source_json.operationName ICONTAINS "billing") groupby(source_json.userIdentity.principalId, source_json.userIdentity.arn, source_json.identity.claims.upn, user) calculate(count)
+  crowdstrike: |
+    (eventName=ListResources OR eventName=GetCostAndUsage OR eventName="resources.cloudresourcemanager.projects.list" OR eventName="compute.*.list" OR eventName="storage.*.list" OR eventSource=*billing* eventName=*Get* OR eventName="Microsoft.CostManagement/query/action")
+    | groupBy([userIdentity, eventName], function=[count(as=total), min(@timestamp, as=first_seen)])
+    | total=1
+    | table([@timestamp, userIdentity, eventName, eventSource, sourceIPAddress, userAgent, first_seen])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter operation in ("ListResources", "GetCostAndUsage", "resourcegroups.list", "resources.list", "cloudbilling.services.list", "compute.instances.list", "storage.buckets.list")
+    | alter identity_key = coalesce(identity_name, actor_user)
+    | comp min(_time) as first_seen by identity_key, operation
+    | join type=left (dataset = cloud_audit_logs | filter operation in ("ListResources", "GetCostAndUsage", "resourcegroups.list", "resources.list", "cloudbilling.services.list", "compute.instances.list", "storage.buckets.list") | alter identity_key = coalesce(identity_name, actor_user) | comp min(_time) as historical_first by identity_key, operation) as historical historical.identity_key = identity_key and historical.operation = operation
+    | filter first_seen = historical_first
+    | fields _time, identity_key, operation, cloud_provider, tenant_id, project_id
+  lucene: |
+    (event.action:("resourcegroups:ListResources" OR "billing:GetCostAndUsage" OR "ce:GetCostAndUsage" OR "cloudbilling.services.list" OR "compute.instances.list" OR "storage.buckets.list" OR "iam.roles.list" OR "Microsoft.Resources/subscriptions/resources/read" OR "Microsoft.Consumption/usageDetails/read" OR "Microsoft.CostManagement/query/action") AND event.outcome:success) AND NOT tags:baseline_enumeration
+  sumo: "_sourceCategory=*CloudTrail* OR _sourceCategory=*Azure* OR _sourceCategory=*GCP*\n| json field=_raw \"eventName\" as event_name\n| json\
+    \ field=_raw \"userIdentity.principalId\" as principal_id\n| json field=_raw \"userIdentity.arn\" as user_arn\n| json field=_raw \"operationName\"\
+    \ as operation_name\n| json field=_raw \"callerIdentity\" as caller_identity\n| json field=_raw \"protoPayload.methodName\" as method_name\n\
+    | where event_name in (\"ListResources\", \"GetCostAndUsage\") \n   OR operation_name matches \"*ListResources*\" \n   OR operation_name matches\
+    \ \"*GetCostAndUsage*\"\n   OR method_name matches \"*listResources*\"\n   OR method_name matches \"*getCostAndUsage*\"\n| if(isNull(principal_id),\
+    \ if(isNull(caller_identity), user_arn, caller_identity), principal_id) as identity\n| count as invocation_count by identity, event_name,\
+    \ operation_name, method_name\n| where invocation_count = 1\n| fields identity, event_name, operation_name, method_name, invocation_count\n"
 pseudo_logic: Identity invokes service-enumeration APIs (resourcegroups.ListResources, billing.GetCostAndUsage) for the first time. New tenants
   of a compromised role.
 false_positives:
@@ -105,7 +146,7 @@ references:
 - https://attack.mitre.org/techniques/T1526/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

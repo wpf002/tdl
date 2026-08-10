@@ -16,76 +16,77 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=web sourcetype=access_* status=200 referer="-" (uri_path="/*.php" OR uri_path="/*.aspx" OR uri_path="/*.jsp" OR uri_path="/*.cgi")
+  spl: 'index=web sourcetype=access_* status=200 referer="-" (uri_path="/*.php" OR uri_path="/*.aspx" OR uri_path="/*.jsp" OR uri_path="/*.cgi")
+
     | regex uri_path="^/[^/]+\.(php|aspx|jsp|cgi)$"
+
     | search NOT (uri_path="/index.php" OR uri_path="/login.php" OR uri_path="/default.aspx" OR uri_path="/index.jsp")
+
     | table _time, src, uri_path, status, referer, user_agent, host
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000234 {\n  meta:\n    author = \"TDL\"\n    description = \"Suspicious Webserver Script Location\"\n    severity =\
-    \ \"LOW\"\n    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    W3CIISLog
+    | where TimeGenerated > ago(1h)
+    | where scStatus == 200
+    | where csUriStem matches regex @"\.(php|asp|aspx|jsp|cgi|pl|py)$"
+    | where csReferer == "-"
+    | where csUriStem matches regex @"^/[^/]+\.(php|asp|aspx|jsp|cgi|pl|py)$"
+    | where csUriStem !startswith "/wwwroot/" and csUriStem !startswith "/inetpub/" and csUriStem !startswith "/var/www/" and csUriStem !startswith "/usr/share/" and csUriStem !startswith "/home/"
+    | project TimeGenerated, Computer, sSiteName, csUriStem, csReferer, cIP, csUserAgent, scStatus
+  aql: |
+    SELECT sourceip, destinationip, username, URL, "Referer", "HTTP Response Code", COUNT(*) AS request_count
+    FROM events
+    WHERE "HTTP Response Code" = '200'
+      AND (URL ILIKE '%.php' OR URL ILIKE '%.asp' OR URL ILIKE '%.aspx' OR URL ILIKE '%.jsp' OR URL ILIKE '%.cgi')
+      AND "Referer" = '-'
+      AND URL MATCHES '^/[^/]+\.(php|asp|aspx|jsp|cgi)'
+      AND URL NOT ILIKE '%/wwwroot/%'
+      AND URL NOT ILIKE '%/www/%'
+      AND URL NOT ILIKE '%/public_html/%'
+      AND URL NOT ILIKE '%/htdocs/%'
+      AND URL NOT ILIKE '%/html/%'
+    GROUP BY sourceip, destinationip, username, URL, "Referer", "HTTP Response Code"
+    LAST 1 HOURS
+  yara_l: "rule webshell_direct_access_t1078 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects direct access to web script files in\
+    \ non-standard locations with HTTP 200 response\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique = \"T1078\"\
+    \n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.security_result.action = \"ALLOW\"\n   \
+    \ $e.network.http.response_code = 200\n    re.regex($e.target.url, `(?i)\\.(asp|aspx|php|jsp|jspx|cfm)($|\\?)`)\n    $e.network.http.referrer\
+    \ = \"-\"\n    re.regex($e.target.url, `(?i)^/[^/]+\\.(asp|aspx|php|jsp|jspx|cfm)($|\\?)`)\n    not re.regex($e.target.url, `(?i)^/(www|wwwroot|public_html|html|web|htdocs|inetpub/wwwroot)/`)\n\
+    \    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n  outcome:\n    $risk_score = 85\n    \n  condition:\n    $e\n\
+    }\n"
+  esql: "FROM logs-web* \n| WHERE @timestamp > NOW() - 24 hour \n  AND http.response.status_code == 200 \n  AND (url.path LIKE \"*.php\" OR url.path\
+    \ LIKE \"*.asp\" OR url.path LIKE \"*.aspx\" OR url.path LIKE \"*.jsp\" OR url.path LIKE \"*.cgi\")\n  AND (http.request.referrer == \"-\"\
+    \ OR http.request.referrer == \"\" OR http.request.referrer IS NULL)\n  AND url.path RLIKE \"^/[^/]+\\\\.(php|asp|aspx|jsp|cgi)$\"\n  AND\
+    \ NOT url.path LIKE \"/var/www/*\"\n  AND NOT url.path LIKE \"/usr/share/*\"\n  AND NOT url.path LIKE \"/inetpub/wwwroot/*\"\n| KEEP @timestamp,\
+    \ host.name, source.ip, url.path, http.request.referrer, http.response.status_code, user_agent.original\n"
+  leql: |
+    where(source_json.http_code=200 AND (source_json.url ENDS-WITH ".php" OR source_json.url ENDS-WITH ".asp" OR source_json.url ENDS-WITH ".aspx" OR source_json.url ENDS-WITH ".jsp" OR source_json.url ENDS-WITH ".cgi") AND source_json.referrer="-" AND source_json.url=/^\/[^\/]+\.(php|asp|aspx|jsp|cgi)$/ AND NOT (source_json.url ICONTAINS "/wwwroot/" OR source_json.url ICONTAINS "/www/" OR source_json.url ICONTAINS "/html/" OR source_json.url ICONTAINS "/public_html/" OR source_json.url ICONTAINS "/htdocs/"))
+  crowdstrike: "#type=webserver status=200 referer=\"-\" \n| regex(\"^/[^/]+\\.(php|asp|aspx|jsp|cgi|pl)$\", field=uri_path, strict=false)\n|\
+    \ regex(\"^(?!/var/www/|/usr/share/|/var/www/html/|/inetpub/wwwroot/)\", field=uri_path, strict=false)\n| table([@timestamp, host, uri_path,\
+    \ status, referer, user_agent, src_ip])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter http_response_code = 200
+    | filter http_url ~= "\.(php|asp|aspx|jsp|cgi|pl)$"
+    | filter http_referer = "-"
+    | filter http_url ~= "^/[^/]+\.(php|asp|aspx|jsp|cgi|pl)$"
+    | filter http_url !~= "^/(wwwroot|inetpub|var/www|html|www|public_html|httpdocs)/"
+    | fields _time, src_ip, dst_ip, http_url, http_referer, http_response_code
+  lucene: |
+    http.response.status_code:200 AND url.path:(*.php OR *.asp OR *.aspx OR *.jsp OR *.cgi) AND http.request.referrer:"-" AND url.path:/*.* AND NOT url.path:(/var/www/* OR /usr/share/* OR /inetpub/wwwroot/* OR /opt/*)
+  sumo: |
+    _sourceCategory=*Web* OR _sourceCategory=*IIS* OR _sourceCategory=*Apache* OR _sourceCategory=*nginx*
+    | parse regex "(?<status_code>\d{3})" nodrop
+    | parse regex "\"(?<method>\w+)\s+(?<url>[^\s]+)\s+" nodrop
+    | parse regex "\"(?<referrer>[^\"]+)\"" nodrop
+    | where status_code = "200"
+    | where referrer = "-"
+    | where url matches "*.php" or url matches "*.aspx" or url matches "*.asp" or url matches "*.jsp" or url matches "*.cgi" or url matches "*.pl"
+    | parse regex field=url "^/[^/]+\.(php|aspx|asp|jsp|cgi|pl)" as script_in_root
+    | where !isNull(script_in_root)
+    | where !(url matches "*/wwwroot/*" or url matches "*/htdocs/*" or url matches "*/www/*" or url matches "*/public_html/*" or url matches "*/html/*")
+    | fields _messageTime, _sourceHost, url, referrer, status_code
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -95,7 +96,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Webserver Request Event
 

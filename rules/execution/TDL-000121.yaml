@@ -17,77 +17,89 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security EventCode IN (602, 4698)
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security EventCode IN (602, 4698)
+
     | where NOT like(SubjectUserName, "%$")
+
     | lookup high_value_targets.csv ComputerName OUTPUT is_hvt
+
     | where is_hvt="true"
+
     | table _time, ComputerName, SubjectUserName, TaskName, TaskContent
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4698")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4698')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000121 {\n  meta:\n    author = \"TDL\"\n    description = \"Scheduled Task Created - HVT\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1053\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4698)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (602, 4698)
+    | where SubjectUserName !endswith "$"
+    | where Computer in (_GetWatchlist('HighValueTargetHosts') | project Computer = SearchKey)
+    | project TimeGenerated, Computer, SubjectUserName, SubjectDomainName, TaskName, EventID, Activity
+  aql: |
+    SELECT eventtime, sourceip, destinationip, LOGSOURCENAME(logsourceid) AS hostname, "Source Username", "Task Name", "Task Content"
+    FROM events
+    WHERE "EventID" IN ('602', '4698')
+      AND "Source Username" NOT LIKE '%$'
+      AND destinationip IN (SELECT destinationip FROM reference_set WHERE name = 'High_Value_Target_Host_List')
+    LAST 24 HOURS
+  yara_l: |
+    rule scheduled_task_creation_hvt {
+      meta:
+        author = "TDL"
+        description = "Detects scheduled task creation on high value targets"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1053"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "SETTING_CREATION"
+        (
+          $e.metadata.product_event_type = "602" or
+          $e.metadata.product_event_type = "4698"
+        )
+        not re.regex($e.principal.user.userid, `\$$`)
+        $e.target.hostname = $host
 
-    | WHERE event.category == "process" AND event_id IN ("4698")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4698])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4698)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4698")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4698)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4698")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e and #host > 0
+    }
+  esql: |
+    FROM logs-system.security*, logs-windows.security*
+    | WHERE event.code IN ("602", "4698")
+      AND NOT ENDS_WITH(user.name, "$")
+    | EVAL is_hvt = CASE(
+        host.name IN ("DC01", "DC02", "EXCH01", "EXCH02", "CA01", "FS01", "BACKUP01", "ADMIN01", "PKI01", "VAULT01"), 1,
+        0
+      )
+    | WHERE is_hvt == 1
+    | KEEP @timestamp, host.name, user.name, event.code, winlog.event_data.TaskName, winlog.event_data.TaskContent
+  leql: |
+    where(source_json.EventID IN [602, 4698] AND NOT source_user ENDS-WITH "$" AND asset IN high_value_hosts)
+  crowdstrike: |
+    EventCode IN [602, 4698]
+    | NOT UserName=*$
+    | groupBy([ComputerName, UserName, TaskName], function=count(as=task_created))
+    | table([ComputerName, UserName, TaskName, task_created])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (602, 4698)
+    | filter actor_effective_username != null and actor_effective_username !~= ".*\$$"
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_id, action_evtlog_message, action_evtlog_event_data_TaskName
+  lucene: |
+    event.code:(602 OR 4698) AND NOT user.name:*$ AND host.name:(DC01 OR DC02 OR EXCHANGE01 OR FILESERVER01 OR SQLSERVER01)
+  sumo: |
+    _sourceCategory=*Windows* (EventID=602 OR EventID=4698)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "SubjectUserName" as source_user
+    | json field=_raw "Computer" as dest_host
+    | where event_id in ("602", "4698")
+    | where !matches(source_user, "*$")
+    | lookup high_value_targets on dest_host=hostname
+    | where !isNull(high_value_targets)
+    | fields _messageTime, dest_host, source_user, event_id, _raw
 false_positives:
 - Security software
 - Authorized admin tools
@@ -97,7 +109,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Windows Scheduled Task Created Event
 

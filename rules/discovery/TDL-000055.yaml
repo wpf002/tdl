@@ -21,77 +21,75 @@ queries:
     | where (dest_port >= 1 AND dest_port <= 1024) OR (sourcetype=\"fortigate\" AND NOT action IN(\"server-rst\", \"client-rst\", \"timeout\"\
     )) OR (NOT action IN(\"reset\", \"timeout\"))\n| bin _time span=15m\n| stats dc(dest_port) as unique_ports by _time, src, dest\n| where unique_ports\
     \ >= 30\n| table _time, src, dest, unique_ports\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_dis_000055 {\n  meta:\n    author = \"TDL\"\n    description = \"Port Scan Detected - Inbound\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0007\"\n    technique = \"T1046\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(15m)
+    | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Cisco", "Check Point", "Zscaler") or isnotempty(DestinationPort)
+    | where CommunicationDirection == "Inbound" or (isnotempty(SourceIP) and isnotempty(DestinationIP) and not(ipv4_is_private(SourceIP)) and ipv4_is_private(DestinationIP))
+    | where (DestinationPort between (1 .. 1024))
+          or (DeviceVendor == "Fortinet" and DeviceProduct == "Fortigate" and DeviceAction !in~ ("server-rst", "client-rst", "timeout"))
+    | where DeviceAction !in~ ("reset", "timeout")
+    | summarize UniqueDestPorts = dcount(DestinationPort), DestPorts = make_set(DestinationPort), EventCount = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by SourceIP, DestinationIP, bin(TimeGenerated, 15m)
+    | where UniqueDestPorts >= 30
+    | project TimeGenerated, SourceIP, DestinationIP, UniqueDestPorts, EventCount, DestPorts, FirstSeen, LastSeen
+  aql: |
+    SELECT sourceip, destinationip, UNIQUECOUNT(destinationport) AS unique_ports, COUNT(*) AS event_count
+    FROM events
+    WHERE (destinationport >= 1 AND destinationport <= 1024)
+      AND LOGSOURCETYPENAME(devicetype) ILIKE '%firewall%'
+      AND (INOFFENSE(sourceip) = FALSE OR sourceip NOT IN (SELECT destinationip FROM events WHERE INOFFENSE(destinationip) = TRUE))
+      AND qidname(qid) NOT ILIKE '%server-rst%'
+      AND qidname(qid) NOT ILIKE '%client-rst%'
+      AND qidname(qid) NOT ILIKE '%timeout%'
+      AND qidname(qid) NOT ILIKE '%reset%'
+    GROUP BY sourceip, destinationip
+    HAVING unique_ports >= 30
+    LAST 15 MINUTES
+  yara_l: "rule network_port_scan_discovery {\n  meta:\n    author = \"TDL\"\n    description = \"Detects potential network port scanning activity\
+    \ (MITRE T1046)\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1046\"\n    \n  events:\n    $e.metadata.event_type\
+    \ = \"NETWORK_CONNECTION\"\n    $e.metadata.product_name = \"Firewall\" or $e.metadata.vendor_name = \"Fortinet\" or $e.metadata.product_name\
+    \ = \"FortiGate\"\n    $e.network.direction = \"INBOUND\"\n    \n    // Destination port 1-1024\n    $e.target.port >= 1\n    $e.target.port\
+    \ <= 1024\n    \n    // Exclusions for Fortinet and general firewall actions\n    not (\n      $e.metadata.product_name = \"FortiGate\" and\
+    \ \n      ($e.security_result.action = \"server-rst\" or \n       $e.security_result.action = \"client-rst\" or \n       $e.security_result.action\
+    \ = \"timeout\")\n    )\n    \n    not (\n      $e.security_result.action = \"reset\" or \n      $e.security_result.action = \"timeout\"\n\
+    \    )\n    \n    $e.principal.ip = $src_ip\n    $e.target.ip = $dst_ip\n    $e.target.port = $dst_port\n    \n  match:\n    $src_ip, $dst_ip\
+    \ over 15m\n    \n  outcome:\n    $risk_score = 75\n    $unique_ports = count_distinct($dst_port)\n    \n  condition:\n    #e >= 30 and $unique_ports\
+    \ >= 30\n}\n"
+  esql: "FROM logs-firewall*\n| WHERE @timestamp > NOW() - 15 minutes\n  AND network.direction == \"inbound\"\n  AND source.ip IS NOT NULL\n \
+    \ AND destination.ip IS NOT NULL\n  AND destination.port IS NOT NULL\n  AND (\n    (destination.port >= 1 AND destination.port <= 1024)\n\
+    \    OR (\n      observer.vendor == \"Fortinet\" AND observer.product == \"FortiGate\"\n      AND event.action NOT IN (\"server-rst\", \"\
+    client-rst\", \"timeout\")\n      AND event.outcome NOT IN (\"reset\", \"timeout\")\n    )\n  )\n| STATS unique_ports = COUNT_DISTINCT(destination.port),\
+    \ total_events = COUNT(*) \n  BY source.ip, destination.ip, window = BUCKET(@timestamp, 15 minutes)\n| WHERE unique_ports >= 30\n| KEEP window,\
+    \ source.ip, destination.ip, unique_ports, total_events\n"
+  leql: |
+    where(source_address NOT IN PRIVATE_ADDRESSES AND destination_address IN PRIVATE_ADDRESSES AND destination_port >= 1 AND destination_port <= 1024 AND action != "server-rst" AND action != "client-rst" AND action != "timeout" AND action != "reset") groupby(source_address, destination_address) calculate(unique:destination_port)
+  crowdstrike: "#type=firewall \n(direction=inbound OR action=*inbound* OR src_ip!=10.* src_ip!=172.16.* src_ip!=192.168.* dest_ip=10.* OR dest_ip=172.16.*\
+    \ OR dest_ip=192.168.*)\n(dest_port<=1024 OR (#source=*fortinet* OR #source=*fortigate* OR vendor=fortinet OR product=fortigate action!=server-rst\
+    \ action!=client-rst action!=timeout action!=reset))\naction!=reset action!=timeout\n| groupBy([src_ip, dest_ip], function=count(dest_port,\
+    \ distinct=true, as=unique_ports))\n| unique_ports >= 30\n| table([src_ip, dest_ip, unique_ports, @timestamp])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_source in ("from-zone", "inbound") and action_destination in ("to-zone", "internal")
+    | filter (dest_port >= 1 and dest_port <= 1024) or (observer_vendor = "Fortinet" and observer_product = "FortiGate" and action not in ("server-rst", "client-rst", "timeout"))
+    | filter action not in ("reset", "timeout")
+    | bin _time span=15m
+    | comp count_distinct(dest_port) as unique_ports, count() as event_count by _time, source_ip, dest_ip
+    | filter unique_ports >= 30 or event_count >= 30
+    | fields _time, source_ip, dest_ip, unique_ports, event_count
+  lucene: |
+    (destination.port:[1 TO 1024] AND (source.ip:* AND NOT source.ip:[10.0.0.0 TO 10.255.255.255] AND NOT source.ip:[172.16.0.0 TO 172.31.255.255] AND NOT source.ip:[192.168.0.0 TO 192.168.255.255]) AND (destination.ip:[10.0.0.0 TO 10.255.255.255] OR destination.ip:[172.16.0.0 TO 172.31.255.255] OR destination.ip:[192.168.0.0 TO 192.168.255.255])) OR (observer.vendor:"Fortinet" AND NOT action:(server-rst OR client-rst OR timeout OR reset))
+  sumo: |
+    _sourceCategory=*firewall*
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "action" as action
+    | json field=_raw "log_source" as log_source
+    | where (dest_port >= 1 and dest_port <= 1024) or (log_source matches "*FortiGate*" and !(action in ("server-rst", "client-rst", "timeout")) and !(action in ("reset", "timeout")))
+    | timeslice 15m
+    | count_distinct(dest_port) as unique_ports by _timeslice, src_ip, dest_ip
+    | where unique_ports >= 30
+    | fields _timeslice, src_ip, dest_ip, unique_ports
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -101,7 +99,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "30 Firewall Events\nFrom one external source to one internal destination (Inbound)\nWhere the Destination Port is 1-1024\nOR\n\t\
   Where the Log Source is Fortinet FortiGate\n\tWhere the action is NOT in [server-rst, client-rst, timeout]\n\n\tWhere the action/result is NOT\

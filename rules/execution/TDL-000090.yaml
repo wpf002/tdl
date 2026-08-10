@@ -15,82 +15,113 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=network sourcetype=suricata (alert.category="Potential Corporate Privacy Violation" OR alert.category="Attempted User Privilege Gain" OR alert.category="Executable code was detected" OR alert.category="A suspicious string was detected" OR alert.category="A Network Trojan was detected" OR alert.category="A suspicious filename was detected" OR alert.category="An attempted login using a suspicious username was detected" OR alert.category="A client was using an unusual port" OR alert.category="Detection of a denial of service attack" OR alert.category="Detection of a non-standard protocol or event" OR alert.category="Generic Protocol Command Decode" OR alert.category="access to a potentially vulnerable web application" OR alert.category="Web Application Attack" OR alert.category="Misc Attack" OR alert.category="Attempted Administrator Privilege Gain" OR alert.category="Attempted Information Leak" OR alert.category="Potentially Bad Traffic" OR alert.category="Exploit Kit Activity Detected" OR signature_category="Exploit*" OR alert.category="exploit-kit" OR category="exploit*" OR signature_category="exploit*" OR event_type="alert") (action=allowed OR action=alert OR event_type=alert) src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) NOT dest_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+  spl: 'index=network sourcetype=suricata (alert.category="Potential Corporate Privacy Violation" OR alert.category="Attempted User Privilege
+    Gain" OR alert.category="Executable code was detected" OR alert.category="A suspicious string was detected" OR alert.category="A Network Trojan
+    was detected" OR alert.category="A suspicious filename was detected" OR alert.category="An attempted login using a suspicious username was
+    detected" OR alert.category="A client was using an unusual port" OR alert.category="Detection of a denial of service attack" OR alert.category="Detection
+    of a non-standard protocol or event" OR alert.category="Generic Protocol Command Decode" OR alert.category="access to a potentially vulnerable
+    web application" OR alert.category="Web Application Attack" OR alert.category="Misc Attack" OR alert.category="Attempted Administrator Privilege
+    Gain" OR alert.category="Attempted Information Leak" OR alert.category="Potentially Bad Traffic" OR alert.category="Exploit Kit Activity Detected"
+    OR signature_category="Exploit*" OR alert.category="exploit-kit" OR category="exploit*" OR signature_category="exploit*" OR event_type="alert")
+    (action=allowed OR action=alert OR event_type=alert) src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) NOT dest_ip IN (10.0.0.0/8, 172.16.0.0/12,
+    192.168.0.0/16)
+
     | stats count by src_ip, dest_ip, signature, action, dest_port
+
     | where count >= 1
+
     | table src_ip, dest_ip, signature, action, dest_port, count
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceVendor in~ ("Palo Alto Networks", "Fortinet", "Cisco", "Check Point", "Snort", "Suricata")
+    | where DeviceEventClassID has_any ("exploit", "cve", "vulnerability")
+    | where DeviceAction in~ ("allow", "alert")
+    | extend SourceIPType = iff(ipv4_is_private(SourceIP), "Internal", "External")
+    | extend DestinationIPType = iff(ipv4_is_private(DestinationIP), "Internal", "External")
+    | where SourceIPType == "Internal" and DestinationIPType == "External"
+    | project TimeGenerated, DeviceVendor, DeviceProduct, DeviceEventClassID, Activity, DeviceAction, SourceIP, DestinationIP, DestinationPort, Message
+  aql: |
+    SELECT sourceip, destinationip, qidname(qid), categoryname(category), COUNT(*) AS event_count
+    FROM events
+    WHERE category IN (13000, 13001, 13002, 13003, 13004, 13005, 13006, 13007, 13008, 13009, 13010, 13011, 13012, 13013, 13014, 13015, 13016, 13017, 13018, 13019, 13020)
+      AND sourceip IN (SELECT sourceip FROM events WHERE INOFFENSE() OR INCIDR('10.0.0.0/8', sourceip) OR INCIDR('172.16.0.0/12', sourceip) OR INCIDR('192.168.0.0/16', sourceip))
+      AND destinationip NOT IN (SELECT destinationip FROM events WHERE INCIDR('10.0.0.0/8', destinationip) OR INCIDR('172.16.0.0/12', destinationip) OR INCIDR('192.168.0.0/16', destinationip))
+      AND categoryname(category) ILIKE '%exploit%'
+    GROUP BY sourceip, destinationip, qid, category
     LAST 1 HOURS
+  yara_l: |
+    rule mitre_t1203_exploitation_for_client_execution {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects exploitation attempts via IDS/IPS events from internal to external destinations"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1203"
+        severity = "HIGH"
 
-    '
-  yara_l: "rule tdl_tdl_exe_000090 {\n  meta:\n    author = \"TDL\"\n    description = \"Allowed Exploit Attempt - Outbound\"\n    severity =\
-    \ \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1203\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.metadata.product_event_type = "exploit" or $e.metadata.product_event_type = "intrusion"
+        (
+          $e.security_result.action = "ALLOW" or
+          $e.security_result.action = "ALERT"
+        )
+        $e.network.direction = "OUTBOUND"
+        net.ip_in_range_cidr($e.principal.ip, "10.0.0.0/8") or
+        net.ip_in_range_cidr($e.principal.ip, "172.16.0.0/12") or
+        net.ip_in_range_cidr($e.principal.ip, "192.168.0.0/16")
+        not net.ip_in_range_cidr($e.target.ip, "10.0.0.0/8")
+        not net.ip_in_range_cidr($e.target.ip, "172.16.0.0/12")
+        not net.ip_in_range_cidr($e.target.ip, "192.168.0.0/16")
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dst_ip
 
-    | WHERE @timestamp > NOW() - 1 hour
+      match:
+        $src_ip, $dst_ip over 5m
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+      outcome:
+        $risk_score = max(75)
 
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network_traffic.ips*, logs-network_traffic.ids*, logs-zeek.notice*, logs-suricata.eve*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.kind == "alert"
+      AND (event.category == "intrusion_detection" OR event.type == "exploit")
+      AND event.action IN ("allow", "alert", "allowed")
+      AND NOT (source.ip STARTS_WITH "10." OR source.ip STARTS_WITH "172.16." OR source.ip STARTS_WITH "172.17." OR source.ip STARTS_WITH "172.18." OR source.ip STARTS_WITH "172.19." OR source.ip STARTS_WITH "172.20." OR source.ip STARTS_WITH "172.21." OR source.ip STARTS_WITH "172.22." OR source.ip STARTS_WITH "172.23." OR source.ip STARTS_WITH "172.24." OR source.ip STARTS_WITH "172.25." OR source.ip STARTS_WITH "172.26." OR source.ip STARTS_WITH "172.27." OR source.ip STARTS_WITH "172.28." OR source.ip STARTS_WITH "172.29." OR source.ip STARTS_WITH "172.30." OR source.ip STARTS_WITH "172.31." OR source.ip STARTS_WITH "192.168." OR source.ip STARTS_WITH "127.")
+      AND (destination.ip STARTS_WITH "10." OR destination.ip STARTS_WITH "172.16." OR destination.ip STARTS_WITH "172.17." OR destination.ip STARTS_WITH "172.18." OR destination.ip STARTS_WITH "172.19." OR destination.ip STARTS_WITH "172.20." OR destination.ip STARTS_WITH "172.21." OR destination.ip STARTS_WITH "172.22." OR destination.ip STARTS_WITH "172.23." OR destination.ip STARTS_WITH "172.24." OR destination.ip STARTS_WITH "172.25." OR destination.ip STARTS_WITH "172.26." OR destination.ip STARTS_WITH "172.27." OR destination.ip STARTS_WITH "172.28." OR destination.ip STARTS_WITH "172.29." OR destination.ip STARTS_WITH "172.30." OR destination.ip STARTS_WITH "172.31." OR destination.ip STARTS_WITH "192.168." OR destination.ip STARTS_WITH "127.")
+    | STATS event_count = COUNT(*) BY source.ip, destination.ip
+    | WHERE event_count >= 1
+    | KEEP source.ip, destination.ip, event_count
+  leql: |
+    where(source_json.alert.action IN [allow, alert] AND source_json.alert.category ICONTAINS "exploit" AND (destination_address!=PRIVATE(10.0.0.0/8) AND destination_address!=PRIVATE(172.16.0.0/12) AND destination_address!=PRIVATE(192.168.0.0/16)) AND (source_address=PRIVATE(10.0.0.0/8) OR source_address=PRIVATE(172.16.0.0/12) OR source_address=PRIVATE(192.168.0.0/16)))
+  crowdstrike: |
+    #type=ids_ips event_simpleName=*Exploit* direction=outbound action IN [allow, alert]
+    | cidr(src_ip, as=src_internal, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+    | src_internal=true
+    | cidr(dest_ip, as=dest_internal, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+    | dest_internal=false
+    | table([@timestamp, src_ip, dest_ip, action, signature, protocol, src_port, dest_port])
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter threat_category in ("code-execution", "exploit-kit", "command-injection") and action_firewall_action in ("allow", "alert") and not incidr(dest_ip, "10.0.0.0/8") and not incidr(dest_ip, "172.16.0.0/12") and not incidr(dest_ip, "192.168.0.0/16") and (incidr(src_ip, "10.0.0.0/8") or incidr(src_ip, "172.16.0.0/12") or incidr(src_ip, "192.168.0.0/16"))
+    | fields _time, src_ip, dest_ip, threat_name, action_firewall_action, app, dest_port
+  lucene: |
+    event_type:"exploit" AND direction:"outbound" AND source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND action:(allow OR alert)
+  sumo: |
+    _sourceCategory=*IDS* OR _sourceCategory=*IPS* OR _sourceCategory=*Intrusion*
+    | parse regex "(?i)exploit|attack|CVE-\d{4}-\d+" as exploit_indicator
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?i)action[:\s=]+(?<action>\w+)" nodrop
+    | where isPrivateIP(src_ip) and !isPrivateIP(dest_ip)
+    | where action in ("allow", "alert")
+    | count by src_ip, dest_ip, action
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -100,7 +131,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 IDS/IPS Exploit Event
 

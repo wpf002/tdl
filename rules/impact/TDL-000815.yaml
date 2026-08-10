@@ -31,68 +31,125 @@ queries:
     \ as last_time values(affected_table) as tables values(operation) as operations values(host) as hosts by db_user\n| where count > 0\n| eval\
     \ first_time=strftime(first_time, \"%Y-%m-%d %H:%M:%S\"), last_time=strftime(last_time, \"%Y-%m-%d %H:%M:%S\")\n| table db_user, count, operations,\
     \ tables, hosts, first_time, last_time\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    let lookback = 7d;
+    let financial_tables = dynamic(["transactions", "payments", "invoices", "ledger", "audit_log", "financial_records"]);
+    let app_service_accounts = dynamic(["app_svc", "web_service", "api_service"]);
+    union
+    (Sysmon
+    | where TimeGenerated > ago(lookback)
+    | where EventID == 1
+    | where CommandLine has_any ("UPDATE", "DELETE")
+    | where CommandLine has_any (financial_tables)
+    | extend Account = tolower(AccountName)
+    | where Account !in~ (app_service_accounts)
+    | project TimeGenerated, Computer, Account, CommandLine, ParentImage, Image),
+    (Event
+    | where TimeGenerated > ago(lookback)
+    | where Source == "Linux Auditd" or RenderedDescription has "auditd"
+    | where RenderedDescription has_any ("UPDATE", "DELETE")
+    | where RenderedDescription has_any (financial_tables)
+    | parse RenderedDescription with * "user=" Account " " *
+    | extend Account = tolower(Account)
+    | where Account !in~ (app_service_accounts)
+    | project TimeGenerated, Computer, Account, RenderedDescription),
+    (AWSCloudTrail
+    | where TimeGenerated > ago(lookback)
+    | where EventName in ("ExecuteStatement", "BatchExecuteStatement")
+    | extend StatementContent = tostring(parse_json(RequestParameters).statement)
+    | where StatementContent has_any ("UPDATE", "DELETE")
+    | where StatementContent has_any (financial_tables)
+    | extend Account = tolower(UserIdentityPrincipalid)
+    | where Account !in~ (app_service_accounts)
+    | project TimeGenerated, Account, EventName, StatementContent, SourceIpAddress, UserAgent)
+    | project TimeGenerated, Computer, Account
+  aql: |
+    SELECT eventtime, username, sourceip, destinationip, LOGSOURCENAME(logsourceid) AS host, "Database Name" AS database_name, "Object Name" AS table_name, "SQL Command" AS sql_command, COUNT(*) AS event_count
+    FROM events
+    WHERE (LOWER("SQL Command") LIKE '%update%' OR LOWER("SQL Command") LIKE '%delete%')
+      AND (LOWER("Object Name") LIKE '%financial%' OR LOWER("Object Name") LIKE '%audit%' OR LOWER("Object Name") LIKE '%finance%' OR LOWER("Object Name") LIKE '%transaction%' OR LOWER("Object Name") LIKE '%payment%')
+      AND username NOT IN ('app_service_account', 'finance_app', 'audit_service', 'etl_service', 'reporting_service')
+    GROUP BY eventtime, username, sourceip, destinationip, LOGSOURCENAME(logsourceid), "Database Name", "Object Name", "SQL Command"
+    LAST 1 HOURS
+  yara_l: |
+    rule data_manipulation_financial_audit_tables {
+      meta:
+        author = "TDL"
+        description = "Detects UPDATE/DELETE operations on financial or audit tables by non-service accounts"
+        mitre_attack_tactic = "Impact"
+        mitre_attack_technique = "T1565"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "GENERIC_EVENT"
+        (
+          re.regex($e.metadata.description, `(?i)(UPDATE|DELETE)`) or
+          re.regex($e.security_result.summary, `(?i)(UPDATE|DELETE)`) or
+          re.regex($e.target.resource.name, `(?i)(UPDATE|DELETE)`)
+        )
+        (
+          re.regex($e.target.resource.name, `(?i)(financial|audit|transaction|payment|invoice|ledger|account)`) or
+          re.regex($e.target.file.full_path, `(?i)(financial|audit|transaction|payment|invoice|ledger|account)`) or
+          re.regex($e.metadata.description, `(?i)(financial|audit|transaction|payment|invoice|ledger|account)`)
+        )
+        $e.principal.user.userid = $user
+        not re.regex($e.principal.user.userid, `(?i)(svc|service|app|system|dbapp|webapp)`)
+        $e.target.hostname = $host
 
-    | where eventName matches regex ".+"
+      match:
+        $user, $host over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+      outcome:
+        $risk_score = 85
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_000815 {\n  meta:\n    author = \"TDL\"\n    description = \"Modification of Financial / Audit Records by Non-App\
-    \ Identity\"\n    severity = \"HIGH\"\n    tactic = \"TA0040\"\n    technique = \"T1565\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-*
+    | WHERE @timestamp > NOW() - 15 minutes
+      AND (
+        (event.category == "database" AND event.action IN ("update", "delete"))
+        OR (process.name IN ("mysql", "mysqld", "postgres", "psql", "sqlservr.exe", "oracle", "mongod") AND process.args RLIKE ".*(UPDATE|DELETE).*")
+        OR (event.dataset == "aws.rds" AND event.action IN ("UPDATE", "DELETE"))
+      )
+      AND (
+        TO_LOWER(event.dataset) LIKE "*financial*"
+        OR TO_LOWER(event.dataset) LIKE "*audit*"
+        OR TO_LOWER(process.args) RLIKE ".*(financial|audit|transaction|payment|ledger).*"
+        OR TO_LOWER(cloud.resource.name) LIKE "*financial*"
+        OR TO_LOWER(cloud.resource.name) LIKE "*audit*"
+      )
+      AND NOT user.name IN ("app_service_account", "application_user", "svc_app", "rds_service_account")
+    | STATS operations = COUNT(*) BY user.name, host.name, event.action, event.dataset, source.ip
+    | WHERE operations >= 1
+    | KEEP @timestamp, user.name, host.name, event.action, event.dataset, source.ip, operations
+  leql: |
+    where((source_json.EventName=UpdateItem OR source_json.EventName=DeleteItem OR source_json.EventName=PutItem OR source_json.EventData ICONTAINS "UPDATE" OR source_json.EventData ICONTAINS "DELETE") AND (source_json.ObjectName ICONTAINS "financial" OR source_json.ObjectName ICONTAINS "audit" OR source_json.TableName ICONTAINS "financial" OR source_json.TableName ICONTAINS "audit") AND NOT (source_json.SubjectUserName IN [app_svc_acct, db_service_account, application_user])) groupby(source_json.SubjectUserName, source_json.ObjectName, asset) calculate(count)
+  crowdstrike: |
+    (event_simpleName=ProcessRollup2 OR #type=auditd OR #type=cloudaudit OR event_simpleName=SyntheticProcessRollup2)
+    (CommandLine=*UPDATE* OR CommandLine=*DELETE* OR CommandLine=*update* OR CommandLine=*delete* OR event.action=*UPDATE* OR event.action=*DELETE* OR proctitle=*UPDATE* OR proctitle=*DELETE*)
+    (CommandLine=*financial* OR CommandLine=*audit* OR CommandLine=*transaction* OR CommandLine=*ledger* OR event.data=*financial* OR event.data=*audit* OR event.data=*transaction* OR event.data=*ledger*)
+    NOT (UserName=*svc-* OR UserName=*service* OR UserName=*app-account* OR UserName=db_app OR UserName=application_user OR user.name=*svc-* OR user.name=*service* OR user.name=*app-account*)
+    | groupBy([ComputerName, UserName, CommandLine], function=count(as=modifications))
+    | table([@timestamp, ComputerName, UserName, CommandLine, modifications])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and resource_type = "dynamodb" and operation_name in ("UpdateItem", "DeleteItem", "BatchWriteItem", "ExecuteStatement")
+    | alter table_name = lowercase(coalesce(json_extract_scalar(resource_json_object, "$.tableName"), json_extract_scalar(resource_json_object, "$.resourceName")))
+    | filter table_name ~= "(financial|finance|audit|transaction|payment|billing|ledger|accounting)"
+    | alter service_account = actor_caller_account
+    | filter service_account not in ("app-service-account", "application-db-user", "backend-service", "approved-app-account")
+    | fields _time, actor_caller_account, operation_name, table_name, cloud_resource_identifier, actor_caller_ip_address, user_agent
+  lucene: |
+    (event.action:(UPDATE OR DELETE) OR action:(UPDATE OR DELETE) OR operation:(UPDATE OR DELETE)) AND (database.table:(*financial* OR *audit* OR *transaction* OR *ledger* OR *payment*) OR table_name:(*financial* OR *audit* OR *transaction* OR *ledger* OR *payment*) OR object_name:(*financial* OR *audit* OR *transaction* OR *ledger* OR *payment*)) AND NOT (user.name:(app_service_account OR db_service_user OR application_user OR system_service) OR database.user:(app_service_account OR db_service_user OR application_user OR system_service) OR db_user:(app_service_account OR db_service_user OR application_user OR system_service))
+  sumo: "_sourceCategory=*database* OR _sourceCategory=*audit* OR _sourceCategory=*auditd* OR _sourceCategory=*cloudtrail*\n| parse regex \"(?i)(?<query_type>UPDATE|DELETE)\\\
+    s+.*\\s+(?:FROM\\s+)?(?<table_name>\\S+)\" nodrop\n| parse regex \"(?i)user[=:\\s]+['\\\"]?(?<db_user>[^'\\\";\\s]+)\" nodrop\n| json field=_raw\
+    \ \"userIdentity.principalId\" as db_user nodrop\n| json field=_raw \"requestParameters.statement\" as sql_statement nodrop\n| parse field=sql_statement\
+    \ regex \"(?i)(?<query_type>UPDATE|DELETE)\\s+.*\\s+(?:FROM\\s+)?(?<table_name>\\S+)\" nodrop\n| where (query_type = \"UPDATE\" OR query_type\
+    \ = \"DELETE\") \n  AND (table_name matches \"*financial*\" OR table_name matches \"*audit*\" OR table_name matches \"*transaction*\" OR table_name\
+    \ matches \"*payment*\" OR table_name matches \"*ledger*\")\n  AND !(db_user matches \"*app_service*\" OR db_user matches \"*service_account*\"\
+    \ OR db_user matches \"*application*\")\n| fields _messageTime, _sourceHost, db_user, query_type, table_name, sql_statement\n"
 pseudo_logic: UPDATE/DELETE on financial or audit tables by a database account outside the application service account allowlist.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -109,7 +166,7 @@ references:
 - https://attack.mitre.org/techniques/T1565/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'

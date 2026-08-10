@@ -14,75 +14,105 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 90
 queries:
-  spl: |
-    index=windows sourcetype="WinEventLog:Security" EventCode=4688 (New_Process_Name="*\\regsvr32.exe" OR Process_Command_Line="*regsvr32*") (Process_Command_Line="*/i:http*" OR Process_Command_Line="*/i:https*") Process_Command_Line="*.sct*"
+  spl: 'index=windows sourcetype="WinEventLog:Security" EventCode=4688 (New_Process_Name="*\\regsvr32.exe" OR Process_Command_Line="*regsvr32*")
+    (Process_Command_Line="*/i:http*" OR Process_Command_Line="*/i:https*") Process_Command_Line="*.sct*"
+
     | stats count values(ComputerName) as affected_hosts by Account_Name, IpAddress, EventCode, New_Process_Name, Process_Command_Line
+
     | where count >= 1
+
     | table _time, Account_Name, IpAddress, EventCode, New_Process_Name, Process_Command_Line, affected_hosts, count
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4688")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_005 {\n  meta:\n    author = \"TDL\"\n    description = \"Regsvr32 Executing Remote SCT Scriptlet (Squiblydoo)\"\n\
-    \    severity = \"CRITICAL\"\n    tactic = \"TA0002\"\n    technique = \"T1218.010\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\
-    \n    $e.event_id = /(4688)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(90d)
+    | where EventID == 4688
+    | where (NewProcessName has_any ("regsvr32.exe", "REGSVR32.EXE") or CommandLine has_any ("regsvr32.exe", "REGSVR32.EXE"))
+    | where CommandLine has "/i:" and CommandLine has_any ("http://", "https://", "ftp://") and CommandLine has ".sct"
+    | extend IpAddress = IpAddress, User = Account, EventCode = EventID
+    | summarize EventCount = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Computers = make_set(Computer) by User, IpAddress, CommandLine, NewProcessName, LogonType, EventCode
+    | where EventCount >= 1
+    | project FirstSeen, LastSeen, User, IpAddress, LogonType, EventCode, NewProcessName, CommandLine, Computers, EventCount
+  aql: |
+    SELECT username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process CommandLine", eventtime
+    FROM events
+    WHERE "EventID" = '4688'
+      AND ("Process Name" ILIKE '%regsvr32.exe%' OR "Process CommandLine" ILIKE '%regsvr32%')
+      AND "Process CommandLine" MATCHES '.*(/i:|/u:|-i:|-u:).*https?://.*\.sct.*'
+    GROUP BY username, sourceip, LOGSOURCENAME(logsourceid), "Process CommandLine", eventtime
+    LAST 24 HOURS
+  yara_l: |
+    rule regsvr32_squiblydoo_remote_sct {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects Regsvr32 executing remote SCT scriptlet (Squiblydoo T1218.010)"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1218.010"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 day
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.metadata.product_event_type = "4688"
+        (
+          re.regex($e.principal.process.file.full_path, `(?i)\\regsvr32\.exe$`) or
+          re.regex($e.principal.process.command_line, `(?i)regsvr32`)
+        )
+        (
+          re.regex($e.principal.process.command_line, `(?i)/u\s+http`) or
+          re.regex($e.principal.process.command_line, `(?i)/i\s+http`) or
+          re.regex($e.principal.process.command_line, `(?i)\.sct`)
+        )
+        $e.principal.user.userid = $user
+        $e.principal.ip = $ip
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "authentication" AND event_id IN ("4688")
+      match:
+        $user, $ip, $host over 1h
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+      outcome:
+        $risk_score = 85
+        $user = array_distinct($e.principal.user.userid)
+        $ip_address = array_distinct($e.principal.ip)
+        $command_line = array_distinct($e.principal.process.command_line)
+        $hostname = array_distinct($e.principal.hostname)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4688])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4688)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4688")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4688)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4688")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: "FROM logs-system.security*, winlogbeat-*\n| WHERE event.code == \"4688\" \n  AND TO_LOWER(process.name) LIKE \"*regsvr32.exe*\"\n  AND\
+    \ (process.command_line LIKE \"*http://*\" OR process.command_line LIKE \"*https://*\" OR process.command_line LIKE \"*ftp://*\")\n  AND (process.command_line\
+    \ LIKE \"*.sct*\" OR process.command_line LIKE \"*scrobj.dll*\")\n| STATS hosts = COUNT_DISTINCT(host.name) BY user.name, source.ip\n| WHERE\
+    \ hosts >= 1\n| KEEP user.name, source.ip, hosts\n"
+  leql: |
+    where(source_json.EventID=4688 AND process_name ICONTAINS "regsvr32.exe" AND (process_cmd_line ICONTAINS "/u" OR process_cmd_line ICONTAINS "/i") AND (process_cmd_line ICONTAINS "http://" OR process_cmd_line ICONTAINS "https://") AND process_cmd_line ICONTAINS ".sct") groupby(user, source_address, asset) calculate(count)
+  crowdstrike: |
+    EventCode=4688 (NewProcessName=*regsvr32.exe OR CommandLine=*regsvr32*)
+    CommandLine=*/i:http* CommandLine=*scrobj.dll*
+    | groupBy([SubjectUserName, IpAddress, ComputerName], function=count(as=instances))
+    | instances >= 1
+    | table([@timestamp, ComputerName, SubjectUserName, IpAddress, NewProcessName, CommandLine, EventCode, instances])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4688
+    | filter lowercase(action_process_image_name) contains "regsvr32.exe" or lowercase(action_process_image_command_line) contains "regsvr32"
+    | filter action_process_image_command_line ~= "(?i)(http|https|ftp)://.*\.sct"
+    | alter user = coalesce(actor_effective_username, action_evtlog_event_data_SubjectUserName),
+            IpAddress = coalesce(action_remote_ip, action_evtlog_event_data_IpAddress),
+            LogonType = action_evtlog_event_data_LogonType,
+            EventCode = action_evtlog_event_id
+    | dedup user, IpAddress, agent_hostname
+    | comp count() as instances by user, IpAddress, agent_hostname, EventCode, LogonType, action_process_image_name, action_process_image_command_line
+    | filter instances >= 1
+    | fields _time, agent_hostname, user, IpAddress, LogonType, EventCode, action_process_image_name, action_process_image_command_line, instances
+  lucene: |
+    event.code:4688 AND (process.name:*regsvr32.exe OR CommandLine:*regsvr32*) AND CommandLine:(*scrobj.dll* AND (*http* OR *https* OR *ftp*))
+  sumo: "_sourceCategory=*Windows*Security* \"4688\" regsvr32\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"NewProcessName\"\
+    \ as process_name\n| json field=_raw \"CommandLine\" as command_line\n| json field=_raw \"SubjectUserName\" as user\n| json field=_raw \"\
+    IpAddress\" as ip_address\n| json field=_raw \"LogonType\" as logon_type\n| json field=_raw \"Computer\" as host\n| where event_id = \"4688\"\
+    \ \n  and (process_name matches \"*regsvr32.exe\" or command_line matches \"*regsvr32*\")\n  and (command_line matches \"*http://*\" or command_line\
+    \ matches \"*https://*\" or command_line matches \"*ftp://*\")\n  and (command_line matches \"*.sct*\" or command_line matches \"*scrobj.dll*\"\
+    )\n| fields _messageTime, host, user, ip_address, logon_type, event_id, process_name, command_line\n| dedup host, user, ip_address\n"
 false_positives:
 - Extremely rare in production
 tags:
@@ -92,7 +122,7 @@ tags:
 author: TDL
 created: '2024-01-17'
 test_method: purple_team
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'
 - Inspect the parent → child process tree, command line arguments, and code-signing status — pay attention to short-lived processes, encoded arguments,

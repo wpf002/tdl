@@ -14,76 +14,123 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 100
 queries:
-  spl: |
-    index=windows sourcetype="WinEventLog:Security" EventCode=4688 (NewProcessName="*\\vssadmin.exe" OR NewProcessName="*\\wmic.exe") (CommandLine="*delete shadows*" OR CommandLine="*resize shadowstorage*" OR CommandLine="*shadowcopy delete*" OR CommandLine="*delete shadowcopy*" OR CommandLine="*shadowstorage /for=*" OR CommandLine="*Win32_ShadowCopy*")
-    | search NOT [| inputlookup authorized_backup_accounts.csv | fields SubjectUserName] NOT [| inputlookup admin_allowlist_hosts.csv | fields ComputerName]
-    | stats count values(SubjectUserName) as user values(IpAddress) as IpAddress values(SubjectLogonId) as LogonType values(EventCode) as EventCode by ComputerName, SubjectUserName, IpAddress
+  spl: 'index=windows sourcetype="WinEventLog:Security" EventCode=4688 (NewProcessName="*\\vssadmin.exe" OR NewProcessName="*\\wmic.exe") (CommandLine="*delete
+    shadows*" OR CommandLine="*resize shadowstorage*" OR CommandLine="*shadowcopy delete*" OR CommandLine="*delete shadowcopy*" OR CommandLine="*shadowstorage
+    /for=*" OR CommandLine="*Win32_ShadowCopy*")
+
+    | search NOT [| inputlookup authorized_backup_accounts.csv | fields SubjectUserName] NOT [| inputlookup admin_allowlist_hosts.csv | fields
+    ComputerName]
+
+    | stats count values(SubjectUserName) as user values(IpAddress) as IpAddress values(SubjectLogonId) as LogonType values(EventCode) as EventCode
+    by ComputerName, SubjectUserName, IpAddress
+
     | where count >= 1
+
     | table _time, ComputerName, user, IpAddress, LogonType, EventCode, count
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4688")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_002 {\n  meta:\n    author = \"TDL\"\n    description = \"Shadow Copy Deletion via vssadmin or wmic\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0040\"\n    technique = \"T1490\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id\
-    \ = /(4688)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where NewProcessName has_any ("vssadmin.exe", "wmic.exe")
+    | where CommandLine has_any ("delete shadows", "resize shadowstorage", "shadowcopy delete")
+    | where not(Account has_any ("backup_svc", "veeam_svc", "commvault_svc"))
+    | where not(Computer has_any ("BACKUP-SERVER-01", "BACKUP-SERVER-02"))
+    | summarize count(), EventIDs = make_set(EventID), Hosts = make_set(Computer), LogonTypes = make_set(LogonType) by Account, IpAddress, NewProcessName, CommandLine
+    | where count_ >= 1
+    | project TimeGenerated = now(), Account, IpAddress, NewProcessName, CommandLine, EventCount = count_, EventIDs, Hosts, LogonTypes
+  aql: |
+    SELECT username, sourceip, LOGSOURCENAME(logsourceid) AS host, "NewProcessName", "CommandLine", COUNT(*) AS event_count
+    FROM events
+    WHERE ("EventID" = '4688' OR "EventID" = '1')
+      AND ("NewProcessName" ILIKE '%vssadmin.exe%' OR "NewProcessName" ILIKE '%wmic.exe%' OR "Image" ILIKE '%vssadmin.exe%' OR "Image" ILIKE '%wmic.exe%')
+      AND ("CommandLine" ILIKE '%delete shadows%' OR "CommandLine" ILIKE '%resize shadowstorage%' OR "CommandLine" ILIKE '%shadowcopy delete%' OR "CommandLine" ILIKE '%Win32_Shadowcopy%' OR "CommandLine" ILIKE '%delete%shadow%')
+      AND username NOT IN ('BACKUP_SERVICE_ACCOUNT', 'AUTHORIZED_BACKUP_USER')
+      AND LOGSOURCENAME(logsourceid) NOT IN ('BACKUP_SERVER_01', 'BACKUP_SERVER_02')
+    GROUP BY username, sourceip, LOGSOURCENAME(logsourceid), "NewProcessName", "CommandLine"
+    HAVING event_count >= 1
+    LAST 24 HOURS
+  yara_l: |
+    rule vss_deletion_impact_t1490 {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects Volume Shadow Copy deletion via vssadmin or wmic - MITRE T1490"
+        mitre_attack_tactic = "Impact"
+        mitre_attack_technique = "T1490"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 day
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.metadata.product_event_type = "4688"
+        (
+          re.regex($e.target.process.file.full_path, `(?i)\\vssadmin\.exe$`) or
+          re.regex($e.target.process.file.full_path, `(?i)\\wmic\.exe$`)
+        )
+        (
+          re.regex($e.target.process.command_line, `(?i)delete\s+shadows`) or
+          re.regex($e.target.process.command_line, `(?i)resize\s+shadowstorage`) or
+          re.regex($e.target.process.command_line, `(?i)shadowcopy\s+delete`)
+        )
+        not re.regex($e.principal.user.userid, `(?i)(backup_svc|veeam_svc|commvault_svc)`)
+        $e.principal.user.userid = $user
+        $e.principal.ip = $ip
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "authentication" AND event_id IN ("4688")
+      match:
+        $user, $ip over 1h
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+      outcome:
+        $risk_score = 85
+        $event_count = count_distinct($e.metadata.id)
+        $hosts = array_distinct($host)
+        $command_lines = array_distinct($e.target.process.command_line)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4688])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4688)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4688")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4688)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4688")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: "FROM logs-windows.security*, logs-system.security*, winlogbeat-*\n| WHERE @timestamp > NOW() - 24 hour\n  AND (event.code == \"4688\"\
+    \ OR winlog.event_id == \"4688\")\n  AND (\n    TO_LOWER(process.executable) LIKE \"*vssadmin.exe\" OR \n    TO_LOWER(process.executable)\
+    \ LIKE \"*wmic.exe\" OR\n    TO_LOWER(winlog.event_data.NewProcessName) LIKE \"*vssadmin.exe\" OR\n    TO_LOWER(winlog.event_data.NewProcessName)\
+    \ LIKE \"*wmic.exe\"\n  )\n  AND (\n    TO_LOWER(process.command_line) LIKE \"*delete shadows*\" OR\n    TO_LOWER(process.command_line) LIKE\
+    \ \"*resize shadowstorage*\" OR\n    TO_LOWER(process.command_line) LIKE \"*shadowcopy delete*\" OR\n    TO_LOWER(winlog.event_data.CommandLine)\
+    \ LIKE \"*delete shadows*\" OR\n    TO_LOWER(winlog.event_data.CommandLine) LIKE \"*resize shadowstorage*\" OR\n    TO_LOWER(winlog.event_data.CommandLine)\
+    \ LIKE \"*shadowcopy delete*\"\n  )\n  AND user.name NOT IN (\"BACKUP_SERVICE_ACCOUNT\", \"AUTHORIZED_BACKUP_USER\")\n  AND host.name NOT\
+    \ IN (\"ADMIN_ALLOWED_HOST_1\", \"ADMIN_ALLOWED_HOST_2\")\n| STATS event_count = COUNT(*), \n        users = VALUES(user.name), \n       \
+    \ ip_addresses = VALUES(source.ip), \n        logon_types = VALUES(winlog.event_data.LogonType), \n        event_codes = VALUES(event.code),\n\
+    \        hosts = VALUES(host.name),\n        command_lines = VALUES(COALESCE(process.command_line, winlog.event_data.CommandLine))\n  BY user.name,\
+    \ source.ip\n| WHERE event_count >= 1\n| KEEP @timestamp, user.name, source.ip, event_count, users, ip_addresses, logon_types, event_codes,\
+    \ hosts, command_lines\n"
+  leql: |
+    where(source_json.EventID=4688 AND (source_json.NewProcessName ICONTAINS "vssadmin.exe" OR source_json.NewProcessName ICONTAINS "wmic.exe") AND (source_json.CommandLine ICONTAINS "delete shadows" OR source_json.CommandLine ICONTAINS "resize shadowstorage" OR source_json.CommandLine ICONTAINS "shadowcopy delete")) groupby(source_json.SubjectUserName, source_json.IpAddress, asset) calculate(count)
+  crowdstrike: |
+    EventCode=4688 (NewProcessName=*vssadmin.exe OR NewProcessName=*wmic.exe) (CommandLine=*delete*shadows* OR CommandLine=*resize*shadowstorage* OR CommandLine=*shadowcopy*delete*)
+    | groupBy([SubjectUserName, IpAddress], function=[count(as=cnt), collect([LogonType, EventCode, ComputerName])])
+    | cnt >= 1
+    | table([SubjectUserName, IpAddress, cnt, LogonType, EventCode, ComputerName])
+  xql: "dataset = xdr_data\n| filter action_evtlog_event_id = 4688\n| filter (lowercase(action_process_image_name) contains \"vssadmin.exe\" or\
+    \ lowercase(action_process_image_name) contains \"wmic.exe\")\n| filter (lowercase(action_process_image_command_line) contains \"delete shadows\"\
+    \ \n         or lowercase(action_process_image_command_line) contains \"resize shadowstorage\" \n         or lowercase(action_process_image_command_line)\
+    \ contains \"shadowcopy delete\"\n         or (lowercase(action_process_image_command_line) contains \"shadowcopy\" and lowercase(action_process_image_command_line)\
+    \ contains \"delete\"))\n| comp count() as event_count, \n       array_distinct(action_evtlog_event_data_LogonType) as logon_types,\n    \
+    \   array_distinct(action_evtlog_event_id) as event_codes\n       by actor_effective_username, action_remote_ip, agent_hostname\n| filter\
+    \ event_count >= 1\n| fields _time, agent_hostname, actor_effective_username, action_remote_ip, event_count, logon_types, event_codes\n"
+  lucene: |
+    event.code:4688 AND (NewProcessName:*vssadmin.exe OR NewProcessName:*wmic.exe) AND (CommandLine:*delete\ shadows* OR CommandLine:*resize\ shadowstorage* OR CommandLine:*shadowcopy\ delete* OR CommandLine:*Win32_Shadowcopy* OR CommandLine:*delete* AND CommandLine:*shadow*)
+  sumo: |
+    _sourceCategory=*Windows*Security* "4688"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "CommandLine" as cmd
+    | json field=_raw "SubjectUserName" as user
+    | json field=_raw "IpAddress" as ip_address
+    | json field=_raw "LogonType" as logon_type
+    | json field=_raw "Computer" as host
+    | where event_id = "4688"
+    | where process_name matches "*vssadmin.exe" or process_name matches "*wmic.exe"
+    | where cmd matches "*delete shadows*" or cmd matches "*resize shadowstorage*" or cmd matches "*shadowcopy delete*"
+    | count as event_count, values(user) as users, values(ip_address) as ip_addresses, values(logon_type) as logon_types, values(event_id) as event_codes, values(host) as hosts by user, ip_address
+    | where event_count >= 1
 false_positives:
 - Authorized backup solutions managing shadow storage
 tags:
@@ -94,7 +141,7 @@ tags:
 author: TDL
 created: '2024-03-01'
 test_method: purple_team
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'
 - Inspect the file path, file hash, parent process, and any prior network/email delivery — characterize the destructive action (encrypt, delete,

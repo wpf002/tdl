@@ -21,77 +21,114 @@ queries:
     \ span=1h as hour_bucket\n| eventstats sum(bytes_mb) as hourly_mb by src_ip, dest_ip, dest_port, hour_bucket\n| where hourly_mb < 1\n| bin\
     \ _time span=10m as ten_min_bucket\n| stats sum(bytes_mb) as transfer_mb values(hourly_mb) as prior_hourly_rates by src_ip, dest_ip, dest_port,\
     \ ten_min_bucket\n| where transfer_mb > 50\n| table ten_min_bucket, src_ip, dest_ip, dest_port, transfer_mb, prior_hourly_rates\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+  kql: |
+    let BaselineWindow = 24h;
+    let DetectionWindow = 10m;
+    let BaselineThreshold = 1048576; // 1MB in bytes
+    let SpikeThreshold = 52428800; // 50MB in bytes
+    let RecentConnections = CommonSecurityLog
+        | where TimeGenerated > ago(DetectionWindow)
+        | where DeviceAction in ("Allow", "Allowed", "accept")
+        | where CommunicationDirection == "Outbound"
+        | summarize RecentBytes = sum(SentBytes) by SourceIP, DestinationIP, DestinationPort, bin(TimeGenerated, DetectionWindow);
+    let BaselineConnections = CommonSecurityLog
+        | where TimeGenerated between (ago(BaselineWindow + DetectionWindow) .. ago(DetectionWindow))
+        | where DeviceAction in ("Allow", "Allowed", "accept")
+        | where CommunicationDirection == "Outbound"
+        | summarize BaselineHours = count_distinct(bin(TimeGenerated, 1h)), TotalBaselineBytes = sum(SentBytes) by SourceIP, DestinationIP, DestinationPort
+        | extend AvgBytesPerHour = TotalBaselineBytes / BaselineHours
+        | where AvgBytesPerHour < BaselineThreshold and BaselineHours >= 2;
+    RecentConnections
+    | join kind=inner (BaselineConnections) on SourceIP, DestinationIP, DestinationPort
+    | where RecentBytes > SpikeThreshold
+    | project TimeGenerated, SourceIP, DestinationIP, DestinationPort, RecentBytes, AvgBytesPerHour, BaselineHours
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(totalbytes) AS bytes_10m, (SELECT SUM(totalbytes) FROM flows WHERE sourceip = outer.sourceip AND destinationip = outer.destinationip AND destinationport = outer.destinationport START (CURRENT_TIMESTAMP - 3610000) STOP (CURRENT_TIMESTAMP - 610000)) AS bytes_prior_hour
+    FROM flows outer
+    WHERE destinationport NOT IN (80, 443, 22, 21, 25, 110, 143, 993, 995, 587, 465)
     GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exf_000811 {\n  meta:\n    author = \"TDL\"\n    description = \"Outbound Volume Spike on Existing C2 Beacon\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0010\"\n    technique = \"T1041\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    HAVING bytes_10m > 52428800 AND bytes_prior_hour < 1048576 AND bytes_prior_hour > 0
+    LAST 10 MINUTES
+  yara_l: "rule exfil_over_c2_channel {\n  meta:\n    author = \"TDL\"\n    description = \"Detects large data transfer over previously beaconing\
+    \ C2 channel - T1041\"\n    mitre_attack_tactic = \"Exfiltration\"\n    mitre_attack_technique = \"T1041\"\n    \n  events:\n    // Beaconing\
+    \ traffic: small transfers (<1MB/hour)\n    $beacon.metadata.event_type = \"NETWORK_CONNECTION\"\n    $beacon.network.direction = \"OUTBOUND\"\
+    \n    $beacon.security_result.action = \"ALLOW\"\n    $beacon.principal.hostname = $host\n    $beacon.target.ip = $dest_ip\n    $beacon.target.port\
+    \ = $dest_port\n    $beacon.network.sent_bytes < 1048576\n    \n    // Large transfer: >50MB in 10m window\n    $exfil.metadata.event_type\
+    \ = \"NETWORK_CONNECTION\"\n    $exfil.network.direction = \"OUTBOUND\"\n    $exfil.security_result.action = \"ALLOW\"\n    $exfil.principal.hostname\
+    \ = $host\n    $exfil.target.ip = $dest_ip\n    $exfil.target.port = $dest_port\n    $exfil.network.sent_bytes > 52428800\n    $beacon.metadata.event_timestamp.seconds\
+    \ <= $exfil.metadata.event_timestamp.seconds\n    \n  match:\n    $host, $dest_ip, $dest_port over 70m\n    \n  outcome:\n    $risk_score\
+    \ = max(85)\n    $total_exfil_bytes = sum($exfil.network.sent_bytes)\n    $beacon_count = count_distinct($beacon.metadata.id)\n    \n  condition:\n\
+    \    #beacon >= 5 and #exfil >= 1 and $exfil\n}\n"
+  esql: "FROM logs-network*, logs-firewall*, logs-zeek.conn*, packetbeat-*\n| WHERE @timestamp > NOW() - 70 minutes\n  AND network.direction ==\
+    \ \"outbound\"\n  AND network.transport IN (\"tcp\", \"udp\")\n  AND destination.bytes IS NOT NULL\n| EVAL conn_key = CONCAT(TO_STRING(source.ip),\
+    \ \":\", TO_STRING(destination.ip), \":\", TO_STRING(destination.port))\n| EVAL time_bucket = BUCKET(@timestamp, 10 minutes)\n| STATS \n \
+    \   recent_bytes = SUM(CASE(time_bucket >= BUCKET(NOW() - 10 minutes, 10 minutes), destination.bytes, 0)),\n    historical_bytes = SUM(CASE(time_bucket\
+    \ < BUCKET(NOW() - 10 minutes, 10 minutes), destination.bytes, 0)),\n    historical_windows = COUNT_DISTINCT(CASE(time_bucket < BUCKET(NOW()\
+    \ - 10 minutes, 10 minutes), time_bucket, null)),\n    first_seen = MIN(@timestamp),\n    last_seen = MAX(@timestamp)\n  BY conn_key, source.ip,\
+    \ destination.ip, destination.port\n| EVAL avg_historical_per_hour = historical_bytes / (historical_windows * 10.0 / 60.0)\n| WHERE recent_bytes\
+    \ > 52428800\n  AND avg_historical_per_hour < 1048576\n  AND historical_windows >= 3\n| KEEP last_seen, source.ip, destination.ip, destination.port,\
+    \ recent_bytes, avg_historical_per_hour, first_seen\n| SORT recent_bytes DESC\n"
+  leql: |
+    where(direction=OUTBOUND AND bytes>52428800) groupby(source_address, destination_address) calculate(sum:bytes)
+  crowdstrike: |
+    #type=network OR #type=firewall OR event_simpleName=NetworkConnectIP4
+    | groupBy([ComputerName, RemoteAddressIP4, RemotePort], function=[sum(SentBytes, as=totalSent), count(as=connCount)])
+    | eval(mbPerHour := totalSent / (1024*1024) / (connCount / 60.0))
+    | mbPerHour < 1.0
+    | rename(field=RemoteAddressIP4, as=dst_ip)
+    | rename(field=RemotePort, as=dst_port)
+    | join({
+        #type=network OR #type=firewall OR event_simpleName=NetworkConnectIP4
+        | bucket(span=10m, field=@timestamp, as=window)
+        | groupBy([ComputerName, RemoteAddressIP4, RemotePort, window], function=sum(SentBytes, as=burstBytes))
+        | eval(burstMB := burstBytes / (1024*1024))
+        | burstMB > 50
+        | rename(field=RemoteAddressIP4, as=dst_ip)
+        | rename(field=RemotePort, as=dst_port)
+      }, field=[ComputerName, dst_ip, dst_port], include=[window, burstMB])
+    | table([ComputerName, dst_ip, dst_port, mbPerHour, burstMB, window])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action = "allow" and dest_location = "external"
+    | alter session_bytes = to_number(bytes_sent)
+    | bin _time span=1h as hourly_window
+    | comp sum(session_bytes) as hourly_bytes, max(_time) as latest_time by src_ip, dest_ip, dest_port, hourly_window
+    | filter hourly_bytes < 1048576
+    | alter session_id = concat(src_ip, ":", dest_ip, ":", to_string(dest_port))
+    | join type=left (
+        dataset = panw_ngfw_traffic_raw
+        | filter action = "allow" and dest_location = "external"
+        | alter session_bytes = to_number(bytes_sent)
+        | bin _time span=10m as ten_min_window
+        | comp sum(session_bytes) as ten_min_bytes by src_ip, dest_ip, dest_port, ten_min_window
+        | alter session_id = concat(src_ip, ":", dest_ip, ":", to_string(dest_port))
+    ) as recent_traffic recent_traffic.session_id = session_id
+    | filter recent_traffic.ten_min_bytes > 52428800 and recent_traffic.ten_min_window > latest_time
+    | fields src_ip, dest_ip, dest_port, hourly_bytes, recent_traffic.ten_min_bytes, recent_traffic.ten_min_window
+  lucene: |
+    event.type:connection AND network.direction:outbound AND network.bytes:>52428800 AND network.transport:(tcp OR udp) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)
+  sumo: |
+    _sourceCategory=*Firewall* OR _sourceCategory=*IDS*
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?<bytes_out>\d+)" nodrop
+    | where bytes_out != ""
+    | timeslice 10m
+    | sum(bytes_out) as total_bytes_10m by _timeslice, src_ip, dest_ip
+    | where total_bytes_10m > 52428800
+    | join (
+        _sourceCategory=*Firewall* OR _sourceCategory=*IDS*
+        | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+        | parse regex "(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+        | parse regex "(?<bytes_out>\d+)" nodrop
+        | where bytes_out != ""
+        | timeslice 1h
+        | sum(bytes_out) as hourly_bytes by _timeslice, src_ip, dest_ip
+        | where hourly_bytes < 1048576
+        | count by src_ip, dest_ip
+        | where _count >= 2
+    ) as historical on src_ip, dest_ip
+    | fields _timeslice, src_ip, dest_ip, total_bytes_10m
 pseudo_logic: Established outbound session previously beaconing <1MB/h suddenly transfers >50MB in 10m. Exfil over C2.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -107,7 +144,7 @@ references:
 - https://attack.mitre.org/techniques/T1041/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination, total bytes transferred, and the protocol used.'

@@ -15,71 +15,47 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=github (action="business.disable_saml" OR action="org.disable_saml" OR action="business.disable_oidc")
+  spl: 'index=github (action="business.disable_saml" OR action="org.disable_saml" OR action="business.disable_oidc")
+
     | table _time, actor, action, org, repo, user_agent
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000546 {\n  meta:\n    author = \"TDL\"\n    description = \"Single SIgn-on Disbaled\"\n    severity = \"HIGH\"\n \
-    \   tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n\
-    \    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    GitHubAuditLogPolling
+    | where TimeGenerated > ago(1h)
+    | where Action in ("business.disable_saml", "org.disable_saml", "business.disable_oidc")
+    | project TimeGenerated, Action, Actor, Org, Repository, IPaddress, Country, OperationType, ActorLocation
+  aql: |
+    SELECT eventtime, username, sourceip, "action", LOGSOURCENAME(logsourceid) AS source
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%github%'
+      AND ("action" = 'business.disable_saml' OR "action" = 'org.disable_saml' OR "action" = 'business.disable_oidc')
+    LAST 24 HOURS
+  yara_l: "rule github_saml_oidc_disabled {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects disabling of SAML or OIDC\
+    \ authentication in GitHub\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"HIGH\"\
+    \n    \n  events:\n    $e.metadata.vendor_name = \"GITHUB\"\n    (\n      $e.metadata.product_event_type = \"business.disable_saml\" or\n\
+    \      $e.metadata.product_event_type = \"org.disable_saml\" or\n      $e.metadata.product_event_type = \"business.disable_oidc\"\n    )\n\
+    \    $e.principal.user.userid = $user\n    \n  match:\n    $user over 1h\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-github*
+    | WHERE event.action IN ("business.disable_saml", "org.disable_saml", "business.disable_oidc")
+    | KEEP @timestamp, event.action, user.name, organization.name, source.ip, event.id
+  leql: |
+    where(source_json.action IN ["business.disable_saml", "org.disable_saml", "business.disable_oidc"])
+  crowdstrike: |
+    #repo=github action IN [business.disable_saml, org.disable_saml, business.disable_oidc]
+    | table([@timestamp, actor, action, org, repo, user])
+  xql: |
+    dataset = github_audit_log_raw
+    | filter action in ("business.disable_saml", "org.disable_saml", "business.disable_oidc")
+    | fields _time, action, actor, org, repository, repo
+  lucene: |
+    action:(business.disable_saml OR org.disable_saml OR business.disable_oidc)
+  sumo: |
+    _sourceCategory=*Github* (business.disable_saml OR org.disable_saml OR buisness.disable_oidc)
+    | json field=_raw "action" as action
+    | where action in ("business.disable_saml", "org.disable_saml", "buisness.disable_oidc")
+    | fields _messageTime, _sourceHost, action
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +65,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Github event\n   where actions IN (business.disable_saml, org.disable_saml, buisness.disable_oidc)"
 triage_steps:

@@ -19,77 +19,105 @@ queries:
     \ dest_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)) OR [| inputlookup tor_exit_nodes.csv | fields dest_ip] OR app=\"Tor\" OR application=\"\
     Tor\")\n| append [search index=mcas event_name=\"Activity from a Tor IP Address\"]\n| table _time, src_ip, dest_ip, src_port, dest_port, app,\
     \ application, action, user, event_name\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  kql: "let TorExitNodes = externaldata(TorIP: string)[@\"https://check.torproject.org/torbulkexitlist\"] with (format=\"txt\", ignoreFirstRecord=false)\n\
+    | where isnotempty(TorIP) and TorIP !startswith \"#\"\n| distinct TorIP;\nlet FirewallTorDetection = \nCommonSecurityLog\n| where TimeGenerated\
+    \ > ago(1h)\n| where DeviceVendor has \"Firewall\" or DeviceProduct has \"Firewall\"\n| where DeviceAction != \"Deny\" and DeviceAction !=\
+    \ \"Block\"\n| where (ipv4_is_private(SourceIP) and not(ipv4_is_private(DestinationIP)))\n| where DestinationIP in (TorExitNodes) or ApplicationProtocol\
+    \ =~ \"Tor\" or DeviceCustomString1 =~ \"Tor\" or DeviceCustomString2 =~ \"Tor\" or DeviceCustomString3 =~ \"Tor\" or Activity has \"Tor\"\
+    \n| project TimeGenerated, SourceIP, DestinationIP, DestinationPort, ApplicationProtocol, DeviceAction, DeviceVendor, DeviceProduct, Activity,\
+    \ SourceHostName, DestinationHostName;\nlet MCASDetection = \nCloudAppEvents\n| where TimeGenerated > ago(1h)\n| where ActionType =~ \"Activity\
+    \ from a Tor IP Address\" or ActivityType =~ \"Activity from a Tor IP Address\"\n| project TimeGenerated, AccountObjectId, AccountDisplayName,\
+    \ IPAddress, Application, ActionType, ActivityType, RawEventData;\nunion isfuzzy=true FirewallTorDetection, MCASDetection\n"
+  aql: "SELECT sourceip, destinationip, COUNT(*) AS event_count, QIDNAME(qid) AS event_name, LOGSOURCENAME(logsourceid) AS log_source\nFROM events\n\
+    WHERE (category IN (SELECT category FROM categories WHERE name ILIKE '%firewall%') \n   AND ((sourceip IN (SELECT sourceip FROM events WHERE\
+    \ RFC1918(sourceip) = 'true' LAST 1 HOURS) \n         AND destinationip NOT IN (SELECT destinationip FROM events WHERE RFC1918(destinationip)\
+    \ = 'true' LAST 1 HOURS))\n        OR \"Application\" ILIKE '%Tor%'\n        OR LOWER(QIDNAME(qid)) LIKE '%tor exit node%'\n        OR LOWER(QIDNAME(qid))\
+    \ LIKE '%tor ip%'))\n   OR (LOWER(QIDNAME(qid)) LIKE '%activity from a tor ip address%' \n       OR LOWER(QIDNAME(qid)) LIKE '%mcas%tor%')\n\
+    GROUP BY sourceip, destinationip, QIDNAME(qid), LOGSOURCENAME(logsourceid)\nLAST 1 HOURS\n"
+  yara_l: |
+    rule lateral_movement_tor_proxy_usage {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects potential lateral movement via Tor proxy usage from internal to external destinations"
+        mitre_attack_tactic = "Lateral Movement"
+        mitre_attack_technique = "T1090"
+        severity = "High"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        // Firewall events: outbound connections to Tor exit nodes or Tor application traffic
+        $fw.metadata.event_type = "NETWORK_CONNECTION"
+        $fw.network.direction = "OUTBOUND"
+        (
+          $fw.network.application_protocol = "Tor" or
+          $fw.metadata.product_event_type = "Tor" or
+          strings.contains(strings.to_upper($fw.network.application_protocol), "TOR")
+        )
+        net.ip_in_range_cidr($fw.principal.ip, "10.0.0.0/8") or
+        net.ip_in_range_cidr($fw.principal.ip, "172.16.0.0/12") or
+        net.ip_in_range_cidr($fw.principal.ip, "192.168.0.0/16")
+        not (
+          net.ip_in_range_cidr($fw.target.ip, "10.0.0.0/8") or
+          net.ip_in_range_cidr($fw.target.ip, "172.16.0.0/12") or
+          net.ip_in_range_cidr($fw.target.ip, "192.168.0.0/16")
+        )
+        $fw.principal.ip = $src_ip
+        $fw.target.ip = $dst_ip
 
-    | where application matches regex "Tor"
+        // MCAS events: Activity from Tor IP address
+        $mcas.metadata.product_name = "Microsoft Cloud App Security"
+        $mcas.metadata.product_event_type = "Activity from a Tor IP Address"
+        $mcas.principal.ip = $mcas_ip
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+      match:
+        $src_ip over 1h
 
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "application" LIKE ''%Tor%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_lm_000256 {\n  meta:\n    author = \"TDL\"\n    description = \"Traffic to Known TOR Exit Node\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0008\"\n    technique = \"T1090\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.application =\
-    \ /Tor/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND application LIKE "%Tor%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND application=/Tor/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*Tor*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND application ~= "Tor"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND application:*Tor*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where application matches "*Tor*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $fw or $mcas
+    }
+  esql: |
+    FROM logs-network.firewall*, logs-cloud.mcas*
+    | WHERE @timestamp > NOW() - 24 hour
+    | WHERE (
+        (event.category == "network" AND network.direction == "outbound" AND source.ip RLIKE "^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)" AND NOT destination.ip RLIKE "^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)" AND (threat.indicator.name == "Tor Exit Node" OR network.application == "Tor" OR TO_LOWER(network.application) == "tor"))
+        OR
+        (event.dataset == "mcas" AND event.action == "Activity from a Tor IP Address")
+      )
+    | KEEP @timestamp, host.name, source.ip, destination.ip, network.application, event.action, event.dataset, user.name
+  leql: |
+    where(log_source_type="Firewall" AND (destination_address IN [Tor Exit Node IPs] OR application="Tor") AND direction="Outbound") OR where(log_source_type="MCAS" AND event_name="Activity from a Tor IP Address")
+  crowdstrike: |
+    (#type=firewall OR event_simpleName=FirewallEvent* OR #repo=firewall)
+    (
+      (direction=outbound AND src_ip=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND NOT dst_ip=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/)
+      OR (DestinationIP=* TorExitNode=true)
+      OR (Application="Tor" OR app="Tor" OR application_name="Tor")
+    )
+    OR
+    (
+      (#type=mcas OR event_simpleName=MCAS* OR #repo=mcas OR source=mcas)
+      (EventName="Activity from a Tor IP Address" OR event_name="Activity from a Tor IP Address" OR activity_type="Activity from a Tor IP Address")
+    )
+    | table([@timestamp, ComputerName, src_ip, dst_ip, DestinationIP, direction, Application, app, EventName, event_name, UserName, user])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter (incidr(src_ip, "10.0.0.0/8") or incidr(src_ip, "172.16.0.0/12") or incidr(src_ip, "192.168.0.0/16"))
+      and not (incidr(dst_ip, "10.0.0.0/8") or incidr(dst_ip, "172.16.0.0/12") or incidr(dst_ip, "192.168.0.0/16"))
+      and app = "tor"
+    | fields _time, src_ip, dst_ip, app, src_port, dst_port, action
+  lucene: |
+    (event_type:"firewall" AND direction:outbound AND source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND (tor_exit_node:true OR application:"Tor")) OR (event_type:"mcas" AND event_name:"Activity from a Tor IP Address")
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*MCAS*
+    | if (_sourceCategory matches "*firewall*", "firewall", "mcas") as source_type
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "application" as application
+    | json field=_raw "direction" as direction
+    | json field=_raw "event_name" as event_name
+    | json field=_raw "tor_exit_node" as tor_exit_node
+    | where (source_type = "firewall" and direction = "outbound" and (tor_exit_node = "true" or application = "Tor"))
+       or (source_type = "mcas" and event_name = "Activity from a Tor IP Address")
+    | fields _messageTime, _sourceHost, src_ip, dest_ip, application, event_name, source_type
 false_positives:
 - Authorized pen testing
 - Security research
@@ -99,7 +127,7 @@ tags:
 - lateral-movement
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Firewall Event \nFrom one internal source to one external destination (Outbound)\nOR\n\tWhere the Destination IP is on the Tor\
   \ Exit Node IP List\n\t\n\tWhere the Application is \"Tor\"\n\n---------------------------------------------------------------------------------\n\

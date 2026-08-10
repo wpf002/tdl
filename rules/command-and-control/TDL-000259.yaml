@@ -17,77 +17,85 @@ risk_score: 30
 queries:
   spl: "index=firewall \n| bin _time span=30m\n| search dest_country IN (\"CN\", \"RU\", \"KP\", \"IR\", \"SY\", \"CU\", \"VE\", \"BY\")\n| stats\
     \ count by _time, src_ip, dest_country\n| where count >= 50\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(30m)
+    | where DeviceVendor has "Firewall" or DeviceProduct has "Firewall"
+    | where isnotempty(DestinationGeoCountry)
+    | where DestinationGeoCountry in ("KP", "IR", "SY", "CU", "RU", "CN", "BY")
+    | summarize EventCount = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), DestinationIPs = make_set(DestinationIP) by SourceIP, DestinationGeoCountry, bin(TimeGenerated, 30m)
+    | where EventCount >= 50
+    | project TimeGenerated, SourceIP, DestinationGeoCountry, EventCount, FirstSeen, LastSeen, DestinationIPs
+  aql: |
+    SELECT sourceip, "Destination Country" AS dest_country, COUNT(*) AS event_count
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%firewall%'
+      AND "Destination Country" IN ('CN', 'RU', 'KP', 'IR', 'SY', 'CU', 'SD', 'VE', 'BY', 'MM')
+    GROUP BY sourceip, "Destination Country"
+    HAVING event_count >= 50
+    LAST 30 MINUTES
+  yara_l: |
+    rule c2_high_risk_country_connections {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects 50+ firewall events to high-risk countries from same source IP within 30 minutes"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1071"
+        severity = "High"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.metadata.product_log_id = "FIREWALL"
+        (
+          $e.principal.location.country_or_region = "CN" or
+          $e.principal.location.country_or_region = "RU" or
+          $e.principal.location.country_or_region = "IR" or
+          $e.principal.location.country_or_region = "KP" or
+          $e.principal.location.country_or_region = "SY" or
+          $e.target.location.country_or_region = "CN" or
+          $e.target.location.country_or_region = "RU" or
+          $e.target.location.country_or_region = "IR" or
+          $e.target.location.country_or_region = "KP" or
+          $e.target.location.country_or_region = "SY"
+        )
+        $e.principal.ip = $src_ip
+        $e.target.location.country_or_region = $dst_country
 
-    | where network.protocol matches regex "tcp"
+      match:
+        $src_ip, $dst_country over 30m
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000259 {\n  meta:\n    author = \"TDL\"\n    description = \"Excessive Outbound Connections to Foreign Country\"\n\
-    \    severity = \"LOW\"\n    tactic = \"TA0011\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 50
+    }
+  esql: |
+    FROM logs-network.firewall*
+    | WHERE @timestamp > NOW() - 30 minutes
+      AND destination.geo.country_name IN ("Iran", "North Korea", "Syria", "Cuba", "Sudan", "Russia", "China", "Belarus")
+    | STATS event_count = COUNT(*) BY source.ip, destination.geo.country_name, time_window = BUCKET(@timestamp, 30 minutes)
+    | WHERE event_count >= 50
+    | KEEP time_window, source.ip, destination.geo.country_name, event_count
+  leql: |
+    where(log_source_type=FIREWALL AND destination_country IN ["CN", "RU", "KP", "IR", "SY", "CU", "VE"]) groupby(source_address, destination_country) calculate(count)
+  crowdstrike: |
+    #type=firewall DestinationCountry IN [CN, RU, KP, IR, SY, CU, BY, VE, SD, SS]
+    | bucket(span=30m, field=@timestamp, as=time_bucket)
+    | groupBy([SourceIP, DestinationCountry, time_bucket], function=count(as=event_count))
+    | event_count >= 50
+    | table([SourceIP, DestinationCountry, time_bucket, event_count])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter dest_country in ("CN", "RU", "KP", "IR", "SY", "CU", "VE", "BY")
+    | bin _time span=30m
+    | comp count() as event_count by _time, src_ip, dest_country
+    | filter event_count >= 50
+  lucene: |
+    _exists_:destination.geo.country_iso_code AND destination.geo.country_iso_code:(CN OR RU OR IR OR KP OR SY OR CU OR BY OR VE OR SD OR MM) AND _exists_:source.ip
+  sumo: |
+    _sourceCategory=*Firewall*
+    | where dest_country in ("CN", "RU", "KP", "IR", "SY", "CU", "SD", "BY")
+    | timeslice 30m
+    | count as event_count by _timeslice, src_ip, dest_country
+    | where event_count >= 50
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -97,7 +105,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '50 Firewall Events
 

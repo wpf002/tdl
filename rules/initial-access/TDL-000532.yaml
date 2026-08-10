@@ -15,74 +15,88 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=cloud sourcetype=aws:cloudtrail eventName=*
+  spl: 'index=cloud sourcetype=aws:cloudtrail eventName=*
+
     | stats count values(sourceIPAddress) as source_ips by userIdentity.arn, eventName, resources{}.ARN
+
     | where count >= 1 AND NOT (source_ips IN ("10.0.0.1", "192.168.1.1"))
+
     | sort - count
+
     | table userIdentity.arn, eventName, resources{}.ARN, source_ips, count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000532 {\n  meta:\n    author = \"TDL\"\n    description = \"Long URL Containing SQL Commands\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1068\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(24h)
+    | where isnotempty(EventName)
+    | where EventName matches regex ".+"
+    | where SourceIpAddress !in ("52.1.1.1", "52.2.2.2")
+    | extend UserArn = tostring(UserIdentityArn)
+    | extend ResourceArn = tostring(parse_json(Resources)[0].ARN)
+    | where isnotempty(UserArn) and isnotempty(ResourceArn)
+    | summarize EventCount = count(), SourceIPs = make_set(SourceIpAddress) by UserArn, EventName, ResourceArn
+    | where EventCount >= 1
+    | sort by EventCount desc
+    | project TimeGenerated = now(), UserArn, EventName, ResourceArn, EventCount, SourceIPs
+  aql: "SELECT LOGSOURCENAME(logsourceid) AS source, \n       \"userIdentity.arn\" AS user_arn, \n       \"eventName\", \n       \"resources{}.ARN\"\
+    \ AS resource_arn, \n       sourceip, \n       COUNT(*) AS event_count\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) = 'Amazon AWS ELB'\n\
+    \  AND \"eventName\" MATCHES '.*'\n  AND sourceip NOT IN ('10.0.0.1', '192.168.1.100')\nGROUP BY \"userIdentity.arn\", \"eventName\", \"resources{}.ARN\"\
+    , sourceip\nHAVING event_count >= 1\nORDER BY event_count DESC\nLAST 1 HOURS\n"
+  yara_l: "rule aws_elb_url_based_exploitation_attempt {\n  meta:\n    author = \"Chronicle Detection\"\n    description = \"Detects potential\
+    \ exploitation attempts via URL-based events from AWS ELB logs (T1068 - Exploitation for Privilege Escalation)\"\n    mitre_attack_tactic\
+    \ = \"Initial Access\"\n    mitre_attack_technique = \"T1068\"\n    severity = \"MEDIUM\"\n\n  events:\n    $e.metadata.vendor_name = \"AMAZON\"\
+    \n    $e.metadata.product_name = \"AWS CloudTrail\"\n    $e.metadata.product_event_type != \"\"\n    re.regex($e.metadata.product_event_type,\
+    \ `.+`)\n    \n    $e.principal.user.userid = $user_arn\n    $e.metadata.product_event_type = $event_name\n    $e.target.resource.name = $resource_arn\n\
+    \    $e.principal.ip = $source_ip\n    \n    not re.regex($e.principal.ip, `(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)`)\n    not\
+    \ $e.principal.ip in [\"52.94.133.131\", \"52.94.133.132\", \"52.94.133.133\"]\n\n  match:\n    $user_arn, $event_name, $resource_arn over\
+    \ 1h\n\n  outcome:\n    $risk_score = 35\n    $source_ips = array_distinct($source_ip)\n    $event_count = count_distinct($e.metadata.id)\n\
+    \n  condition:\n    #e >= 1\n}\n"
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND sourcetype IN ("aws:cloudtrail", "azure:auditlogs", "gcp:audit")
+      AND event.dataset LIKE "*elb*"
+      AND eventName LIKE "*"
+      AND NOT (source.ip IN ("10.0.0.1", "192.168.1.1", "172.16.0.1"))
+    | STATS event_count = COUNT(*), source_ips = VALUES(source.ip) BY userIdentity.arn, eventName, resources_arn = TO_STRING(aws.cloudtrail.resources)
+    | WHERE event_count >= 1
+    | SORT event_count DESC
+    | KEEP userIdentity.arn, eventName, resources_arn, event_count, source_ips
+  leql: |
+    where(log_source_type=aws:elb AND url=/.+/) groupby(source_json.userIdentity.arn, source_json.eventName, source_json.resources{}.ARN, source_json.sourceIPAddress) calculate(count)
+  crowdstrike: |
+    #repo=cloud sourcetype=aws:elb
+    | regex("^.+$", field=url, strict=false)
+    | groupBy([userIdentity.arn, eventName, resources{}.ARN, sourceIPAddress], function=count(as=event_count))
+    | event_count >= 1
+    | !in(field=sourceIPAddress, values=["scanner_ip_1", "scanner_ip_2", "monitoring_agent_ip"])
+    | sort(event_count, order=desc, limit=10000)
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and resource_type = "ELB"
+    | filter event_name ~= ".+"
+    | filter action_country not in ("scanner", "monitoring")
+    | alter user_arn = json_extract_scalar(identity_invoked_by, "$.arn")
+    | alter resource_arn = json_extract_scalar(resource, "$.ARN")
+    | comp count() as event_count, count_distinct(action_remote_ip) as ip_count, array_agg(action_remote_ip) as source_ips by user_arn, event_name, resource_arn
+    | filter event_count >= 1
+    | sort desc event_count
+    | fields user_arn, event_name, resource_arn, event_count, ip_count, source_ips
+  lucene: |
+    sourcetype:"aws:elb:accesslogs" AND (request:*%* OR request:*script* OR request:*exec* OR request:*cmd* OR request:*eval* OR request:*union* OR request:*select* OR request:*insert* OR request:*drop* OR request:*delete* OR request:*update* OR request:*etc* OR request:*passwd* OR request:*shadow* OR request:*\.\.* OR request:*../* OR request:*\\..* OR request_uri:*%* OR request_uri:*script* OR request_uri:*exec* OR request_uri:*cmd* OR request_uri:*eval* OR request_uri:*union* OR request_uri:*select* OR request_uri:*insert* OR request_uri:*drop* OR request_uri:*delete* OR request_uri:*update* OR request_uri:*etc* OR request_uri:*passwd* OR request_uri:*shadow* OR request_uri:*\.\.* OR request_uri:*../* OR request_uri:*\\..*) AND NOT (client_ip:("10.0.0.0/8" OR "172.16.0.0/12" OR "192.168.0.0/16" OR "100.64.0.0/10") OR user_agent:*scanner* OR user_agent:*monitor* OR user_agent:*nagios* OR user_agent:*zabbix* OR user_agent:*pingdom* OR user_agent:*newrelic*)
+  sumo: |
+    _sourceCategory=*ELB* OR _sourceCategory=*elb* OR _sourceCategory=*cloudtrail*
+    | json field=_raw "eventName" as eventName
+    | json field=_raw "userIdentity.arn" as user_arn
+    | json field=_raw "resources[0].ARN" as resource_arn
+    | json field=_raw "sourceIPAddress" as src_ip
+    | where eventName matches "*"
+    | where !(src_ip in ("10.0.0.100", "192.168.1.50"))
+    | count as event_count by user_arn, eventName, resource_arn, src_ip
+    | where event_count >= 1
+    | sort by event_count desc
+    | fields user_arn, eventName, resource_arn, src_ip, event_count
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -92,7 +106,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

@@ -16,74 +16,70 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=624 OR EventCode=4720)
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=624 OR EventCode=4720)
+
     | eval dest_domain=mvindex(split(TargetUserName,"\\"),0)
+
     | where dest_domain IN ("corp.company.com","company.local","ad.company.net")
+
     | regex TargetUserName!="(?i)^[a-z]{3}\d{4}$|^[a-z]+\.[a-z]+$|^svc-|^admin-"
+
     | table _time, ComputerName, SubjectUserName, TargetUserName, TargetDomainName, dest_domain
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000140 {\n  meta:\n    author = \"TDL\"\n    description = \"User Account Created with Abnormal Name\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (624, 4720)
+    | where TargetDomainName in ("CONTOSO", "CORP", "DOMAIN")
+    | where TargetUserName !matches regex @"^[a-z]+\.[a-z]+$"
+    | project TimeGenerated, Computer, EventID, Account, TargetUserName, TargetDomainName, SubjectUserName, SubjectDomainName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username AS creator, "Target Username" AS created_user, "Target User Domain" AS domain, "Target User SID"
+    FROM events
+    WHERE "EventID" IN ('624', '4720')
+      AND "Target User Domain" IN ('corp.company.com', 'company.local', 'prod.company.com')
+      AND "Target Username" NOT MATCHES '^[a-z]{2,3}[0-9]{4,6}$'
+    LAST 24 HOURS
+  yara_l: "rule suspicious_user_account_creation {\n  meta:\n    author = \"TDL\"\n    description = \"Detects Windows user account creation that\
+    \ does not follow naming convention - MITRE T1098\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1098\"\n\
+    \    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"USER_CREATION\"\n    ($e.metadata.product_event_type = \"624\"\
+    \ or $e.metadata.product_event_type = \"4720\")\n    $e.target.user.userid = $username\n    $e.target.user.windows_sid = $sid\n    $e.principal.hostname\
+    \ = $host\n    \n    // Company AD domains - adjust this list to match your organization\n    (\n      strings.to_lower($e.target.administrative_domain)\
+    \ = \"corp.company.com\" or\n      strings.to_lower($e.target.administrative_domain) = \"company.local\" or\n      strings.to_lower($e.target.administrative_domain)\
+    \ = \"ad.company.com\"\n    )\n    \n    // Does NOT match naming convention - adjust regex to your organization's standard\n    // Example:\
+    \ expecting format like firstname.lastname or firstinitiallastname\n    not re.regex($e.target.user.userid, `^[a-z]+\\.[a-z]+$`)\n    not\
+    \ re.regex($e.target.user.userid, `^[a-z][a-z]+[0-9]*$`)\n    \n  match:\n    $host over 5m\n    \n  outcome:\n    $risk_score = 65\n    \n\
+    \  condition:\n    $e\n}\n"
+  esql: "FROM logs-system.security*, winlogbeat-*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.code IN (\"624\", \"4720\")\n  AND winlog.event_data.TargetDomainName\
+    \ IN (\"corp.company.com\", \"company.local\", \"ad.company.com\")\n  AND NOT RLIKE(winlog.event_data.TargetUserName, \"^[a-z]{1,8}[0-9]{3,6}$\"\
+    )\n| KEEP @timestamp, host.name, winlog.event_data.SubjectUserName, winlog.event_data.TargetUserName, winlog.event_data.TargetDomainName,\
+    \ event.code\n"
+  leql: |
+    where(source_json.EventID IN [624, 4720] AND source_json.TargetDomainName IN [company_domain_list] AND NOT source_json.TargetUserName=/user_naming_convention_regex/)
+  crowdstrike: |
+    EventCode IN [624, 4720]
+    | regex("(?<DestUserDomain>[^\\]+)\\(?<DestUserName>.+)", field=TargetUserName)
+    | DestUserDomain IN [DC1, DC2, DC3]
+    | NOT DestUserName=/^(admin_|svc_|[a-z]+\.[a-z]+)$/
+    | table([@timestamp, ComputerName, SubjectUserName, TargetUserName, DestUserDomain, DestUserName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (624, 4720)
+    | filter action_evtlog_event_data_TargetDomainName in ("corp.company.com", "company.local")
+    | filter action_evtlog_event_data_TargetUserName ~= "^(?!([a-z]{3}[0-9]{4}|[A-Z][a-z]+\.[A-Z][a-z]+)).*"
+    | fields _time, agent_hostname, action_evtlog_event_data_TargetUserName, action_evtlog_event_data_TargetDomainName, action_evtlog_event_data_SubjectUserName, action_evtlog_event_data_SubjectDomainName
+  lucene: |
+    event.code:(624 OR 4720) AND winlog.event_data.TargetDomainName:(corp.local OR domain.local OR company.local) AND NOT winlog.event_data.TargetUserName:/[a-z]{2,3}\d{4,6}/
+  sumo: |
+    _sourceCategory=*Windows*Security* ("624" OR "4720")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetDomainName" as dest_domain
+    | json field=_raw "TargetUserName" as dest_user
+    | where event_id in ("624", "4720")
+    | where dest_domain in ("corp.company.com", "company.local", "company.com")
+    | where !(dest_user matches "^[a-z]{2}[0-9]{4}$")
+    | fields _messageTime, _sourceHost, event_id, dest_domain, dest_user
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -93,7 +89,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows User Created Event
 

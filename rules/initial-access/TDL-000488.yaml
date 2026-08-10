@@ -15,93 +15,120 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=firewall (action=allowed OR dest_port=23 OR app=telnet) src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) NOT dest_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+  spl: 'index=firewall (action=allowed OR dest_port=23 OR app=telnet) src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) NOT dest_ip IN (10.0.0.0/8,
+    172.16.0.0/12, 192.168.0.0/16)
+
     | eval baseline_start=relative_time(now(), "-90d")
+
     | eval baseline_end=relative_time(now(), "-30d")
+
     | eval detection_start=relative_time(now(), "-30d")
+
     | where _time >= baseline_start
+
     | eval period=if(_time >= detection_start, "detection", "baseline")
+
     | eventstats dc(dest_ip) as baseline_dest_count by src_ip, period
+
     | where period="detection"
+
     | stats values(dest_ip) as dest_ips, dc(dest_ip) as dest_count by src_ip
+
     | mvexpand dest_ips
+
     | eval dest_ip=dest_ips
+
     | lookup baseline_telnet_destinations src_ip, dest_ip OUTPUT dest_ip as known_dest
+
     | where isnull(known_dest)
+
     | stats values(dest_ip) as new_destinations by src_ip
+
     | table src_ip, new_destinations
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where application matches regex "telnet"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: "let LearningPeriod = 30d;\nlet DetectionPeriod = 1d;\nlet BaselineData = \n    CommonSecurityLog\n    | where TimeGenerated between (ago(LearningPeriod\
+    \ + DetectionPeriod) .. ago(DetectionPeriod))\n    | where DeviceVendor has \"Firewall\" or DeviceProduct has \"Firewall\"\n    | where DeviceAction\
+    \ =~ \"Allow\" or DeviceAction =~ \"Allowed\"\n    | where (DestinationPort == 23 or ApplicationProtocol =~ \"telnet\")\n    | where isnotempty(SourceIP)\
+    \ and isnotempty(DestinationIP)\n    | where not(ipv4_is_private(DestinationIP))\n    | summarize by DestinationIP;\nCommonSecurityLog\n|\
+    \ where TimeGenerated > ago(DetectionPeriod)\n| where DeviceVendor has \"Firewall\" or DeviceProduct has \"Firewall\"\n| where DeviceAction\
+    \ =~ \"Allow\" or DeviceAction =~ \"Allowed\"\n| where (DestinationPort == 23 or ApplicationProtocol =~ \"telnet\")\n| where isnotempty(SourceIP)\
+    \ and isnotempty(DestinationIP)\n| where not(ipv4_is_private(DestinationIP))\n| where DestinationIP !in (BaselineData)\n| project TimeGenerated,\
+    \ SourceIP, DestinationIP, DestinationPort, ApplicationProtocol, DeviceAction, DeviceVendor, DeviceProduct\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, qidname(qid) AS event_name, COUNT(*) AS event_count
+    FROM events
+    WHERE (INOFFENSE(sourceip) OR INCIDR(sourceip, '10.0.0.0/8') OR INCIDR(sourceip, '172.16.0.0/12') OR INCIDR(sourceip, '192.168.0.0/16'))
+      AND NOT (INOFFENSE(destinationip) OR INCIDR(destinationip, '10.0.0.0/8') OR INCIDR(destinationip, '172.16.0.0/12') OR INCIDR(destinationip, '192.168.0.0/16') OR INCIDR(destinationip, '127.0.0.0/8'))
+      AND (CATEGORYNAME(category) ILIKE '%firewall%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%firewall%')
+      AND (qidname(qid) ILIKE '%accept%' OR qidname(qid) ILIKE '%allow%' OR qidname(qid) ILIKE '%permit%' OR destinationport = 23 OR LOWER(qidname(qid)) LIKE '%telnet%')
+    GROUP BY sourceip, destinationip, destinationport, qidname(qid)
+    LAST 90 DAYS
+  yara_l: |
+    rule telnet_outbound_new_destination {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects outbound telnet connections to new external destinations"
+        mitre_attack_technique = "T1021"
+        mitre_attack_tactic = "Initial Access"
+        severity = "Medium"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.security_result.action = "ALLOW"
+        $e.network.direction = "OUTBOUND"
+        (
+          $e.target.port = 23 or
+          $e.network.application_protocol = "telnet"
+        )
+        net.ip_in_range_cidr($e.principal.ip, "10.0.0.0/8") or
+        net.ip_in_range_cidr($e.principal.ip, "172.16.0.0/12") or
+        net.ip_in_range_cidr($e.principal.ip, "192.168.0.0/16")
+        not net.ip_in_range_cidr($e.target.ip, "10.0.0.0/8")
+        not net.ip_in_range_cidr($e.target.ip, "172.16.0.0/12")
+        not net.ip_in_range_cidr($e.target.ip, "192.168.0.0/16")
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dest_ip
 
-    WHERE "application" LIKE ''%telnet%''
+      match:
+        $src_ip over 1h
 
-    GROUP BY sourceip, destinationip, destinationport
+      outcome:
+        $risk_score = 50
+        $dest_ip_list = array_distinct($dest_ip)
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000488 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Allowed Outbound Telnet Traffic\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1021\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.application\
-    \ = /telnet/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND application LIKE "%telnet%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND application=/telnet/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*telnet*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND application ~= "telnet"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND application:*telnet*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where application matches "*telnet*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e and #dest_ip > 0
+    }
+  esql: |
+    FROM logs-network.firewall*
+    | WHERE @timestamp > NOW() - 90 days
+      AND network.direction == "outbound"
+      AND source.ip RLIKE "^(10\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.|192\\.168\\.)"
+      AND NOT destination.ip RLIKE "^(10\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.|192\\.168\\.)"
+      AND (event.action == "allowed" OR destination.port == 23 OR network.application == "telnet")
+    | EVAL baseline_period = CASE(@timestamp <= NOW() - 60 days, "baseline", @timestamp > NOW() - 60 days AND @timestamp <= NOW() - 30 days, "baseline", "detection")
+    | STATS first_seen = MIN(@timestamp), last_seen = MAX(@timestamp), event_count = COUNT(*) BY source.ip, destination.ip, baseline_period
+    | WHERE (baseline_period == "detection" AND first_seen > NOW() - 30 days)
+    | KEEP source.ip, destination.ip, first_seen, last_seen, event_count
+  leql: |
+    where(source_address=INTERNAL AND destination_address=EXTERNAL AND action=ALLOW AND (destination_port=23 OR application="telnet"))
+  crowdstrike: |
+    #type=firewall action=allow (DestinationPort=23 OR Application=telnet)
+    | !cidr(SourceIP, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+    | cidr(DestinationIP, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+    | selfJoinFilter(field=[DestinationIP], where=[{@timestamp < start() - 30d}], prefilter=true)
+    | table([@timestamp, SourceIP, DestinationIP, DestinationPort, Application, action])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter action_firewall_rule_action = \"allow\" \n  and (dest_port = 23 or app = \"telnet\")\n  and\
+    \ direction = \"outbound\"\n| comp count_distinct(_time) as event_count by src_ip, dest_ip\n| filter event_count >= 1\n| fields src_ip, dest_ip,\
+    \ event_count\n"
+  lucene: |
+    (firewall_action:allowed OR destination.port:23 OR application:telnet) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)
+  sumo: "_sourceCategory=*Firewall* \n| parse regex \"(?<src_ip>\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\" nodrop\n| parse regex \"(?<dest_ip>\\\
+    d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\" nodrop\n| parse regex \"(?i)dest.*?port[:\\s=]+(?<dest_port>\\d+)\" nodrop\n| parse regex \"(?i)action[:\\\
+    s=]+(?<action>\\w+)\" nodrop\n| parse regex \"(?i)app.*?[:\\s=]+(?<application>\\S+)\" nodrop\n| where (action matches \"*allow*\" or action\
+    \ matches \"*permit*\") or (dest_port = \"23\") or (application matches \"*telnet*\")\n| where !isPrivateIP(src_ip) = true and isPrivateIP(dest_ip)\
+    \ = false\n| fields _messageTime, src_ip, dest_ip, dest_port, action, application\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -111,7 +138,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Firewall Event \nFrom one internal source to one external destination (Outbound)\nWhere the Action is Allowed\nOR\n    Where\
   \ the Destination Port is \"23\"\n\n    Where the Application is \"telnet\"\n\nBaseline Learning: 30 Days\nRetention: 90 Days\n\nNew Value:\

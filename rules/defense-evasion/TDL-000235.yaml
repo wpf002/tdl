@@ -16,74 +16,58 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=web OR index=webserver status=200 method=POST (uri="*.jpg" OR uri="*.jpeg" OR uri="*.png" OR uri="*.gif" OR uri="*.bmp" OR uri="*.ico" OR uri="*.svg" OR uri="*.webp" OR uri="*.tiff" OR uri="*.tif")
+  spl: 'index=web OR index=webserver status=200 method=POST (uri="*.jpg" OR uri="*.jpeg" OR uri="*.png" OR uri="*.gif" OR uri="*.bmp" OR uri="*.ico"
+    OR uri="*.svg" OR uri="*.webp" OR uri="*.tiff" OR uri="*.tif")
+
     | table _time, clientip, uri, method, status, useragent, bytes
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000235 {\n  meta:\n    author = \"TDL\"\n    description = \"Suspicious POST Request to Image - Webserver\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1036\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    W3CIISLog
+    | where TimeGenerated > ago(1h)
+    | where scStatus == 200
+    | where csMethod =~ "POST"
+    | where csUriStem matches regex @"\.(jpg|jpeg|png|gif|bmp|svg|ico|webp|tiff|tif)$"
+    | project TimeGenerated, Computer, cIP, csMethod, csUriStem, scStatus, csUserAgent, csReferer
+  aql: |
+    SELECT sourceip, destinationip, username, "URL", "HTTP Method", "HTTP Response Code", COUNT(*) AS requests
+    FROM events
+    WHERE "HTTP Response Code" = '200'
+      AND "HTTP Method" = 'POST'
+      AND ("URL" ILIKE '%.jpg' OR "URL" ILIKE '%.jpeg' OR "URL" ILIKE '%.png' OR "URL" ILIKE '%.gif' OR "URL" ILIKE '%.bmp' OR "URL" ILIKE '%.ico' OR "URL" ILIKE '%.svg' OR "URL" ILIKE '%.tif' OR "URL" ILIKE '%.tiff')
+    GROUP BY sourceip, destinationip, username, "URL", "HTTP Method", "HTTP Response Code"
+    LAST 1 HOURS
+  yara_l: "rule masquerading_post_to_image_file {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"T1036 - POST request to image\
+    \ file extension with 200 response\"\n    mitre_attack_technique = \"T1036\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    severity\
+    \ = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.network.http.method = \"POST\"\n    $e.security_result.action\
+    \ = \"ALLOW\"\n    re.regex($e.security_result.summary, `(?i)200`)\n    re.regex($e.target.url, `(?i)\\.(jpg|jpeg|png|gif|bmp|ico|svg|webp|tiff|tif)(\\\
+    ?.*)?$`)\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-web*\n| WHERE @timestamp > NOW() - 1 hour \n  AND http.response.status_code == 200 \n  AND TO_LOWER(http.request.method) ==\
+    \ \"post\"\n  AND (TO_LOWER(url.path) LIKE \"*.jpg\" OR TO_LOWER(url.path) LIKE \"*.jpeg\" OR TO_LOWER(url.path) LIKE \"*.png\" OR TO_LOWER(url.path)\
+    \ LIKE \"*.gif\" OR TO_LOWER(url.path) LIKE \"*.bmp\" OR TO_LOWER(url.path) LIKE \"*.ico\" OR TO_LOWER(url.path) LIKE \"*.svg\")\n| KEEP @timestamp,\
+    \ host.name, source.ip, url.path, http.request.method, http.response.status_code, user_agent.original\n"
+  leql: |
+    where(source_json.response_code=200 AND source_json.method="POST" AND (source_json.url ICONTAINS ".jpg" OR source_json.url ICONTAINS ".jpeg" OR source_json.url ICONTAINS ".png" OR source_json.url ICONTAINS ".gif" OR source_json.url ICONTAINS ".bmp" OR source_json.url ICONTAINS ".ico" OR source_json.url ICONTAINS ".svg"))
+  crowdstrike: |
+    #type=webserver status=200 method=POST (url=*.jpg OR url=*.jpeg OR url=*.png OR url=*.gif OR url=*.bmp OR url=*.svg OR url=*.ico OR url=*.tiff OR url=*.webp)
+    | table([@timestamp, ComputerName, url, method, status, src_ip, user_agent])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter http_response_code = 200 and http_method = POST and (uri_path ~= ".*\\.(jpg|jpeg|png|gif|bmp|svg|ico|tiff|webp)$")
+    | fields _time, source_ip, destination_ip, uri_path, http_method, http_response_code, user_agent
+  lucene: |
+    event.dataset:webserver AND http.response.status_code:200 AND http.request.method:POST AND (url.path:*.jpg OR url.path:*.jpeg OR url.path:*.png OR url.path:*.gif OR url.path:*.bmp OR url.path:*.ico OR url.path:*.svg OR url.path:*.webp OR url.path:*.tiff OR url.path:*.tif)
+  sumo: |
+    _sourceCategory=*Webserver* OR _sourceCategory=*Web* OR _sourceCategory=*IIS* OR _sourceCategory=*Apache* OR _sourceCategory=*nginx*
+    | parse regex "(?<method>GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(?<url>\S+)\s+HTTP" nodrop
+    | parse regex "HTTP/[\d\.]+\"\s+(?<status_code>\d{3})" nodrop
+    | json field=_raw "status" as status_code nodrop
+    | json field=_raw "method" as method nodrop
+    | json field=_raw "url" as url nodrop
+    | json field=_raw "uri" as url nodrop
+    | json field=_raw "request" as url nodrop
+    | where status_code = "200" and method = "POST" and (url matches "*.jpg*" or url matches "*.jpeg*" or url matches "*.png*" or url matches "*.gif*" or url matches "*.bmp*" or url matches "*.ico*" or url matches "*.svg*" or url matches "*.tiff*" or url matches "*.webp*")
+    | fields _messageTime, _sourceHost, method, url, status_code
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -93,7 +77,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Webserver Request Event
 

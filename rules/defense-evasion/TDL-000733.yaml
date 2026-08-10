@@ -16,86 +16,65 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 95
 queries:
-  spl: |
-    index=network sourcetype IN(cisco:ios, cisco:asa, juniper:junos, arista:eos) (action="copy" OR action="boot") ((dest="running-config" AND src="tftp://*") OR (command="boot system flash:*" AND NOT (command="*flash:c*.bin" OR command="*flash:*.tar")))
-    | rex field=command "boot system flash:(?<boot_image>[^\s]+)"
-    | rex field=src "tftp://(?<tftp_server>[^/]+)"
-    | eval anomaly_type=case(
-        isnotnull(tftp_server), "TFTP config download",
-        isnotnull(boot_image), "Boot image change",
-        1=1, "Unknown")
-    | table _time, host, user, command, src, dest, tftp_server, boot_image, anomaly_type
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_de_000733 {\n  meta:\n    author = \"TDL\"\n    description = \"Network Device Firmware/Image Replaced from Untrusted\
-    \ Source\"\n    severity = \"CRITICAL\"\n    tactic = \"TA0005\"\n    technique = \"T1601\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  spl: "index=network sourcetype IN(cisco:ios, cisco:asa, juniper:junos, arista:eos) (action=\"copy\" OR action=\"boot\") ((dest=\"running-config\"\
+    \ AND src=\"tftp://*\") OR (command=\"boot system flash:*\" AND NOT (command=\"*flash:c*.bin\" OR command=\"*flash:*.tar\")))\n| rex field=command\
+    \ \"boot system flash:(?<boot_image>[^\\s]+)\"\n| rex field=src \"tftp://(?<tftp_server>[^/]+)\"\n| eval anomaly_type=case(\n    isnotnull(tftp_server),\
+    \ \"TFTP config download\",\n    isnotnull(boot_image), \"Boot image change\",\n    1=1, \"Unknown\")\n| table _time, host, user, command,\
+    \ src, dest, tftp_server, boot_image, anomaly_type\n"
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceVendor in~ ("Cisco", "Juniper", "Arista")
+    | where Activity has_any ("SYS-5-CONFIG_I", "SYSTEM", "CONFIG")
+    | where Message has_any ("copy tftp:", "boot system flash:")
+    | where Message has_any ("running-config", "startup-config") or Message matches regex @"boot system flash:[^\s]+"
+    | where Message !has "boot system flash:packages.conf" and Message !has "boot system flash:c"
+    | extend ConfigSource = extract(@"copy (tftp://[^\s]+|[^\s]+) running-config", 1, Message)
+    | extend BootImage = extract(@"boot system flash:([^\s]+)", 1, Message)
+    | where isnotempty(ConfigSource) or (isnotempty(BootImage) and BootImage !startswith "c" and BootImage !endswith ".bin")
+    | project TimeGenerated, DeviceVendor, DeviceProduct, DeviceName = Computer, SourceIP, Message, ConfigSource, BootImage, Activity
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS device, sourceip, username, UTF8(payload) AS command_text, COUNT(*) AS occurrences\nFROM\
+    \ events\nWHERE (LOGSOURCENAME(logsourceid) ILIKE '%cisco%' OR LOGSOURCENAME(logsourceid) ILIKE '%juniper%' OR LOGSOURCENAME(logsourceid)\
+    \ ILIKE '%arista%')\n  AND (UTF8(payload) ILIKE '%copy tftp:%running-config%' \n       OR UTF8(payload) ILIKE '%boot system flash:%' \n  \
+    \     OR UTF8(payload) ILIKE '%copy%running-config%'\n       OR UTF8(payload) ILIKE '%software install%'\n       OR UTF8(payload) ILIKE '%request\
+    \ system software%')\nGROUP BY eventtime, LOGSOURCENAME(logsourceid), sourceip, username, UTF8(payload)\nLAST 24 HOURS\n"
+  yara_l: "rule network_device_firmware_modification {\n  meta:\n    author = \"TDL\"\n    description = \"Detects network device firmware or\
+    \ configuration modification attempts (MITRE T1601)\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1601\"\
+    \n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.event_type = \"SETTING_MODIFICATION\"\n    $e.metadata.product_log_id = \"CONFIG_I\"\
+    \ or\n    $e.metadata.product_log_id = \"SYS-5-CONFIG_I\" or\n    $e.metadata.event_type = \"SYSTEM_AUDIT_LOG_UNCATEGORIZED\"\n    \n    (\n\
+    \      re.regex($e.security_result.summary, `(?i)copy\\s+tftp://.*running-config`) or\n      re.regex($e.security_result.summary, `(?i)boot\\\
+    s+system\\s+flash:`) or\n      re.regex($e.principal.process.command_line, `(?i)copy\\s+tftp://.*running-config`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)boot\\s+system\\s+flash:`) or\n      re.regex($e.metadata.description, `(?i)copy\\s+tftp://.*running-config`) or\n      re.regex($e.metadata.description,\
+    \ `(?i)boot\\s+system\\s+flash:`) or\n      re.regex($e.target.resource.name, `(?i)copy\\s+tftp://.*running-config`) or\n      re.regex($e.target.resource.name,\
+    \ `(?i)boot\\s+system\\s+flash:`)\n    )\n    \n    $e.principal.hostname = $device\n    \n  match:\n    $device over 5m\n    \n  outcome:\n\
+    \    $risk_score = 85\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-network.device*, logs-cisco.*, logs-juniper.*, logs-arista.*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND (
+        (message LIKE "*copy tftp://*" AND message LIKE "*running-config*")
+        OR (message LIKE "*boot system flash:*" AND NOT message LIKE "*boot system flash:c*" AND NOT message LIKE "*boot system flash:cat*")
+        OR event.action IN ("config-change", "system-config-change", "boot-config-change")
+      )
+    | KEEP @timestamp, host.name, host.ip, observer.hostname, observer.ip, event.action, message, user.name, source.ip
+  leql: |
+    where(source_json.message ICONTAINS "copy tftp" OR source_json.message ICONTAINS "running-config" OR source_json.message ICONTAINS "boot system flash") AND (source_json.message ICONTAINS "cisco" OR source_json.message ICONTAINS "juniper" OR source_json.message ICONTAINS "arista" OR vendor ICONTAINS "cisco" OR vendor ICONTAINS "juniper" OR vendor ICONTAINS "arista") groupby(asset, source_json.message) calculate(count)
+  crowdstrike: |
+    #type=network_device_logs (event_simpleName=ConfigChange OR event_simpleName=SystemImage OR event_simpleName=CommandExecution)
+    (CommandLine=*"copy tftp://"*"running-config"* OR CommandLine=*"boot system flash:"* OR command=*"copy tftp://"*"running-config"* OR command=*"boot system flash:"*)
+    | table([@timestamp, ComputerName, DeviceName, hostname, CommandLine, command, SourceIP, UserName, user])
+  xql: "dataset = panw_ngfw_config_raw\n| filter (vendor = \"Cisco\" or vendor = \"Juniper\" or vendor = \"Arista\")\n| filter (action_evtlog_message\
+    \ ~= \"copy\\\\s+tftp://.*\\\\s+running-config\" \n         or action_evtlog_message ~= \"boot\\\\s+system\\\\s+flash:\" \n         or raw_log_data\
+    \ ~= \"copy\\\\s+tftp://.*\\\\s+running-config\"\n         or raw_log_data ~= \"boot\\\\s+system\\\\s+flash:\")\n| fields _time, vendor, agent_hostname,\
+    \ action_evtlog_message, raw_log_data, actor_effective_username\n"
+  lucene: |
+    (event_type:"config_change" OR log_type:"network_device" OR source_type:"cisco" OR source_type:"juniper" OR source_type:"arista") AND (message:(*"copy tftp"* AND *"running-config"*) OR message:(*"copy"* AND *"tftp://"* AND *"running-config"*) OR message:(*"boot system flash"*) OR command:(*"copy tftp"* AND *"running-config"*) OR command:(*"copy"* AND *"tftp://"* AND *"running-config"*) OR command:(*"boot system flash"*) OR command_text:(*"copy tftp"* AND *"running-config"*) OR command_text:(*"copy"* AND *"tftp://"* AND *"running-config"*) OR command_text:(*"boot system flash"*))
+  sumo: |
+    _sourceCategory=*Network* OR _sourceCategory=*Cisco* OR _sourceCategory=*Juniper* OR _sourceCategory=*Arista*
+    | where _raw matches "*copy tftp:*running-config*" OR _raw matches "*boot system flash:*" OR _raw matches "*copy*running-config*" OR _raw matches "*configure replace*" OR _raw matches "*boot*flash*"
+    | parse regex "(?<command>copy\s+tftp:.*?running-config|boot\s+system\s+flash:.*|configure\s+replace.*|copy.*running-config)" nodrop
+    | where !isEmpty(command)
+    | fields _messageTime, _sourceHost, command, _raw
 pseudo_logic: 'Cisco/Juniper/Arista config event: copy tftp://… running-config or boot system flash:<unknown>. Image swap on network gear.'
 false_positives:
 - Sanctioned admin or engineering activity
@@ -113,7 +92,7 @@ references:
 - https://attack.mitre.org/techniques/T1601/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

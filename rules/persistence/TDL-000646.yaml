@@ -15,74 +15,50 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=varonis sourcetype=varonis:datadvantage alert_name IN ("Old ransomware note was found in the system", "Past ransomware activity indicated by a residual ransomware note")
+  spl: 'index=varonis sourcetype=varonis:datadvantage alert_name IN ("Old ransomware note was found in the system", "Past ransomware activity
+    indicated by a residual ransomware note")
+
     | table _time, host, alert_name, user, file_path, severity, description
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000646 {\n  meta:\n    author = \"TDL\"\n    description = \"Ransomware Remnants Discovered - Varonis\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1547\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DatAlert
+    | where TimeGenerated > ago(24h)
+    | where AlertName in ("Old ransomware note was found in the system", "Past ransomware activity indicated by a residual ransomware note")
+    | project TimeGenerated, AlertName, AlertSeverity, UserName, DeviceName, FilePath, Description
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS log_source, "Alert Name", sourceip, username, "File Path", "Device Name"
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%Varonis%'
+      AND "Alert Name" IN ('Old ransomware note was found in the system', 'Past ransomware activity indicated by a residual ransomware note')
+    LAST 24 HOURS
+  yara_l: "rule varonis_ransomware_note_detected {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects Varonis DatAdvantage\
+    \ alerts for old or residual ransomware notes indicating past ransomware activity\"\n    mitre_attack_tactic = \"Persistence\"\n    mitre_attack_technique\
+    \ = \"T1547\"\n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.vendor_name = \"Varonis\"\n    $e.metadata.product_name = \"DatAdvantage\"\
+    \n    (\n      $e.security_result.summary = \"Old ransomware note was found in the system\" or\n      $e.security_result.summary = \"Past\
+    \ ransomware activity indicated by a residual ransomware note\"\n    )\n    $e.principal.hostname = $host\n    \n  match:\n    $host over\
+    \ 5m\n    \n  outcome:\n    $risk_score = max(85)\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-varonis.datadvantage*
+    | WHERE varonis.alert.name IN ("Old ransomware note was found in the system", "Past ransomware activity indicated by a residual ransomware note")
+    | KEEP @timestamp, host.name, user.name, varonis.alert.name, varonis.alert.description, file.path, source.ip
+  leql: |
+    where(source_json.AlertName IN ["Old ransomware note was found in the system", "Past ransomware activity indicated by a residual ransomware note"])
+  crowdstrike: |
+    #repo=varonis #type=datadvantage_alert
+    | AlertName in ["Old ransomware note was found in the system", "Past ransomware activity indicated by a residual ransomware note"]
+    | table([@timestamp, ComputerName, AlertName, FilePath, UserName, Severity])
+  xql: |
+    dataset = varonis_datadvantage_raw
+    | filter alert_name in ("Old ransomware note was found in the system", "Past ransomware activity indicated by a residual ransomware note")
+    | fields _time, alert_name, alert_severity, resource_name, user_name, device_name
+  lucene: |
+    alert_name:("Old ransomware note was found in the system" OR "Past ransomware activity indicated by a residual ransomware note")
+  sumo: |
+    _sourceCategory=*Varonis* ("Old ransomware note was found in the system" OR "Past ransomware activity indicated by a residual ransomware note")
+    | json field=_raw "AlertName" as alert_name
+    | where alert_name in ("Old ransomware note was found in the system", "Past ransomware activity indicated by a residual ransomware note")
+    | fields _messageTime, _sourceHost, alert_name
 false_positives:
 - Security software
 - Authorized admin tools
@@ -92,7 +68,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Varonis DatAdvantage Alert
 

@@ -16,85 +16,91 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=proxy (action=allowed OR action=blocked) src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) NOT dest_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+  spl: 'index=proxy (action=allowed OR action=blocked) src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) NOT dest_ip IN (10.0.0.0/8, 172.16.0.0/12,
+    192.168.0.0/16)
+
     | rex field=dest_domain "^(?<domain_label>[a-z0-9]{8,})\.(?:com|net|org|info|biz)$"
-    | where isnotnull(domain_label) AND match(dest_domain, "^[a-z0-9]{8,}\.(com|net|org|info|biz)$") AND (len(domain_label) >= 10 OR (len(domain_label) >= 8 AND match(domain_label, "^[bcdfghjklmnpqrstvwxyz]{5,}")))
+
+    | where isnotnull(domain_label) AND match(dest_domain, "^[a-z0-9]{8,}\.(com|net|org|info|biz)$") AND (len(domain_label) >= 10 OR (len(domain_label)
+    >= 8 AND match(domain_label, "^[bcdfghjklmnpqrstvwxyz]{5,}")))
+
     | bin _time span=3m
+
     | stats count by _time, src_ip, dest_domain
+
     | where count >= 5
+
     | table _time, src_ip, dest_domain, count
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exe_000254 {\n  meta:\n    author = \"TDL\"\n    description = \"Traffic Pattern to Randomly Generated Domain\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0002\"\n    technique = \"T1568\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    let timeWindow = 3m;
+    let dgaRegex = @"^[a-z]{8,}\.(?:com|net|org|info|biz)$";
+    CommonSecurityLog
+    | where TimeGenerated > ago(1h)
+    | where DeviceVendor has "Proxy" or DeviceProduct has "Proxy" or DeviceEventClassID has "proxy"
+    | where DeviceDirection == "Outbound" or CommunicationDirection == "Outbound"
+    | where DestinationHostName matches regex dgaRegex
+    | extend SourceIP = coalesce(SourceIP, SourceTranslatedAddress)
+    | extend DestDomain = tolower(DestinationHostName)
+    | summarize EventCount = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), DestinationIPs = make_set(DestinationIP) by SourceIP, DestDomain, bin(TimeGenerated, timeWindow)
+    | where EventCount >= 5
+    | where datetime_diff('minute', LastSeen, FirstSeen) <= 3
+    | project FirstSeen, LastSeen, SourceIP, DestDomain, EventCount, DestinationIPs
+  aql: |
+    SELECT sourceip, destinationip, QIDNAME(qid) AS event_name, "Destination Domain", COUNT(*) AS event_count
+    FROM events
+    WHERE INOFFENSE('*') = FALSE
+      AND category IN (SELECT category FROM categories WHERE name ILIKE '%proxy%')
+      AND "Destination Domain" MATCHES '([a-z]{8,}\.){1,}(com|net|org|info|biz)'
+    GROUP BY sourceip, destinationip, QIDNAME(qid), "Destination Domain"
+    HAVING event_count >= 5
+    LAST 3 MINUTES
+  yara_l: "rule dga_domain_activity {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects potential DGA domain usage\
+    \ via multiple proxy requests to suspicious domains\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1568\"\n \
+    \   \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.direction = \"OUTBOUND\"\n    re.regex($e.target.hostname,\
+    \ `^(?:[a-z0-9]{10,}\\.)+[a-z]{2,}$`)\n    $e.principal.ip = $internal_ip\n    $e.target.hostname = $domain\n    \n  match:\n    $internal_ip,\
+    \ $domain over 3m\n    \n  condition:\n    #e >= 5\n}\n"
+  esql: |
+    FROM logs-network.proxy*
+    | WHERE @timestamp > NOW() - 3 minutes
+      AND source.nat.ip IS NOT NULL
+      AND destination.domain IS NOT NULL
+      AND destination.ip IS NOT NULL
+      AND NOT CIDR_MATCH(destination.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+      AND RLIKE(destination.domain, "^[a-z0-9]{8,}\\.(com|net|org|info|biz)$")
+    | STATS event_count = COUNT(*) BY source.ip, destination.domain, window = BUCKET(@timestamp, 3 minutes)
+    | WHERE event_count >= 5
+    | KEEP source.ip, destination.domain, event_count, window
+  leql: |
+    where(destination_domain=/^[a-z]{8,63}\.(com|net|org|info|biz)$/i AND direction=OUTBOUND) groupby(source_address, destination_domain) calculate(count)
+  crowdstrike: "#type=proxy event_direction=outbound \n| DestinationDomain=/^[a-z]{16,}\\.(com|net|org|info|biz)$/i\n| groupBy([SourceIP, DestinationDomain],\
+    \ function=count(as=event_count))\n| event_count >= 5\n| groupBy([SourceIP, DestinationDomain], function=selectLast([@timestamp], as=last_seen))\n\
+    | groupBy([SourceIP, DestinationDomain], function=selectFirst([@timestamp], as=first_seen))\n| time_diff := last_seen - first_seen\n| time_diff\
+    \ <= 180000\n| table([SourceIP, DestinationDomain, event_count, first_seen, last_seen])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter traffic_direction = "Outbound" and dest_location = "ExternalNetwork"
+    | filter dest_host ~= "^[a-z]{8,}\.(?:com|net|org|info|biz)$"
+    | bin _time span=3m
+    | comp count() as event_count by _time, src_ip, dest_host
+    | filter event_count >= 5
+    | fields _time, src_ip, dest_host, event_count
+  lucene: |
+    event_type:"forward_proxy" AND direction:outbound AND destination_domain:/([a-z]{8,63}\.){1,}(com|net|org|info|biz)/ AND NOT destination_ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)
+  sumo: |
+    _sourceCategory=*Proxy* OR _sourceCategory=*Forward*Proxy*
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_domain" as dest_domain
+    | json field=_raw "direction" as direction
+    | where direction = "outbound" OR direction = "Outbound"
+    | where dest_domain matches /^[a-z]{8,63}\.(com|net|org|info|biz)$/
+    | where !isPrivateIP(dest_ip)
+    | timeslice 3m
+    | count as event_count by _timeslice, src_ip, dest_domain
+    | where event_count >= 5
+    | fields _timeslice, src_ip, dest_domain, event_count
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -104,7 +110,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '5 Forward Proxy Events
 

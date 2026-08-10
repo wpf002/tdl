@@ -27,68 +27,117 @@ queries:
     \   \"arn:aws:iam::aws:policy/SystemAdministrator\", \n                                          \"arn:aws:iam::aws:policy/Billing\"))\n|\
     \ table _time, userIdentity.principalId, userIdentity.arn, eventName, requestParameters.policyArn, requestParameters.userName, sourceIPAddress,\
     \ userAgent, awsRegion\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(1h)
+    | where EventName in ("AttachUserPolicy", "PutUserPolicy")
+    | extend PolicyArn = tostring(parse_json(RequestParameters).policyArn)
+    | where PolicyArn has "ClientHVTPolicy" or PolicyArn in (
+        "arn:aws:iam::aws:policy/AdministratorAccess",
+        "arn:aws:iam::aws:policy/AmazonSNSFullAccess",
+        "arn:aws:iam::aws:policy/AmazonEC2FullAccess",
+        "arn:aws:iam::aws:policy/AmazonS3FullAccess",
+        "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess",
+        "arn:aws:iam::aws:policy/AWSCodeCommitPowerUser",
+        "arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser",
+        "arn:aws:iam::aws:policy/PowerUserAccess",
+        "arn:aws:iam::aws:policy/DatabaseAdministrator",
+        "arn:aws:iam::aws:policy/NetworkAdministrator",
+        "arn:aws:iam::aws:policy/SystemAdministrator",
+        "arn:aws:iam::aws:policy/Billing"
+    )
+    | extend TargetUserName = tostring(parse_json(RequestParameters).userName)
+    | project TimeGenerated, EventName, UserIdentityArn, TargetUserName, PolicyArn, SourceIpAddress, UserAgent, AWSRegion
+  aql: |
+    SELECT eventtime, username, sourceip, "Event Name", "Policy ARN", "Affected User ARN", LOGSOURCENAME(logsourceid) AS source
+    FROM events
+    WHERE ("Event Name" = 'AttachUserPolicy' OR "Event Name" = 'PutUserPolicy')
+      AND ("Policy ARN" IN ('arn:aws:iam::aws:policy/AdministratorAccess', 'arn:aws:iam::aws:policy/AmazonSNSFullAccess', 'arn:aws:iam::aws:policy/AmazonEC2FullAccess', 'arn:aws:iam::aws:policy/AmazonS3FullAccess', 'arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess', 'arn:aws:iam::aws:policy/AWSCodeCommitPowerUser', 'arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser', 'arn:aws:iam::aws:policy/PowerUserAccess', 'arn:aws:iam::aws:policy/DatabaseAdministrator', 'arn:aws:iam::aws:policy/NetworkAdministrator', 'arn:aws:iam::aws:policy/SystemAdministrator', 'arn:aws:iam::aws:policy/Billing')
+           OR "Policy ARN" ILIKE '%ClientHVTPolicy%')
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_high_value_policy_attachment {
+      meta:
+        author = "TDL"
+        description = "Detects attachment of high-value AWS IAM policies to users"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.vendor_name = "AMAZON"
+        $e.metadata.product_name = "AWS CloudTrail"
+        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
+        (
+          $e.target.resource.attribute.labels["eventName"] = "AttachUserPolicy" or
+          $e.target.resource.attribute.labels["eventName"] = "PutUserPolicy"
+        )
+        (
+          re.regex($e.target.resource.attribute.labels["policyArn"], `(?i)Client.*HVT.*Policy`) or
+          $e.target.resource.attribute.labels["policyArn"] = "arn:aws:iam::aws:policy/AdministratorAccess" or
+          $e.target.resource.attribute.labels["policyArn"] = "arn:aws:iam::aws:policy/AmazonSNSFullAccess" or
+          $e.target.resource.attribute.labels["policyArn"] = "arn:aws:iam::aws:policy/AmazonEC2FullAccess" or
+          $e.target.resource.attribute.labels["policyArn"] = "arn:aws:iam::aws:policy/AmazonS3FullAccess" or
+          $e.target.resource.attribute.labels["policyArn"] = "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess" or
+          $e.target.resource.attribute.labels["policyArn"] = "arn:aws:iam::aws:policy/AWSCodeCommitPowerUser" or
+          $e.target.resource.attribute.labels["policyArn"] = "arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser" or
+          $e.target.resource.attribute.labels["policyArn"] = "arn:aws:iam::aws:policy/PowerUserAccess" or
+          $e.target.resource.attribute.labels["policyArn"] = "arn:aws:iam::aws:policy/DatabaseAdministrator" or
+          $e.target.resource.attribute.labels["policyArn"] = "arn:aws:iam::aws:policy/NetworkAdministrator" or
+          $e.target.resource.attribute.labels["policyArn"] = "arn:aws:iam::aws:policy/SystemAdministrator" or
+          $e.target.resource.attribute.labels["policyArn"] = "arn:aws:iam::aws:policy/Billing"
+        )
+        $e.principal.user.userid = $user
+        $e.target.user.userid = $target_user
 
-    | where eventName matches regex ".+"
+      match:
+        $user over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000181 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Privilege Escalation via User Policy\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE event.action IN ("AttachUserPolicy", "PutUserPolicy")
+      AND (
+        aws.cloudtrail.request_parameters LIKE "*arn:aws:iam::aws:policy/AdministratorAccess*"
+        OR aws.cloudtrail.request_parameters LIKE "*arn:aws:iam::aws:policy/AmazonSNSFullAccess*"
+        OR aws.cloudtrail.request_parameters LIKE "*arn:aws:iam::aws:policy/AmazonEC2FullAccess*"
+        OR aws.cloudtrail.request_parameters LIKE "*arn:aws:iam::aws:policy/AmazonS3FullAccess*"
+        OR aws.cloudtrail.request_parameters LIKE "*arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess*"
+        OR aws.cloudtrail.request_parameters LIKE "*arn:aws:iam::aws:policy/AWSCodeCommitPowerUser*"
+        OR aws.cloudtrail.request_parameters LIKE "*arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser*"
+        OR aws.cloudtrail.request_parameters LIKE "*arn:aws:iam::aws:policy/PowerUserAccess*"
+        OR aws.cloudtrail.request_parameters LIKE "*arn:aws:iam::aws:policy/DatabaseAdministrator*"
+        OR aws.cloudtrail.request_parameters LIKE "*arn:aws:iam::aws:policy/NetworkAdministrator*"
+        OR aws.cloudtrail.request_parameters LIKE "*arn:aws:iam::aws:policy/SystemAdministrator*"
+        OR aws.cloudtrail.request_parameters LIKE "*arn:aws:iam::aws:policy/Billing*"
+      )
+    | KEEP @timestamp, event.action, user.name, aws.cloudtrail.user_identity.arn, aws.cloudtrail.request_parameters, cloud.region, source.ip
+  leql: |
+    where(source_json.eventName IN [AttachUserPolicy, PutUserPolicy] AND (source_json.requestParameters.policyArn IN ["arn:aws:iam::aws:policy/AdministratorAccess", "arn:aws:iam::aws:policy/AmazonSNSFullAccess", "arn:aws:iam::aws:policy/AmazonEC2FullAccess", "arn:aws:iam::aws:policy/AmazonS3FullAccess", "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess", "arn:aws:iam::aws:policy/AWSCodeCommitPowerUser", "arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser", "arn:aws:iam::aws:policy/PowerUserAccess", "arn:aws:iam::aws:policy/DatabaseAdministrator", "arn:aws:iam::aws:policy/NetworkAdministrator", "arn:aws:iam::aws:policy/SystemAdministrator", "arn:aws:iam::aws:policy/Billing"]))
+  crowdstrike: |
+    #event_type=AwsApiCall (eventName=AttachUserPolicy OR eventName=PutUserPolicy)
+    (requestParameters.policyArn="arn:aws:iam::aws:policy/AdministratorAccess" OR requestParameters.policyArn="arn:aws:iam::aws:policy/AmazonSNSFullAccess" OR requestParameters.policyArn="arn:aws:iam::aws:policy/AmazonEC2FullAccess" OR requestParameters.policyArn="arn:aws:iam::aws:policy/AmazonS3FullAccess" OR requestParameters.policyArn="arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess" OR requestParameters.policyArn="arn:aws:iam::aws:policy/AWSCodeCommitPowerUser" OR requestParameters.policyArn="arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser" OR requestParameters.policyArn="arn:aws:iam::aws:policy/PowerUserAccess" OR requestParameters.policyArn="arn:aws:iam::aws:policy/DatabaseAdministrator" OR requestParameters.policyArn="arn:aws:iam::aws:policy/NetworkAdministrator" OR requestParameters.policyArn="arn:aws:iam::aws:policy/SystemAdministrator" OR requestParameters.policyArn="arn:aws:iam::aws:policy/Billing")
+    | table([@timestamp, eventName, userIdentity.principalId, userIdentity.arn, requestParameters.userName, requestParameters.policyArn, sourceIPAddress, awsRegion])
+  xql: "dataset = cloud_audit_logs\n| filter cloud_provider = \"AWS\" \n  and action_name in (\"AttachUserPolicy\", \"PutUserPolicy\")\n  and\
+    \ (action_resource contains \"Client HVT Policy\"\n       or action_resource in (\"arn:aws:iam::aws:policy/AdministratorAccess\",\n      \
+    \                         \"arn:aws:iam::aws:policy/AmazonSNSFullAccess\",\n                               \"arn:aws:iam::aws:policy/AmazonEC2FullAccess\"\
+    ,\n                               \"arn:aws:iam::aws:policy/AmazonS3FullAccess\",\n                               \"arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess\"\
+    ,\n                               \"arn:aws:iam::aws:policy/AWSCodeCommitPowerUser\",\n                               \"arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser\"\
+    ,\n                               \"arn:aws:iam::aws:policy/PowerUserAccess\",\n                               \"arn:aws:iam::aws:policy/DatabaseAdministrator\"\
+    ,\n                               \"arn:aws:iam::aws:policy/NetworkAdministrator\",\n                               \"arn:aws:iam::aws:policy/SystemAdministrator\"\
+    ,\n                               \"arn:aws:iam::aws:policy/Billing\"))\n| fields _time, actor_effective_username, action_name, action_resource,\
+    \ actor_caller_ip_geo_country, event_id\n"
+  lucene: |
+    eventName:(AttachUserPolicy OR PutUserPolicy) AND (requestParameters.policyArn:("arn:aws:iam::aws:policy/AdministratorAccess" OR "arn:aws:iam::aws:policy/AmazonSNSFullAccess" OR "arn:aws:iam::aws:policy/AmazonEC2FullAccess" OR "arn:aws:iam::aws:policy/AmazonS3FullAccess" OR "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess" OR "arn:aws:iam::aws:policy/AWSCodeCommitPowerUser" OR "arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser" OR "arn:aws:iam::aws:policy/PowerUserAccess" OR "arn:aws:iam::aws:policy/DatabaseAdministrator" OR "arn:aws:iam::aws:policy/NetworkAdministrator" OR "arn:aws:iam::aws:policy/SystemAdministrator" OR "arn:aws:iam::aws:policy/Billing") OR _exists_:clientHVTPolicy)
+  sumo: |
+    _sourceCategory=*CloudTrail*
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "requestParameters.policyArn" as policy_arn
+    | where event_name in ("AttachUserPolicy", "PutUserPolicy")
+    | where policy_arn in ("arn:aws:iam::aws:policy/AdministratorAccess", "arn:aws:iam::aws:policy/AmazonSNSFullAccess", "arn:aws:iam::aws:policy/AmazonEC2FullAccess", "arn:aws:iam::aws:policy/AmazonS3FullAccess", "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess", "arn:aws:iam::aws:policy/AWSCodeCommitPowerUser", "arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser", "arn:aws:iam::aws:policy/PowerUserAccess", "arn:aws:iam::aws:policy/DatabaseAdministrator", "arn:aws:iam::aws:policy/NetworkAdministrator", "arn:aws:iam::aws:policy/SystemAdministrator", "arn:aws:iam::aws:policy/Billing")
+    | fields _messageTime, event_name, policy_arn, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -98,7 +147,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 AWS APICall Event\nWhere the Event Name is in [AttachUserPolicy, PutUserPolicy]\nWhere Policy ARN is Client HVT Policy\nOR \n\
   Where the Policy ARN is in [arn:aws:iam::aws:policy/AdministratorAccess\" or \"arn:aws:iam::aws:policy/AmazonSNSFullAccess\" or \"arn:aws:iam::aws:policy/AmazonEC2FullAccess\"\

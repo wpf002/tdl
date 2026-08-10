@@ -19,76 +19,63 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    (index=aws (sourcetype=aws:cloudtrail (userIdentity.type=Root NOT userIdentity.invokedBy=* eventType!=AwsServiceEvent)) OR (sourcetype=aws:guardduty (finding.type="Policy:IAMUser/RootCredentialUsage" OR finding.type="Policy:IAMUser/ShortTermRootCredentialUsage")))
-    | eval detection_source=case(
-        sourcetype="aws:cloudtrail", "CloudTrail",
-        sourcetype="aws:guardduty", "GuardDuty",
-        1=1, "Unknown"
+  spl: "(index=aws (sourcetype=aws:cloudtrail (userIdentity.type=Root NOT userIdentity.invokedBy=* eventType!=AwsServiceEvent)) OR (sourcetype=aws:guardduty\
+    \ (finding.type=\"Policy:IAMUser/RootCredentialUsage\" OR finding.type=\"Policy:IAMUser/ShortTermRootCredentialUsage\")))\n| eval detection_source=case(\n\
+    \    sourcetype=\"aws:cloudtrail\", \"CloudTrail\",\n    sourcetype=\"aws:guardduty\", \"GuardDuty\",\n    1=1, \"Unknown\"\n)\n| table _time,\
+    \ detection_source, userIdentity.type, userIdentity.invokedBy, eventType, eventName, sourceIPAddress, userIdentity.arn, awsRegion, finding.type,\
+    \ finding.severity\n"
+  kql: |
+    union
+    (
+    AWSCloudTrail
+    | where TimeGenerated > ago(24h)
+    | where UserIdentityType == "Root"
+    | where isempty(UserIdentityInvokedBy) or isnull(UserIdentityInvokedBy)
+    | where EventTypeName != "AwsServiceEvent"
+    | project TimeGenerated, EventName, EventTypeName, UserIdentityType, UserIdentityArn, UserIdentityAccountId, SourceIpAddress, UserAgent, RequestParameters, ResponseElements, AWSRegion, EventSource
+    ),
+    (
+    AWSGuardDuty
+    | where TimeGenerated > ago(24h)
+    | where Type in ("Policy:IAMUser/RootCredentialUsage", "Policy:IAMUser/ShortTermRootCredentialUsage")
+    | project TimeGenerated, Title, Type, Severity, Description, AccountId, Region, ResourceType, ResourceId, ServiceAction = tostring(parse_json(AdditionalData).serviceAction)
     )
-    | table _time, detection_source, userIdentity.type, userIdentity.invokedBy, eventType, eventName, sourceIPAddress, userIdentity.arn, awsRegion, finding.type, finding.severity
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000134 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Root Account Used\"\n    severity = \"HIGH\"\n \
-    \   tactic = \"TA0001\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n\
-    \    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  aql: "SELECT \n    eventtime,\n    LOGSOURCENAME(logsourceid) AS log_source,\n    username,\n    \"eventName\" AS event_name,\n    \"userIdentity.type\"\
+    \ AS user_type,\n    \"userIdentity.invokedBy\" AS invoked_by,\n    \"eventType\" AS event_type,\n    \"finding.type\" AS finding_type,\n\
+    \    sourceip,\n    \"userAgent\" AS user_agent,\n    \"requestParameters\" AS request_parameters\nFROM events\nWHERE \n    (\n        (LOGSOURCENAME(logsourceid)\
+    \ ILIKE '%CloudTrail%' \n         AND \"userIdentity.type\" = 'Root' \n         AND (\"userIdentity.invokedBy\" IS NULL OR \"userIdentity.invokedBy\"\
+    \ = '')\n         AND \"eventType\" != 'AwsServiceEvent')\n        OR\n        (LOGSOURCENAME(logsourceid) ILIKE '%GuardDuty%' \n        \
+    \ AND \"finding.type\" IN ('Policy:IAMUser/RootCredentialUsage', 'Policy:IAMUser/ShortTermRootCredentialUsage'))\n    )\nLAST 24 HOURS\n"
+  yara_l: "rule aws_root_account_usage {\n  meta:\n    author = \"TDL\"\n    description = \"Detects AWS root account usage via CloudTrail or\
+    \ GuardDuty events\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1098\"\n    severity = \"HIGH\"\n\n  events:\n\
+    \    // CloudTrail root usage detection\n    $ct.metadata.product_name = \"AWS CloudTrail\"\n    $ct.metadata.vendor_name = \"AMAZON\"\n \
+    \   $ct.security_result.detection_fields[\"userIdentity.type\"] = \"Root\"\n    not $ct.security_result.detection_fields[\"userIdentity.invokedBy\"\
+    ] != \"\"\n    $ct.metadata.product_event_type != \"AwsServiceEvent\"\n    $ct.principal.user.userid = $user\n    \n    // GuardDuty root\
+    \ usage detection\n    $gd.metadata.product_name = \"AWS GuardDuty\"\n    $gd.metadata.vendor_name = \"AMAZON\"\n    (\n      $gd.metadata.product_event_type\
+    \ = \"Policy:IAMUser/RootCredentialUsage\" or\n      $gd.metadata.product_event_type = \"Policy:IAMUser/ShortTermRootCredentialUsage\"\n \
+    \   )\n    $gd.principal.user.userid = $user_gd\n\n  match:\n    $user over 5m\n\n  outcome:\n    $risk_score = 85\n\n  condition:\n    $ct\
+    \ or $gd\n}\n"
+  esql: "FROM logs-aws.cloudtrail*, .alerts-security.alerts-*\n| WHERE \n    (\n      (userIdentity.type == \"Root\" \n       AND NOT ENDS_WITH(COALESCE(userIdentity.invokedBy,\
+    \ \"\"), \".amazonaws.com\")\n       AND event.type != \"AwsServiceEvent\")\n    )\n    OR\n    (\n      event.action IN (\"Policy:IAMUser/RootCredentialUsage\"\
+    , \"Policy:IAMUser/ShortTermRootCredentialUsage\")\n    )\n| KEEP @timestamp, event.dataset, event.action, event.type, userIdentity.type,\
+    \ userIdentity.invokedBy, userIdentity.principalId, userIdentity.arn, source.ip, cloud.account.id, user.name, event.outcome\n"
+  leql: |
+    where(source_json.userIdentity.type="Root" AND source_json.userIdentity.invokedBy=NULL AND source_json.eventType!="AwsServiceEvent") OR where(source_json.type IN ["Policy:IAMUser/RootCredentialUsage", "Policy:IAMUser/ShortTermRootCredentialUsage"])
+  crowdstrike: |
+    (#type=cloudtrail userIdentity.type=Root NOT userIdentity.invokedBy=* eventType!=AwsServiceEvent) OR (#type=guardduty (finding.type="Policy:IAMUser/RootCredentialUsage" OR finding.type="Policy:IAMUser/ShortTermRootCredentialUsage"))
+    | table([@timestamp, #type, eventName, userIdentity.type, userIdentity.invokedBy, eventType, finding.type, userIdentity.principalId, sourceIPAddress, userAgent])
+  xql: "dataset = cloud_audit_logs\n| filter cloud_provider = \"AWS\" \n  and (\n    (vendor_name = \"AWS\" and event_type = \"CloudTrail\" \n\
+    \     and json_extract_scalar(raw_log, \"$.userIdentity.type\") = \"Root\" \n     and json_extract_scalar(raw_log, \"$.userIdentity.invokedBy\"\
+    ) = null\n     and json_extract_scalar(raw_log, \"$.eventType\") != \"AwsServiceEvent\")\n    or\n    (vendor_name = \"AWS\" and event_type\
+    \ = \"GuardDuty\"\n     and json_extract_scalar(raw_log, \"$.type\") in (\"Policy:IAMUser/RootCredentialUsage\", \"Policy:IAMUser/ShortTermRootCredentialUsage\"\
+    ))\n  )\n| fields _time, cloud_provider, vendor_name, event_type, raw_log\n"
+  lucene: |
+    (eventSource:cloudtrail AND userIdentity.type:Root AND NOT _exists_:userIdentity.invokedBy AND NOT eventType:AwsServiceEvent) OR (eventSource:guardduty AND findingType:("Policy:IAMUser/RootCredentialUsage" OR "Policy:IAMUser/ShortTermRootCredentialUsage"))
+  sumo: "_sourceCategory=*cloudtrail* OR _sourceCategory=*guardduty*\n| json field=_raw \"userIdentity.type\" as user_type\n| json field=_raw\
+    \ \"userIdentity.invokedBy\" as invoked_by\n| json field=_raw \"eventType\" as event_type\n| json field=_raw \"type\" as guardduty_type\n\
+    | json field=_raw \"eventName\" as event_name\n| where (user_type = \"Root\" and isNull(invoked_by) and event_type != \"AwsServiceEvent\"\
+    ) \n   or (guardduty_type in (\"Policy:IAMUser/RootCredentialUsage\", \"Policy:IAMUser/ShortTermRootCredentialUsage\"))\n| fields _messageTime,\
+    \ _sourceCategory, user_type, invoked_by, event_type, guardduty_type, event_name\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -98,7 +85,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 AWS CloudTrail Event\nWhere the User Type {userIdentity.type} is Root\nWhere the Parent Process {userIdentity.invokedBy} name\
   \ is NULL\nWhere the Event Type is NOT \"AwsServiceEvent\"\n\n\n-----------------------------------------------------------------------------------------\n\

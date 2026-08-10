@@ -16,71 +16,47 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=google_workspace sourcetype=gsuite:admin events{}.name="ADD_TRUSTED_DOMAINS"
+  spl: 'index=google_workspace sourcetype=gsuite:admin events{}.name="ADD_TRUSTED_DOMAINS"
+
     | table _time, actor.email, events{}.name, events{}.parameters{}.value, org_unit_name
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000302 {\n  meta:\n    author = \"TDL\"\n    description = \"Domain Added to Google Workspace Trusted Domains\"\n \
-    \   severity = \"LOW\"\n    tactic = \"TA0005\"\n    technique = \"T1484\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    GWorkspaceActivityReports
+    | where TimeGenerated > ago(90d)
+    | where RecordType == "admin"
+    | mv-expand Events = parse_json(Events)
+    | where Events.name == "ADD_TRUSTED_DOMAINS"
+    | project TimeGenerated, ActorIpAddress, ActorUserId, EventName = tostring(Events.name), Parameters = Events.parameters
+  aql: |
+    SELECT eventtime, username, sourceip, QIDNAME(qid), LOGSOURCENAME(logsourceid), "Event Name"
+    FROM events
+    WHERE "Event Name" = 'ADD_TRUSTED_DOMAINS'
+    LAST 24 HOURS
+  yara_l: "rule gws_trusted_domain_added {\n  meta:\n    author = \"TDL\"\n    description = \"Detects addition of trusted domains in Google Workspace\
+    \ (T1484 Defense Evasion)\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1484\"\n    severity = \"Medium\"\
+    \n    \n  events:\n    $e.metadata.product_name = \"Google Workspace\"\n    $e.metadata.product_event_type = \"ADD_TRUSTED_DOMAINS\"\n   \
+    \ $e.principal.user.userid = $user\n    \n  match:\n    $user over 1h\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-google_workspace*
+    | WHERE event.action == "ADD_TRUSTED_DOMAINS" OR event.dataset == "google_workspace.admin" AND event.action == "ADD_TRUSTED_DOMAINS"
+    | KEEP @timestamp, user.email, source.ip, event.action, google_workspace.admin.domain.name, google_workspace.admin.new_value
+  leql: |
+    where(source_json.events.name="ADD_TRUSTED_DOMAINS")
+  crowdstrike: |
+    #event_platform=Google* events.name="ADD_TRUSTED_DOMAINS"
+    | table([@timestamp, actor.email, events.name, events.parameters.DOMAIN_NAME, events.parameters.NEW_VALUE])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Google" and logon.application = "Google Workspace" and action_name = "ADD_TRUSTED_DOMAINS"
+    | fields _time, actor_user, action_name, action_resource_name, action_resource_type
+  lucene: |
+    events.name:"ADD_TRUSTED_DOMAINS"
+  sumo: |
+    _sourceCategory=*Google*Workspace*
+    | json field=_raw "events[*].name" as event_name
+    | where event_name = "ADD_TRUSTED_DOMAINS"
+    | fields _messageTime, _sourceHost, event_name
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +66,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Google Workspace Event
 

@@ -19,73 +19,90 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    (index=wineventlog sourcetype=WinEventLog:Security (EventCode=592 OR EventCode=4688) NOT [| inputlookup high_value_targets.csv | fields ComputerName] CommandLine=* | regex CommandLine="(?:(?:^[\"\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"\'][^\"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"\']))") OR (index=linux (sourcetype=linux_secure OR sourcetype=syslog OR sourcetype=linux_audit) NOT [| inputlookup high_value_targets.csv | rename ComputerName as host | fields host] COMMAND=* | regex COMMAND="(?:(?:^[\"\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"\'][^\"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"\']))") | eval platform=if(isnotnull(EventCode),"Windows","Linux"), command=coalesce(CommandLine,COMMAND), hostname=coalesce(ComputerName,host) | table _time, platform, hostname, User, command
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4688")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
+  spl: '(index=wineventlog sourcetype=WinEventLog:Security (EventCode=592 OR EventCode=4688) NOT [| inputlookup high_value_targets.csv | fields
+    ComputerName] CommandLine=* | regex CommandLine="(?:(?:^[\"\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"\''][^\"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"\'']))")
+    OR (index=linux (sourcetype=linux_secure OR sourcetype=syslog OR sourcetype=linux_audit) NOT [| inputlookup high_value_targets.csv | rename
+    ComputerName as host | fields host] COMMAND=* | regex COMMAND="(?:(?:^[\"\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"\''][^\"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"\'']))")
+    | eval platform=if(isnotnull(EventCode),"Windows","Linux"), command=coalesce(CommandLine,COMMAND), hostname=coalesce(ComputerName,host) |
+    table _time, platform, hostname, User, command
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000185 {\n  meta:\n    author = \"TDL\"\n    description = \"Code Compiling\"\n    severity = \"LOW\"\n    tactic =\
-    \ \"TA0005\"\n    technique = \"T1027\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4688)/\n    $host\
-    \ = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    let HighValueHosts = dynamic(["HVT-DC01", "HVT-SQL01", "HVT-WEB01"]);
+    let CompilerRegex = @"(?:(?:^[\""\\s]{0,1}(gcc|g\\+\\+|cc|c\\+\\+|javac)\\b)|(?:^(?:[\\\\\/](?:\\w|\\\\\\s)*)+(gcc|g\\+\\+|cc|c\\+\\+|javac)\\b)|(?:\\|\\s*(gcc|g\\+\\+|cc|c\\+\\+|javac)\\b)|(?:^[\""\\'][^\""]*[\\\\\/](gcc|g\\+\\+|cc|c\\+\\+|javac)[\""\\']))";
+    union
+    (SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (592, 4688)
+    | where Computer !in (HighValueHosts)
+    | where CommandLine matches regex CompilerRegex
+    | project TimeGenerated, Computer, Account, EventID, CommandLine, Process, ProcessId
+    ),
+    (Syslog
+    | where TimeGenerated > ago(24h)
+    | where Computer !in (HighValueHosts)
+    | where SyslogMessage matches regex CompilerRegex
+    | project TimeGenerated, Computer, ProcessName, SyslogMessage, HostIP
+    )
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process CommandLine", sourceip
+    FROM events
+    WHERE ("EventID" IN ('592', '4688') OR LOGSOURCETYPE(logsourceid) ILIKE '%linux%')
+      AND "Process CommandLine" MATCHES '(?:(?:^[\"\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"\'][^\"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"\']))'
+    LAST 24 HOURS
+  yara_l: |
+    rule t1027_compiler_invocation_defense_evasion {
+      meta:
+        author = "TDL"
+        description = "Detects compiler invocation (gcc, g++, cc, c++, javac) on non-HVT hosts indicating potential obfuscation or defense evasion"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1027"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        ($w.metadata.event_type = "PROCESS_LAUNCH" and
+         ($w.metadata.product_event_type = "592" or $w.metadata.product_event_type = "4688") and
+         re.regex($w.principal.process.command_line, `(?:(?:^["\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"'][^"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"']))`) and
+         $w.principal.hostname = $host) or
+        ($l.metadata.event_type = "PROCESS_LAUNCH" and
+         re.regex($l.principal.process.command_line, `(?:(?:^["\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"'][^"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"']))`) and
+         $l.principal.hostname = $host)
 
-    | WHERE event.category == "process" AND event_id IN ("4688")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4688])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4688)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4688")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4688)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4688")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $w or $l
+    }
+  esql: |
+    FROM logs-endpoint.events.process*, logs-system.security*, logs-system.sysmon*, winlogbeat-*
+    | WHERE (event.code IN ("592", "4688") OR event.category == "process")
+      AND process.command_line RLIKE """(?:(?:^["\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^["'][^"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)["']))"""
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, event.code
+  leql: |
+    where((source_json.EventID IN [592, 4688] AND process_cmd_line=/(?:(?:^[\"\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"\'][^\"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"\']))/) OR (process_cmd_line=/(?:(?:^[\"\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"\'][^\"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"\'])/))
+  crowdstrike: |
+    (event_simpleName=ProcessRollup2 OR EventCode=4688 OR EventCode=592 OR event_simpleName IN [ProcessRollup2, EndOfProcess, CommandHistory])
+    | regex("(?:(?:^[\"\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"\'][^\"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"\']))", field=CommandLine)
+    | table([@timestamp, ComputerName, event_simpleName, EventCode, UserName, CommandLine, FileName, ParentBaseFileName])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) or event_type = ENUM.EVENT_TYPE_PROCESS)
+    | filter action_process_image_command_line ~= "(?:(?:^[\"\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"\'][^\"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"\']))"
+    | fields _time, agent_hostname, os_type, actor_effective_username, action_process_image_name, action_process_image_command_line
+  lucene: |
+    (event.code:(592 OR 4688) AND process.command_line:/(?:(?:^[\"\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"\'][^\"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"\']))/) OR (event.category:process AND process.command_line:/(?:(?:^[\"\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"\'][^\"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"\']))/))
+  sumo: |
+    (_sourceCategory=*Windows* OR _sourceCategory=*Linux*) (gcc OR "g++" OR cc OR "c++" OR javac)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Computer" as computer
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "ProcessCommandLine" as process_cmd
+    | if(isEmpty(command_line), process_cmd, command_line) as cmd
+    | if(isEmpty(computer), _sourceHost, computer) as host
+    | where (event_id in ("592", "4688") OR isNull(event_id))
+    | where cmd matches /(?:(?:^["\s]{0,1}(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^(?:[\\\/](?:\w|\\\s)*)+(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:\|\s*(gcc|g\+\+|cc|c\+\+|javac)\b)|(?:^[\"'][^"]*[\\\/](gcc|g\+\+|cc|c\+\+|javac)[\"']))/
+    | fields _messageTime, host, event_id, cmd
 false_positives:
 - 'Old Regex for the command line: \b(gcc|g\+\+|cc|c\+\+|javac)\b
 
@@ -100,7 +117,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Destination Hostname is NOT on a High Value\
   \ Target Host List\nWhere the Command matches the regex \"(?:(?:^[\\\"\\s]{0,1}(gcc|g\\+\\+|cc|c\\+\\+|javac)\\b)|(?:^(?:[\\\\\\/](?:\\w|\\\\\

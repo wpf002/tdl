@@ -15,71 +15,62 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=o365 sourcetype=o365:management:activity Operation="Ransomware activity"
+  spl: 'index=o365 sourcetype=o365:management:activity Operation="Ransomware activity"
+
     | table _time, UserId, ClientIP, Operation, Workload, OfficeObjectId
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000367 {\n  meta:\n    author = \"TDL\"\n    description = \"Ransomware Activity\"\n    severity = \"HIGH\"\n    tactic\
-    \ = \"TA0002\"\n    technique = \"T1486\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n   \
-    \ $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    CloudAppEvents
+    | where TimeGenerated > ago(1h)
+    | where Application == "Microsoft 365"
+    | where ActionType == "Ransomware activity"
+    | project TimeGenerated, AccountObjectId, AccountDisplayName, IPAddress, ISP, City, CountryCode, RawEventData
+  aql: |
+    SELECT eventtime, username, sourceip, destinationip, qidname(qid), LOGSOURCENAME(logsourceid), "Event Name"
+    FROM events
+    WHERE "Event Name" = 'Ransomware activity'
+    LAST 24 HOURS
+  yara_l: |
+    rule o365_ransomware_activity_detected {
+      meta:
+        author = "TDL"
+        description = "Detects O365 ATP ransomware activity events"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1486"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Microsoft"
+        $e.metadata.product_name = "Office 365"
+        $e.metadata.product_event_type = "Ransomware activity"
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-o365*
+    | WHERE event.action == "Ransomware activity" OR event.dataset == "o365.audit" AND o365.audit.Operation == "Ransomware activity"
+    | KEEP @timestamp, user.name, host.name, source.ip, event.action, o365.audit.Operation, o365.audit.ObjectId, o365.audit.ClientIP
+  leql: |
+    where(source_json.Operation="Ransomware activity")
+  crowdstrike: |
+    #repo=o365* event.name="Ransomware activity"
+    | table([@timestamp, user.name, user.email, source.ip, event.action, event.outcome, file.name, file.path])
+  xql: |
+    dataset = msft_365_defender_raw
+    | filter action_evtlog_event_id = "Ransomware activity" or action_external_hostname = "Ransomware activity" or event_type = "Ransomware activity"
+    | fields _time, actor_effective_username, agent_hostname, action_file_name, action_file_path
+  lucene: |
+    event.action:"Ransomware activity" OR o365.audit.Operation:"Ransomware activity" OR action:"Ransomware activity"
+  sumo: |
+    _sourceCategory=*O365* OR _sourceCategory=*Office365* "Ransomware activity"
+    | json field=_raw "Operation" as operation
+    | where operation = "Ransomware activity"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -89,7 +80,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: 1 O365 event where event name is "Ransomware activity"
 suppression:

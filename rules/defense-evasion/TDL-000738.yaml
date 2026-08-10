@@ -23,71 +23,70 @@ queries:
     \ apt, apt-get, dnf, zypper, pacman)))\n)\n| eval alert_reason=case(\n    EventCode=6, \"Untrusted driver loaded: \".ImageLoaded,\n    process_name\
     \ IN (\"insmod\",\"modprobe\"), \"Manual kernel module load outside package manager\"\n  )\n| table _time, host, sourcetype, EventCode, ImageLoaded,\
     \ Signature, SignatureStatus, process_name, parent_process_name, command_line, alert_reason\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000738 {\n  meta:\n    author = \"TDL\"\n    description = \"Unsigned Kernel Driver Load\"\n    severity = \"CRITICAL\"\
-    \n    tactic = \"TA0005\"\n    technique = \"T1014\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: "union\n(DeviceEvents\n| where TimeGenerated > ago(24h)\n| where ActionType == \"DriverLoad\"\n| where isnotempty(SHA1)\n| extend Publisher\
+    \ = tostring(AdditionalFields.SignaturePublisher)\n| where Publisher !startswith \"Microsoft\" \n    and Publisher !contains \"Intel\" \n\
+    \    and Publisher !contains \"NVIDIA\" \n    and Publisher !contains \"AMD\" \n    and Publisher !contains \"Realtek\"\n    and Publisher\
+    \ !contains \"Qualcomm\"\n    and Publisher !contains \"Broadcom\"\n    and Publisher !contains \"Dell\"\n    and Publisher !contains \"HP\"\
+    \n    and Publisher !contains \"Lenovo\"\n    and isnotempty(Publisher)\n| project TimeGenerated, DeviceName, ActionType, FileName, FolderPath,\
+    \ SHA1, Publisher, InitiatingProcessFileName, InitiatingProcessCommandLine),\n(DeviceProcessEvents\n| where TimeGenerated > ago(24h)\n| where\
+    \ FileName in~ (\"insmod\",\"modprobe\")\n| where ProcessCommandLine !has \"/lib/modules\"\n    and ProcessCommandLine !has \"apt\"\n    and\
+    \ ProcessCommandLine !has \"yum\"\n    and ProcessCommandLine !has \"dnf\"\n    and ProcessCommandLine !has \"zypper\"\n| project TimeGenerated,\
+    \ DeviceName, ActionType = \"LinuxKernelModuleLoad\", FileName, FolderPath = \"\", SHA1, Publisher = \"N/A\", InitiatingProcessFileName, InitiatingProcessCommandLine\
+    \ = ProcessCommandLine)\n| sort by TimeGenerated desc\n"
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Image Loaded" AS driver_path, "Signer", sourceip, COUNT(*) AS load_count
+    FROM events
+    WHERE (
+      ("EventID" = '6' AND "Signer" NOT ILIKE '%Microsoft%' AND "Signer" NOT ILIKE '%Windows%' AND "Signer" IS NOT NULL)
+      OR ("EventID" = '6' AND "Signer" IS NULL)
+      OR ("Process Name" ILIKE '%insmod%' OR "Process Name" ILIKE '%modprobe%')
+    )
+    AND "Image Loaded" NOT ILIKE '%/lib/modules/%'
+    GROUP BY eventtime, LOGSOURCENAME(logsourceid), username, "Process Name", "Image Loaded", "Signer", sourceip
+    LAST 24 HOURS
+  yara_l: "rule rootkit_driver_load_untrusted {\n  meta:\n    author = \"TDL\"\n    description = \"Detects loading of drivers or kernel modules\
+    \ from untrusted publishers - MITRE T1014 Defense Evasion\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"\
+    T1014\"\n    severity = \"HIGH\"\n\n  events:\n    // Windows driver load events\n    ($w.metadata.event_type = \"DRIVER_LOAD\" or \n    \
+    \ $w.metadata.product_event_type = \"6\" or\n     $w.metadata.product_event_type = \"7045\") and\n    (\n      not re.regex($w.target.file.signature_info.signer,\
+    \ `(?i)Microsoft`) and\n      not re.regex($w.target.file.signature_info.signer, `(?i)Intel`) and\n      not re.regex($w.target.file.signature_info.signer,\
+    \ `(?i)NVIDIA`) and\n      not re.regex($w.target.file.signature_info.signer, `(?i)AMD`) and\n      not re.regex($w.target.file.signature_info.signer,\
+    \ `(?i)Dell`) and\n      not re.regex($w.target.file.signature_info.signer, `(?i)HP`) and\n      not re.regex($w.target.file.signature_info.signer,\
+    \ `(?i)Lenovo`) and\n      not $w.target.file.signature_info.signed = true\n    )\n    $w.principal.hostname = $host\n    $w.target.file.full_path\
+    \ = $driver_path\n\n    or\n\n    // Linux kernel module load via insmod/modprobe\n    $l.metadata.event_type = \"PROCESS_LAUNCH\" and\n \
+    \   (\n      re.regex($l.principal.process.file.full_path, `(?i)/s?bin/(insmod|modprobe)$`) or\n      re.regex($l.principal.process.command_line,\
+    \ `(?i)(insmod|modprobe)\\s+`)\n    ) and\n    not re.regex($l.principal.process.command_line, `(?i)/lib/modules/`) and\n    not re.regex($l.principal.process.command_line,\
+    \ `(?i)/usr/lib/modules/`)\n    $l.principal.hostname = $host\n    $l.principal.process.command_line = $driver_path\n\n  match:\n    $host\
+    \ over 5m\n\n  outcome:\n    $risk_score = 85\n    $driver_loaded = array_distinct($driver_path)\n\n  condition:\n    $w or $l\n}\n"
+  esql: "FROM logs-endpoint.events.driver*, logs-endpoint.events.process*, logs-linux.auditd*\n| WHERE \n    (event.category == \"driver\" AND\
+    \ event.action == \"load\" \n     AND NOT (\n       STARTS_WITH(file.code_signature.subject_name, \"Microsoft\") \n       OR file.code_signature.trusted\
+    \ == true\n     ))\n    OR \n    (process.name IN (\"insmod\", \"modprobe\", \"kmod\") \n     AND process.args LIKE \"*.ko\" \n     AND NOT\
+    \ process.parent.name IN (\"dpkg\", \"rpm\", \"yum\", \"apt\", \"apt-get\", \"dnf\", \"zypper\", \"pacman\"))\n| STATS events = COUNT(*) BY\
+    \ host.name, file.path, file.name, file.code_signature.subject_name, process.name, process.command_line, user.name, @timestamp\n| KEEP @timestamp,\
+    \ host.name, file.path, file.name, file.code_signature.subject_name, process.name, process.command_line, user.name, events\n"
+  leql: |
+    where((source_json.EventID=6 AND NOT (source_json.ImageLoaded ICONTAINS "microsoft" OR source_json.Signed="true")) OR (process_name IN ["insmod", "modprobe"] AND NOT process_cmd_line ICONTAINS "apt" AND NOT process_cmd_line ICONTAINS "yum" AND NOT process_cmd_line ICONTAINS "dnf" AND NOT process_cmd_line ICONTAINS "zypper" AND NOT process_cmd_line ICONTAINS "dpkg"))
+  crowdstrike: |
+    (event_simpleName=DriverLoad event_platform=Win AND NOT (ImageLoaded=*\Windows\System32\drivers\* OR ImageLoaded=*\Windows\SysWOW64\drivers\* OR Signed=true OR Publisher=*Microsoft*)) OR (event_simpleName=ProcessRollup2 event_platform=Lin (FileName=insmod OR FileName=modprobe OR CommandLine=*insmod* OR CommandLine=*modprobe*) NOT (CommandLine=*/usr/lib/* OR CommandLine=*/lib/modules/* OR CommandLine=*yum* OR CommandLine=*apt* OR CommandLine=*dnf* OR CommandLine=*zypper*)) | table([@timestamp, event_platform, ComputerName, UserName, FileName, ImageLoaded, CommandLine, Publisher, Signed, SHA256HashData])
+  xql: |
+    dataset = xdr_data
+    | filter (event_type = ENUM.EVENT_TYPE_LOAD_IMAGE and event_sub_type = ENUM.EVENT_SUB_TYPE_LOAD_IMAGE_DRIVER)
+       or (event_type = ENUM.EVENT_TYPE_PROCESS and (actor_process_image_name in ("insmod", "modprobe") or actor_process_image_name ~= ".*(insmod|modprobe)$"))
+    | filter (event_sub_type = ENUM.EVENT_SUB_TYPE_LOAD_IMAGE_DRIVER and (action_module_publisher = null or action_module_publisher = "" or (action_module_publisher != "Microsoft Corporation" and action_module_publisher != "Microsoft Windows" and not action_module_publisher ~= ".*Intel.*" and not action_module_publisher ~= ".*AMD.*" and not action_module_publisher ~= ".*NVIDIA.*" and not action_module_publisher ~= ".*Dell.*" and not action_module_publisher ~= ".*HP.*" and not action_module_publisher ~= ".*Lenovo.*")))
+       or (actor_process_image_name in ("insmod", "modprobe") or actor_process_image_name ~= ".*(insmod|modprobe)$")
+    | fields _time, agent_hostname, actor_effective_username, event_type, event_sub_type, action_module_path, action_module_publisher, actor_process_image_name, action_process_image_command_line
+  lucene: |
+    (event.code:6 AND NOT winlog.event_data.Signature:(*Microsoft* OR *Intel* OR *AMD* OR *NVIDIA* OR *Realtek* OR *Broadcom* OR *Qualcomm* OR *Dell* OR *HP* OR *Lenovo*)) OR (process.name:(insmod OR modprobe) AND NOT process.command_line:*/lib/modules/*)
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Linux* OR _sourceCategory=*EDR* OR _sourceCategory=*Auditd*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ImageLoaded" as image_loaded
+    | json field=_raw "Signature" as signature
+    | json field=_raw "SignatureStatus" as signature_status
+    | json field=_raw "Signed" as signed
+    | parse regex "(?:insmod|modprobe)\s+(?<kernel_module>\S+)" nodrop
+    | parse regex "type=(?:SYSCALL|PATH)\s+.*\s+comm=\"(?:insmod|modprobe)\".*\s+name=\"(?<auditd_module>[^\"]+)\"" nodrop
+    | where (event_id = "6" AND (signature_status != "Valid" OR signed = "false" OR (signature != "*Microsoft*" AND signature != "*Intel*" AND signature != "*NVIDIA*" AND signature != "*AMD*" AND signature != "*Realtek*" AND signature != "*Broadcom*" AND signature != "*Qualcomm*" AND signature != "*Dell*" AND signature != "*HP*" AND signature != "*Lenovo*"))) OR isNotNull(kernel_module) OR isNotNull(auditd_module)
+    | fields _messageTime, _sourceHost, event_id, image_loaded, signature, signature_status, kernel_module, auditd_module
 pseudo_logic: DriverLoad event for a driver not in the Microsoft / vendor-trusted publisher allowlist; or insmod / modprobe of an LKM outside
   package management.
 false_positives:
@@ -106,7 +105,7 @@ references:
 - https://attack.mitre.org/techniques/T1014/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

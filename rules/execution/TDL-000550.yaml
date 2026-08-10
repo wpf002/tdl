@@ -16,77 +16,82 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=endpoint sourcetype=antivirus signature_name="*" OR signature="*" OR threat_name="*" OR malware_name="*" OR action="quarantine" OR action="blocked" OR action="detected"
+  spl: 'index=endpoint sourcetype=antivirus signature_name="*" OR signature="*" OR threat_name="*" OR malware_name="*" OR action="quarantine"
+    OR action="blocked" OR action="detected"
+
     | eval detection_type=coalesce(signature_name, signature, threat_name, malware_name, "unknown")
+
     | where detection_type!="unknown"
+
     | dedup host, user, detection_type, file_name, file_path
+
     | table _time, host, user, detection_type, file_name, file_path, action, sourcetype
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000550 {\n  meta:\n    author = \"TDL\"\n    description = \"Anti-virus Malware Found\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: "SecurityEvent\n| where TimeGenerated > ago(90d)\n| where EventID == 1116\n| where ThreatName !in~ (\"PUA:\", \"LowFi\", \"BrowserModifier\"\
+    )\n| where InitiatingProcessFileName !in~ (\"MsMpEng.exe\", \"NisSrv.exe\", \"MpCmdRun.exe\", \"ConfigSecurityPolicy.exe\")\n| summarize \n\
+    \    Hosts = make_set(Computer),\n    Users = make_set(SubjectUserName),\n    FirstSeen = min(TimeGenerated),\n    LastSeen = max(TimeGenerated),\n\
+    \    EventCount = count()\n    by ThreatName, Process, CommandLine, ParentProcessName\n| where EventCount >= 1\n| project FirstSeen, LastSeen,\
+    \ ThreatName, Process, ParentProcessName, CommandLine, Hosts, Users, EventCount\n"
+  aql: |
+    SELECT DATEFORMAT(eventtime, 'yyyy-MM-dd HH:mm:ss') AS event_time, LOGSOURCENAME(logsourceid) AS host, username AS user, "Process Name" AS process_name, "Parent Process Name" AS parent_process_name, "Process CommandLine" AS command_line, CATEGORYNAME(category) AS event_category, qidname(qid) AS event_name FROM events WHERE (CATEGORYNAME(category) ILIKE '%malware%' OR CATEGORYNAME(category) ILIKE '%virus%' OR CATEGORYNAME(category) ILIKE '%antivirus%' OR qidname(qid) ILIKE '%malware%' OR qidname(qid) ILIKE '%virus%' OR qidname(qid) ILIKE '%threat%detected%') AND "Process Name" IS NOT NULL LAST 7 DAYS
+  yara_l: |
+    rule antivirus_malware_found {
+      meta:
+        author = "Detection Engineering"
+        description = "T1204 - User Execution - Antivirus malware detection"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "SCAN_UNCATEGORIZED"
+        $e.security_result.summary = "VIRUS_DETECTED" or
+        $e.security_result.summary = "MALWARE_DETECTED" or
+        re.regex($e.metadata.description, `(?i)(malware|virus|threat).*(detected|found)`) or
+        re.regex($e.security_result.description, `(?i)(malware|virus|threat).*(detected|found)`)
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $user
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host, $user over 1h
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM .alerts-security.alerts-*\n| WHERE @timestamp > NOW() - 24 hour \n  AND event.kind == \"alert\" \n  AND event.category == \"malware\"\
+    \n  AND (event.type == \"info\" OR event.type == \"detection\")\n| STATS alert_count = COUNT(*) BY host.name, user.name, file.name, file.path,\
+    \ process.name\n| WHERE alert_count >= 1\n| KEEP @timestamp, host.name, user.name, file.name, file.path, process.name, alert_count\n"
+  leql: |
+    where(source_json.EventID=1 AND process_name=/.*\+.*/)
+  crowdstrike: |
+    #event_type=Event_ExternalApiEvent ExternalApiType=Event_DetectionSummaryEvent DetectName=*malware* OR DetectDescription=*malware* OR Tactic=*malware* OR (event_simpleName=DetectionSummaryEvent (DetectName=*malware* OR DetectDescription=*malware*))
+    | groupBy([ComputerName, UserName, FileName, SHA256HashData], function=count(as=detections))
+    | detections >= 1
+    | table([@timestamp, ComputerName, UserName, FileName, SHA256HashData, DetectName, DetectDescription, detections])
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_MALWARE and action_evtlog_event_id = 1 \n| dedup agent_hostname, actor_effective_username,\
+    \ action_process_image_name, actor_process_image_name, action_process_image_command_line\n| fields _time, agent_hostname, actor_effective_username,\
+    \ action_process_image_name, actor_process_image_name, action_process_image_command_line\n"
+  lucene: |
+    event.action:"malware_detected" OR event.action:"threat_detected" OR event.type:"malware" OR signature:"malware" OR threat.name:* OR malware.name:* OR av_action:("detected" OR "quarantined" OR "blocked")
+  sumo: |
+    _sourceCategory=*Antivirus* OR _sourceCategory=*AV* OR _sourceCategory=*endpoint*
+    | where _raw matches "*malware*" OR _raw matches "*threat*" OR _raw matches "*virus*" OR _raw matches "*detected*"
+    | json field=_raw "process_name" as process_name nodrop
+    | json field=_raw "parent_process_name" as parent_process_name nodrop
+    | json field=_raw "command_line" as command_line nodrop
+    | json field=_raw "host" as host nodrop
+    | json field=_raw "Computer" as Computer nodrop
+    | json field=_raw "user" as user nodrop
+    | json field=_raw "TargetUserName" as TargetUserName nodrop
+    | json field=_raw "threat_name" as threat_name nodrop
+    | json field=_raw "file_path" as file_path nodrop
+    | json field=_raw "detection_type" as detection_type nodrop
+    | if(isNull(host), Computer, host) as host
+    | if(isNull(user), TargetUserName, user) as user
+    | where !(process_name matches "*defender*" OR process_name matches "*mcafee*" OR process_name matches "*symantec*" OR process_name matches "*norton*" OR parent_process_name matches "*sccm*" OR parent_process_name matches "*tanium*")
+    | dedup process_name, parent_process_name, command_line, host, user
+    | fields _messageTime, host, user, process_name, parent_process_name, command_line, threat_name, file_path, detection_type
 false_positives:
 - Security software
 - Authorized admin tools
@@ -96,7 +101,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'

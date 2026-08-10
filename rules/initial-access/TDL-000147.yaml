@@ -19,77 +19,84 @@ queries:
     \ 172.16.0.0/12, 192.168.0.0/16) \n| search dest_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)\n| lookup threat_intel_ip ip as src_ip\
     \ OUTPUT threat_category\n| where isnotnull(threat_category)\n| table _time, src_ip, dest_ip, alert.signature, alert.category, alert.severity,\
     \ threat_category\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    ThreatIntelligenceIndicator
+    | where TimeGenerated > ago(14d)
+    | where isnotempty(NetworkIP) or isnotempty(NetworkSourceIP)
+    | extend TI_IP = coalesce(NetworkIP, NetworkSourceIP)
+    | where isnotempty(TI_IP)
+    | join kind=inner (
+        CommonSecurityLog
+        | where TimeGenerated > ago(1h)
+        | where DeviceVendor has_any ("Palo Alto", "Cisco", "Fortinet", "Check Point", "Snort", "Suricata") or DeviceProduct has_any ("IDS", "IPS", "Firewall", "NGFW")
+        | where Activity has_any ("Intrusion", "Exploit", "Attack") or DeviceEventClassID has_any ("exploit", "vulnerability")
+        | where DeviceAction in~ ("allow", "alert", "allowed")
+        | extend SourceIsExternal = not(ipv4_is_private(SourceIP))
+        | extend DestinationIsInternal = ipv4_is_private(DestinationIP)
+        | where SourceIsExternal and DestinationIsInternal
+        | extend SourceIP = tostring(SourceIP)
+    ) on $left.TI_IP == $right.SourceIP
+    | project TimeGenerated, SourceIP, DestinationIP, DeviceVendor, DeviceProduct, Activity, DeviceAction, DeviceEventClassID, Message, ThreatType, IndicatorThreatType = ThreatType, Confidence
+  aql: |
+    SELECT sourceip, destinationip, destinationport, qidname(qid), CATEGORYNAME(category), eventtime, username
+    FROM events
+    WHERE INOFFENSE('*') = 'false'
+      AND category IN (SELECT categoryid FROM categories WHERE name ILIKE '%exploit%' OR name ILIKE '%ids%' OR name ILIKE '%ips%' OR name ILIKE '%intrusion%')
+      AND sourceip NOT IN (SELECT "sourceip" FROM events WHERE sourceip >= INET_ATON('10.0.0.0') AND sourceip <= INET_ATON('10.255.255.255'))
+      AND sourceip NOT IN (SELECT "sourceip" FROM events WHERE sourceip >= INET_ATON('172.16.0.0') AND sourceip <= INET_ATON('172.31.255.255'))
+      AND sourceip NOT IN (SELECT "sourceip" FROM events WHERE sourceip >= INET_ATON('192.168.0.0') AND sourceip <= INET_ATON('192.168.255.255'))
+      AND (destinationip >= INET_ATON('10.0.0.0') AND destinationip <= INET_ATON('10.255.255.255')
+           OR destinationip >= INET_ATON('172.16.0.0') AND destinationip <= INET_ATON('172.31.255.255')
+           OR destinationip >= INET_ATON('192.168.0.0') AND destinationip <= INET_ATON('192.168.255.255'))
+      AND sourceip IN (SELECT sourceip FROM events WHERE category IN (SELECT categoryid FROM categories WHERE name ILIKE '%threat%'))
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000147 {\n  meta:\n    author = \"TDL\"\n    description = \"Allowed Exploit from Threat Host\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1203\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  yara_l: "rule t1203_exploitation_for_client_execution {\n  meta:\n    author = \"TDL\"\n    description = \"Detects exploitation attempts from\
+    \ threat intel IPs via IDS/IPS\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1203\"\n    severity = \"\
+    HIGH\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.metadata.product_event_type = \"exploit\" or \n    $e.metadata.product_event_type\
+    \ = \"attack\" or\n    re.regex($e.security_result.summary, `(?i)(exploit|attack|intrusion)`)\n    $e.network.direction = \"INBOUND\"\n  \
+    \  ($e.security_result.action = \"ALLOW\" or $e.security_result.action = \"ALERT\")\n    $e.principal.ip = $source_ip\n    $e.target.ip =\
+    \ $dest_ip\n    net.ip_in_range_cidr($source_ip, \"0.0.0.0/0\")\n    not net.ip_in_range_cidr($source_ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($source_ip,\
+    \ \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($source_ip, \"192.168.0.0/16\")\n    (net.ip_in_range_cidr($dest_ip, \"10.0.0.0/8\") or\n\
+    \     net.ip_in_range_cidr($dest_ip, \"172.16.0.0/12\") or\n     net.ip_in_range_cidr($dest_ip, \"192.168.0.0/16\"))\n    $e.security_result.threat_name\
+    \ != \"\"\n    \n  match:\n    $source_ip, $dest_ip over 5m\n    \n  outcome:\n    $risk_score = 85\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-network.ids-*,logs-zeek.notice-*,packetbeat-*,logs-suricata.eve-*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.category == "intrusion_detection"
+      AND event.kind == "alert"
+      AND (event.action IN ("allow", "alert", "allowed"))
+      AND network.direction == "inbound"
+      AND source.ip IS NOT NULL
+      AND destination.ip IS NOT NULL
+    | ENRICH threat_intel_indicator ON source.ip
+    | WHERE threat.indicator.ip IS NOT NULL
+    | STATS alert_count = COUNT(*) BY source.ip, destination.ip, host.name, event.action, rule.name, threat.indicator.type
+    | KEEP @timestamp, source.ip, destination.ip, host.name, event.action, rule.name, threat.indicator.type, alert_count
+  leql: |
+    where(log_source_type=IDS AND direction=INBOUND AND (action=allow OR action=alert) AND source_address.in_threat_list=true AND source_address.is_external=true AND destination_address.is_internal=true)
+  crowdstrike: |
+    #type=ids_ips action IN [allow, alert] direction=inbound ThreatIntelMatch=true
+    | table([@timestamp, src_ip, dest_ip, signature, action, threat_intel_category, ComputerName])
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter threat_category = "vulnerability" and direction = "Inbound" and (action = "allow" or action = "alert") and source_ip_is_on_threat_intel = true
+    | fields _time, source_ip, destination_ip, source_port, destination_port, threat_name, threat_id, action, application, agent_hostname
+  lucene: |
+    event_type:"IDS" AND direction:"inbound" AND (action:"allow" OR action:"alert") AND source_ip_threat_intel:true AND NOT source_ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)
+  sumo: |
+    _sourceCategory=*IDS* OR _sourceCategory=*IPS* OR _sourceCategory=*network*
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "action" as action
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "alert.category" as category
+    | json field=_raw "alert.signature" as signature
+    | where (event_type matches "*exploit*" OR category matches "*exploit*" OR signature matches "*exploit*")
+    | where action in ("allow", "alert")
+    | where !isPrivateIP(src_ip) AND isPrivateIP(dest_ip)
+    | lookup type, actor, raw, threatlevel as malicious_confidence from sumo://threat/cs on threat=src_ip
+    | where !isNull(malicious_confidence)
+    | fields _messageTime, src_ip, dest_ip, action, event_type, signature, category, type, actor, malicious_confidence
 false_positives:
 - Authorized pen testing
 - Security research
@@ -99,7 +106,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 IDS/IPS Exploit Event
 

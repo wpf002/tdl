@@ -18,74 +18,73 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=sharepoint OR index=o365 OR index=cloud sourcetype IN (mscs:sharepoint, o365:management:activity, netskope:events, box:events, dropbox:events) Operation=FileDownload
+  spl: 'index=sharepoint OR index=o365 OR index=cloud sourcetype IN (mscs:sharepoint, o365:management:activity, netskope:events, box:events, dropbox:events)
+    Operation=FileDownload
+
     | search NOT [| inputlookup authorized_countries.csv | fields Country | rename Country as src_country]
+
     | eval src_country=coalesce(ClientIP_Country, src_country, SourceCountry, client_location_country)
+
     | where isnotnull(src_country)
+
     | table _time, user, src_country, Operation, ObjectId, SourceFileName, Workload, ClientIP
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "FileDownload"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%FileDownload%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000066 {\n  meta:\n    author = \"TDL\"\n    description = \"File Download From Unauthorized Country\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0009\"\n    technique = \"T1213\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /FileDownload/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%FileDownload%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/FileDownload/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*FileDownload*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "FileDownload"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*FileDownload*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*FileDownload*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    OfficeActivity
+    | where TimeGenerated > ago(24h)
+    | where RecordType == "SharePointFileOperation"
+    | where Operation == "FileDownloaded"
+    | where OfficeWorkload == "SharePoint"
+    | extend SourceCountry = tostring(parse_json(ExtendedProperties).ClientCountry)
+    | where isnotempty(SourceCountry)
+    | where SourceCountry !in ("US", "CA", "GB", "AU", "NZ")
+    | project TimeGenerated, UserId, SourceIP, SourceCountry, OfficeObjectId, Site_Url, SourceFileName, Operation, UserAgent
+  aql: |
+    SELECT sourceip, username, "Operation", "SourceCountry", "FileName", "SiteUrl", COUNT(*) AS download_count
+    FROM events
+    WHERE "Operation" = 'FileDownload'
+      AND "SourceCountry" NOT IN ('US', 'CA', 'GB', 'DE', 'FR', 'AU', 'NZ', 'JP', 'SG')
+      AND (LOGSOURCETYPENAME(devicetype) ILIKE '%sharepoint%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%office 365%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%microsoft 365%')
+    GROUP BY sourceip, username, "Operation", "SourceCountry", "FileName", "SiteUrl"
+    LAST 24 HOURS
+  yara_l: "rule sharepoint_file_download_unauthorized_country {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects SharePoint\
+    \ file downloads from unauthorized countries - MITRE T1213 Collection\"\n    mitre_attack_technique = \"T1213\"\n    mitre_attack_tactic =\
+    \ \"Collection\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.product_name = \"Microsoft 365\"\n    $e.metadata.product_event_type\
+    \ = \"FileDownloaded\"\n    $e.target.resource.attribute.labels[\"operation\"] = \"FileDownload\"\n    $e.principal.location.country_or_region\
+    \ = $country\n    $e.principal.user.userid = $user\n    $e.target.resource.name = $resource\n    \n    // Exclude authorized countries\n \
+    \   not $country in [\"US\", \"GB\", \"CA\", \"AU\", \"DE\", \"FR\", \"NL\", \"SE\", \"NO\", \"DK\", \"FI\", \"IE\", \"NZ\", \"SG\", \"JP\"\
+    ]\n    \n  match:\n    $user over 5m\n    \n  condition:\n    $e\n    \n  outcome:\n    $risk_score = 65\n    $country_accessed = $country\n\
+    \    $user_id = $user\n    $downloaded_resource = $resource\n}\n"
+  esql: "FROM logs-o365.audit*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.action == \"FileDownloaded\" \n  AND o365.audit.Workload ==\
+    \ \"SharePoint\"\n  AND source.geo.country_name NOT IN (\"United States\", \"Canada\", \"United Kingdom\", \"Germany\", \"France\", \"Australia\"\
+    , \"Japan\", \"Singapore\", \"India\", \"Brazil\")\n| STATS downloads = COUNT(*) BY user.name, source.geo.country_name, source.ip, o365.audit.ObjectId\n\
+    | KEEP @timestamp, user.name, source.geo.country_name, source.ip, o365.audit.ObjectId, downloads\n"
+  leql: |
+    where(source_json.Operation="FileDownload" AND source_json.SourceCountry NOT IN ["US", "CA", "GB", "AU", "DE", "FR", "IT", "ES", "NL", "SE", "NO", "DK", "FI", "IE", "BE", "AT", "CH", "NZ", "JP", "SG"])
+  crowdstrike: |
+    #type=sharepoint Operation=FileDownloaded
+    | SourceCountry!=US AND SourceCountry!=CA AND SourceCountry!=GB AND SourceCountry!=DE AND SourceCountry!=FR AND SourceCountry!=AU AND SourceCountry!=NZ AND SourceCountry!=JP AND SourceCountry!=SG
+    | table([@timestamp, ComputerName, UserId, SourceCountry, ObjectId, ClientIP, UserAgent])
+  xql: |
+    dataset = msft_365_audit_log_raw
+    | filter Operation = "FileDownloaded" and Workload = "SharePoint"
+    | filter SourceCountry not in ("US", "CA", "GB", "AU", "NZ", "DE", "FR", "IT", "ES", "NL", "SE", "NO", "DK", "FI", "IE", "BE", "CH", "AT", "JP", "SG")
+    | fields _time, UserId, Operation, SourceCountry, SourceIP, ObjectId, SiteUrl, ClientIP
+  lucene: |
+    data_source:Sharepoint AND Operation:FileDownload AND NOT source_country:(US OR CA OR GB OR DE OR FR OR AU OR NZ OR JP OR SG OR IE OR NL OR SE OR NO OR DK OR FI OR CH OR AT OR BE OR IT OR ES OR PT OR IL)
+  sumo: |
+    _sourceCategory=*Sharepoint* OR _sourceCategory=*Microsoft365* OR _sourceCategory=*M365* OR _sourceCategory=*Office365*
+    | json field=_raw "Operation" as operation
+    | json field=_raw "ClientIP" as client_ip
+    | json field=_raw "UserId" as user_id
+    | json field=_raw "SourceFileExtension" as file_extension
+    | json field=_raw "ObjectId" as object_id
+    | json field=_raw "SourceFileName" as file_name
+    | where operation = "FileDownloaded"
+    | lookup latitude, longitude, country_code, country_name from geo://location on ip=client_ip
+    | where !(country_code in ("US", "GB", "CA", "AU", "DE", "FR", "NL", "SE", "NO", "DK", "FI", "IE", "NZ", "SG", "JP"))
+    | fields _messageTime, user_id, operation, client_ip, country_name, country_code, file_name, object_id
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -95,7 +94,7 @@ tags:
 - collection
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Sharepoint Event
 

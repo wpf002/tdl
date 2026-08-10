@@ -20,68 +20,71 @@ queries:
     Impact:Kubernetes/SuccessfulAnonymousAccess\" OR detail.type=\"Persistence:Kubernetes/SuccessfulAnonymousAccess\" OR detail.type=\"Policy:Kubernetes/AnonymousAccessGranted\"\
     )\n| table _time, detail.type, detail.severity, detail.accountId, detail.region, detail.resource.kubernetesDetails.kubernetesUserDetails.username,\
     \ detail.resource.kubernetesDetails.kubernetesWorkloadDetails.name, detail.service.action.kubernetesApiCallAction.requestUri\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where Type in ("CredentialAccess:Kubernetes/SuccessfulAnonymousAccess", "DefenseEvasion:Kubernetes/SuccessfulAnonymousAccess", "Discovery:Kubernetes/SuccessfulAnonymousAccess", "Impact:Kubernetes/SuccessfulAnonymousAccess", "Persistence:Kubernetes/SuccessfulAnonymousAccess", "Policy:Kubernetes/AnonymousAccessGranted")
+    | project TimeGenerated, Type, Title, Description, Severity, AccountId, Region, ResourceType, ServiceName, AdditionalData
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS source, "Event Type", "AWS Account ID", "Resource Type", "Resource Name", sourceip, COUNT(*) AS event_count
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%guardduty%'
+      AND "Event Type" IN ('CredentialAccess:Kubernetes/SuccessfulAnonymousAccess', 'DefenseEvasion:Kubernetes/SuccessfulAnonymousAccess', 'Discovery:Kubernetes/SuccessfulAnonymousAccess', 'Impact:Kubernetes/SuccessfulAnonymousAccess', 'Persistence:Kubernetes/SuccessfulAnonymousAccess', 'Policy:Kubernetes/AnonymousAccessGranted')
+    GROUP BY eventtime, LOGSOURCENAME(logsourceid), "Event Type", "AWS Account ID", "Resource Type", "Resource Name", sourceip
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_k8s_anonymous_access {
+      meta:
+        author = "TDL"
+        description = "Detects AWS GuardDuty alerts for anonymous access to Kubernetes clusters"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.product_name = "AWS GuardDuty"
+        $e.metadata.vendor_name = "Amazon"
+        (
+          $e.metadata.product_event_type = "CredentialAccess:Kubernetes/SuccessfulAnonymousAccess" or
+          $e.metadata.product_event_type = "DefenseEvasion:Kubernetes/SuccessfulAnonymousAccess" or
+          $e.metadata.product_event_type = "Discovery:Kubernetes/SuccessfulAnonymousAccess" or
+          $e.metadata.product_event_type = "Impact:Kubernetes/SuccessfulAnonymousAccess" or
+          $e.metadata.product_event_type = "Persistence:Kubernetes/SuccessfulAnonymousAccess" or
+          $e.metadata.product_event_type = "Policy:Kubernetes/AnonymousAccessGranted"
+        )
+        $e.target.resource.name = $cluster
+        $e.principal.ip = $source_ip
 
-    | where eventName matches regex "GuardDuty"
+      match:
+        $cluster, $source_ip over 1h
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+      outcome:
+        $risk_score = max(75)
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000346 {\n  meta:\n    author = \"TDL\"\n    description = \"Anonymous Kubernetes Access Detected - GuardDuty\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-aws.guardduty*\n| WHERE event.dataset == \"aws.guardduty\" \n  AND aws.guardduty.finding.type IN (\n    \"CredentialAccess:Kubernetes/SuccessfulAnonymousAccess\"\
+    ,\n    \"DefenseEvasion:Kubernetes/SuccessfulAnonymousAccess\",\n    \"Discovery:Kubernetes/SuccessfulAnonymousAccess\",\n    \"Impact:Kubernetes/SuccessfulAnonymousAccess\"\
+    ,\n    \"Persistence:Kubernetes/SuccessfulAnonymousAccess\",\n    \"Policy:Kubernetes/AnonymousAccessGranted\"\n  )\n| KEEP @timestamp, cloud.account.id,\
+    \ cloud.region, aws.guardduty.finding.type, aws.guardduty.finding.severity, aws.guardduty.finding.id, event.action, source.ip\n"
+  leql: |
+    where(source_json.type IN ["CredentialAccess:Kubernetes/SuccessfulAnonymousAccess", "DefenseEvasion:Kubernetes/SuccessfulAnonymousAccess", "Discovery:Kubernetes/SuccessfulAnonymousAccess", "Impact:Kubernetes/SuccessfulAnonymousAccess", "Persistence:Kubernetes/SuccessfulAnonymousAccess", "Policy:Kubernetes/AnonymousAccessGranted"])
+  crowdstrike: "#repo=guardduty \n| detail.type IN [\"CredentialAccess:Kubernetes/SuccessfulAnonymousAccess\", \"DefenseEvasion:Kubernetes/SuccessfulAnonymousAccess\"\
+    , \"Discovery:Kubernetes/SuccessfulAnonymousAccess\", \"Impact:Kubernetes/SuccessfulAnonymousAccess\", \"Persistence:Kubernetes/SuccessfulAnonymousAccess\"\
+    , \"Policy:Kubernetes/AnonymousAccessGranted\"]\n| table([@timestamp, detail.type, detail.resource.kubernetesDetails.kubernetesUserDetails.username,\
+    \ detail.resource.kubernetesDetails.kubernetesWorkloadDetails.name, detail.accountId, detail.region])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and event_type = "GuardDuty"
+    | filter action_finding_type in ("CredentialAccess:Kubernetes/SuccessfulAnonymousAccess", "DefenseEvasion:Kubernetes/SuccessfulAnonymousAccess", "Discovery:Kubernetes/SuccessfulAnonymousAccess", "Impact:Kubernetes/SuccessfulAnonymousAccess", "Persistence:Kubernetes/SuccessfulAnonymousAccess", "Policy:Kubernetes/AnonymousAccessGranted")
+    | fields _time, action_finding_type, action_resource_cluster_name, action_kubernetes_service_action_type, action_kubernetes_user_details_username, cloud_provider_account_id
+  lucene: |
+    event.dataset:aws.guardduty AND guardduty.finding.type:("CredentialAccess:Kubernetes/SuccessfulAnonymousAccess" OR "DefenseEvasion:Kubernetes/SuccessfulAnonymousAccess" OR "Discovery:Kubernetes/SuccessfulAnonymousAccess" OR "Impact:Kubernetes/SuccessfulAnonymousAccess" OR "Persistence:Kubernetes/SuccessfulAnonymousAccess" OR "Policy:Kubernetes/AnonymousAccessGranted")
+  sumo: |
+    _sourceCategory=*GuardDuty*
+    | json field=_raw "detail.type" as event_type
+    | where event_type in ("CredentialAccess:Kubernetes/SuccessfulAnonymousAccess", "DefenseEvasion:Kubernetes/SuccessfulAnonymousAccess", "Discovery:Kubernetes/SuccessfulAnonymousAccess", "Impact:Kubernetes/SuccessfulAnonymousAccess", "Persistence:Kubernetes/SuccessfulAnonymousAccess", "Policy:Kubernetes/AnonymousAccessGranted")
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +94,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"CredentialAccess:Kubernetes/SuccessfulAnonymousAccess\", \"DefenseEvasion:Kubernetes/SuccessfulAnonymousAccess\"\
   , \"Discovery:Kubernetes/SuccessfulAnonymousAccess\", \"Impact:Kubernetes/SuccessfulAnonymousAccess\", \"Persistence:Kubernetes/SuccessfulAnonymousAccess\"\

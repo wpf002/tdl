@@ -17,85 +17,103 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=dns (record_type="TXT" OR query_type="TXT")
+  spl: 'index=dns (record_type="TXT" OR query_type="TXT")
+
     | bin _time span=5m
+
     | rex field=query "(?<zone>[^\.]+\.[^\.]+)$"
+
     | eval label_length=len(mvindex(split(query, "."), 0))
+
     | stats count avg(label_length) as avg_label_len dc(query) as unique_queries values(query) as queries by _time, src_ip, zone
+
     | where count >= 50 AND avg_label_len > 30
+
     | table _time, src_ip, zone, count, avg_label_len, unique_queries, queries
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "dns"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: |
+    DnsEvents
+    | where TimeGenerated > ago(5m)
+    | where QueryType == "TXT"
+    | extend QueryLabels = split(Name, ".")
+    | extend LabelCount = array_length(QueryLabels)
+    | extend TotalLabelLength = strlen(Name) - (LabelCount - 1)
+    | extend AvgLabelLength = TotalLabelLength / LabelCount
+    | extend Zone = strcat(QueryLabels[LabelCount - 2], ".", QueryLabels[LabelCount - 1])
+    | where AvgLabelLength > 30
+    | summarize QueryCount = count(), AvgLabelLen = avg(AvgLabelLength) by ClientIP, Zone
+    | where QueryCount >= 50
+    | project ClientIP, Zone, QueryCount, AvgLabelLen
+  aql: "SELECT sourceip, \n       \"Query\" AS dns_query, \n       \"Query Type\" AS query_type,\n       COUNT(*) AS txt_query_count,\n      \
+    \ AVG(LEN(\"Query\")) AS avg_query_length\nFROM events\nWHERE \"Query Type\" = 'TXT'\n  AND \"Query\" IS NOT NULL\nGROUP BY sourceip, \"Query\"\
+    \nHAVING txt_query_count >= 50 AND avg_query_length > 30\nLAST 5 MINUTES\n"
+  yara_l: |
+    rule dns_tunneling_txt_query_volume {
+      meta:
+        author = "TDL"
+        description = "Detects potential DNS tunneling via high volume of TXT queries with long labels to a single zone"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1572"
+        severity = "HIGH"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "NETWORK_DNS"
+        $e.network.dns.questions.type = 16
+        $e.principal.ip = $client_ip
+        re.regex($e.network.dns.questions.name, `^([^.]+)\.(.+)$`) as $match
+        strings.concat(arrays.join($match.1, ""), arrays.join($match.2, "")) = $full_query
+        strings.to_lower(arrays.join($match.2, "")) = $zone
+        strings.length(arrays.join($match.1, "")) > 30
 
-    WHERE "network.protocol" LIKE ''%dns%''
+      match:
+        $client_ip, $zone over 5m
 
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000806 {\n  meta:\n    author = \"TDL\"\n    description = \"DNS Tunnel Indicator (High TXT Record Volume)\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0011\"\n    technique = \"T1572\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /dns/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%dns%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/dns/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*dns*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "dns"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*dns*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*dns*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 50
+    }
+  esql: |
+    FROM logs-network.dns*
+    | WHERE @timestamp > NOW() - 5 minute AND dns.question.type == "TXT"
+    | EVAL zone = SUBSTRING(dns.question.name, LOCATE(dns.question.name, ".", LOCATE(dns.question.name, ".") + 1))
+    | EVAL label = SUBSTRING(dns.question.name, 0, LOCATE(dns.question.name, "."))
+    | EVAL label_length = LENGTH(label)
+    | STATS query_count = COUNT(*), avg_label_length = AVG(label_length) BY source.ip, zone
+    | WHERE query_count >= 50 AND avg_label_length > 30
+    | KEEP source.ip, zone, query_count, avg_label_length
+  leql: |
+    where(query_type="TXT") groupby(source_address, query) calculate(count)
+  crowdstrike: |
+    #type=dns query_type=TXT
+    | bucket(span=5m, function=[count(as=txt_count), avg(length(query_name), as=avg_len), collectSet(query_name, limit=5, as=sample_queries)])
+    | txt_count >= 50 AND avg_len > 30
+    | table([@timestamp, client_ip, zone, txt_count, avg_len, sample_queries])
+  xql: |
+    dataset = dns_logs
+    | filter dns_query_type = "TXT"
+    | alter zone = arrayindex(regextract(dns_query_name, "([^\.]+\.[^\.]+)$"), 0)
+    | alter label = arrayindex(regextract(dns_query_name, "^([^\.]+)"), 0)
+    | alter label_length = len(label)
+    | bin _time span=5m
+    | comp count() as query_count, avg(label_length) as avg_label_len by _time, source_ip, zone
+    | filter query_count >= 50 and avg_label_len > 30
+    | fields _time, source_ip, zone, query_count, avg_label_len
+  lucene: |
+    dns.question.type:TXT AND _exists_:dns.question.name AND _exists_:client.ip
+  sumo: |
+    _sourceCategory=*DNS* OR _sourceCategory=*Firewall* "TXT"
+    | parse regex "(?<query_name>[^\s]+)\s+(?:IN\s+)?TXT" nodrop
+    | parse regex "query=(?<query_name>[^\s]+)" nodrop
+    | parse regex "\"(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\"" nodrop
+    | parse regex "client=(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | where !isNull(query_name) and !isNull(src_ip)
+    | parse regex field=query_name "(?<labels>.+)\.(?<zone>[^\.]+\.[^\.]+)$"
+    | where !isNull(zone)
+    | timeslice 5m
+    | length(labels) as label_length
+    | count as txt_count, avg(label_length) as avg_label_len by _timeslice, src_ip, zone
+    | where txt_count >= 50 and avg_label_len > 30
+    | fields _timeslice, src_ip, zone, txt_count, avg_label_len
 pseudo_logic: Single client emits ≥50 DNS TXT queries to one zone in 5m, with average label length > 30. DNS tunneling.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -113,7 +131,7 @@ references:
 - https://attack.mitre.org/techniques/T1572/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

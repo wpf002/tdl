@@ -22,71 +22,77 @@ queries:
     *\\\\EXCEL.EXE\" OR Image=\"*\\\\POWERPNT.EXE\" OR Image=\"*\\\\OUTLOOK.EXE\")\n(ImageLoaded=\"*.dotm\" OR ImageLoaded=\"*.xlam\" OR ImageLoaded=\"\
     *.ppam\" OR ImageLoaded=\"*.wll\" OR ImageLoaded=\"*.xll\")\n(ImageLoaded=\"*\\\\AppData\\\\Roaming\\\\*\" OR ImageLoaded=\"*\\\\AppData\\\
     \\Local\\\\Temp\\\\*\")\n| table _time, ComputerName, User, Image, ImageLoaded\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000711 {\n  meta:\n    author = \"TDL\"\n    description = \"Office Application Loading Template or Add-in from User\
-    \ Path\"\n    severity = \"HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1137\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
-    \n    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceFileEvents
+    | where TimeGenerated > ago(24h)
+    | where FolderPath has_any ("%APPDATA%", "%TEMP%", "\\AppData\\Roaming\\", "\\AppData\\Local\\Temp\\")
+    | where FileName endswith ".dotm" or FileName endswith ".xlam" or FileName endswith ".ppam" or FileName endswith ".wll" or FileName endswith ".xll"
+    | join kind=inner (
+        DeviceImageLoadEvents
+        | where TimeGenerated > ago(24h)
+        | where InitiatingProcessFileName in~ ("winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe")
+        | extend LoadedFilePathLower = tolower(FolderPath)
+    ) on DeviceId, FileName
+    | where LoadedFilePathLower has_any ("\\appdata\\roaming\\", "\\appdata\\local\\temp\\")
+    | project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, FileName, FolderPath, InitiatingProcessCommandLine
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Image" AS process, "ImageLoaded" AS loaded_module, "Process CommandLine"
+    FROM events
+    WHERE ("EventID" = '7' OR "EventID" = '3')
+      AND ("Image" ILIKE '%winword.exe%' OR "Image" ILIKE '%excel.exe%' OR "Image" ILIKE '%powerpnt.exe%' OR "Image" ILIKE '%outlook.exe%')
+      AND ("ImageLoaded" ILIKE '%appdata%' OR "ImageLoaded" ILIKE '%temp%')
+      AND ("ImageLoaded" ILIKE '%.dotm' OR "ImageLoaded" ILIKE '%.xlam' OR "ImageLoaded" ILIKE '%.ppam' OR "ImageLoaded" ILIKE '%.wll' OR "ImageLoaded" ILIKE '%.xll')
+    LAST 24 HOURS
+  yara_l: "rule office_template_load_suspicious_path {\n  meta:\n    author = \"TDL\"\n    description = \"Detects Office applications loading\
+    \ template/add-in files from suspicious locations like APPDATA or TEMP\"\n    mitre_attack_tactic = \"Persistence\"\n    mitre_attack_technique\
+    \ = \"T1137\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"FILE_OPEN\" or $e.metadata.event_type = \"PROCESS_OPEN\"\
+    \n    re.regex($e.principal.process.file.full_path, `(?i)(winword|excel|powerpnt|outlook|msaccess)\\.exe$`)\n    re.regex($e.target.file.full_path,\
+    \ `(?i)\\.(dotm|xlam|ppam|wll|xll)$`)\n    (re.regex($e.target.file.full_path, `(?i)\\\\appdata\\\\`) or \n     re.regex($e.target.file.full_path,\
+    \ `(?i)\\\\temp\\\\`) or\n     re.regex($e.target.file.full_path, `(?i)\\\\tmp\\\\`))\n    $e.principal.hostname = $host\n    \n  match:\n\
+    \    $host over 5m\n    \n  outcome:\n    $risk_score = 65\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.library*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (winlog.event_id == 7 OR event.category == "library")
+      AND (
+        process.name IN ("winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "msaccess.exe", "WINWORD.EXE", "EXCEL.EXE", "POWERPNT.EXE", "OUTLOOK.EXE", "MSACCESS.EXE")
+      )
+      AND (
+        (dll.path LIKE "*\\AppData\\Roaming\\*" OR dll.path LIKE "*\\AppData\\Local\\Temp\\*" OR file.path LIKE "*\\AppData\\Roaming\\*" OR file.path LIKE "*\\AppData\\Local\\Temp\\*" OR winlog.event_data.ImageLoaded LIKE "*\\AppData\\Roaming\\*" OR winlog.event_data.ImageLoaded LIKE "*\\AppData\\Local\\Temp\\*")
+        AND (
+          TO_LOWER(COALESCE(dll.path, file.path, winlog.event_data.ImageLoaded)) LIKE "*.dotm" OR
+          TO_LOWER(COALESCE(dll.path, file.path, winlog.event_data.ImageLoaded)) LIKE "*.xlam" OR
+          TO_LOWER(COALESCE(dll.path, file.path, winlog.event_data.ImageLoaded)) LIKE "*.ppam" OR
+          TO_LOWER(COALESCE(dll.path, file.path, winlog.event_data.ImageLoaded)) LIKE "*.wll" OR
+          TO_LOWER(COALESCE(dll.path, file.path, winlog.event_data.ImageLoaded)) LIKE "*.xll"
+        )
+      )
+    | EVAL loaded_file = COALESCE(dll.path, file.path, winlog.event_data.ImageLoaded)
+    | KEEP @timestamp, host.name, user.name, process.name, loaded_file
+  leql: |
+    where((source_json.EventID=7 OR source_json.EventID=11) AND (process_name ICONTAINS "winword.exe" OR process_name ICONTAINS "excel.exe" OR process_name ICONTAINS "powerpnt.exe" OR process_name ICONTAINS "outlook.exe") AND (source_json.ImageLoaded ICONTAINS ".dotm" OR source_json.ImageLoaded ICONTAINS ".xlam" OR source_json.ImageLoaded ICONTAINS ".ppam" OR source_json.ImageLoaded ICONTAINS ".wll" OR source_json.ImageLoaded ICONTAINS ".xll" OR source_json.TargetFilename ICONTAINS ".dotm" OR source_json.TargetFilename ICONTAINS ".xlam" OR source_json.TargetFilename ICONTAINS ".ppam" OR source_json.TargetFilename ICONTAINS ".wll" OR source_json.TargetFilename ICONTAINS ".xll") AND (source_json.ImageLoaded ICONTAINS "\\AppData\\" OR source_json.ImageLoaded ICONTAINS "\\Temp\\" OR source_json.TargetFilename ICONTAINS "\\AppData\\" OR source_json.TargetFilename ICONTAINS "\\Temp\\"))
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 (ParentBaseFileName=*word* OR ParentBaseFileName=*excel* OR ParentBaseFileName=*powerpnt* OR ParentBaseFileName=*outlook*) (CommandLine=*APPDATA* OR CommandLine=*Temp* OR CommandLine=*TEMP*) (CommandLine=*.dotm* OR CommandLine=*.xlam* OR CommandLine=*.ppam* OR CommandLine=*.wll* OR CommandLine=*.xll*)
+    | table([@timestamp, ComputerName, UserName, ParentBaseFileName, FileName, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_LOAD_IMAGE
+    | filter actor_process_image_name ~= "(?i)(winword|excel|powerpnt|outlook)\.exe"
+    | filter action_module_path ~= "(?i)\.(dotm|xlam|ppam|wll|xll)$"
+    | filter action_module_path ~= "(?i)(\\appdata\\|\\temp\\)"
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_module_path, action_process_image_command_line
+  lucene: |
+    (process.name:(WINWORD.EXE OR EXCEL.EXE OR POWERPNT.EXE OR OUTLOOK.EXE) AND (file.path:(*\\AppData\\Roaming\\* OR *\\AppData\\Local\\Temp\\*) AND file.extension:(dotm OR xlam OR ppam OR wll OR xll))) OR (event.action:"load" AND process.executable:(*\\WINWORD.EXE OR *\\EXCEL.EXE OR *\\POWERPNT.EXE OR *\\OUTLOOK.EXE) AND file.path:((*\\AppData\\Roaming\\*.dotm OR *\\AppData\\Roaming\\*.xlam OR *\\AppData\\Roaming\\*.ppam OR *\\AppData\\Roaming\\*.wll OR *\\AppData\\Roaming\\*.xll) OR (*\\AppData\\Local\\Temp\\*.dotm OR *\\AppData\\Local\\Temp\\*.xlam OR *\\AppData\\Local\\Temp\\*.ppam OR *\\AppData\\Local\\Temp\\*.wll OR *\\AppData\\Local\\Temp\\*.xll)))
+  sumo: |
+    _sourceCategory=*Sysmon* "7"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Image" as image
+    | json field=_raw "ImageLoaded" as image_loaded
+    | where event_id = "7"
+    | where (image matches "*\\WINWORD.EXE" or image matches "*\\EXCEL.EXE" or image matches "*\\POWERPNT.EXE" or image matches "*\\OUTLOOK.EXE")
+    | where (image_loaded matches "*\\AppData\\Roaming\\*" or image_loaded matches "*\\AppData\\Local\\Temp\\*")
+    | where (image_loaded matches "*.dotm" or image_loaded matches "*.xlam" or image_loaded matches "*.ppam" or image_loaded matches "*.wll" or image_loaded matches "*.xll")
+    | fields _messageTime, _sourceHost, image, image_loaded
 pseudo_logic: Office app loads a .dotm/.xlam/.ppam/.wll/.xll from %APPDATA% or %TEMP%. Common Office persistence (Outlook Home Page, template
   injection, COM addins).
 false_positives:
@@ -106,7 +112,7 @@ references:
 - https://attack.mitre.org/techniques/T1137/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'

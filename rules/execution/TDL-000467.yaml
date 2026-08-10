@@ -19,77 +19,90 @@ queries:
     \ | rename src_ip as src]\n| search NOT [| inputlookup security_research_vendor_ips.csv | fields src_ip | rename src_ip as src]\n| lookup\
     \ threat_intel_feed.csv ip as dest_ip OUTPUT threat_flag\n| search threat_flag=1\n| stats count sum(bytes_out) as bytes_out dc(dest_ip) as\
     \ unique_dests by src_ip, dest_ip\n| where count >= 1\n| sort - bytes_out\n| table src_ip dest_ip dest_port bytes_out count unique_dests\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exe_000467 {\n  meta:\n    author = \"TDL\"\n    description = \"Web Request to Threat IP\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
+  kql: |
+    let ThreatIPs = externaldata(ThreatIP: string)[@"https://yourthreattable.blob.core.windows.net/indicators/threatips.csv"] with (format="csv", ignoreFirstRecord=true);
+    let AuthorizedTestIPs = dynamic(["10.0.10.50", "10.0.10.51", "192.168.5.100"]);
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceVendor has_any ("Proxy", "Firewall", "IDS") or DeviceProduct has_any ("Proxy", "Firewall", "IDS")
+    | where Protocol =~ "TCP"
+    | where SourceIP !in (AuthorizedTestIPs)
+    | extend dest_ip = DestinationIP
+    | join kind=inner (ThreatIPs | extend dest_ip = ThreatIP) on dest_ip
+    | summarize count_connections = count(), bytes_out = sum(SentBytes), unique_dests = dcount(DestinationIP) by SourceIP, DestinationIP
+    | where count_connections >= 1
     | sort by bytes_out desc
-
-    '
+    | project SourceIP, DestinationIP, count_connections, bytes_out, unique_dests
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(totalbytes) AS bytes_out, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_dests
+    FROM flows
+    WHERE protocol = 6
+      AND destinationip IN (SELECT ip FROM reference_set WHERE name = 'ThreatIntelIPs')
+      AND sourceip NOT IN (SELECT ip FROM reference_set WHERE name = 'AuthorizedPentestIPs')
+      AND sourceip NOT IN (SELECT ip FROM reference_set WHERE name = 'SecurityResearchVendorIPs')
+    GROUP BY sourceip, destinationip, destinationport
+    HAVING event_count >= 1
+    ORDER BY bytes_out DESC
+    LAST 24 HOURS
+  yara_l: "rule ti_feed_connection_execution {\n  meta:\n    author = \"TDL\"\n    description = \"Detects connections from internal hosts to\
+    \ threat intel listed IPs\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"HIGH\"\n  \
+    \  \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.ip_protocol = \"TCP\"\n    $e.principal.ip = $src_ip\n\
+    \    $e.target.ip = $dest_ip\n    $e.target.port = $dest_port\n    \n    // Match on threat intel enrichment\n    $e.target.asset.ip_threat_feed_name\
+    \ != \"\"\n    \n    // Exclude authorized penetration testing and security research IPs\n    not net.ip_in_range_cidr($e.principal.ip, \"\
+    10.250.0.0/24\")\n    not net.ip_in_range_cidr($e.principal.ip, \"192.168.99.0/24\")\n    \n  match:\n    $src_ip, $dest_ip over 1h\n    \n\
+    \  outcome:\n    $risk_score = 85\n    $principal_ip = array_distinct($e.principal.ip)\n    $target_ip = array_distinct($e.target.ip)\n  \
+    \  $dest_ports = array_distinct($e.target.port)\n    $bytes_sent = sum($e.network.sent_bytes)\n    $connection_count = count_distinct($e.metadata.id)\n\
+    \    $threat_feed_names = array_distinct($e.target.asset.ip_threat_feed_name)\n    \n  condition:\n    #e >= 1\n}\n"
+  esql: "FROM logs-network.firewall*, logs-network.ids*\n| WHERE network.protocol == \"tcp\"\n| EVAL threat_listed = CASE(\n    destination.ip\
+    \ IN (\n      \"192.0.2.100\", \"198.51.100.50\", \"203.0.113.75\"\n    ), 1,\n    0\n  )\n| WHERE threat_listed == 1\n| EVAL is_excluded\
+    \ = CASE(\n    source.ip IN (\n      \"10.0.99.10\", \"10.0.99.11\", \"172.16.200.5\"\n    ), 1,\n    0\n  )\n| WHERE is_excluded == 0\n|\
+    \ STATS \n    count = COUNT(*),\n    bytes_out = SUM(network.bytes),\n    unique_dests = COUNT_DISTINCT(destination.ip)\n    BY source.ip,\
+    \ destination.ip, destination.port\n| WHERE count >= 1\n| SORT bytes_out DESC\n| KEEP source.ip, destination.ip, destination.port, bytes_out,\
+    \ count, unique_dests\n"
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp" AND threat_detected=true AND source_address!=10.0.1.100 AND source_address!=192.168.50.0/24) groupby(source_address, destination_address) calculate(sum:bytes_out)
+  crowdstrike: |
+    #repo=network (#type=firewall OR #type=ids) network.protocol=*tcp*
+    | not (src_ip in ["10.0.99.0/24", "192.168.254.0/24"])
+    | in(field=dest_ip, repo=threat_intel)
+    | groupBy([src_ip, dest_ip], function=[count(as=count), sum(bytes_out, as=total_bytes), count(dest_ip, distinct=true, as=unique_dests)])
+    | count >= 1
+    | sort(field=total_bytes, order=desc, limit=10000)
+    | table([src_ip, dest_ip, dest_port, count, total_bytes, unique_dests])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_destination_ip in (
+        dataset = threat_intelligence_feeds
+        | filter indicator_type = "IP"
+        | fields indicator_value
+        | alter dest_ip = indicator_value
+        | comp values(dest_ip) as threat_ips
+        | arrayexpand threat_ips
+        | fields threat_ips
+    )
+    | filter proto = "tcp"
+    | filter action_source_ip not in ("10.0.1.50", "10.0.1.51", "192.168.100.10")
+    | alter src_ip = action_source_ip, dest_ip = action_destination_ip, dest_port = action_destination_port, bytes_out = action_total_upload
+    | comp count() as count, sum(bytes_out) as total_bytes_out, count_distinct(dest_ip) as unique_dests by src_ip, dest_ip
+    | filter count >= 1
+    | sort desc total_bytes_out
+    | fields src_ip, dest_ip, dest_port, total_bytes_out, count, unique_dests
+  lucene: |
+    network.protocol:tcp AND _exists_:dest_ip AND _exists_:src_ip AND NOT (src_ip:(10.200.50.* OR 192.168.99.* OR 172.31.254.*))
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*ids*
+    | where protocol matches "*tcp*" OR _raw matches "*tcp*"
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dst[_=:]?(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dstport[_=:]?(?<dest_port>\d+)" nodrop
+    | parse regex "bytes[_out]*[_=:]?(?<bytes_out>\d+)" nodrop
+    | where !(src_ip matches "10.99.88.*" OR src_ip matches "192.168.250.*")
+    | lookup type, malicious_confidence, last_seen from https://threat-intel-feed on threat_ip = dest_ip
+    | where !isNull(malicious_confidence) OR type matches "*malicious*"
+    | count as event_count, sum(bytes_out) as total_bytes_out, count_distinct(dest_ip) as unique_dests by src_ip, dest_ip, dest_port
+    | where event_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, total_bytes_out, event_count, unique_dests
 false_positives:
 - Authorized pen testing
 - Security research
@@ -99,7 +112,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'

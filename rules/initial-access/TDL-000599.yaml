@@ -18,75 +18,89 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    (index=okta sourcetype=OktaIM2:log outcome.result=SUCCESS eventType=user.authentication.auth_via_mfa) OR (index=azure sourcetype=azure:aad:signin Status=Success authenticationMethod=*MFA*) OR (index=duo sourcetype=duo:authentication result=SUCCESS factor=*)
-    | eval source_country=coalesce('client.geographicalContext.country', Location, location.country)
+  spl: '(index=okta sourcetype=OktaIM2:log outcome.result=SUCCESS eventType=user.authentication.auth_via_mfa) OR (index=azure sourcetype=azure:aad:signin
+    Status=Success authenticationMethod=*MFA*) OR (index=duo sourcetype=duo:authentication result=SUCCESS factor=*)
+
+    | eval source_country=coalesce(''client.geographicalContext.country'', Location, location.country)
+
     | lookup high_value_users.csv username AS user OUTPUT is_hvt
+
     | lookup authorized_countries.csv country AS source_country OUTPUT is_authorized
+
     | where is_hvt="true" AND is_authorized!="true"
+
     | table _time, user, source_country, src_ip, eventType, authenticationMethod, factor, app
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000599 {\n  meta:\n    author = \"TDL\"\n    description = \"HVT MFA Login from Unauthorized Country\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "let HighValueTargetUsers = dynamic([\"admin@contoso.com\", \"ceo@contoso.com\", \"cfo@contoso.com\"]);\nlet AuthorizedCountries = dynamic([\"\
+    United States\", \"Canada\", \"United Kingdom\"]);\nunion \n    (SigninLogs\n    | where TimeGenerated > ago(1h)\n    | where ResultType ==\
+    \ 0\n    | where AuthenticationRequirement == \"multiFactorAuthentication\"\n    | where NetworkLocationDetails has \"external\" or IPAddress\
+    \ !startswith \"10.\" and IPAddress !startswith \"192.168.\" and IPAddress !startswith \"172.16.\"\n    | where UserPrincipalName in (HighValueTargetUsers)\n\
+    \    | where Location !in (AuthorizedCountries)\n    | project TimeGenerated, UserPrincipalName, IPAddress, Location, AuthenticationRequirement,\
+    \ ResultType, AppDisplayName, DeviceDetail),\n    (OktaSSO\n    | where TimeGenerated > ago(1h)\n    | where outcome_result_s == \"SUCCESS\"\
+    \n    | where authenticationContext_externalSessionId_s != \"\"\n    | where actor_alternateId_s in (HighValueTargetUsers)\n    | where client_geographicalContext_country_s\
+    \ !in (AuthorizedCountries)\n    | project TimeGenerated, UserPrincipalName = actor_alternateId_s, IPAddress = client_ipAddress_s, Location\
+    \ = client_geographicalContext_country_s, AuthenticationMethod = authenticationContext_authenticationStep_s, ResultType = outcome_result_s,\
+    \ AppDisplayName = target_displayName_s),\n    (DuoSecurityAuth\n    | where TimeGenerated > ago(1h)\n    | where result_s == \"success\"\n\
+    \    | where factor_s in (\"push\", \"phone\", \"passcode\")\n    | where user_name_s in (HighValueTargetUsers)\n    | where access_device_location_country_s\
+    \ !in (AuthorizedCountries)\n    | project TimeGenerated, UserPrincipalName = user_name_s, IPAddress = access_device_ip_s, Location = access_device_location_country_s,\
+    \ AuthenticationMethod = factor_s, ResultType = result_s, AppDisplayName = application_name_s)\n| project TimeGenerated, UserPrincipalName,\
+    \ IPAddress, Location, ResultType\n"
+  aql: |
+    SELECT username, sourceip, QIDNAME(qid) AS event_name, LOGSOURCENAME(logsourceid) AS log_source, "Country" AS source_country, eventtime
+    FROM events
+    WHERE (qid IN (SELECT qid FROM qidmap WHERE logsourcetypename IN ('Okta', 'Azure Active Directory', 'Duo Security')) OR LOGSOURCENAME(logsourceid) ILIKE '%Okta%' OR LOGSOURCENAME(logsourceid) ILIKE '%Azure%' OR LOGSOURCENAME(logsourceid) ILIKE '%Duo%')
+      AND (CATEGORYNAME(category) ILIKE '%authentication%' OR CATEGORYNAME(category) ILIKE '%logon%')
+      AND (qidname(qid) ILIKE '%success%' OR qidname(qid) ILIKE '%accepted%' OR "AuthenticationResult" = 'Success' OR "EventResult" = 'Success')
+      AND (qidname(qid) ILIKE '%mfa%' OR qidname(qid) ILIKE '%multi%factor%' OR "AuthenticationMethod" ILIKE '%mfa%' OR "FactorType" IS NOT NULL)
+      AND username IN (SELECT "Username" FROM reference_set_data WHERE set_name = 'High_Value_Target_Users')
+      AND "Country" NOT IN (SELECT "Country" FROM reference_set_data WHERE set_name = 'Authorized_Remote_Login_Countries')
+      AND (sourceip NOT IN (INOFFICE(sourceip)) OR sourceip NOT IN (SELECT ip FROM reference_set_data WHERE set_name = 'Corporate_IP_Ranges'))
+    LAST 24 HOURS
+  yara_l: "rule high_value_user_login_from_unauthorized_country {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects\
+    \ successful MFA login from unauthorized country for high value users - T1078 Initial Access\"\n    mitre_attack_tactic = \"Initial Access\"\
+    \n    mitre_attack_technique = \"T1078\"\n    severity = \"HIGH\"\n    \n  events:\n    $login.metadata.event_type = \"USER_LOGIN\"\n    $login.security_result.action\
+    \ = \"ALLOW\"\n    $login.security_result.action_details = \"MFA_SUCCESS\" or \n    $login.extensions.auth.type = \"MFA\" or\n    $login.security_result.summary\
+    \ = /(?i)(multi.factor|mfa|2fa|duo)/\n    \n    $login.target.user.userid = $user\n    $login.principal.location.country_or_region = $country\n\
+    \    \n    // High value target users list\n    $user in %high_value_users\n    \n    // Exclude authorized remote login countries\n    not\
+    \ $country in %authorized_countries\n    \n    $login.principal.hostname = $host\n\n  match:\n    $user over 5m\n\n  outcome:\n    $risk_score\
+    \ = 85\n    $country_name = array_distinct($login.principal.location.country_or_region)\n    $source_ip = array_distinct($login.principal.ip)\n\
+    \    \n  condition:\n    $login\n}\n"
+  esql: |
+    FROM logs-okta*, logs-azure*, logs-duo*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.outcome == "success"
+      AND (event.category == "authentication" OR event.action LIKE "*mfa*" OR event.action LIKE "*multi*factor*")
+      AND (source.geo.country_name NOT IN ("United States", "Canada", "United Kingdom") OR source.ip NOT LIKE "10.*" AND source.ip NOT LIKE "172.16.*" AND source.ip NOT LIKE "192.168.*")
+      AND user.name IN ("admin@company.com", "ceo@company.com", "cfo@company.com", "it-admin@company.com")
+    | KEEP @timestamp, host.name, user.name, source.ip, source.geo.country_name, event.action, event.provider, event.outcome
+  leql: |
+    where(result=SUCCESS AND source_json.mfa_result=SUCCESS AND source_json.network_location="external" AND user IN [high_value_target_users] AND source_json.country NOT IN [authorized_countries])
+  crowdstrike: "(#type=okta OR #type=azure OR #type=duo) \n(event.action=user.authentication.sso OR event.action=user.authentication.auth_via_mfa\
+    \ OR eventType=UserAuthentication OR eventType=Sign-in OR event_type=authentication)\n(outcome.result=success OR result=success OR status=success\
+    \ OR eventResult=Success)\n(client.geolocation.country_code=* OR src_location.country=* OR location.countryOrRegion=*)\n| case {\n    #type=okta\
+    \ | outcome.result=success | user:=actor.alternateId | country:=client.geolication.country_code;\n    #type=azure | eventResult=Success |\
+    \ user:=userPrincipalName | country:=location.countryOrRegion;\n    #type=duo | result=success | user:=user.name | country:=access_device.location.country;\n\
+    \    * | user:=\"\" | country:=\"\";\n  }\n| test(user=/high.?value|executive|admin|c-level|cfo|ceo|cio|ciso|privileged/i)\n| test(country!=/^(US|USA|United\
+    \ States|CA|Canada|GB|United Kingdom|AU|Australia)$/i)\n| table([@timestamp, user, country, #type])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter event_type = ENUM.AUDIT_EVENT_TYPE_AUTHENTICATION and outcome = ENUM.AUDIT_OUTCOME_SUCCESS and auth_method contains "mfa"
+    | filter source_ip_country not in ("US", "CA", "GB", "DE", "FR", "AU")
+    | filter target_user_username in ("admin@company.com", "ceo@company.com", "cfo@company.com", "cio@company.com", "it-admin@company.com")
+    | fields _time, source_ip, source_ip_country, target_user_username, application, device_name, source_location_city, auth_method
+  lucene: |
+    (event.action:"user.authentication.auth_via_mfa" OR event.action:"UserLoggedIn" OR event.action:"authentication_success") AND event.outcome:success AND (source.geo.country_name:* AND NOT source.geo.country_name:("United States" OR "Canada" OR "United Kingdom" OR "Germany" OR "France")) AND (user.name:("admin*" OR "svc-*" OR "*-admin" OR "root" OR "administrator") OR user.email:("*@executive.*" OR "*ceo*" OR "*cfo*" OR "*cio*"))
+  sumo: "_sourceCategory=*Azure* OR _sourceCategory=*Okta* OR _sourceCategory=*Duo*\n| json field=_raw \"eventType\" as event_type\n| json field=_raw\
+    \ \"outcome.result\" as outcome\n| json field=_raw \"actor.alternateId\" as okta_user\n| json field=_raw \"client.geographicalContext.country\"\
+    \ as okta_country\n| json field=_raw \"properties.userPrincipalName\" as azure_user\n| json field=_raw \"properties.location\" as azure_country\n\
+    | json field=_raw \"properties.authenticationRequirement\" as azure_mfa\n| json field=_raw \"user.name\" as duo_user\n| json field=_raw \"\
+    access_device.location.country\" as duo_country\n| json field=_raw \"result\" as duo_result\n| where (event_type = \"user.authentication.auth_via_mfa\"\
+    \ and outcome = \"SUCCESS\") \n   OR (azure_mfa = \"multiFactorAuthentication\" and outcome = \"success\") \n   OR (duo_result = \"SUCCESS\"\
+    )\n| if(_sourceCategory matches \"*Okta*\", okta_user, if(_sourceCategory matches \"*Azure*\", azure_user, duo_user)) as username\n| if(_sourceCategory\
+    \ matches \"*Okta*\", okta_country, if(_sourceCategory matches \"*Azure*\", azure_country, duo_country)) as country\n| where username in (\"\
+    admin@company.com\", \"ceo@company.com\", \"cfo@company.com\", \"executive@company.com\")\n| where !(country in (\"US\", \"United States\"\
+    , \"USA\", \"GB\", \"United Kingdom\", \"CA\", \"Canada\"))\n| fields _messageTime, username, country, _sourceHost, event_type\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -96,7 +110,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Successful MFA Login Event \nFrom an external source\nWhere the Destination Username is on the High Value Target User List\n\
   Where the Source Country is NOT on the Authorized Remote Login Countries List"

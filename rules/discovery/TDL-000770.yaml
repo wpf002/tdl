@@ -18,86 +18,110 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=* sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (CommandLine="*ipconfig*" OR CommandLine="*route*print*" OR CommandLine="*arp*-a*" OR CommandLine="*ifconfig*" OR CommandLine="*ip*addr*")
-    | eval network_recon_cmd=case(
-        match(CommandLine, "(?i)ipconfig"), "ipconfig",
-        match(CommandLine, "(?i)route\s+print"), "route_print",
-        match(CommandLine, "(?i)arp\s+-a"), "arp_a",
-        match(CommandLine, "(?i)ifconfig"), "ifconfig",
-        match(CommandLine, "(?i)ip\s+addr"), "ip_addr",
-        1=1, "other"
+  spl: "index=* sourcetype=\"WinEventLog:Microsoft-Windows-Sysmon/Operational\" EventCode=1 (CommandLine=\"*ipconfig*\" OR CommandLine=\"*route*print*\"\
+    \ OR CommandLine=\"*arp*-a*\" OR CommandLine=\"*ifconfig*\" OR CommandLine=\"*ip*addr*\")\n| eval network_recon_cmd=case(\n    match(CommandLine,\
+    \ \"(?i)ipconfig\"), \"ipconfig\",\n    match(CommandLine, \"(?i)route\\s+print\"), \"route_print\",\n    match(CommandLine, \"(?i)arp\\s+-a\"\
+    ), \"arp_a\",\n    match(CommandLine, \"(?i)ifconfig\"), \"ifconfig\",\n    match(CommandLine, \"(?i)ip\\s+addr\"), \"ip_addr\",\n    1=1,\
+    \ \"other\"\n)\n| where network_recon_cmd!=\"other\"\n| bin _time span=30s\n| stats dc(network_recon_cmd) as unique_cmds values(network_recon_cmd)\
+    \ as cmds values(CommandLine) as command_lines by _time, ComputerName, User\n| where unique_cmds >= 3\n| table _time, ComputerName, User,\
+    \ unique_cmds, cmds, command_lines\n"
+  kql: |
+    Event
+    | where TimeGenerated > ago(1h)
+    | where EventID == 1
+    | extend CommandLine = tostring(EventData.CommandLine)
+    | extend ProcessName = tostring(EventData.Image)
+    | extend User = tostring(EventData.User)
+    | extend Computer = Computer
+    | where CommandLine has_any ("ipconfig", "route print", "arp -a", "ifconfig", "ip addr")
+    | extend CommandType = case(
+        CommandLine has "ipconfig", "ipconfig",
+        CommandLine has "route print", "route",
+        CommandLine has "arp -a", "arp",
+        CommandLine has "ifconfig", "ifconfig",
+        CommandLine has "ip addr", "ip_addr",
+        "other"
     )
-    | where network_recon_cmd!="other"
-    | bin _time span=30s
-    | stats dc(network_recon_cmd) as unique_cmds values(network_recon_cmd) as cmds values(CommandLine) as command_lines by _time, ComputerName, User
+    | summarize Commands = make_set(CommandType), EventTimes = make_list(TimeGenerated), CommandLines = make_list(CommandLine) by Computer, User, bin(TimeGenerated, 30s)
+    | where array_length(Commands) >= 2
+    | extend TimeSpan = datetime_diff('second', EventTimes[array_length(EventTimes)-1], EventTimes[0])
+    | where TimeSpan <= 30
+    | project TimeGenerated, Computer, User, Commands, CommandLines, TimeSpan
+  aql: |
+    SELECT DATEFORMAT(eventtime, 'yyyy-MM-dd HH:mm:ss') AS event_time,
+           username,
+           sourceip,
+           LOGSOURCENAME(logsourceid) AS host,
+           "Process CommandLine" AS command,
+           COUNT(*) AS command_count
+    FROM events
+    WHERE "EventID" = '1'
+      AND (
+        "Process CommandLine" ILIKE '%ipconfig%/all%'
+        OR "Process CommandLine" ILIKE '%route%print%'
+        OR "Process CommandLine" ILIKE '%arp%-a%'
+        OR "Process CommandLine" ILIKE '%ifconfig%'
+        OR "Process CommandLine" ILIKE '%ip%addr%'
+      )
+    GROUP BY username, sourceip, LOGSOURCENAME(logsourceid), eventtime, "Process CommandLine"
+    HAVING command_count >= 3
+      AND (MAX(eventtime) - MIN(eventtime)) <= 30000
+    LAST 1 HOURS
+  yara_l: "rule network_config_recon_sequence {\n  meta:\n    author = \"TDL\"\n    description = \"Detects sequential execution of network configuration\
+    \ reconnaissance commands within 30 seconds\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1016\"\n    severity\
+    \ = \"Medium\"\n  \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      re.regex($e.principal.process.command_line, `(?i)ipconfig\\\
+    s+/all`) or\n      re.regex($e.principal.process.command_line, `(?i)route\\s+print`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)arp\\s+-a`) or\n      re.regex($e.principal.process.command_line, `(?i)ifconfig`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)ip\\s+addr`)\n    )\n    $e.principal.hostname = $host\n    $e.principal.user.userid = $user\n  \n  match:\n    $host, $user over 30s\n\
+    \  \n  outcome:\n    $risk_score = max(50)\n  \n  condition:\n    #e >= 3\n}\n"
+  esql: "FROM logs-windows.sysmon_operational*, logs-endpoint.events.process*\n| WHERE @timestamp > NOW() - 1 hour \n  AND (\n    (process.name\
+    \ IN (\"ipconfig.exe\", \"route.exe\", \"arp.exe\") AND (process.command_line LIKE \"*ipconfig*\" OR process.command_line LIKE \"*route*print*\"\
+    \ OR process.command_line LIKE \"*arp*-a*\"))\n    OR (process.name IN (\"ifconfig\", \"ip\") AND (process.command_line LIKE \"*ifconfig*\"\
+    \ OR process.command_line LIKE \"*ip*addr*\"))\n  )\n| EVAL process_key = CASE(\n    process.name == \"ipconfig.exe\" OR process.command_line\
+    \ LIKE \"*ipconfig*\", \"ipconfig\",\n    process.name == \"route.exe\" OR process.command_line LIKE \"*route*print*\", \"route\",\n    process.name\
+    \ == \"arp.exe\" OR process.command_line LIKE \"*arp*-a*\", \"arp\",\n    process.name == \"ifconfig\" OR process.command_line LIKE \"*ifconfig*\"\
+    , \"ifconfig\",\n    process.name == \"ip\" AND process.command_line LIKE \"*ip*addr*\", \"ip\",\n    \"other\"\n  )\n| STATS \n    min_time\
+    \ = MIN(@timestamp), \n    max_time = MAX(@timestamp), \n    commands = COUNT_DISTINCT(process_key),\n    command_list = VALUES(process_key)\n\
+    \  BY host.name, user.name\n| WHERE commands >= 3 AND (max_time - min_time) <= 30000\n| KEEP host.name, user.name, commands, command_list,\
+    \ min_time, max_time\n"
+  leql: |
+    where(process_name IN ["ipconfig.exe", "route.exe", "arp.exe", "ifconfig", "ip"] AND (process_cmd_line ICONTAINS "/all" OR process_cmd_line ICONTAINS "print" OR process_cmd_line ICONTAINS "-a" OR process_cmd_line ICONTAINS "addr")) groupby(asset, user) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 (CommandLine=*ipconfig* OR CommandLine=*route* OR CommandLine=*arp* OR CommandLine=*ifconfig* OR CommandLine=*ip?addr*)
+    | case {
+        CommandLine=*ipconfig* | cmd_type := "ipconfig" ;
+        CommandLine=*route* | cmd_type := "route" ;
+        CommandLine=*arp* | cmd_type := "arp" ;
+        CommandLine=*ifconfig* | cmd_type := "ifconfig" ;
+        CommandLine=*ip?addr* | cmd_type := "ip_addr" ;
+        * | cmd_type := "other" ;
+      }
+    | groupBy([ComputerName, UserName], function=[collect([cmd_type, @timestamp, CommandLine]), min(@timestamp, as=first_seen), max(@timestamp, as=last_seen), count(cmd_type, distinct=true, as=distinct_cmds)])
+    | (last_seen - first_seen) <= 30000
+    | distinct_cmds >= 3
+    | table([ComputerName, UserName, distinct_cmds, first_seen, last_seen, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter action_process_image_command_line ~= "(?i)(ipconfig\\s+/all|route\\s+print|arp\\s+-a|ifconfig|ip\\s+addr)"
+    | alter command_type = arraystring(regextract(lowercase(action_process_image_command_line), "(?:ipconfig|route|arp|ifconfig|ip)"), "")
+    | bin _time span = 30s
+    | comp count_distinct(command_type) as unique_commands, values(action_process_image_command_line) as commands by _time, agent_hostname, actor_effective_username, actor_process_image_name
+    | filter unique_commands >= 2
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, unique_commands, commands
+  lucene: |
+    (process.name:(ipconfig.exe OR route.exe OR arp.exe OR ifconfig OR ip) AND (process.command_line:(*\/all* OR *print* OR *-a* OR *addr*))) AND _exists_:process.parent.name
+  sumo: |
+    _sourceCategory=*Sysmon* ("1" OR "EventID=1")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as cmd
+    | json field=_raw "Computer" as host
+    | json field=_raw "User" as user
+    | where event_id = "1"
+    | where cmd matches "*ipconfig*" or cmd matches "*route print*" or cmd matches "*arp -a*" or cmd matches "*ifconfig*" or cmd matches "*ip addr*"
+    | timeslice 30s
+    | count_distinct(cmd) as unique_cmds by _timeslice, host, user
     | where unique_cmds >= 3
-    | table _time, ComputerName, User, unique_cmds, cmds, command_lines
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000770 {\n  meta:\n    author = \"TDL\"\n    description = \"ipconfig / route / arp -a Burst\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1016\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
 pseudo_logic: ipconfig /all, route print, arp -a, ifconfig, ip addr issued sequentially within 30s. Network-config recon.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -114,7 +138,7 @@ references:
 - https://attack.mitre.org/techniques/T1016/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

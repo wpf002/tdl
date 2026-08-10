@@ -26,71 +26,127 @@ queries:
     \ EventCode=1) \n    | eval logon_time=_time \n    | fields logon_time, ComputerName, User]\n| where (process_time - logon_time) <= 30 AND\
     \ (process_time - logon_time) >= 0\n| stats earliest(_time) as first_seen, values(Image) as recon_process, values(CommandLine) as command_line,\
     \ values(User) as user by ComputerName\n| table first_seen, ComputerName, user, recon_process, command_line\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (4624, 4648)
+    | extend LogonTime = TimeGenerated
+    | project LogonTime, Computer, TargetAccount = coalesce(TargetUserName, TargetAccount), LogonID = TargetLogonId
+    | join kind=inner (
+        Event
+        | where TimeGenerated > ago(1h)
+        | where EventID == 1
+        | extend CommandLine = tolower(tostring(EventData.CommandLine))
+        | where CommandLine has_any ("whoami", "id ", " id", "query user", "quser", " w ")
+        | where CommandLine !contains "whoami.exe"
+        | extend ProcessTime = TimeGenerated
+        | project ProcessTime, Computer, CommandLine, User = UserName, ProcessId = tostring(EventData.ProcessId)
+    ) on Computer
+    | where ProcessTime between (LogonTime .. (LogonTime + 30s))
+    | project LogonTime, ProcessTime, Computer, TargetAccount, CommandLine, User
+  aql: "SELECT sourceip, username, \"Process CommandLine\", \"Process Name\", \"Parent Process Name\", LOGSOURCENAME(logsourceid) AS host, eventtime\n\
+    FROM events\nWHERE (\"Process CommandLine\" ILIKE '%whoami%/all%' \n   OR \"Process CommandLine\" ILIKE '%whoami /all%'\n   OR \"Process CommandLine\"\
+    \ ILIKE '%query user%'\n   OR \"Process CommandLine\" ILIKE '%quser%'\n   OR \"Process CommandLine\" MATCHES '.*\\bid\\b.*'\n   OR \"Process\
+    \ CommandLine\" MATCHES '.*\\bw\\b.*')\n  AND eventtime IN (\n    SELECT eventtime + 30000\n    FROM events\n    WHERE \"EventID\" IN ('4624',\
+    \ '4648')\n      AND eventtime BETWEEN (SELECT MIN(eventtime) - 30000 FROM events WHERE \"Process CommandLine\" ILIKE '%whoami%' OR \"Process\
+    \ CommandLine\" ILIKE '%query user%' OR \"Process CommandLine\" ILIKE '%quser%' OR \"Process CommandLine\" MATCHES '.*\\bid\\b.*' OR \"Process\
+    \ CommandLine\" MATCHES '.*\\bw\\b.*' LAST 1 HOURS) \n                    AND (SELECT MAX(eventtime) FROM events WHERE \"Process CommandLine\"\
+    \ ILIKE '%whoami%' OR \"Process CommandLine\" ILIKE '%query user%' OR \"Process CommandLine\" ILIKE '%quser%' OR \"Process CommandLine\" MATCHES\
+    \ '.*\\bid\\b.*' OR \"Process CommandLine\" MATCHES '.*\\bw\\b.*' LAST 1 HOURS)\n      LAST 1 HOURS\n  )\nLAST 1 HOURS\n"
+  yara_l: |
+    rule user_discovery_after_logon {
+      meta:
+        author = "TDL"
+        description = "Detects whoami /all, id, query user, quser, or w commands within 30s of a new logon - T1033 Discovery"
+        mitre_attack_tactic = "Discovery"
+        mitre_attack_technique = "T1033"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $logon.metadata.event_type = "USER_LOGIN"
+        $logon.security_result.action = "ALLOW"
+        $logon.principal.hostname = $host
+        $logon.target.user.userid = $user
 
-    | where process_name matches regex ".+"
+        $discovery.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          re.regex($discovery.principal.process.file.full_path, `(?i)whoami(\.exe)?$`) or
+          re.regex($discovery.principal.process.file.full_path, `(?i)\\id$`) or
+          re.regex($discovery.principal.process.file.full_path, `(?i)(query|quser)(\.exe)?$`) or
+          re.regex($discovery.principal.process.file.full_path, `(?i)\\w$`)
+        )
+        (
+          re.regex($discovery.principal.process.command_line, `(?i)whoami\s+/all`) or
+          re.regex($discovery.principal.process.command_line, `(?i)^id\s*`) or
+          re.regex($discovery.principal.process.command_line, `(?i)query\s+user`) or
+          re.regex($discovery.principal.process.command_line, `(?i)quser`) or
+          re.regex($discovery.principal.process.command_line, `(?i)^w\s*`)
+        )
+        $discovery.principal.hostname = $host
+        $discovery.principal.user.userid = $user
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+        $logon.metadata.event_timestamp.seconds <= $discovery.metadata.event_timestamp.seconds
 
-    | order by Count desc
+      match:
+        $host, $user over 30s
 
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000772 {\n  meta:\n    author = \"TDL\"\n    description = \"whoami /all Followed Quickly by Discovery Tooling\"\n\
-    \    severity = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1033\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
+      condition:
+        $logon and $discovery
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.process*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      AND (
+        (process.name IN ("whoami.exe", "quser.exe", "query.exe") AND process.command_line LIKE "*user*")
+        OR (process.name IN ("whoami.exe") AND process.command_line LIKE "*/all*")
+        OR (process.name IN ("id", "w"))
+      )
+    | EVAL logon_window = BUCKET(@timestamp, 30 seconds)
+    | STATS first_exec = MIN(@timestamp), commands = COUNT(*) BY host.name, user.name, process.parent.name, logon_window
+    | WHERE commands >= 1
+    | KEEP first_exec, host.name, user.name, process.parent.name, commands
+  leql: |
+    where(source_json.EventID=4624 AND (process_name ICONTAINS "whoami" OR process_name ICONTAINS "id" OR process_name ICONTAINS "quser" OR process_name ICONTAINS "query" OR process_name ICONTAINS "w") AND (process_cmd_line ICONTAINS "/all" OR process_cmd_line ICONTAINS "user" OR process_cmd_line ICONTAINS "quser" OR process_cmd_line ICONTAINS "w")) groupby(user, asset) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 (CommandLine=*whoami* OR CommandLine=*" id"* OR CommandLine=*" id " OR CommandLine="id" OR CommandLine=*"query user"* OR CommandLine=*quser* OR CommandLine=*" w" OR CommandLine=*" w ")
+    | ComputerName=* AND @timestamp=*
+    | selfJoinFilter(field=[ComputerName], where=[{event_simpleName=UserLogon}], window=30s)
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter action_process_image_name in ("whoami.exe", "whoami", "id", "quser.exe", "quser", "query.exe", "w")
+        or (action_process_image_name = "query.exe" and action_process_image_command_line ~= "(?i)query\s+user")
+        or (action_process_image_name = "whoami.exe" and action_process_image_command_line ~= "(?i)whoami\s+/all")
+    | alter logon_time = coalesce(
+        arrayindex(regextract(action_process_image_command_line, "(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"), 0),
+        to_string(_time)
+    )
+    | join type=inner (
+        dataset = xdr_data
+        | filter event_type = ENUM.EVENT_TYPE_NETWORK or action_evtlog_event_id in (4624, 4648)
+        | alter session_start = _time
+        | fields session_start, agent_hostname, actor_effective_username
+    ) as logon_events
+        logon_events.agent_hostname = agent_hostname and logon_events.actor_effective_username = actor_effective_username
+    | filter to_epoch(_time, "MILLIS") - to_epoch(logon_events.session_start, "MILLIS") <= 30000
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, logon_events.session_start
+  lucene: |
+    (process.name:(whoami OR id OR quser OR w) OR (process.name:whoami AND process.command_line:*/all*) OR process.name:query AND process.command_line:*user*) AND event.code:(1 OR 4688)
+  sumo: |
+    _sourceCategory=*Sysmon* "1"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "UtcTime" as utc_time
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "User" as user
+    | json field=_raw "Computer" as computer
+    | where event_id = "1"
+    | where command_line matches "*whoami*" or command_line matches "*id*" or command_line matches "*query user*" or command_line matches "*quser*" or command_line matches "* w *"
+    | parseDate(utc_time, "yyyy-MM-dd HH:mm:ss") as cmd_time
+    | sort by computer, user, cmd_time
+    | first(cmd_time) as first_cmd by computer, user
+    | where (cmd_time - first_cmd) <= 30000
+    | fields computer, user, command_line, utc_time
 pseudo_logic: whoami /all, id, query user, quser, w issued within 30s of new logon — typical first-step recon.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -107,7 +163,7 @@ references:
 - https://attack.mitre.org/techniques/T1033/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

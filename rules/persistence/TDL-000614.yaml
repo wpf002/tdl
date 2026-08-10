@@ -16,74 +16,52 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security EventCode=4738 UserAccountControl="%%2089"
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security EventCode=4738 UserAccountControl="%%2089"
+
     | table _time, ComputerName, Account_Name, UserAccountControl, TargetUserName, SubjectUserName
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4738")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4738')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000614 {\n  meta:\n    author = \"TDL\"\n    description = \"User Password Set to Never Expire\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id\
-    \ = /(4738)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND event_id IN ("4738")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4738])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4738)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4738")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4738)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4738")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4738
+    | where UserAccountControl == "%%2089"
+    | project TimeGenerated, Computer, Account, TargetAccount, SubjectUserName, UserAccountControl, Activity, EventData
+  aql: |
+    SELECT eventtime, username, sourceip, "Target Username", "User Account Control", LOGSOURCENAME(logsourceid) AS host
+    FROM events
+    WHERE "EventID" = '4738'
+      AND "User Account Control" = '%%2089'
+    LAST 24 HOURS
+  yara_l: "rule windows_user_account_password_not_required {\n  meta:\n    author = \"TDL\"\n    description = \"Detects Windows user account\
+    \ modification where password is not required (T1098 - Account Manipulation)\"\n    mitre_attack_tactic = \"Persistence\"\n    mitre_attack_technique\
+    \ = \"T1098\"\n    severity = \"Medium\"\n  \n  events:\n    $e.metadata.event_type = \"USER_ACCOUNT_MODIFICATION\"\n    $e.metadata.product_event_type\
+    \ = \"4738\"\n    $e.metadata.vendor_name = \"Microsoft\"\n    $e.metadata.product_name = \"Windows\"\n    re.regex($e.security_result.summary,\
+    \ `%%2089`) or\n    re.regex($e.target.resource.attribute.labels.value, `%%2089`)\n    $e.principal.hostname = $host\n    $e.target.user.userid\
+    \ = $user\n  \n  match:\n    $host, $user over 5m\n  \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-windows.security*, logs-system.security*, winlogbeat-*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.code == "4738"
+      AND winlog.event_data.UserAccountControl == "%%2089"
+    | KEEP @timestamp, host.name, user.name, winlog.event_data.TargetUserName, winlog.event_data.SubjectUserName, winlog.event_data.UserAccountControl, event.code
+  leql: |
+    where(source_json.EventID=4738 AND source_json.UserAccountControl="%%2089")
+  crowdstrike: |
+    EventCode=4738 UserAccountControl="%%2089"
+    | table([@timestamp, ComputerName, TargetUserName, SubjectUserName, UserAccountControl])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4738 and action_evtlog_message contains "%%2089"
+    | fields _time, agent_hostname, action_evtlog_event_data_TargetUserName, action_evtlog_event_data_SubjectUserName, action_evtlog_message
+  lucene: |
+    event.code:4738 AND winlog.event_data.UserAccountControl:"%%2089"
+  sumo: |
+    _sourceCategory=*Windows*Security* "4738"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "UserAccountControl" as user_account_control
+    | where event_id = "4738" and user_account_control = "%%2089"
+    | fields _messageTime, _sourceHost, event_id, user_account_control
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -93,7 +71,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows User Account Change Event
 

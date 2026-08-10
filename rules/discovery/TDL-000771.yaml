@@ -18,77 +18,72 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=* sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (CommandLine="*netstat*-ano*" OR CommandLine="*ss*-tulnp*" OR CommandLine="*lsof*-i*")
+  spl: 'index=* sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (CommandLine="*netstat*-ano*" OR CommandLine="*ss*-tulnp*"
+    OR CommandLine="*lsof*-i*")
+
     | bin _time span=60s
+
     | stats count by _time, ComputerName, User
+
     | where count >= 3
+
     | table _time, ComputerName, User, count
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000771 {\n  meta:\n    author = \"TDL\"\n    description = \"netstat / ss Enumerated Repeatedly in Short Window\"\n\
-    \    severity = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1049\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
+  kql: "Event\n| where TimeGenerated > ago(1h)\n| where EventID == 1\n| where (ProcessCommandLine has \"netstat\" and ProcessCommandLine has_any\
+    \ (\"-ano\", \"-an\", \"-a\")) \n    or (ProcessCommandLine has \"ss\" and ProcessCommandLine has_any (\"-tulnp\", \"-tuln\", \"-tul\"))\n\
+    \    or (ProcessCommandLine has \"lsof\" and ProcessCommandLine has \"-i\")\n| summarize executions = count(), CommandLines = make_set(ProcessCommandLine),\
+    \ Computers = make_set(Computer) by bin(TimeGenerated, 60s), Account\n| where executions >= 3\n| project TimeGenerated, Account, executions,\
+    \ CommandLines, Computers\n"
+  aql: |
+    SELECT "Process CommandLine", username, sourceip, LOGSOURCENAME(logsourceid) AS host, COUNT(*) AS executions
+    FROM events
+    WHERE ("Process CommandLine" ILIKE '%netstat%' OR "Process CommandLine" ILIKE '%ss -t%' OR "Process CommandLine" ILIKE '%ss -u%' OR "Process CommandLine" ILIKE '%lsof -i%')
+    GROUP BY "Process CommandLine", username, sourceip, LOGSOURCENAME(logsourceid)
+    HAVING executions >= 3
+    LAST 1 MINUTES
+  yara_l: "rule network_connection_enumeration_t1049 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects repeated execution of network\
+    \ connection enumeration commands (netstat, ss, lsof) - MITRE T1049\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique\
+    \ = \"T1049\"\n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)netstat\\s+.*-ano`) or\n      re.regex($e.principal.process.command_line, `(?i)ss\\s+.*-tulnp`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)lsof\\s+.*-i`)\n    )\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 60s\n    \n  outcome:\n    $risk_score = 65\n\
+    \    \n  condition:\n    #e >= 3\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.process*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      AND (
+        (process.name == "netstat.exe" AND process.command_line LIKE "*-ano*")
+        OR (process.name == "ss" AND (process.command_line LIKE "*-tulnp*" OR process.command_line LIKE "*-antp*"))
+        OR (process.name == "lsof" AND process.command_line LIKE "*-i*")
+      )
+    | STATS invocations = COUNT(*) BY host.name, user.name, process.name, win = BUCKET(@timestamp, 60 second)
+    | WHERE invocations >= 3
+    | KEEP host.name, user.name, process.name, win, invocations
+  leql: |
+    where(process_cmd_line ICONTAINS "netstat" OR process_cmd_line ICONTAINS "ss -" OR process_cmd_line ICONTAINS "lsof -i") groupby(asset, user) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 (CommandLine=*netstat* OR CommandLine=*ss* OR CommandLine=*lsof*)
+    | bucket(span=60s, field=@timestamp, as=time_window)
+    | groupBy([time_window, ComputerName, UserName], function=count(as=invocations))
+    | invocations >= 3
+    | table([time_window, ComputerName, UserName, invocations])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter (action_process_image_command_line contains "netstat" and action_process_image_command_line ~= "netstat\s+.*-a.*-n.*-o|netstat.*-ano")
+       or (action_process_image_command_line contains "ss" and action_process_image_command_line ~= "ss\s+.*-t.*-u.*-l.*-n.*-p|ss.*-tulnp")
+       or (action_process_image_command_line contains "lsof" and action_process_image_command_line ~= "lsof\s+-i")
+    | bin _time span=60s
+    | comp count() as invocations by _time, agent_hostname, actor_effective_username
+    | filter invocations >= 3
+    | fields _time, agent_hostname, actor_effective_username, invocations
+  lucene: |
+    (process.name:(netstat.exe OR netstat OR ss OR lsof) AND (process.command_line:(*-ano* OR *-tulnp* OR *-i*))) OR (process.command_line:(*netstat* AND *-ano*) OR (process.command_line:*ss* AND process.command_line:(*-tulnp* OR *-tun*)) OR (process.command_line:*lsof* AND process.command_line:*-i*))
+  sumo: "_sourceCategory=*Sysmon* (\"netstat\" OR \"ss\" OR \"lsof\")\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"CommandLine\"\
+    \ as cmd\n| json field=_raw \"Image\" as image\n| json field=_raw \"Computer\" as computer\n| where event_id = \"1\" \n| where (image matches\
+    \ \"*netstat*\" and cmd matches \"*-ano*\") \n   OR (image matches \"*ss*\" and cmd matches \"*-tulnp*\") \n   OR (image matches \"*lsof*\"\
+    \ and cmd matches \"*-i*\")\n| timeslice 60s\n| count as executions by _timeslice, computer, image\n| where executions >= 3\n| fields _timeslice,\
+    \ computer, image, executions\n"
 pseudo_logic: netstat -ano / ss -tulnp / lsof -i invoked ≥3 times within 60s. Active-connection survey.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -105,7 +100,7 @@ references:
 - https://attack.mitre.org/techniques/T1049/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

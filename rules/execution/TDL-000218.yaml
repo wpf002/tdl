@@ -17,74 +17,72 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=windows EventCode=4688 ParentProcessName="*\\sc.exe" CommandLine="*start winrm*"
+  spl: 'index=windows EventCode=4688 ParentProcessName="*\\sc.exe" CommandLine="*start winrm*"
+
     | table _time, ComputerName, User, ParentProcessName, ProcessName, CommandLine
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("sc.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('sc.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000218 {\n  meta:\n    author = \"TDL\"\n    description = \"WinRM Activated\"\n    severity = \"MEDIUM\"\n    tactic\
-    \ = \"TA0002\"\n    technique = \"T1021\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(sc.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4688
+    | where ParentProcessName has "sc.exe"
+    | where CommandLine has "start winrm"
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName, ProcessId
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Parent Process Name", "Process Name", "Process CommandLine"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Parent Process Name" ILIKE '%sc.exe%'
+      AND "Process CommandLine" ILIKE '%start winrm%'
+    LAST 24 HOURS
+  yara_l: |
+    rule winrm_service_started_by_sc {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects WinRM service started via sc.exe - T1021"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1021"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.metadata.product_event_type = "4688"
+        re.regex($e.principal.process.file.full_path, `(?i)\\sc\.exe$`)
+        re.regex($e.target.process.command_line, `(?i)start\s+winrm`)
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name IN ("sc.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [sc.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (sc.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("sc.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(sc.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("sc.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-windows.sysmon_operational*, logs-system.security*, logs-endpoint.events.process*, winlogbeat-*\n| WHERE event.code IN (\"\
+    592\", \"4688\") \n  AND TO_LOWER(process.parent.name) LIKE \"*sc.exe\"\n  AND TO_LOWER(process.command_line) LIKE \"*start*\" \n  AND TO_LOWER(process.command_line)\
+    \ LIKE \"*winrm*\"\n| KEEP @timestamp, host.name, user.name, process.name, process.parent.name, process.command_line, process.executable\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND parent_process_name ICONTAINS "sc.exe" AND process_cmd_line ICONTAINS "start winrm")
+  crowdstrike: |
+    EventCode=4688 ParentProcessName=*sc.exe CommandLine=*start*winrm*
+    | table([@timestamp, ComputerName, UserName, ProcessName, ParentProcessName, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter lowercase(actor_process_image_name) contains "sc.exe"
+    | filter lowercase(action_process_image_command_line) contains "start" and lowercase(action_process_image_command_line) contains "winrm"
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:(592 OR 4688) AND process.parent.name:sc.exe AND process.command_line:*start\ winrm*
+  sumo: |
+    _sourceCategory=*Windows* ("4688" OR "592")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ParentProcessName" as parent_process
+    | json field=_raw "CommandLine" as command_line
+    | where event_id in ("4688", "592")
+    | where parent_process matches "*sc.exe"
+    | where command_line matches "*start*" and command_line matches "*winrm*"
+    | fields _messageTime, _sourceHost, event_id, parent_process, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +92,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Process Execution Event
 

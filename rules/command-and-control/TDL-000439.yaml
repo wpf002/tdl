@@ -15,84 +15,104 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (http_user_agent="*Metasploit*" OR http_user_agent="*Cobalt Strike*" OR http_user_agent="*Empire*" OR http_user_agent="*Koadic*" OR http_user_agent="*Mythic*" OR http_user_agent="*Sliver*" OR http_user_agent="*Merlin*" OR http_user_agent="*PoshC2*" OR http_user_agent="*Covenant*")
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (http_user_agent="*Metasploit*" OR http_user_agent="*Cobalt Strike*"
+    OR http_user_agent="*Empire*" OR http_user_agent="*Koadic*" OR http_user_agent="*Mythic*" OR http_user_agent="*Sliver*" OR http_user_agent="*Merlin*"
+    OR http_user_agent="*PoshC2*" OR http_user_agent="*Covenant*")
+
     | search NOT (src_ip IN ("10.0.0.5", "10.0.0.6") OR src_host IN ("scanner01", "scanner02", "monitoring-agent*"))
+
     | stats count dc(dest_ip) as unique_dests sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+
     | where count >= 1
+
     | sort - total_bytes_out
+
     | table src_ip, dest_ip, dest_port, count, unique_dests, total_bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
 
+    '
+  kql: |
+    CommonSecurityLog
     | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000439 {\n  meta:\n    author = \"TDL\"\n    description = \"Exploit Framework User Agent\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0011\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
+    | where DeviceVendor has_any ("Proxy", "Firewall", "Web")
+    | where RequestClientApplication has_any ("Mozilla/4.0 (compatible; Metasploit", "Cobalt Strike", "Empire", "Meterpreter", "Beacon", "Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; WOW64; Trident/5.0; BOIE9;ENUS)", "python-requests", "curl", "Wget")
+    | where RequestClientApplication !has "Chrome" and RequestClientApplication !has "Firefox" and RequestClientApplication !has "Safari"
+    | extend src_ip = SourceIP, dest_ip = DestinationIP, dest_port = DestinationPort
+    | where src_ip !in ("10.1.1.100", "10.1.1.101", "192.168.50.10")
+    | summarize count_connections = count(), unique_dests = dcount(dest_ip), bytes_out = sum(SentBytes) by src_ip, dest_ip, dest_port
+    | where count_connections >= 1
     | sort by bytes_out desc
-
-    '
+    | project TimeGenerated = now(), src_ip, dest_ip, dest_port, count_connections, unique_dests, bytes_out
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS connection_count, UNIQUECOUNT(destinationip) AS unique_dests, SUM(sourcelongbytes) AS total_bytes_out, UTF8(payload) AS user_agent
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%proxy%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%firewall%' OR category IN (17000, 18000, 19000))
+      AND protocolid = 6
+      AND (UTF8(payload) MATCHES '(?i).*(metasploit|cobalt.?strike|msfconsole|meterpreter|beacon|empire|koadic|pupy|mythic|sliver|brute.?ratel|havoc).*'
+           OR "User Agent" MATCHES '(?i).*(metasploit|cobalt.?strike|msfconsole|meterpreter|beacon|empire|koadic|pupy|mythic|sliver|brute.?ratel|havoc).*')
+      AND sourceip NOT IN ('10.0.0.100', '10.0.0.101', '192.168.1.50')
+      AND LOGSOURCENAME(logsourceid) NOT ILIKE '%scanner%'
+      AND LOGSOURCENAME(logsourceid) NOT ILIKE '%monitor%'
+    GROUP BY sourceip, destinationip, destinationport, UTF8(payload)
+    HAVING connection_count >= 1
+    ORDER BY total_bytes_out DESC
+    LAST 24 HOURS
+  yara_l: "rule command_and_control_exploit_framework_user_agent {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"T1071 -\
+    \ Detects exploit framework user agent patterns in proxy logs\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique\
+    \ = \"T1071\"\n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.network.ip_protocol = \"TCP\"\
+    \n    (\n      re.regex($e.network.http.user_agent, `(?i)metasploit`) or\n      re.regex($e.network.http.user_agent, `(?i)meterpreter`) or\n\
+    \      re.regex($e.network.http.user_agent, `(?i)cobalt.*strike`) or\n      re.regex($e.network.http.user_agent, `(?i)empire`) or\n      re.regex($e.network.http.user_agent,\
+    \ `(?i)^curl/`) or\n      re.regex($e.network.http.user_agent, `(?i)^wget/`) or\n      re.regex($e.network.http.user_agent, `(?i)python-requests`)\
+    \ or\n      re.regex($e.network.http.user_agent, `(?i)powershell`) or\n      re.regex($e.network.http.user_agent, `(?i)^msf/`) or\n      re.regex($e.network.http.user_agent,\
+    \ `(?i)nmap.*scripting.*engine`) or\n      re.regex($e.network.http.user_agent, `(?i)sqlmap`) or\n      re.regex($e.network.http.user_agent,\
+    \ `(?i)nikto`) or\n      re.regex($e.network.http.user_agent, `(?i)havoc`) or\n      re.regex($e.network.http.user_agent, `(?i)sliver`) or\n\
+    \      re.regex($e.network.http.user_agent, `(?i)mythic`) or\n      re.regex($e.network.http.user_agent, `(?i)beacon`)\n    )\n    not (\n\
+    \      $e.principal.ip = \"10.10.10.100\" or\n      $e.principal.ip = \"10.10.10.101\" or\n      $e.principal.hostname = \"scanner01\" or\n\
+    \      $e.principal.hostname = \"scanner02\" or\n      $e.principal.hostname = \"nagios-monitor\" or\n      $e.principal.hostname = \"zabbix-agent\"\
+    \n    )\n    $e.principal.ip = $src_ip\n    $e.target.ip = $dest_ip\n    $e.target.port = $dest_port\n    \n  match:\n    $src_ip, $dest_ip,\
+    \ $dest_port over 5m\n    \n  outcome:\n    $risk_score = max(75)\n    $total_bytes_out = sum($e.network.sent_bytes)\n    $connection_count\
+    \ = count_distinct($e.metadata.id)\n    \n  condition:\n    #e >= 1\n}\n"
+  esql: "FROM logs-network.proxy*\n| WHERE @timestamp > NOW() - 24 hour\n  AND (user_agent.original LIKE \"*Metasploit*\" \n    OR user_agent.original\
+    \ LIKE \"*Cobalt Strike*\"\n    OR user_agent.original LIKE \"*Empire*\"\n    OR user_agent.original LIKE \"*Merlin*\"\n    OR user_agent.original\
+    \ LIKE \"*PoshC2*\"\n    OR user_agent.original LIKE \"*Sliver*\"\n    OR user_agent.original LIKE \"*Mythic*\"\n    OR user_agent.original\
+    \ LIKE \"*Brute Ratel*\"\n    OR user_agent.original RLIKE \"^(Python-urllib|curl|Wget|Invoke-WebRequest).*\"\n    OR user_agent.original\
+    \ RLIKE \".*[Ff]ramework.*\"\n    OR user_agent.original RLIKE \".*[Aa]gent.*[0-9].*\")\n  AND network.protocol == \"tcp\"\n  AND source.ip\
+    \ NOT IN (\"10.0.0.100\", \"10.0.0.101\", \"192.168.1.50\")\n  AND host.name NOT IN (\"scanner-01\", \"nessus-host\", \"qualys-agent\")\n\
+    | STATS count = COUNT(*), unique_dests = COUNT_DISTINCT(destination.ip), total_bytes = SUM(network.bytes) BY source.ip, destination.ip, destination.port\n\
+    | WHERE count >= 1\n| SORT total_bytes DESC\n| KEEP source.ip, destination.ip, destination.port, count, unique_dests, total_bytes\n"
+  leql: |
+    where(log_source_type=Forward Proxy AND (user_agent ICONTAINS "metasploit" OR user_agent ICONTAINS "meterpreter" OR user_agent ICONTAINS "cobalt strike" OR user_agent ICONTAINS "empire" OR user_agent ICONTAINS "sqlmap" OR user_agent ICONTAINS "nmap scripting engine" OR user_agent ICONTAINS "nikto" OR user_agent ICONTAINS "paros" OR user_agent ICONTAINS "ZmEu" OR user_agent ICONTAINS "w3af.org" OR user_agent ICONTAINS "dirbuster" OR user_agent ICONTAINS "acunetix" OR user_agent ICONTAINS "havij" OR user_agent ICONTAINS "absinthe" OR user_agent ICONTAINS "beef/" OR user_agent ICONTAINS "masscan/" OR user_agent ICONTAINS "python-requests" OR user_agent ICONTAINS "curl/" OR user_agent ICONTAINS "wget")) groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    #type=firewall OR #type=ids network.protocol=*tcp* (user_agent=/.*Metasploit.*|.*Cobalt Strike.*|.*Empire.*|.*Mythic.*|.*Sliver.*|.*Meterpreter.*|.*Armitage.*|.*PowerShell-Empire.*|.*SharpC2.*|.*Koadic.*|.*PoshC2.*|.*SILENTTRINITY.*|.*Covenant.*|.*Merlin.*|.*PupyRAT.*|.*QuasarRAT.*/)
+    | NOT (src_ip IN ["10.0.0.100", "10.0.0.101", "192.168.1.50"] OR ComputerName IN ["scanner-host", "monitoring-agent"])
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=connection_count), count(dest_ip, distinct=true, as=unique_dests), sum(bytes_out, as=total_bytes_out)])
+    | connection_count >= 1
+    | sort(total_bytes_out, order=desc)
+    | table([src_ip, dest_ip, dest_port, connection_count, unique_dests, total_bytes_out])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter proto = "tcp" and (http_user_agent ~= "(?i)(metasploit|meterpreter|cobalt.*strike|beacon|empire|powershell.*empire|koadic|sliver|mythic|brute.*ratel|havoc|covenant)" or http_user_agent ~= "(?i)(python-requests/2\\.6\\.|curl/7\\.22\\.|\\bMSXMLHTTP\\b|User-Agent:\\s*$)")
+    | alter src_ip = src, dest_ip = dst, dest_port = dport
+    | filter not (src_ip in ("10.0.0.50", "192.168.1.100") or actor_process_image_name contains "nessus" or actor_process_image_name contains "qualys")
+    | comp count() as connection_count, count_distinct(dest_ip) as unique_dests, sum(bytes_sent) as bytes_out by src_ip, dest_ip, dest_port
+    | filter connection_count >= 1
+    | sort desc bytes_out
+    | fields src_ip, dest_ip, dest_port, connection_count, unique_dests, bytes_out
+  lucene: |
+    http.request.headers.user_agent:(*metasploit* OR *meterpreter* OR *cobalt?strike* OR *Empire* OR *Koadic* OR *PoshC2* OR *Mythic* OR *Sliver* OR *BRC4* OR *Brute?Ratel* OR *Havoc* OR *Covenant* OR *Merlin* OR *PhantomC2* OR *python-requests/2.6* OR *curl/7.* OR *Mozilla/4.0?compatible* OR *MSOffice?12* OR *MSOffice?14* OR *MSOffice?16* OR *WinHTTP*) AND network.protocol:tcp AND NOT (source.ip:(10.0.0.100 OR 10.0.0.101 OR 192.168.1.50) OR host.name:(scanner-01 OR monitoring-agent-*))
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*ids*
+    | where _sourceCategory matches "*proxy*"
+    | parse regex "(?i)(?<user_agent>metasploit|msfstage|meterpreter|cobalt[\s\-]?strike|empire|covenant|sliver|mythic|brute\s?ratel|merlin|havoc|koadic)" nodrop
+    | parse regex "\"(?<user_agent_full>[^\"]+)\"" nodrop
+    | where user_agent_full matches "*metasploit*" OR user_agent_full matches "*msfstage*" OR user_agent_full matches "*meterpreter*" OR user_agent_full matches "*CobaltStrike*" OR user_agent_full matches "*Empire*" OR user_agent_full matches "*Covenant*" OR user_agent_full matches "*Sliver*" OR user_agent_full matches "*Mythic*" OR user_agent_full matches "*Brute Ratel*" OR user_agent_full matches "*Merlin*" OR user_agent_full matches "*Havoc*" OR user_agent_full matches "*Koadic*" OR user_agent matches "*"
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex ":(?<dest_port>\d+)" nodrop
+    | where !(src_ip in ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
+    | count as connection_count, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as total_bytes by src_ip, dest_ip, dest_port
+    | where connection_count >= 1
+    | sort by total_bytes desc
+    | fields src_ip, dest_ip, dest_port, connection_count, unique_dests, total_bytes
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -102,7 +122,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

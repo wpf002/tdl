@@ -13,75 +13,88 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=windows sourcetype="WinEventLog:Security" EventCode=4663
+  spl: 'index=windows sourcetype="WinEventLog:Security" EventCode=4663
+
     | stats count by user, IpAddress, LogonType, EventCode
+
     | where count >= 1
+
     | sort - count
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4663")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4663')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_002 {\n  meta:\n    author = \"TDL\"\n    description = \"Bulk File Access to Sensitive Directories\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0009\"\n    technique = \"T1074.001\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id\
-    \ = /(4663)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
+  kql: |
+    SecurityEvent
+    | where EventID == 4663
+    | summarize AccessCount = count() by Account, IpAddress, LogonType, EventID
+    | where AccessCount >= 1
+    | sort by AccessCount desc
+    | project Account, IpAddress, LogonType, EventID, AccessCount
+  aql: |
+    SELECT username, sourceip, "Logon Type", "EventID", COUNT(*) AS access_count
+    FROM events
+    WHERE "EventID" = '4663'
+    GROUP BY username, sourceip, "Logon Type", "EventID"
+    HAVING access_count >= 1
+    ORDER BY access_count DESC
+    LAST 24 HOURS
+  yara_l: |
+    rule windows_object_access_staging {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects Windows Security Event 4663 (Object Access) events indicating potential data staging for collection - MITRE T1074.001"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1074.001"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 day
+      events:
+        $e.metadata.product_event_type = "4663"
+        $e.metadata.event_type = "FILE_READ" or $e.metadata.event_type = "FILE_OPEN" or $e.metadata.event_type = "GENERIC_EVENT"
+        $e.target.user.userid = $user
+        $e.principal.ip = $ip
+        $e.metadata.product_log_id = $logon_type
 
-    | WHERE event.category == "authentication" AND event_id IN ("4663")
+      match:
+        $user, $ip, $logon_type over 24h
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+      outcome:
+        $risk_score = max(35)
+        $access_count = count_distinct($e.metadata.id)
 
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code == "4663"
+    | STATS count = COUNT(*) BY user.name, source.ip, winlog.logon.type, event.code
+    | WHERE count >= 1
     | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4663])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4663)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4663")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4663)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4663")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+    | KEEP user.name, source.ip, winlog.logon.type, event.code, count
+  leql: |
+    where(source_json.EventID=4663) groupby(user, source_json.IpAddress, source_json.LogonType, source_json.EventCode) calculate(count)
+  crowdstrike: |
+    EventCode=4663
+    | groupBy([user, IpAddress, LogonType, EventCode], function=count(as=access_count))
+    | access_count >= 1
+    | sort(access_count, order=desc)
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4663
+    | comp count() as access_count by actor_effective_username, action_remote_ip, action_evtlog_event_data_LogonType, action_evtlog_event_id
+    | filter access_count >= 1
+    | sort desc access_count
+  lucene: |
+    event.code:4663
+  sumo: |
+    _sourceCategory=*Windows*Security* "4663"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetUserName" as user
+    | json field=_raw "IpAddress" as IpAddress
+    | json field=_raw "LogonType" as LogonType
+    | where event_id = "4663"
+    | count as access_count by user, IpAddress, LogonType, event_id
+    | where access_count >= 1
+    | sort by access_count desc
 false_positives:
 - Authorized data analysts
 - Batch processing jobs
@@ -92,7 +105,7 @@ tags:
 author: TDL
 created: '2024-03-11'
 test_method: historical
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'
 - Inspect the file path, file hash, parent process, and any prior network/email delivery — determine the collection scope (single file, recursive

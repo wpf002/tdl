@@ -15,86 +15,114 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=firewall (src_ip IN ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")) (dest_ip IN ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")) (action=allowed OR dest_port IN ("139", "445") OR app IN ("*smb*", "*samba*"))
+  spl: 'index=firewall (src_ip IN ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")) (dest_ip IN ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+    (action=allowed OR dest_port IN ("139", "445") OR app IN ("*smb*", "*samba*"))
+
     | bin _time span=1d
+
     | stats count by _time, src_ip
+
     | eventstats avg(count) as avg_count, stdev(count) as stdev_count by src_ip
+
     | where _time >= relative_time(now(), "-90d") AND _time < relative_time(now(), "-30d") OR _time >= relative_time(now(), "-30d")
+
     | eval threshold=avg_count + (3 * stdev_count)
+
     | where count > threshold AND count >= 3 AND _time >= relative_time(now(), "-1d")
+
     | table _time, src_ip, count, avg_count, threshold
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where application matches regex "smb"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "application" LIKE ''%smb%''
-
+  kql: |
+    let learning_period = 90d;
+    let baseline_period = 30d;
+    let detection_period = 1d;
+    let sensitivity = 3.0;
+    let minimum_threshold = 3;
+    let baseline_start = ago(learning_period);
+    let baseline_end = ago(detection_period);
+    let detection_start = ago(detection_period);
+    let smb_events = CommonSecurityLog
+        | where TimeGenerated between(baseline_start .. now())
+        | where DeviceVendor has_any ("Palo Alto", "Fortinet", "Cisco", "Check Point", "Firewall")
+        | where (SourceIP has "10." or SourceIP has "172.16." or SourceIP has "192.168." or SourceIP startswith "10." or SourceIP startswith "172." or SourceIP startswith "192.168.")
+        | where (DestinationIP has "10." or DestinationIP has "172.16." or DestinationIP has "192.168." or DestinationIP startswith "10." or DestinationIP startswith "172." or DestinationIP startswith "192.168.")
+        | where DeviceAction =~ "Allow" or DeviceAction =~ "Allowed" or DeviceAction =~ "Accept" or DestinationPort in ("139", "445") or ApplicationProtocol contains "smb" or ApplicationProtocol contains "samba" or Application contains "smb" or Application contains "samba"
+        | extend date_bin = bin(TimeGenerated, 1d);
+    let baseline_stats = smb_events
+        | where TimeGenerated between(baseline_start .. baseline_end)
+        | summarize daily_counts = make_list(count()) by SourceIP, date_bin
+        | summarize avg_count = avg(toint(daily_counts)), stdev_count = stdev(toint(daily_counts)) by SourceIP
+        | extend threshold = avg_count + (sensitivity * stdev_count)
+        | project SourceIP, avg_count, stdev_count, threshold;
+    let detection_counts = smb_events
+        | where TimeGenerated >= detection_start
+        | summarize current_count = count() by SourceIP;
+    detection_counts
+    | join kind=inner (baseline_stats) on SourceIP
+    | where current_count > threshold and current_count >= minimum_threshold
+    | project SourceIP, current_count, avg_count, stdev_count, threshold, deviation = (current_count - avg_count) / stdev_count
+    | sort by deviation desc
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count
+    FROM events
+    WHERE (sourceip IN (SELECT sourceip FROM events WHERE INOFFENSE('RFC1918')) OR sourceip MATCHES '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')
+      AND (destinationip IN (SELECT destinationip FROM events WHERE INOFFENSE('RFC1918')) OR destinationip MATCHES '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')
+      AND CATEGORYNAME(category) ILIKE '%firewall%'
+      AND (LOWER(QIDNAME(qid)) LIKE '%allow%' OR LOWER(QIDNAME(qid)) LIKE '%accept%' OR LOWER(QIDNAME(qid)) LIKE '%permit%')
+      AND (destinationport IN ('139', '445') OR "Application" ILIKE '%smb%' OR "Application" ILIKE '%samba%')
     GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_dis_000493 {\n  meta:\n    author = \"TDL\"\n    description = \"Spike in Internal SMB Traffic from a Single IP\"\n  \
-    \  severity = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1135\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n\
-    \    $e.application = /smb/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND application LIKE "%smb%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND application=/smb/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*smb*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND application ~= "smb"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND application:*smb*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where application matches "*smb*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    HAVING event_count >= 3
+    LAST 24 HOURS
+  yara_l: "rule network_share_enumeration_t1135 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects SMB/network share enumeration activity\
+    \ - MITRE T1135\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1135\"\n    severity = \"Medium\"\n    \n  events:\n\
+    \    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.security_result.action = \"ALLOW\"\n    (\n      $e.target.port = \"139\" or\n\
+    \      $e.target.port = \"445\" or\n      re.regex($e.network.application_protocol, `(?i)smb`) or\n      re.regex($e.network.application_protocol,\
+    \ `(?i)samba`)\n    )\n    net.ip_in_range_cidr($e.principal.ip, \"10.0.0.0/8\") or\n    net.ip_in_range_cidr($e.principal.ip, \"172.16.0.0/12\"\
+    ) or\n    net.ip_in_range_cidr($e.principal.ip, \"192.168.0.0/16\")\n    \n    net.ip_in_range_cidr($e.target.ip, \"10.0.0.0/8\") or\n   \
+    \ net.ip_in_range_cidr($e.target.ip, \"172.16.0.0/12\") or\n    net.ip_in_range_cidr($e.target.ip, \"192.168.0.0/16\")\n    \n    $e.principal.ip\
+    \ = $src_ip\n    \n  match:\n    $src_ip over 24h\n    \n  outcome:\n    $risk_score = max(35)\n    $num_connections = count_distinct($e.target.ip)\n\
+    \    \n  condition:\n    #e >= 3\n}\n"
+  esql: "FROM logs-network.firewall*\n| WHERE @timestamp > NOW() - 90 days\n  AND network.direction == \"internal\"\n  AND (event.action == \"\
+    allowed\" \n       OR destination.port IN (\"139\", \"445\")\n       OR TO_LOWER(network.application) LIKE \"*smb*\"\n       OR TO_LOWER(network.application)\
+    \ LIKE \"*samba*\")\n| EVAL day_bucket = DATE_TRUNC(1 day, @timestamp)\n| STATS daily_count = COUNT(*) BY source.ip, day_bucket\n| STATS avg_daily\
+    \ = AVG(daily_count), stddev_daily = STDDEV(daily_count), max_daily = MAX(daily_count), days_seen = COUNT(*) BY source.ip\n| WHERE days_seen\
+    \ >= 30\n  AND max_daily >= avg_daily + (3 * stddev_daily)\n  AND max_daily >= 3\n| KEEP source.ip, avg_daily, stddev_daily, max_daily, days_seen\n"
+  leql: |
+    where(source_address=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND destination_address=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND (action=ALLOWED OR destination_port IN [139, 445] OR application ICONTAINS "smb" OR application ICONTAINS "samba")) groupby(source_address) calculate(count)
+  crowdstrike: |
+    #type=firewall (src_ip=10.*.*.* OR src_ip=172.16.*.* OR src_ip=172.17.*.* OR src_ip=172.18.*.* OR src_ip=172.19.*.* OR src_ip=172.20.*.* OR src_ip=172.21.*.* OR src_ip=172.22.*.* OR src_ip=172.23.*.* OR src_ip=172.24.*.* OR src_ip=172.25.*.* OR src_ip=172.26.*.* OR src_ip=172.27.*.* OR src_ip=172.28.*.* OR src_ip=172.29.*.* OR src_ip=172.30.*.* OR src_ip=172.31.*.* OR src_ip=192.168.*.*) (dst_ip=10.*.*.* OR dst_ip=172.16.*.* OR dst_ip=172.17.*.* OR dst_ip=172.18.*.* OR dst_ip=172.19.*.* OR dst_ip=172.20.*.* OR dst_ip=172.21.*.* OR dst_ip=172.22.*.* OR dst_ip=172.23.*.* OR dst_ip=172.24.*.* OR dst_ip=172.25.*.* OR dst_ip=172.26.*.* OR dst_ip=172.27.*.* OR dst_ip=172.28.*.* OR dst_ip=172.29.*.* OR dst_ip=172.30.*.* OR dst_ip=172.31.*.* OR dst_ip=192.168.*.*) (action=*allow* OR action=*accept* OR action=*permit*) (dst_port=139 OR dst_port=445 OR app=*smb* OR app=*samba*)
+    | bucket(span=1d, field=@timestamp)
+    | groupBy([_bucket, src_ip], function=count(as=daily_count))
+    | groupBy([src_ip], function=[avg(daily_count, as=baseline_avg), stdev(daily_count, as=baseline_stdev), max(daily_count, as=current_count)])
+    | eval(threshold=baseline_avg + (3 * baseline_stdev))
+    | current_count > threshold AND current_count >= 3
+    | table([src_ip, current_count, baseline_avg, threshold])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action = "allow"
+    | filter (dest_port in ("139", "445") or application contains "smb" or application contains "samba")
+    | filter source_zone = "internal" and destination_zone = "internal"
+    | bin _time span = 1d
+    | comp count() as connection_count by _time, source_ip
+    | comp avg(connection_count) as baseline_avg, stdev(connection_count) as baseline_stdev by source_ip
+    | alter zscore = (connection_count - baseline_avg) / baseline_stdev
+    | filter zscore > 3 and connection_count >= 3
+    | filter _time >= timestamp_sub(current_time(), interval_of_day * 90)
+    | fields _time, source_ip, connection_count, baseline_avg, zscore
+  lucene: |
+    (action:Allowed OR destination.port:("139" OR "445") OR application:(*smb* OR *samba*)) AND source.ip:[10.0.0.0 TO 10.255.255.255] AND destination.ip:[10.0.0.0 TO 10.255.255.255]
+  sumo: "_sourceCategory=*Firewall* \n| where (src_ip matches \"10.*\" OR src_ip matches \"172.16.*\" OR src_ip matches \"172.17.*\" OR src_ip\
+    \ matches \"172.18.*\" OR src_ip matches \"172.19.*\" OR src_ip matches \"172.20.*\" OR src_ip matches \"172.21.*\" OR src_ip matches \"172.22.*\"\
+    \ OR src_ip matches \"172.23.*\" OR src_ip matches \"172.24.*\" OR src_ip matches \"172.25.*\" OR src_ip matches \"172.26.*\" OR src_ip matches\
+    \ \"172.27.*\" OR src_ip matches \"172.28.*\" OR src_ip matches \"172.29.*\" OR src_ip matches \"172.30.*\" OR src_ip matches \"172.31.*\"\
+    \ OR src_ip matches \"192.168.*\")\n| where (dest_ip matches \"10.*\" OR dest_ip matches \"172.16.*\" OR dest_ip matches \"172.17.*\" OR dest_ip\
+    \ matches \"172.18.*\" OR dest_ip matches \"172.19.*\" OR dest_ip matches \"172.20.*\" OR dest_ip matches \"172.21.*\" OR dest_ip matches\
+    \ \"172.22.*\" OR dest_ip matches \"172.23.*\" OR dest_ip matches \"172.24.*\" OR dest_ip matches \"172.25.*\" OR dest_ip matches \"172.26.*\"\
+    \ OR dest_ip matches \"172.27.*\" OR dest_ip matches \"172.28.*\" OR dest_ip matches \"172.29.*\" OR dest_ip matches \"172.30.*\" OR dest_ip\
+    \ matches \"172.31.*\" OR dest_ip matches \"192.168.*\")\n| where action matches \"*allow*\" OR action matches \"*permit*\" OR action matches\
+    \ \"*accept*\"\n| where dest_port in (\"139\", \"445\") OR application matches \"*smb*\" OR application matches \"*samba*\"\n| timeslice 1d\n\
+    | count as connection_count by _timeslice, src_ip\n| where connection_count >= 3\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -104,7 +132,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "Firewall Events\nFrom an internal source to an internal destination (Internal)\nWhere the Action is Allowed\nOR\n    Where the\
   \ Destination Port IN (\"139\", \"445\")\n\n    Where the Application contains \"smb\"\n\n    Where the Application contains \"samba\"\n\nBaseline\

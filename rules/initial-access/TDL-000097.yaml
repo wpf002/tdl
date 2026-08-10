@@ -15,71 +15,68 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=proofpoint sourcetype=proofpoint:tap threatType="impostor"
+  spl: 'index=proofpoint sourcetype=proofpoint:tap threatType="impostor"
+
     | table _time, recipient, sender, subject, threatType, messageID, threatsInfoMap
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000097 {\n  meta:\n    author = \"TDL\"\n    description = \"Imposter Email Delivered\"\n    severity = \"LOW\"\n\
-    \    tactic = \"TA0001\"\n    technique = \"T1566\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    ProofpointTAP
+    | where TimeGenerated > ago(24h)
+    | where threat contains "impostor" or classification contains "impostor" or threatStatus contains "impostor"
+    | project TimeGenerated, recipient, sender, subject, messageID, threatStatus, classification, threat, clicksPermitted, clicksBlocked
+  aql: "SELECT DATEFORMAT(eventtime,'YYYY-MM-dd HH:mm:ss') AS event_time, \n       LOGSOURCENAME(logsourceid) AS log_source,\n       \"Sender\
+    \ Email\" AS sender,\n       \"Recipient Email\" AS recipient,\n       \"Subject\" AS subject,\n       \"Threat Category\" AS threat_category,\n\
+    \       \"Threat Type\" AS threat_type\nFROM events\nWHERE LOGSOURCENAME(logsourceid) ILIKE '%proofpoint%'\n  AND (\"Threat Type\" ILIKE '%imposter%'\
+    \ OR \"Classification\" ILIKE '%imposter%' OR \"campaignId\" ILIKE '%imposter%')\nLAST 24 HOURS\n"
+  yara_l: |
+    rule proofpoint_imposter_email {
+      meta:
+        author = "TDL"
+        description = "Detects ProofPoint TAP events labeled as Imposter email"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1566"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "PROOFPOINT"
+        $e.metadata.product_name = "TAP"
+        $e.security_result.summary = "Imposter"
+        $e.target.user.email_addresses = $recipient
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $recipient over 1h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-proofpoint.tap*\n| WHERE @timestamp > NOW() - 24 hours \n  AND proofpoint.tap.messageParts.disposition == \"Imposter\"\n| STATS\
+    \ count = COUNT(*) BY proofpoint.tap.recipient, proofpoint.tap.sender, proofpoint.tap.messageID, host.name\n| KEEP @timestamp, proofpoint.tap.recipient,\
+    \ proofpoint.tap.sender, proofpoint.tap.subject, proofpoint.tap.messageID, host.name\n"
+  leql: |
+    where(source_json.threatType="imposter" OR source_json.classification="imposter" OR source_json.threat="imposter")
+  crowdstrike: |
+    #type=proofpoint_tap threatsInfoMap.classification=imposter
+    | table([@timestamp, messageID, sender, recipient, subject, threatsInfoMap.threat, threatsInfoMap.threatStatus, threatsInfoMap.classification])
+  xql: |
+    dataset = proofpoint_tap_raw
+    | filter threatType = "imposter" or category = "imposter" or impostor = "true"
+    | fields _time, sender, recipient, subject, threatType, category, messageID, senderIP
+  lucene: |
+    source:"ProofPoint TAP" AND threatType:"imposter"
+  sumo: |
+    _sourceCategory=*ProofPoint* OR _sourceCategory=*proofpoint* OR _sourceCategory=*TAP*
+    | json field=_raw "messageType" as message_type
+    | json field=_raw "threatType" as threat_type
+    | json field=_raw "impostor" as impostor
+    | json field=_raw "subject" as subject
+    | json field=_raw "sender" as sender
+    | json field=_raw "recipient" as recipient
+    | where impostor = "true" OR threat_type matches "*impostor*" OR threat_type matches "*Impostor*"
+    | fields _messageTime, sender, recipient, subject, threat_type, impostor
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -89,7 +86,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 ProofPoint TAP Event
 

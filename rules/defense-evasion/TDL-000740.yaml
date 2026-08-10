@@ -22,71 +22,91 @@ queries:
     \ OR DestinationPort=80 OR DestinationPort=443)\n(DestinationHostname=\"*\" OR DestinationIp=\"*\")\n| rex field=DestinationHostname \"(?<url_path>https?://[^\\\
     s]+)\"\n| where match(url_path, \"(?i)\\.dotm\") OR match(url_path, \"(?i)\\.xltm\")\n| table _time, ComputerName, User, Image, ParentImage,\
     \ DestinationIp, DestinationHostname, DestinationPort, url_path\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    DeviceNetworkEvents
+    | where TimeGenerated > ago(24h)
+    | where RemoteUrl matches regex @"^https?://"
+    | where RemoteUrl has_any (".dotm", ".xltm")
+    | join kind=inner (
+        DeviceProcessEvents
+        | where TimeGenerated > ago(24h)
+        | where InitiatingProcessFileName in~ ("winword.exe", "excel.exe")
+        | project DeviceId, DeviceName, InitiatingProcessFileName, InitiatingProcessId, InitiatingProcessCommandLine, Timestamp
+    ) on DeviceId, $left.InitiatingProcessId == $right.InitiatingProcessId
+    | where Timestamp between ((TimeGenerated - 5m) .. (TimeGenerated + 5m))
+    | project TimeGenerated, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteUrl, RemoteIP, RemotePort
+  aql: "SELECT eventtime, sourceip, LOGSOURCENAME(logsourceid) AS host, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\", destinationip,\
+    \ destinationport, \"URL\" \nFROM events \nWHERE (\"Parent Process Name\" ILIKE '%winword.exe%' OR \"Parent Process Name\" ILIKE '%excel.exe%')\
+    \ \n  AND (\"Process Name\" ILIKE '%http%' OR \"Process CommandLine\" ILIKE '%http://%' OR \"Process CommandLine\" ILIKE '%https://%' OR \"\
+    URL\" ILIKE '%http://%' OR \"URL\" ILIKE '%https://%') \n  AND (\"Process CommandLine\" ILIKE '%.dotm%' OR \"Process CommandLine\" ILIKE '%.xltm%'\
+    \ OR \"URL\" ILIKE '%.dotm%' OR \"URL\" ILIKE '%.xltm%') \nLAST 1 HOURS\n"
+  yara_l: |
+    rule office_remote_template_injection {
+      meta:
+        author = "TDL"
+        description = "Detects Office applications making network connections to retrieve remote templates (.dotm, .xltm)"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1221"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $proc.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          re.regex($proc.principal.process.file.full_path, `(?i)\\winword\.exe$`) or
+          re.regex($proc.principal.process.file.full_path, `(?i)\\excel\.exe$`)
+        )
+        $proc.principal.process.pid = $pid
+        $proc.principal.hostname = $host
 
-    | where process_name in ("winword.exe", "excel.exe")
+        $net.metadata.event_type = "NETWORK_CONNECTION"
+        $net.principal.process.pid = $pid
+        $net.principal.hostname = $host
+        (
+          re.regex($net.target.url, `(?i)^https?://.*\.(dotm|xltm)`) or
+          re.regex($net.network.http.referral_url, `(?i)^https?://.*\.(dotm|xltm)`)
+        )
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      match:
+        $host, $pid over 5m
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('winword.exe', 'excel.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000740 {\n  meta:\n    author = \"TDL\"\n    description = \"Office Document Fetching Remote Template URL\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1221\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(winword.exe|excel.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("winword.exe", "excel.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [winword.exe, excel.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (winword.exe, excel.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("winword.exe", "excel.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(winword.exe OR excel.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("winword.exe", "excel.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $proc and $net
+    }
+  esql: |
+    FROM logs-endpoint.events.network*, logs-windows.sysmon_operational*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (event.category == "network" AND event.action == "connection_attempted")
+        OR winlog.event_id == 3
+      )
+      AND (
+        TO_LOWER(process.parent.name) LIKE "*winword.exe"
+        OR TO_LOWER(process.parent.name) LIKE "*excel.exe"
+      )
+      AND (
+        (url.full RLIKE "https?://.*\\.(dotm|xltm)")
+        OR (destination.port IN (80, 443) AND (process.command_line LIKE "*.dotm*" OR process.command_line LIKE "*.xltm*"))
+      )
+    | KEEP @timestamp, host.name, user.name, process.parent.name, process.name, url.full, destination.ip, destination.port, process.command_line
+  leql: |
+    where(parent_process_name ICONTAINS "winword.exe" OR parent_process_name ICONTAINS "excel.exe") AND (process_cmd_line ICONTAINS "http://" OR process_cmd_line ICONTAINS "https://") AND (process_cmd_line ICONTAINS ".dotm" OR process_cmd_line ICONTAINS ".xltm")
+  crowdstrike: "event_simpleName=NetworkConnectIP4 \n(ParentBaseFileName=winword.exe OR ParentBaseFileName=excel.exe)\n(RemoteAddressIP4!=127.0.0.1\
+    \ AND RemoteAddressIP4!=0.0.0.0)\n(CommandLine=*http://* OR CommandLine=*https://*)\n(CommandLine=*.dotm* OR CommandLine=*.xltm*)\n| table([@timestamp,\
+    \ ComputerName, UserName, ParentBaseFileName, FileName, CommandLine, RemoteAddressIP4, RemotePort])\n"
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_NETWORK
+    | filter actor_process_image_name in ("winword.exe", "excel.exe")
+    | filter action_remote_port in (80, 443)
+    | filter action_network_connection_url ~= "(?i)https?://.*\\.(dotm|xltm)"
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_network_connection_url, action_remote_ip, action_remote_port
+  lucene: |
+    process.parent.name:(winword.exe OR excel.exe) AND (network.protocol:(http OR https) OR destination.port:(80 OR 443)) AND (url.path:*.dotm OR url.path:*.xltm OR http.request.body.content:*.dotm OR http.request.body.content:*.xltm OR process.command_line:*.dotm OR process.command_line:*.xltm)
+  sumo: "_sourceCategory=*Windows* OR _sourceCategory=*Sysmon* \n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"ParentImage\"\
+    \ as parent_image\n| json field=_raw \"Image\" as image\n| json field=_raw \"CommandLine\" as command_line\n| json field=_raw \"DestinationIp\"\
+    \ as dest_ip\n| json field=_raw \"DestinationHostname\" as dest_host\n| where (parent_image matches \"*\\\\winword.exe\" or parent_image matches\
+    \ \"*\\\\excel.exe\")\n| where (command_line matches \"*http://*\" or command_line matches \"*https://*\")\n| where (command_line matches\
+    \ \"*.dotm*\" or command_line matches \"*.xltm*\")\n| fields _messageTime, _sourceHost, parent_image, image, command_line, dest_ip, dest_host\n"
 pseudo_logic: winword.exe / excel.exe child connection to http(s):// retrieving .dotm or .xltm. Remote-template injection delivery.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -103,7 +123,7 @@ references:
 - https://attack.mitre.org/techniques/T1221/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

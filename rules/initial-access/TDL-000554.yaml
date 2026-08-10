@@ -16,82 +16,79 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) action=blocked (signature="*SQL*injection*" OR attack_type="*SQL*injection*") protocol=tcp NOT (src_ip IN ("10.0.1.100", "10.0.1.101", "192.168.100.50"))
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) action=blocked (signature="*SQL*injection*" OR attack_type="*SQL*injection*") protocol=tcp
+    NOT (src_ip IN ("10.0.1.100", "10.0.1.101", "192.168.100.50"))
+
     | stats count sum(bytes_out) as total_bytes_out dc(dest_ip) as unique_dests by src_ip, dest_ip, dest_port
+
     | where count >= 1
+
     | sort - total_bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(1h)\n| where DeviceVendor in (\"Palo Alto Networks\", \"Fortinet\", \"Cisco\", \"Check\
+    \ Point\", \"Snort\", \"Suricata\") or DeviceProduct has_any (\"Firewall\", \"IDS\", \"IPS\", \"WAF\")\n| where Protocol =~ \"tcp\"\n| where\
+    \ DeviceAction in (\"Blocked\", \"Denied\", \"Drop\", \"Reject\") and (Message has_any (\"SQL\", \"sql injection\", \"SQLi\") or Activity\
+    \ has_any (\"SQL Injection\", \"SQLi\"))\n| where SourceIP !in (\"10.0.0.100\", \"10.0.0.101\", \"192.168.1.50\")\n| summarize \n    event_count\
+    \ = count(),\n    bytes_out_sum = sum(SentBytes),\n    unique_dests = dcount(DestinationIP)\n    by SourceIP, DestinationIP, DestinationPort\n\
+    | where event_count >= 1\n| sort by bytes_out_sum desc\n| project SourceIP, DestinationIP, DestinationPort, event_count, unique_dests, bytes_out_sum\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, CATEGORYNAME(category) AS event_category, qidname(qid) AS event_name, COUNT(*) AS event_count, SUM(bytesout) AS total_bytes_out
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%firewall%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%IDS%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%IPS%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%WAF%')
+      ANDprotocolid = 6
+      AND (CATEGORYNAME(category) ILIKE '%SQL Injection%' OR qidname(qid) ILIKE '%SQL Injection%' OR CATEGORYNAME(category) ILIKE '%Attack%' OR CATEGORYNAME(category) ILIKE '%Denied%' OR CATEGORYNAME(category) ILIKE '%Blocked%')
+      AND sourceip NOT IN ('10.0.0.100', '192.168.1.50', '172.16.0.10')
+    GROUP BY sourceip, destinationip, destinationport, category, qid
+    HAVING event_count >= 1
+    ORDER BY total_bytes_out DESC
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000554 {\n  meta:\n    author = \"TDL\"\n    description = \"Blocked SQL Injection Attempt\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
+  yara_l: "rule blocked_sql_injection_attempt {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects blocked SQL injection\
+    \ attempts from network traffic\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1190\"\n    severity = \"\
+    HIGH\"\n  \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.security_result.action = \"BLOCK\"\n    re.regex($e.security_result.summary,\
+    \ `(?i)sql.?(injection|inject)`) or\n    re.regex($e.security_result.category, `(?i)sql.?(injection|inject)`) or\n    re.regex($e.metadata.description,\
+    \ `(?i)sql.?(injection|inject)`)\n    $e.network.ip_protocol = \"TCP\"\n    $e.principal.ip = $src_ip\n    $e.target.ip = $dest_ip\n    $e.target.port\
+    \ = $dest_port\n    not (\n      net.ip_in_range_cidr($e.principal.ip, \"10.0.0.0/8\") or\n      net.ip_in_range_cidr($e.principal.ip, \"\
+    172.16.0.0/12\") or\n      net.ip_in_range_cidr($e.principal.ip, \"192.168.0.0/16\")\n    )\n  \n  match:\n    $src_ip, $dest_ip, $dest_port\
+    \ over 5m\n  \n  outcome:\n    $risk_score = max(75)\n    $source_ip = $src_ip\n    $destination_ip = $dest_ip\n    $destination_port = $dest_port\n\
+    \  \n  condition:\n    #e >= 1\n}\n"
+  esql: "FROM logs-network.firewall*, logs-network.ids*\n| WHERE @timestamp > NOW() - 24 hour\n  AND network.protocol == \"tcp\"\n  AND (event.action\
+    \ == \"blocked\" OR event.action == \"denied\" OR event.action == \"drop\")\n  AND (\n    message LIKE \"*SQL*injection*\" \n    OR message\
+    \ LIKE \"*sql*injection*\"\n    OR event.category == \"intrusion_detection\"\n    OR threat.technique.id == \"T1190\"\n  )\n  AND source.ip\
+    \ NOT IN (\"10.0.0.10\", \"10.0.0.11\", \"192.168.1.100\")\n| STATS \n    event_count = COUNT(*),\n    unique_dests = COUNT_DISTINCT(destination.ip),\n\
+    \    total_bytes_out = SUM(source.bytes)\n  BY source.ip, destination.ip, destination.port\n| WHERE event_count >= 1\n| SORT total_bytes_out\
+    \ DESC\n| KEEP source.ip, destination.ip, destination.port, event_count, unique_dests, total_bytes_out\n"
+  leql: |
+    where(source_json.action=blocked AND (source_json.attack_type ICONTAINS "sql injection" OR source_json.signature ICONTAINS "sql injection" OR source_json.event_type ICONTAINS "sql injection") AND source_json.protocol ICONTAINS "tcp" AND source_address NOT IN ["10.0.0.100", "10.0.0.101", "192.168.1.50"]) groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    #type=firewall OR #type=ids
+    | network.protocol=*tcp*
+    | (signature=*SQL*Injection* OR alert=*SQL*Injection* OR action=blocked OR action=drop)
+    | src_ip!=10.0.1.5 AND src_ip!=10.0.1.6 AND src_ip!=172.16.0.10
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=event_count), sum(bytes_out, as=total_bytes)])
+    | event_count >= 1
+    | groupBy([src_ip], function=[count(dest_ip, distinct=true, as=unique_dests), sum(total_bytes, as=src_total_bytes)])
+    | sort(field=src_total_bytes, order=desc, limit=1000)
+    | table([src_ip, dest_ip, dest_port, event_count, unique_dests, total_bytes, src_total_bytes])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_firewall_rule_name ~= "(?i)(sql|injection|sqli)" and action = "deny"
+    | filter dest_port in (80, 443, 8080, 8443, 3306, 1433, 5432)
+    | filter not (action_source_ip in ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
+    | comp count() as event_count, count_distinct(action_destination_ip) as unique_dests, sum(action_total_bytes) as bytes_out by action_source_ip, action_destination_ip, dest_port
+    | filter event_count >= 1
     | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    | fields action_source_ip, action_destination_ip, dest_port, event_count, unique_dests, bytes_out
+  lucene: |
+    (sourcetype:(firewall OR ids) AND network.protocol:tcp AND (event.action:blocked OR action:blocked OR firewall.action:blocked) AND (http.request.body:*union*select* OR http.request.body:*OR*1=1* OR http.request.body:*;drop* OR http.request.body:*';exec* OR http.request.body:*<script* OR url:*union*select* OR url:*OR*1=1* OR url:*;drop* OR url:*';exec* OR signature:*SQL*injection* OR signature:*SQLi* OR threat.technique.name:*SQL*injection*)) AND NOT (source.ip:(10.0.0.100 OR 10.0.0.101 OR 10.0.0.102 OR 192.168.1.250 OR 172.16.0.50) OR src_ip:(10.0.0.100 OR 10.0.0.101 OR 10.0.0.102 OR 192.168.1.250 OR 172.16.0.50))
+  sumo: "_sourceCategory=*network* (firewall OR ids OR waf OR intrusion)\n| json field=_raw \"protocol\" as protocol\n| json field=_raw \"src_ip\"\
+    \ as src_ip\n| json field=_raw \"dest_ip\" as dest_ip\n| json field=_raw \"dest_port\" as dest_port\n| json field=_raw \"bytes_out\" as bytes_out\n\
+    | json field=_raw \"action\" as action\n| json field=_raw \"signature\" as signature\n| json field=_raw \"attack_type\" as attack_type\n|\
+    \ where protocol matches \"*tcp*\"\n| where (action matches \"*block*\" OR action matches \"*deny*\" OR action matches \"*drop*\") \n  AND\
+    \ (signature matches \"*sql*injection*\" OR attack_type matches \"*sql*injection*\" OR signature matches \"*SQLi*\")\n| where !(src_ip in\
+    \ (\"10.0.0.100\", \"10.0.0.101\", \"192.168.1.50\"))\n| count as event_count, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as\
+    \ total_bytes by src_ip, dest_ip, dest_port\n| where event_count >= 1\n| sort by total_bytes desc\n| fields src_ip, dest_ip, dest_port, event_count,\
+    \ unique_dests, total_bytes\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -101,7 +98,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

@@ -15,71 +15,47 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=github sourcetype=github:audit (action="repo.transfer_outgoing" OR action="repo.transfer_start" OR action="repo.transfer")
+  spl: 'index=github sourcetype=github:audit (action="repo.transfer_outgoing" OR action="repo.transfer_start" OR action="repo.transfer")
+
     | table _time, actor, action, repo, org, created_at, data.*
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000545 {\n  meta:\n    author = \"TDL\"\n    description = \"Repository Ownership Transfered\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    GitHubAuditLogPolling
+    | where TimeGenerated > ago(1h)
+    | where OperationName in ("repo.transfer_outgoing", "repo.transfer_start", "repo.transfer")
+    | project TimeGenerated, OperationName, Actor, Repository, IpAddress, UserAgent, RawEventData
+  aql: |
+    SELECT eventtime, username, sourceip, QIDNAME(qid), LOGSOURCENAME(logsourceid), "Action", "Repository", "Organization"
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%github%'
+      AND "Action" IN ('repo.transfer_outgoing', 'repo.transfer_start', 'repo.transfer')
+    LAST 24 HOURS
+  yara_l: "rule github_repo_transfer_activity {\n  meta:\n    author = \"TDL\"\n    description = \"Detects GitHub repository transfer events\
+    \ (T1078 - Valid Accounts)\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"\
+    Medium\"\n    \n  events:\n    $e.metadata.vendor_name = \"GITHUB\"\n    (\n      $e.metadata.product_event_type = \"repo.transfer_outgoing\"\
+    \ or\n      $e.metadata.product_event_type = \"repo.transfer_start\" or\n      $e.metadata.product_event_type = \"repo.transfer\"\n    )\n\
+    \    $e.principal.user.userid = $user\n    \n  match:\n    $user over 1h\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-github.audit*
+    | WHERE event.action IN ("repo.transfer_outgoing", "repo.transfer_start", "repo.transfer")
+    | KEEP @timestamp, user.name, event.action, github.repo, github.org, source.ip, user.email
+  leql: |
+    where(source_json.action IN [repo.transfer_outgoing, repo.transfer_start, repo.transfer])
+  crowdstrike: |
+    #type=github (action=repo.transfer_outgoing OR action=repo.transfer_start OR action=repo.transfer)
+    | table([@timestamp, actor, repo, action, org])
+  xql: |
+    dataset = github_audit_log_raw
+    | filter action in ("repo.transfer_outgoing", "repo.transfer_start", "repo.transfer")
+    | fields _time, actor, action, repo, org
+  lucene: |
+    Action:(repo.transfer_outgoing OR repo.transfer_start OR repo.transfer)
+  sumo: |
+    _sourceCategory=*github* (repo.transfer_outgoing OR repo.transfer_start OR repo.transfer)
+    | json field=_raw "action" as action
+    | where action in ("repo.transfer_outgoing", "repo.transfer_start", "repo.transfer")
+    | fields _messageTime, _sourceHost, action, *
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -89,7 +65,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "! GitHub Event\n   where Action IN (repo.transfer_outgoing, repo.transfer_start, repo.transfer)"
 triage_steps:

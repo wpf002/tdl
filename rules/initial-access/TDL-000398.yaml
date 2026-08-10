@@ -18,79 +18,158 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=azure OR index=o365 OR index=vpn action=success (eventName=UserLoggedIn OR EventCode=4624 OR activity=UserLoggedIn OR signature="User login") src_ip!=10.* src_ip!=172.16.* src_ip!=172.17.* src_ip!=172.18.* src_ip!=172.19.* src_ip!=172.20.* src_ip!=172.21.* src_ip!=172.22.* src_ip!=172.23.* src_ip!=172.24.* src_ip!=172.25.* src_ip!=172.26.* src_ip!=172.27.* src_ip!=172.28.* src_ip!=172.29.* src_ip!=172.30.* src_ip!=172.31.* src_ip!=192.168.* src_ip!=127.* earliest=-90d
+  spl: 'index=azure OR index=o365 OR index=vpn action=success (eventName=UserLoggedIn OR EventCode=4624 OR activity=UserLoggedIn OR signature="User
+    login") src_ip!=10.* src_ip!=172.16.* src_ip!=172.17.* src_ip!=172.18.* src_ip!=172.19.* src_ip!=172.20.* src_ip!=172.21.* src_ip!=172.22.*
+    src_ip!=172.23.* src_ip!=172.24.* src_ip!=172.25.* src_ip!=172.26.* src_ip!=172.27.* src_ip!=172.28.* src_ip!=172.29.* src_ip!=172.30.* src_ip!=172.31.*
+    src_ip!=192.168.* src_ip!=127.* earliest=-90d
+
     | eval src_country=coalesce(src_country, Country, country)
+
     | eval src_region=coalesce(src_region, Region, State, state, region)
+
     | eval user=coalesce(user, userName, UserName, Account_Name, User)
+
     | where isnotnull(src_country) AND isnotnull(user)
+
     | eventstats earliest(_time) as first_seen by user, src_country, src_region
+
     | where (now() - first_seen) <= 2592000
+
     | eval days_since_first=round((now() - first_seen)/86400, 0)
+
     | where days_since_first <= 30
+
     | table _time, user, src_ip, src_country, src_region, days_since_first
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000398 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Successful Authentication From Unexpected\
-    \ Location\"\n    severity = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    let TrainingWindow = 90d;
+    let BaselineWindow = 30d;
+    let DetectionWindow = 1d;
+    let HistoricalLogins = materialize(
+        SigninLogs
+        | where TimeGenerated between (ago(TrainingWindow) .. ago(DetectionWindow))
+        | where ResultType == 0
+        | where IPAddress != ""
+        | extend Country = tostring(LocationDetails.countryOrRegion)
+        | extend State = tostring(LocationDetails.state)
+        | where isnotempty(Country)
+        | summarize HistoricalCountries = make_set(Country), HistoricalStates = make_set(State) by UserPrincipalName
+    );
+    SigninLogs
+    | where TimeGenerated > ago(DetectionWindow)
+    | where ResultType == 0
+    | where IPAddress != ""
+    | extend Country = tostring(LocationDetails.countryOrRegion)
+    | extend State = tostring(LocationDetails.state)
+    | where isnotempty(Country)
+    | join kind=leftanti (
+        HistoricalLogins
+        | mv-expand HistoricalCountries to typeof(string)
+        | mv-expand HistoricalStates to typeof(string)
+        | project UserPrincipalName, HistoricalCountries, HistoricalStates
+    ) on UserPrincipalName, $left.Country == $right.HistoricalCountries, $left.State == $right.HistoricalStates
+    | project TimeGenerated, UserPrincipalName, IPAddress, Country, State, AppDisplayName, DeviceDetail, LocationDetails
+  aql: |
+    SELECT username AS "Source Username", sourceip AS "Source IP", GEOCOUNTRYCODE(sourceip) AS "Source Country", GEOREGIONCODE(sourceip) AS "Source Region/State", eventtime, LOGSOURCENAME(logsourceid) AS "Log Source", qidname(qid) AS "Event Name", COUNT(*) AS "Event Count"
+    FROM events
+    WHERE (logsourceid IN (SELECT id FROM logSourceType WHERE name ILIKE '%Azure%' OR name ILIKE '%Office 365%' OR name ILIKE '%VPN%') OR LOGSOURCENAME(logsourceid) ILIKE '%Azure%' OR LOGSOURCENAME(logsourceid) ILIKE '%Office 365%' OR LOGSOURCENAME(logsourceid) ILIKE '%VPN%')
+    AND (categoryname(category) ILIKE '%Authentication%' OR categoryname(category) ILIKE '%Logon%' OR qidname(qid) ILIKE '%success%logon%' OR qidname(qid) ILIKE '%success%login%' OR qidname(qid) ILIKE '%sign%in%success%')
+    AND (INOFFENSE(sourceip) = false OR sourceip NOT IN (SELECT sourceip FROM events WHERE username = $username AND (categoryname(category) ILIKE '%Authentication%' OR categoryname(category) ILIKE '%Logon%') START '90 days ago' STOP 'now'))
+    AND NOT (sourceip <<= '10.0.0.0/8' OR sourceip <<= '172.16.0.0/12' OR sourceip <<= '192.168.0.0/16')
+    GROUP BY username, sourceip, GEOCOUNTRYCODE(sourceip), GEOREGIONCODE(sourceip), eventtime, logsourceid, qid
+    LAST 90 DAYS
+  yara_l: "rule new_country_region_login {\n  meta:\n    author = \"TDL\"\n    description = \"Detects successful remote login from new source\
+    \ country or region for a user (30-day baseline)\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1078\"\n\
+    \    severity = \"Medium\"\n    \n  events:\n    $login.metadata.event_type = \"USER_LOGIN\"\n    $login.security_result.action = \"ALLOW\"\
+    \n    (\n      $login.metadata.vendor_name = \"Microsoft\" or\n      $login.metadata.vendor_name = \"AZURE\" or\n      $login.metadata.vendor_name\
+    \ = \"OFFICE 365\"\n    )\n    not net.ip_in_range_cidr($login.principal.ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($login.principal.ip,\
+    \ \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($login.principal.ip, \"192.168.0.0/16\")\n    $login.target.user.userid = $user\n    $login.principal.ip\
+    \ = $source_ip\n    $login.principal.location.country_or_region = $country\n    $login.principal.location.state = $region\n    \n  match:\n\
+    \    $user over 1h\n    \n  outcome:\n    $risk_score = 65\n    $source_ip\n    $country\n    $region\n    \n  condition:\n    $login\n}\n"
+  esql: "FROM logs-azure.signinlogs*, logs-o365.audit*\n| WHERE @timestamp > NOW() - 90 days\n  AND event.outcome == \"success\"\n  AND (event.category\
+    \ == \"authentication\" OR event.action IN (\"UserLoggedIn\", \"UserLoginSuccess\"))\n  AND NOT CIDR_MATCH(source.ip, \"10.0.0.0/8\", \"172.16.0.0/12\"\
+    , \"192.168.0.0/16\")\n| EVAL baseline_start = NOW() - 90 days\n| EVAL baseline_end = NOW() - 30 days\n| EVAL is_baseline = CASE(@timestamp\
+    \ >= baseline_start AND @timestamp < baseline_end, 1, 0)\n| EVAL is_detection = CASE(@timestamp >= baseline_end, 1, 0)\n| STATS \n    baseline_countries\
+    \ = VALUES(CASE(is_baseline == 1, source.geo.country_name, null)),\n    baseline_regions = VALUES(CASE(is_baseline == 1, source.geo.region_name,\
+    \ null)),\n    detection_countries = VALUES(CASE(is_detection == 1, source.geo.country_name, null)),\n    detection_regions = VALUES(CASE(is_detection\
+    \ == 1, source.geo.region_name, null)),\n    latest_timestamp = MAX(@timestamp),\n    latest_ip = VALUES(CASE(is_detection == 1, source.ip,\
+    \ null))\n  BY user.name\n| WHERE is_detection == 1\n| EVAL new_country = detection_countries\n| EVAL new_region = detection_regions\n| WHERE\
+    \ new_country IS NOT NULL OR new_region IS NOT NULL\n| KEEP user.name, new_country, new_region, latest_timestamp, latest_ip\n"
+  leql: |
+    where(result=SUCCESS AND source_address!=PRIVATE(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)) groupby(user, source_json.location.country, source_json.location.state) calculate(count)
+  crowdstrike: |
+    #type=azure-ad OR #type=office365 OR #type=vpn
+    (event_simpleName="UserActivityAuditEvent" OR EventCode=4624 OR event.code=4624 OR event.action="UserLoggedIn" OR activity="UserLoggedIn" OR event_simpleName="RemoteLogin" OR LogonType=10)
+    (ResultStatus="Success" OR event.outcome="success" OR Keywords="Audit Success")
+    | case {
+        src_ip=* | src_ip;
+        SourceIP=* | SourceIP;
+        ipAddress=* | ipAddress;
+        clientIP=* | clientIP;
+        RemoteIP=* | RemoteIP;
+        * | "unknown";
+        test(as=source_ip)
+      }
+    | case {
+        user=* | user;
+        UserName=* | UserName;
+        userId=* | userId;
+        TargetUserName=* | TargetUserName;
+        userPrincipalName=* | userPrincipalName;
+        * | "unknown";
+        test(as=username)
+      }
+    | ipLocation(source_ip)
+    | source_ip!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/
+    | case {
+        source_ip.country=* | source_ip.country;
+        * | "unknown";
+        test(as=country)
+      }
+    | case {
+        source_ip.region=* | source_ip.region;
+        * | "unknown";
+        test(as=region)
+      }
+    | selfJoin(field=[username], where=[{country=* AND region=*}], window=30d, prefilter=true)
+    | country!=country_prev OR region!=region_prev
+    | table([@timestamp, username, source_ip, country, region, event_simpleName, ResultStatus])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter event_type = ENUM.EVENT_TYPE_AUTHENTICATION and outcome = ENUM.OUTCOME_SUCCESS
+    | filter action_remote_ip != null and not incidr(action_remote_ip, "10.0.0.0/8") and not incidr(action_remote_ip, "172.16.0.0/12") and not incidr(action_remote_ip, "192.168.0.0/16")
+    | alter source_country = action_country, source_region = action_region
+    | comp values(source_country) as countries_seen, values(source_region) as regions_seen by actor_effective_username
+    | alter baseline_start = timestamp_add(_time, INTERVAL -30 DAY), retention_end = timestamp_add(_time, INTERVAL -90 DAY)
+    | fields _time, actor_effective_username, action_remote_ip, source_country, source_region, countries_seen, regions_seen
+  lucene: |
+    event.action:"sign-in" AND event.outcome:success AND (source.ip.type:public OR NOT source.ip:10.0.0.0/8) AND NOT source.ip:172.16.0.0/12 AND NOT source.ip:192.168.0.0/16
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*Office* OR _sourceCategory=*M365* OR _sourceCategory=*O365*
+    | json field=_raw "ResultType" as result_type
+    | json field=_raw "UserPrincipalName" as user
+    | json field=_raw "IPAddress" as src_ip
+    | json field=_raw "Location.countryOrRegion" as country
+    | json field=_raw "Location.state" as state
+    | where result_type = "0" AND !isPrivateIP(src_ip)
+    | where !isEmpty(country) AND !isEmpty(user)
+    | timeslice 1d
+    | count by _timeslice, user, country, state, src_ip
+    | where _timeslice >= now() - 90d
+    | lookup user, country, state from (
+        _sourceCategory=*Azure* OR _sourceCategory=*Office* OR _sourceCategory=*M365* OR _sourceCategory=*O365*
+        | json field=_raw "ResultType" as result_type
+        | json field=_raw "UserPrincipalName" as user
+        | json field=_raw "IPAddress" as src_ip
+        | json field=_raw "Location.countryOrRegion" as country
+        | json field=_raw "Location.state" as state
+        | where result_type = "0" AND !isPrivateIP(src_ip)
+        | where _messageTime >= now() - 90d AND _messageTime < now() - 30d
+        | count by user, country, state
+    ) on user, country, state
+    | where isNull(%lookup.user)
+    | fields _timeslice, user, country, state, src_ip
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -100,7 +179,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Successful Remote Login Event \nWhere the Source IP is an External IP\n\nBaseline Learning: 30 Days\nRetention: 90 Days\n\nNew\
   \ Value: Source Country, Source Region/State\nPer Entity: Source Username"

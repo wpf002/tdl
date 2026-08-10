@@ -15,76 +15,82 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=windows EventCode=18456
+  spl: 'index=windows EventCode=18456
+
     | bin _time span=1m
+
     | stats count by _time, ComputerName, Account_Name
+
     | where count >= 3
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000272 {\n  meta:\n    author = \"TDL\"\n    description = \"SQL Login Attempts Failed\"\n    severity = \"LOW\"\n\
-    \    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 18456
+    | summarize FailureCount = count() by bin(TimeGenerated, 1m), Computer, Account
+    | where FailureCount >= 3
+    | project TimeGenerated, Computer, Account, FailureCount
+  aql: |
+    SELECT username, sourceip, LOGSOURCENAME(logsourceid) AS host, COUNT(*) AS failed_attempts
+    FROM events
+    WHERE "EventID" = '18456'
+    GROUP BY username, sourceip, LOGSOURCENAME(logsourceid)
+    HAVING failed_attempts >= 3
+    LAST 1 MINUTES
+  yara_l: |
+    rule sql_login_brute_force {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects 3 or more SQL login failures (Event ID 18456) within 1 minute"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.metadata.product_event_type = "18456"
+        $e.security_result.action = "BLOCK"
+        $e.principal.hostname = $host
+        $e.target.user.userid = $user
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host, $user over 1m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 3
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-system.security*, winlogbeat-*, logs-windows.forwarded*
+    | WHERE @timestamp > NOW() - 1 hour AND event.code == "18456"
+    | STATS failures = COUNT(*) BY user.name, host.name, source.ip, bucket = BUCKET(@timestamp, 1 minute)
+    | WHERE failures >= 3
+    | KEEP bucket, host.name, user.name, source.ip, failures
+  leql: |
+    where(source_json.EventID=18456) groupby(source_address, user) calculate(count)
+  crowdstrike: |
+    EventCode=18456
+    | bucket(span=1m, field=@timestamp, as=time_bucket)
+    | groupBy([time_bucket, ComputerName, TargetUserName], function=count(as=failures))
+    | failures >= 3
+    | table([time_bucket, ComputerName, TargetUserName, failures])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 18456
+    | bin _time span=1m
+    | comp count() as failures by _time, agent_hostname, action_evtlog_event_data_TargetUserName
+    | filter failures >= 3
+    | fields _time, agent_hostname, action_evtlog_event_data_TargetUserName, failures
+  lucene: |
+    event.code:18456 OR EventID:18456
+  sumo: |
+    _sourceCategory=*Windows* "18456"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "LogonUser" as logon_user
+    | where event_id = "18456"
+    | timeslice 1m
+    | count as failures by _timeslice, logon_user, _sourceHost
+    | where failures >= 3
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -94,7 +100,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '3 SQL login Failure Events
 

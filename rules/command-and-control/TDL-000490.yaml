@@ -15,87 +15,101 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=ids OR index=ips tag=ids tag=attack signature=* src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) dest_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+  spl: 'index=ids OR index=ips tag=ids tag=attack signature=* src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) dest_ip IN (10.0.0.0/8, 172.16.0.0/12,
+    192.168.0.0/16)
+
     | eval src_internal=if(cidrmatch("10.0.0.0/8", src_ip) OR cidrmatch("172.16.0.0/12", src_ip) OR cidrmatch("192.168.0.0/16", src_ip), 1, 0)
-    | eval dest_internal=if(cidrmatch("10.0.0.0/8", dest_ip) OR cidrmatch("172.16.0.0/12", dest_ip) OR cidrmatch("192.168.0.0/16", dest_ip), 1, 0)
+
+    | eval dest_internal=if(cidrmatch("10.0.0.0/8", dest_ip) OR cidrmatch("172.16.0.0/12", dest_ip) OR cidrmatch("192.168.0.0/16", dest_ip), 1,
+    0)
+
     | where src_internal=1 AND dest_internal=1
+
     | lookup previously_seen_signatures.csv signature OUTPUT first_seen
+
     | where isnull(first_seen) OR first_seen > relative_time(now(), "-30d@d")
+
     | stats count values(signature) as signature_name earliest(_time) as first_time latest(_time) as last_time by src_ip, dest_ip, signature
+
     | where count >= 1
+
     | table first_time, last_time, src_ip, dest_ip, signature, signature_name, count
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000490 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Exploit from Internal Host\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: "let LookbackPeriod = 90d;\nlet BaselinePeriod = 30d;\nlet CurrentPeriod = 1d;\nCommonSecurityLog\n| where TimeGenerated > ago(LookbackPeriod)\n\
+    | where DeviceVendor has_any (\"Palo Alto\", \"Fortinet\", \"Cisco\", \"Snort\", \"Suricata\", \"Tipping Point\", \"McAfee\", \"Checkpoint\"\
+    ) or Activity has \"IDS\" or Activity has \"IPS\"\n| where Activity has_any (\"Exploit\", \"Attack\", \"Intrusion\") or DeviceEventClassID\
+    \ has_any (\"exploit\", \"attack\", \"intrusion\")\n| extend SourceIsInternal = ipv4_is_private(SourceIP)\n| extend DestinationIsInternal\
+    \ = ipv4_is_private(DestinationIP)\n| where SourceIsInternal == true and DestinationIsInternal == true\n| extend SignatureID = coalesce(DeviceEventClassID,\
+    \ Activity, tostring(EventID))\n| where isnotempty(SignatureID)\n| extend IsBaseline = iff(TimeGenerated < ago(CurrentPeriod), true, false)\n\
+    | summarize \n    BaselineSignatures = make_set_if(SignatureID, IsBaseline == true),\n    CurrentEvents = countif(IsBaseline == false),\n\
+    \    FirstSeen = min(TimeGenerated),\n    LastSeen = max(TimeGenerated)\n    by SourceIP, DestinationIP, SignatureID\n| where CurrentEvents\
+    \ >= 1\n| extend IsNewSignature = iff(array_length(BaselineSignatures) == 0 or not(set_has_element(BaselineSignatures, SignatureID)), true,\
+    \ false)\n| where IsNewSignature == true\n| where LastSeen > ago(CurrentPeriod)\n| project LastSeen, SourceIP, DestinationIP, SignatureID,\
+    \ FirstSeen, CurrentEvents\n"
+  aql: |
+    SELECT sourceip, destinationip, qidname(qid) AS signature, COUNT(*) AS event_count
+    FROM events
+    WHERE category IN (SELECT categoryid FROM categories WHERE highlevelcategory='SIM/Policy')
+      AND sourceip IN (SELECT sourceip FROM events WHERE INOFFENSE() GROUP BY sourceip)
+      AND destinationip IN (SELECT destinationip FROM events WHERE INOFFENSE() GROUP BY destinationip)
+      AND (sourceip << '10.0.0.0/8' OR sourceip << '172.16.0.0/12' OR sourceip << '192.168.0.0/16')
+      AND (destinationip << '10.0.0.0/8' OR destinationip << '172.16.0.0/12' OR destinationip << '192.168.0.0/16')
+    GROUP BY sourceip, destinationip, qid
+    LAST 90 DAYS
+  yara_l: "rule t1078_internal_exploit_new_signature {\n  meta:\n    author = \"TDL\"\n    description = \"Detects new IDS/IPS exploit signatures\
+    \ between internal hosts - T1078 C2\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique = \"T1078\"\n    severity\
+    \ = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.security_result.category_details != \"\"\n  \
+    \  $e.security_result.action = \"BLOCK\" or $e.security_result.action = \"ALERT\"\n    net.ip_in_range_cidr($e.principal.ip, \"10.0.0.0/8\"\
+    ) or \n    net.ip_in_range_cidr($e.principal.ip, \"172.16.0.0/12\") or \n    net.ip_in_range_cidr($e.principal.ip, \"192.168.0.0/16\")\n \
+    \   net.ip_in_range_cidr($e.target.ip, \"10.0.0.0/8\") or \n    net.ip_in_range_cidr($e.target.ip, \"172.16.0.0/12\") or \n    net.ip_in_range_cidr($e.target.ip,\
+    \ \"192.168.0.0/16\")\n    $e.principal.ip = $src\n    $e.target.ip = $dst\n    $e.security_result.category_details = $signature\n    \n \
+    \ match:\n    $src, $dst, $signature over 90d\n    \n  outcome:\n    $risk_score = 50\n    $first_seen_signature = min($e.metadata.event_timestamp.seconds)\n\
+    \    $signature_name = array_distinct($e.security_result.category_details)\n    \n  condition:\n    $e and #signature == 1\n}\n"
+  esql: "FROM logs-network.ids* \n| WHERE @timestamp > NOW() - 90 days \n  AND event.kind == \"alert\" \n  AND source.ip RLIKE \"^(10\\\\.|172\\\
+    \\.(1[6-9]|2[0-9]|3[01])\\\\.|192\\\\.168\\\\.)\" \n  AND destination.ip RLIKE \"^(10\\\\.|172\\\\.(1[6-9]|2[0-9]|3[01])\\\\.|192\\\\.168\\\
+    \\.)\" \n  AND event.category == \"intrusion_detection\"\n| EVAL baseline_start = NOW() - 90 days\n| EVAL baseline_end = NOW() - 30 days\n\
+    | EVAL detection_window_start = NOW() - 30 days\n| EVAL is_baseline = CASE(@timestamp >= baseline_start AND @timestamp < baseline_end, 1,\
+    \ 0)\n| EVAL is_detection = CASE(@timestamp >= detection_window_start, 1, 0)\n| STATS baseline_count = SUM(is_baseline), detection_count =\
+    \ SUM(is_detection) BY rule.name, source.ip, destination.ip\n| WHERE detection_count >= 1 AND baseline_count == 0\n| KEEP rule.name, source.ip,\
+    \ destination.ip, detection_count\n"
+  leql: |
+    where(log_source_type=IDS AND direction=Internal AND signature_class ICONTAINS "exploit") groupby(source_address, destination_address, signature) calculate(count)
+  crowdstrike: |
+    #type=IDS OR #type=IPS OR event_simpleName=*IDS* OR event_simpleName=*IPS*
+    | case {
+        test(src_ip=10.* OR src_ip=172.16.* OR src_ip=172.17.* OR src_ip=172.18.* OR src_ip=172.19.* OR src_ip=172.20.* OR src_ip=172.21.* OR src_ip=172.22.* OR src_ip=172.23.* OR src_ip=172.24.* OR src_ip=172.25.* OR src_ip=172.26.* OR src_ip=172.27.* OR src_ip=172.28.* OR src_ip=172.29.* OR src_ip=172.30.* OR src_ip=172.31.* OR src_ip=192.168.*) | internal_src := "true" ;
+        * | internal_src := "false" ;
+      }
+    | case {
+        test(dest_ip=10.* OR dest_ip=172.16.* OR dest_ip=172.17.* OR dest_ip=172.18.* OR dest_ip=172.19.* OR dest_ip=172.20.* OR dest_ip=172.21.* OR dest_ip=172.22.* OR dest_ip=172.23.* OR dest_ip=172.24.* OR dest_ip=172.25.* OR dest_ip=172.26.* OR dest_ip=172.27.* OR dest_ip=172.28.* OR dest_ip=172.29.* OR dest_ip=172.30.* OR dest_ip=172.31.* OR dest_ip=192.168.*) | internal_dest := "true" ;
+        * | internal_dest := "false" ;
+      }
+    | internal_src="true" AND internal_dest="true"
+    | groupBy([signature, src_ip, dest_ip], function=count(as=event_count))
+    | event_count >= 1
+    | table([src_ip, dest_ip, signature, event_count])
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter threat_category = "exploit" and action_source_translated_ip_indicator = "Internal" and action_destination_translated_ip_indicator = "Internal"
+    | alter signature = coalesce(threat_name, threat_id)
+    | comp count_distinct(signature) as signature_count by action_source_ip, action_destination_ip
+    | filter signature_count >= 1
+    | fields _time, action_source_ip, action_destination_ip, signature
+  lucene: |
+    event.category:"intrusion_detection" AND (event.type:"alert" OR alert.severity:*) AND source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND (alert.category:"Exploit" OR event.kind:"alert")
+  sumo: |
+    _sourceCategory=*IDS* OR _sourceCategory=*IPS* OR _sourceCategory=*Intrusion*
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "signature" as signature
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "alert.severity" as severity
+    | where event_type matches "*exploit*" OR event_type matches "*alert*" OR severity matches "*high*" OR severity matches "*critical*"
+    | where (src_ip matches "10.*" OR src_ip matches "172.16.*" OR src_ip matches "172.17.*" OR src_ip matches "172.18.*" OR src_ip matches "172.19.*" OR src_ip matches "172.20.*" OR src_ip matches "172.21.*" OR src_ip matches "172.22.*" OR src_ip matches "172.23.*" OR src_ip matches "172.24.*" OR src_ip matches "172.25.*" OR src_ip matches "172.26.*" OR src_ip matches "172.27.*" OR src_ip matches "172.28.*" OR src_ip matches "172.29.*" OR src_ip matches "172.30.*" OR src_ip matches "172.31.*" OR src_ip matches "192.168.*")
+    | where (dest_ip matches "10.*" OR dest_ip matches "172.16.*" OR dest_ip matches "172.17.*" OR dest_ip matches "172.18.*" OR dest_ip matches "172.19.*" OR dest_ip matches "172.20.*" OR dest_ip matches "172.21.*" OR dest_ip matches "172.22.*" OR dest_ip matches "172.23.*" OR dest_ip matches "172.24.*" OR dest_ip matches "172.25.*" OR dest_ip matches "172.26.*" OR dest_ip matches "172.27.*" OR dest_ip matches "172.28.*" OR dest_ip matches "172.29.*" OR dest_ip matches "172.30.*" OR dest_ip matches "172.31.*" OR dest_ip matches "192.168.*")
+    | count by signature, src_ip, dest_ip
+    | where _count >= 1
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -105,7 +119,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 IDS/IPS Exploit Event
 

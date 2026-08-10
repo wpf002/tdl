@@ -18,82 +18,101 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=network sourcetype=cisco:firepower:syslog (impact=1 OR impact_flag=1) classification="*exploit*" src_ip!=10.0.0.0/8 src_ip!=172.16.0.0/12 src_ip!=192.168.0.0/16 (dest_ip=10.0.0.0/8 OR dest_ip=172.16.0.0/12 OR dest_ip=192.168.0.0/16)
+  spl: 'index=network sourcetype=cisco:firepower:syslog (impact=1 OR impact_flag=1) classification="*exploit*" src_ip!=10.0.0.0/8 src_ip!=172.16.0.0/12
+    src_ip!=192.168.0.0/16 (dest_ip=10.0.0.0/8 OR dest_ip=172.16.0.0/12 OR dest_ip=192.168.0.0/16)
+
     | lookup vulnerability_scanner_results dest_ip OUTPUT vulnerable_signatures
+
     | where match(vulnerable_signatures, signature_id) OR like(vulnerable_signatures, "%".signature."%")
+
     | table _time, src_ip, dest_ip, signature, signature_id, impact, classification, vulnerable_signatures
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceVendor == "Cisco" and DeviceProduct == "Firepower"
+    | where DeviceEventClassID has "exploit" or Activity has "exploit"
+    | where DeviceCustomNumber1 == 1
+    | where DeviceDirection == "inbound" or CommunicationDirection == "inbound"
+    | where SourceIP !has "10." and SourceIP !has "172.16." and SourceIP !has "192.168."
+    | where DestinationIP has "10." or DestinationIP has "172.16." or DestinationIP has "192.168."
+    | project TimeGenerated, DeviceVendor, DeviceProduct, Activity, DeviceEventClassID, SourceIP, DestinationIP, DestinationHostName, DeviceCustomNumber1, DeviceCustomString1, DeviceCustomString2, Message
+  aql: |
+    SELECT sourceip, destinationip, qidname(qid), CATEGORYNAME(category), logsourceid, LOGSOURCENAME(logsourceid), COUNT(*) AS event_count
+    FROM events
+    WHERE CATEGORYNAME(category) ILIKE '%exploit%'
+      AND (sourceip NOT IN (SELECT destinationip FROM events WHERE INOFFENSE('RFC1918 Address Space')) OR sourceip NOT MATCHES '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')
+      AND (destinationip IN (SELECT sourceip FROM events WHERE INOFFENSE('RFC1918 Address Space')) OR destinationip MATCHES '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')
+      AND (LOGSOURCETYPENAME(devicetype) ILIKE '%IDS%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%IPS%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%Firepower%')
+    GROUP BY sourceip, destinationip, qid, category, logsourceid
+    LAST 24 HOURS
+  yara_l: |
+    rule mitre_t1203_exploit_vulnerable_host {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects exploitation attempts against vulnerable hosts via IDS/IPS - MITRE T1203 Initial Access"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1203"
+        severity = "HIGH"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.security_result.category_details = "exploit"
+        $e.network.direction = "INBOUND"
+        not net.ip_in_range_cidr($e.principal.ip, "10.0.0.0/8")
+        not net.ip_in_range_cidr($e.principal.ip, "172.16.0.0/12")
+        not net.ip_in_range_cidr($e.principal.ip, "192.168.0.0/16")
+        (
+          net.ip_in_range_cidr($e.target.ip, "10.0.0.0/8") or
+          net.ip_in_range_cidr($e.target.ip, "172.16.0.0/12") or
+          net.ip_in_range_cidr($e.target.ip, "192.168.0.0/16")
+        )
+        $e.security_result.detection_fields["impact"] = "1"
+        $e.target.ip = $dest_ip
 
-    WHERE "network.protocol" LIKE ''%tcp%''
+      match:
+        $dest_ip over 5m
 
-    GROUP BY sourceip, destinationip, destinationport
+      outcome:
+        $risk_score = 85
+        $target_ip = $dest_ip
+        $source_ip = $e.principal.ip
+        $signature = $e.security_result.rule_name
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000243 {\n  meta:\n    author = \"TDL\"\n    description = \"Allowed Exploit to Vulnerable Host\"\n    severity =\
-    \ \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1203\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-cisco.firepower*\n| WHERE @timestamp > NOW() - 24 hour \n  AND event.kind == \"alert\" \n  AND cisco.firepower.impact == \"\
+    1\"\n  AND network.direction == \"inbound\"\n  AND NOT CIDR_MATCH(source.ip, \"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\")\n  AND\
+    \ CIDR_MATCH(destination.ip, \"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\")\n| KEEP @timestamp, source.ip, destination.ip, destination.port,\
+    \ event.action, rule.name, host.name, cisco.firepower.impact\n"
+  leql: |
+    where(log_source_type="Cisco Firepower" AND source_json.impact_flag="1" AND direction=INBOUND)
+  crowdstrike: |
+    #type=ips OR #type=ids OR event_simpleName=*IDS* OR event_simpleName=*IPS* OR sourcetype=*firepower* OR sourcetype=*snort*
+    (Impact="1" OR impact="1" OR severity=*exploit* OR alert_category=*exploit* OR signature_category=*exploit*)
+    (direction=inbound OR src_ip!=10.* OR src_ip!=192.168.* OR src_ip!=172.16.* OR (NOT (dest_ip!=10.* AND dest_ip!=192.168.* AND dest_ip!=172.16.*)))
+    | table([@timestamp, src_ip, dest_ip, signature, signature_id, Impact, impact, severity, direction, ComputerName, dest_host])
+  xql: |
+    dataset = firepower_raw
+    | filter impact = "1" and direction = "inbound" and event_type contains "exploit"
+    | join type=inner (dataset = vulnerability_scan_raw | filter status = "vulnerable" | fields host_ip as dest_ip, signature_id as vuln_sig) as vuln on dest_ip = dest_ip and signature_id = vuln_sig
+    | fields _time, src_ip, dest_ip, signature_id, signature_name, impact, host_ip
+  lucene: |
+    (event.category:intrusion_detection OR event.type:ids OR event.type:ips OR source.type:firepower) AND (event.kind:alert OR alert.category:exploit OR event.outcome:exploit) AND (network.direction:inbound OR network.direction:external_to_internal OR (NOT source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16))) AND (vulnerability.scanner.match:true OR vulnerability.status:vulnerable OR vuln_scan_match:true OR cisco.firepower.impact_flag:1 OR impact:1)
+  sumo: |
+    _sourceCategory=*firepower* OR _sourceCategory=*IDS* OR _sourceCategory=*IPS*
+    | json field=_raw "Impact" as impact
+    | json field=_raw "SourceIP" as src_ip
+    | json field=_raw "DestinationIP" as dest_ip
+    | json field=_raw "SignatureID" as signature_id
+    | json field=_raw "SignatureName" as signature_name
+    | json field=_raw "VulnerabilityStatus" as vuln_status
+    | where impact = "1"
+    | where !isPrivateIP(src_ip) AND isPrivateIP(dest_ip)
+    | where vuln_status matches "*vulnerable*" OR vuln_status = "1"
+    | fields _messageTime, src_ip, dest_ip, signature_id, signature_name, vuln_status, _sourceHost
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -103,7 +122,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 IDS/IPS Exploit Event
 

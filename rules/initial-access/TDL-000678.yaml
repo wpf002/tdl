@@ -15,71 +15,46 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=slack sourcetype=slack:events action=guest_reactivated
+  spl: 'index=slack sourcetype=slack:events action=guest_reactivated
+
     | table _time, user, action, guest_user, workspace
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000678 {\n  meta:\n    author = \"TDL\"\n    description = \"Guest User Reactivated - Slack\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    OfficeActivity
+    | where TimeGenerated > ago(24h)
+    | where OfficeWorkload == "Slack"
+    | where Operation == "guest_reactivated"
+    | project TimeGenerated, UserId, ClientIP, Operation, OrganizationId, OfficeObjectId
+  aql: |
+    SELECT eventtime, username, sourceip, "Action", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "Action" = 'guest_reactivated'
+    LAST 24 HOURS
+  yara_l: "rule slack_guest_reactivated {\n  meta:\n    author = \"TDL\"\n    description = \"Detects when a guest user is reactivated in Slack\
+    \ - MITRE T1078 Initial Access\"\n    severity = \"Medium\"\n    mitre_tactic = \"Initial Access\"\n    mitre_technique = \"T1078\"\n    \n\
+    \  events:\n    $e.metadata.product_name = \"Slack\"\n    $e.metadata.product_event_type = \"guest_reactivated\"\n    $e.principal.user.userid\
+    \ = $user\n    \n  match:\n    $user over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-slack*
+    | WHERE event.action == "guest_reactivated"
+    | KEEP @timestamp, user.name, user.email, host.name, event.action, source.ip
+  leql: |
+    where(source_json.action="guest_reactivated")
+  crowdstrike: |
+    action=guest_reactivated
+    | table([@timestamp, user.email, user.name, user.id, actor.user.email, actor.user.name, workspace.name, workspace.id])
+  xql: |
+    dataset = slack_audit_logs
+    | filter action = "guest_reactivated"
+    | fields _time, action, actor_user_email, actor_user_name, entity_user_email, entity_user_name, entity_user_id
+  lucene: |
+    slack.action:guest_reactivated
+  sumo: |
+    _sourceCategory=*Slack* "guest_reactivated"
+    | json field=_raw "action" as action
+    | where action = "guest_reactivated"
+    | fields _messageTime, _sourceHost, action
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +64,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Slack Event
 

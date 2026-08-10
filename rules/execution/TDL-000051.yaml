@@ -21,77 +21,74 @@ queries:
     , \"msi\", \"com\", \"pif\") AND content_type IN (\"application/x-msdownload\", \"application/x-msdos-program\", \"application/x-executable\"\
     , \"application/exe\", \"application/x-exe\", \"application/octet-stream\", \"application/x-dosexec\", \"application/vnd.microsoft.portable-executable\"\
     ))) \n| table _time, src, src_user, dest, url, file_extension, content_type, url_category, http_method, bytes_in, bytes_out\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(24h)\n| where DeviceVendor has \"Proxy\" or DeviceProduct has \"Proxy\" or DeviceEventClassID\
+    \ has \"proxy\"\n| where (RequestURL has_any (\"phishing\", \"malware\", \"malicious\", \"suspicious\") or \n         tolower(RequestContext)\
+    \ has_any (\"malicious\", \"phishing\", \"malware\", \"botnet\", \"c2\", \"command-and-control\") or\n         tolower(DeviceCustomString1)\
+    \ has_any (\"malicious\", \"phishing\", \"malware\", \"botnet\", \"c2\") or\n         tolower(DeviceCustomString2) has_any (\"malicious\"\
+    , \"phishing\", \"malware\", \"botnet\", \"c2\"))\n   or (RequestURL has_any (\".exe\", \".dll\", \".scr\", \".bat\", \".cmd\", \".ps1\",\
+    \ \".vbs\", \".js\", \".jar\", \".msi\", \".com\", \".pif\", \".hta\", \".cpl\") and\n       (tolower(RequestContext) has_any (\"application/x-msdownload\"\
+    , \"application/x-msdos-program\", \"application/x-executable\", \"application/octet-stream\", \"application/x-dosexec\", \"application/exe\"\
+    , \"application/x-exe\", \"application/dos-exe\", \"application/x-winexe\", \"application/msdos-windows\", \"application/x-msi\") or\n   \
+    \     tolower(DeviceCustomString3) has_any (\"application/x-msdownload\", \"application/x-msdos-program\", \"application/x-executable\", \"\
+    application/octet-stream\", \"application/x-dosexec\", \"application/exe\", \"application/x-exe\", \"application/dos-exe\", \"application/x-winexe\"\
+    , \"application/msdos-windows\", \"application/x-msi\")))\n| project TimeGenerated, SourceIP, DestinationIP, RequestURL, RequestContext, DeviceCustomString1,\
+    \ DeviceCustomString2, DeviceCustomString3, SourceUserName, DeviceAction\n"
+  aql: |
+    SELECT sourceip, destinationip, url, "URL Category", "File Extension", "Content Type", COUNT(*) AS event_count
+    FROM events
+    WHERE (logsourcetypename(logsourcetypeid) ILIKE '%proxy%' OR categoryname(category) ILIKE '%proxy%')
+      AND (
+        ("URL Category" IN ('Malware', 'Phishing', 'Malicious Sites', 'Malicious Downloads', 'Command and Control', 'Botnet', 'Suspicious'))
+        OR (
+          ("File Extension" IN ('exe', 'dll', 'scr', 'bat', 'cmd', 'com', 'pif', 'vbs', 'js', 'jar', 'msi', 'ps1', 'hta', 'wsf', 'lnk'))
+          AND ("Content Type" IN ('application/x-msdownload', 'application/x-msdos-program', 'application/x-executable', 'application/octet-stream', 'application/exe', 'application/x-exe', 'application/dos-exe', 'application/x-winexe'))
+        )
+      )
+    GROUP BY sourceip, destinationip, url, "URL Category", "File Extension", "Content Type"
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exe_000051 {\n  meta:\n    author = \"TDL\"\n    description = \"Allowed Malicious File Download\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  yara_l: "rule malicious_url_or_executable_download_via_proxy {\n  meta:\n    author = \"TDL\"\n    description = \"Detects T1204 user execution\
+    \ via malicious URL categories or executable downloads through forward proxy\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique\
+    \ = \"T1204\"\n    severity = \"High\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.metadata.product_name = \"Forward\
+    \ Proxy\" or $e.metadata.product_name = \"Proxy\"\n    \n    (\n      // Malicious URL categories\n      $e.security_result.category_details\
+    \ = \"Malware\" or\n      $e.security_result.category_details = \"Phishing\" or\n      $e.security_result.category_details = \"Command and\
+    \ Control\" or\n      $e.security_result.category_details = \"Compromised\" or\n      $e.security_result.category_details = \"Malicious Sources\"\
+    \ or\n      $e.security_result.category_details = \"Botnet\" or\n      $e.security_result.category_details = \"Cryptojacking\" or\n      $e.security_result.category_details\
+    \ = \"Suspicious\" or\n      \n      // Executable download conditions\n      (\n        (\n          re.regex($e.target.url, `(?i)\\.(exe|dll|bat|cmd|ps1|vbs|js|jse|wsf|wsh|msi|scr|com|pif|hta|cpl|msp|reg|jar|application|gadget|msc|scf|lnk|inf|vb|vbe)(\\\
+    ?|$)`) or\n          re.regex($e.network.http.parsed_user_agent, `(?i)\\.(exe|dll|bat|cmd|ps1|vbs|js|jse|wsf|wsh|msi|scr|com|pif|hta|cpl|msp|reg|jar|application|gadget|msc|scf|lnk|inf|vb|vbe)$`)\n\
+    \        )\n        and\n        (\n          $e.network.http.response_headers = /(?i)application\\/(x-msdownload|x-msdos-program|x-dosexec|octet-stream|x-executable)/\
+    \ or\n          $e.network.http.response_headers = /(?i)application\\/(x-sh|x-bat|x-ms-application)/ or\n          re.regex($e.network.http.response_headers,\
+    \ `(?i)content-type:\\s*(application/(x-msdownload|x-msdos-program|x-dosexec|octet-stream|x-executable|x-sh|x-bat|x-ms-application))`)\n \
+    \       )\n      )\n    )\n    \n    $e.principal.hostname = $host\n    $e.principal.user.userid = $user\n    $e.target.url = $url\n\n  match:\n\
+    \    $host, $user over 5m\n\n  outcome:\n    $risk_score = max(75)\n    $url_list = array_distinct($url)\n\n  condition:\n    $e\n}\n"
+  esql: "FROM logs-network.proxy*\n| WHERE @timestamp > NOW() - 24 hour\n| WHERE (\n    url.category IN (\"malware\", \"malicious\", \"phishing\"\
+    , \"spam\", \"botnet\", \"exploit\", \"trojan\", \"ransomware\", \"c2\", \"command and control\")\n    OR (\n      (url.path RLIKE \".*\\\\\
+    .(exe|dll|msi|bat|cmd|ps1|vbs|js|jar|scr|hta|pif|com|cpl|wsf|reg|vbe|jse)$\" \n       OR file.extension IN (\"exe\", \"dll\", \"msi\", \"\
+    bat\", \"cmd\", \"ps1\", \"vbs\", \"js\", \"jar\", \"scr\", \"hta\", \"pif\", \"com\", \"cpl\", \"wsf\", \"reg\", \"vbe\", \"jse\"))\n   \
+    \   AND http.response.mime_type IN (\"application/x-msdownload\", \"application/x-msdos-program\", \"application/x-executable\", \"application/octet-stream\"\
+    , \"application/x-ms-application\", \"application/x-bat\", \"application/x-sh\", \"application/java-archive\", \"application/x-java-archive\"\
+    )\n    )\n  )\n| KEEP @timestamp, source.ip, user.name, url.full, url.domain, url.path, url.category, file.extension, http.response.mime_type,\
+    \ destination.ip\n"
+  leql: |
+    where((url_category IN ["Malware", "Phishing", "Command and Control", "Malicious Sites", "Malicious Sources", "Botnet"]) OR ((file_extension IN ["exe", "dll", "bat", "cmd", "ps1", "vbs", "js", "jar", "msi", "scr", "com", "pif"]) AND (content_type IN ["application/x-msdownload", "application/x-msdos-program", "application/x-executable", "application/octet-stream", "application/x-dosexec"])))
+  crowdstrike: |
+    #type=proxy (url_category IN ["malware", "phishing", "botnet", "malicious", "exploit", "command and control", "c2"] OR (file_extension IN [".exe", ".dll", ".scr", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jar", ".msi", ".com", ".pif"] AND content_type IN ["application/x-msdownload", "application/x-msdos-program", "application/x-executable", "application/octet-stream", "application/x-dosexec", "application/exe", "application/x-bat", "application/x-sh"]))
+    | table([@timestamp, src_ip, dst_ip, url, url_category, file_extension, content_type, user])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter log_subtype = \"url\"\n| filter url_category_list in (\"malware\", \"command-and-control\",\
+    \ \"phishing\", \"grayware\", \"hacking\") \n   or (file_name ~= \"\\.(exe|dll|bat|cmd|ps1|vbs|js|jar|scr|msi|com|pif|hta)$\" \n       and\
+    \ http_content_type in (\"application/x-msdownload\", \"application/x-msdos-program\", \"application/x-executable\", \"application/x-dosexec\"\
+    , \"application/octet-stream\", \"application/exe\", \"application/x-exe\", \"application/dos-exe\", \"application/x-bat\", \"application/x-sh\"\
+    ))\n| fields _time, src_ip, dst_ip, url_category_list, http_url, file_name, http_content_type, natdst, natdport, user\n"
+  lucene: |
+    (url.category:("Malicious Sites" OR "Phishing" OR "Malware" OR "Command and Control" OR "Exploit Kit" OR "Botnet") OR (file.extension:(exe OR dll OR msi OR bat OR cmd OR ps1 OR vbs OR js OR jar OR scr OR com OR pif) AND http.response.mime_type:("application/x-msdownload" OR "application/x-msdos-program" OR "application/x-executable" OR "application/octet-stream" OR "application/x-dosexec" OR "application/exe" OR "application/x-exe" OR "application/dos-exe" OR "application/x-winexe")))
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*forward*proxy*
+    | parse regex "(?<url_category>[^\s]+)" nodrop
+    | parse regex "(?<file_extension>\.\w+)" nodrop
+    | parse regex "(?<content_type>[^\s;]+)" nodrop
+    | where (url_category in ("Malware", "Phishing", "Malicious", "C2", "Command and Control", "Botnet", "Exploit", "Malicious Sites", "Suspicious"))
+       OR (file_extension in (".exe", ".dll", ".scr", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jar", ".msi", ".com", ".pif", ".hta", ".cpl", ".gadget", ".application", ".appref-ms"))
+       OR (content_type in ("application/x-msdownload", "application/x-msdos-program", "application/x-exe", "application/exe", "application/x-executable", "application/octet-stream", "application/x-bat", "application/x-sh", "application/javascript", "application/x-javascript", "text/javascript", "application/x-jar", "application/java-archive"))
+    | fields _messageTime, _sourceHost, url_category, file_extension, content_type
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -101,7 +98,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Forward Proxy Event\nWhere the URL Cateogry is in the Malicious URL Categories List\nOR\n\tWhere the File Extension is in the\
   \ Executable File Extensions List\n\t\n\tWhere Content Type is in the Executable Content Types List"

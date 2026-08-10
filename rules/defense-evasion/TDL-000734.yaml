@@ -29,77 +29,112 @@ queries:
     \ last_seen values(src_ip) as src_ips values(dest_ip) as dest_ips values(src_port) as src_ports values(dest_port) as dest_ports values(request_path)\
     \ as request_paths values(reply_path) as reply_paths by session_key \n| where count >= 1 \n| table first_seen last_seen session_key src_ips\
     \ dest_ips src_ports dest_ports request_paths reply_paths count\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(1h)\n| where DeviceVendor in (\"Palo Alto Networks\", \"Fortinet\", \"Cisco\", \"Check\
+    \ Point\")\n| where DeviceAction !in (\"deny\", \"drop\", \"block\", \"blocked\")\n| where isnotempty(SourceIP) and isnotempty(DestinationIP)\n\
+    | extend IngressInterface = coalesce(DeviceCustomString1, DeviceInboundInterface, \"\")\n| extend EgressInterface = coalesce(DeviceCustomString2,\
+    \ DeviceOutboundInterface, \"\")\n| where isnotempty(IngressInterface) and isnotempty(EgressInterface)\n| extend SessionKey = strcat(SourceIP,\
+    \ \"-\", DestinationIP, \"-\", DestinationPort, \"-\", Protocol)\n| summarize \n    RequestInterfaces = make_set(IngressInterface),\n    ReplyInterfaces\
+    \ = make_set(EgressInterface),\n    RequestPaths = make_set(strcat(IngressInterface, \"->\", EgressInterface)),\n    ReplyPaths = make_set(strcat(EgressInterface,\
+    \ \"->\", IngressInterface)),\n    SourceIPs = make_set(SourceIP),\n    DestIPs = make_set(DestinationIP),\n    NATSources = make_set(SourceTranslatedAddress),\n\
+    \    NATDests = make_set(DestinationTranslatedAddress),\n    FirstSeen = min(TimeGenerated),\n    LastSeen = max(TimeGenerated),\n    EventCount\
+    \ = count()\n    by SessionKey, DeviceName\n| extend AsymmetricPath = iff(RequestPaths != ReplyPaths, true, false)\n| extend NATBypass = iff(array_length(NATSources)\
+    \ == 0 and array_length(SourceIPs) > 0 and DeviceName has \"egress\", true, false)\n| where AsymmetricPath == true or NATBypass == true\n\
+    | project FirstSeen, LastSeen, DeviceName, SessionKey, SourceIPs, DestIPs, RequestPaths, ReplyPaths, NATSources, NATDests, AsymmetricPath,\
+    \ NATBypass, EventCount\n"
+  aql: |
+    SELECT sourceip, destinationip, sourceport, destinationport, protocol, LOGSOURCENAME(logsourceid) AS device, COUNT(*) AS anomalous_flows
     FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+    WHERE protocol = 6
+      AND (
+        "Ingress Interface" != "Egress Interface"
+        OR "Return Path Interface" != "Forward Path Interface"
+        OR ("NAT Source IP" IS NOT NULL AND logsourceid NOT IN (SELECT logsourceid FROM flows WHERE categoryname(category) ILIKE '%firewall%' AND "Policy Action" = 'accept'))
+      )
+    GROUP BY sourceip, destinationip, sourceport, destinationport, protocol, LOGSOURCENAME(logsourceid)
+    HAVING anomalous_flows >= 5
     LAST 1 HOURS
+  yara_l: |
+    rule asymmetric_routing_defense_evasion {
+      meta:
+        author = "TDL"
+        description = "Detects asymmetric routing where TCP reply path differs from request path, indicating potential rogue route or bridge"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1599"
+        severity = "HIGH"
 
-    '
-  yara_l: "rule tdl_tdl_de_000734 {\n  meta:\n    author = \"TDL\"\n    description = \"Asymmetric Traffic Across Trust Boundary\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1599\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        $request.metadata.event_type = "NETWORK_CONNECTION"
+        $request.network.ip_protocol = "TCP"
+        $request.network.direction = "OUTBOUND"
+        $request.principal.ip = $src_ip
+        $request.target.ip = $dst_ip
+        $request.principal.asset.hostname = $src_host
+        $request.network.session_id = $session
 
-    | WHERE @timestamp > NOW() - 1 hour
+        $response.metadata.event_type = "NETWORK_CONNECTION"
+        $response.network.ip_protocol = "TCP"
+        $response.network.direction = "INBOUND"
+        $response.principal.ip = $dst_ip
+        $response.target.ip = $src_ip
+        $response.target.asset.hostname = $response_host
+        $response.network.session_id = $session
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+        $request.principal.asset.hostname != $response.target.asset.hostname
 
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+      match:
+        $src_ip, $dst_ip, $session over 5m
 
-    | SORT bytes_out DESC
+      outcome:
+        $risk_score = 75
+        $src_host = $request.principal.asset.hostname
+        $response_host_observed = $response.target.asset.hostname
+        $target_ip = $dst_ip
 
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $request and $response
+    }
+  esql: "FROM logs-network.firewall*, logs-network.ids*\n| WHERE @timestamp > NOW() - 15 minute \n  AND network.transport == \"tcp\"\n  AND network.direction\
+    \ IN (\"inbound\", \"outbound\")\n| EVAL flow_key = CONCAT(TO_STRING(source.ip), \":\", TO_STRING(source.port), \"-\", TO_STRING(destination.ip),\
+    \ \":\", TO_STRING(destination.port))\n| STATS \n    request_devices = VALUES(observer.name) BY flow_key, source.ip, destination.ip\n| WHERE\
+    \ MV_COUNT(request_devices) > 1\n| EVAL device_count = MV_COUNT(request_devices)\n| WHERE device_count >= 2\n| KEEP flow_key, source.ip, destination.ip,\
+    \ request_devices, device_count\n"
+  leql: |
+    where(source_json.protocol=TCP AND source_json.ingress_interface != source_json.egress_interface AND (source_json.nat_applied=true OR source_json.security_zone_crossed=true)) groupby(source_address, destination_address, source_json.ingress_interface, source_json.egress_interface) calculate(count)
+  crowdstrike: "(#type=firewall OR #type=ids) \n| case {\n    src_ip=* AND dst_ip=* AND src_port=* AND dst_port=* AND protocol=TCP | regex(\"\
+    (?<session_id>.+)\", field=connection_id, strict=false);\n    SourceAddress=* AND DestinationAddress=* AND SourcePort=* AND DestinationPort=*\
+    \ AND Protocol=*TCP* | format(\"%s:%s->%s:%s\", field=[SourceAddress, SourcePort, DestinationAddress, DestinationPort], as=session_id);\n\
+    \    * | format(\"%s:%s->%s:%s\", field=[src_ip, src_port, dst_ip, dst_port], as=session_id);\n  }\n| case {\n    direction=*inbound* OR action=*received*\
+    \ | direction := \"inbound\";\n    direction=*outbound* OR action=*sent* | direction := \"outbound\";\n    * | direction := \"unknown\";\n\
+    \  }\n| groupBy([session_id], function=[selectLast(src_ip, as=req_src), selectLast(dst_ip, as=req_dst), selectFirst(device, as=req_device),\
+    \ selectLast(device, as=reply_device), count(direction, as=dir_count)])\n| req_device != reply_device\n| table([session_id, req_src, req_dst,\
+    \ req_device, reply_device, dir_count])\n"
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter proto = \"tcp\" and action in (\"allow\", \"deny\")\n| alter request_path = concat(src_zone,\
+    \ \"->\", dst_zone),\n        reply_path = concat(dst_zone, \"->\", src_zone),\n        nat_occurred = if(src_ip != src_xlate_ip or dst_ip\
+    \ != dst_xlate_ip, \"yes\", \"no\")\n| comp count() as sessions, \n       values(src_zone) as src_zones, \n       values(dst_zone) as dst_zones,\n\
+    \       values(nat_occurred) as nat_status,\n       values(action) as actions\n  by src_ip, dst_ip, dst_port\n| filter array_length(src_zones)\
+    \ > 1 or array_length(dst_zones) > 1 or nat_status contains \"yes\"\n| fields src_ip, dst_ip, dst_port, sessions, src_zones, dst_zones, nat_status,\
+    \ actions\n"
+  lucene: |
+    (network.protocol:tcp OR event.category:network) AND (network.direction:("inbound" OR "egress") OR firewall.action:*) AND ((source.nat.ip:* AND NOT destination.nat.ip:*) OR (firewall.ingress_interface:* AND firewall.egress_interface:* AND NOT firewall.ingress_interface:firewall.egress_interface) OR (network.forwarded_ip:* AND NOT source.ip:network.forwarded_ip) OR (observer.ingress.zone:* AND observer.egress.zone:* AND NOT observer.ingress.zone:observer.egress.zone))
+  sumo: |
+    _sourceCategory=*Firewall* OR _sourceCategory=*IDS*
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "src_port" as src_port
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "direction" as direction
+    | json field=_raw "action" as action
+    | json field=_raw "session_id" as session_id
+    | json field=_raw "ingress_interface" as ingress_int
+    | json field=_raw "egress_interface" as egress_int
+    | json field=_raw "nat_src_ip" as nat_src_ip
+    | json field=_raw "nat_dest_ip" as nat_dest_ip
+    | where action != "block" and action != "deny"
+    | fields _messageTime, session_id, src_ip, dest_ip, src_port, dest_port, direction, ingress_int, egress_int, nat_src_ip, nat_dest_ip, _sourceHost
+    | sort by session_id, _messageTime
+    | where (direction = "inbound" or direction = "outbound") and (ingress_int != egress_int or isNotNull(nat_src_ip) or isNotNull(nat_dest_ip))
+    | count by session_id, src_ip, dest_ip, ingress_int, egress_int, nat_src_ip, _sourceHost
+    | where isNotNull(egress_int) and isNotNull(ingress_int)
 pseudo_logic: TCP sessions where reply path differs from request path crossing a security boundary, or NAT'd flows bypassing the egress firewall.
   Indicates rogue route/bridge.
 false_positives:
@@ -117,7 +152,7 @@ references:
 - https://attack.mitre.org/techniques/T1599/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

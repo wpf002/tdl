@@ -17,71 +17,52 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail eventType=AwsApiCall (eventName=DisableKey OR eventName=ScheduleKeyDeletion)
+  spl: 'index=aws sourcetype=aws:cloudtrail eventType=AwsApiCall (eventName=DisableKey OR eventName=ScheduleKeyDeletion)
+
     | table _time, userIdentity.arn, eventName, requestParameters.keyId, sourceIPAddress, userAgent, errorCode
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000135 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Encryption Protection Disabled\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1600\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(90d)
+    | where EventTypeName == "AwsApiCall"
+    | where EventName in ("DisableKey", "ScheduleKeyDeletion")
+    | project TimeGenerated, EventName, EventTypeName, UserIdentityType, UserIdentityArn, UserIdentityAccountId, SourceIpAddress, UserAgent, RequestParameters, ResponseElements, RecipientAccountId, AWSRegion, ErrorCode, ErrorMessage
+  aql: |
+    SELECT eventtime, username, sourceip, "eventName", "requestParameters", "responseElements", LOGSOURCENAME(logsourceid) AS source
+    FROM events
+    WHERE LOGSOURCETYPE(logsourceid) ILIKE '%CloudTrail%'
+      AND "eventType" = 'AwsApiCall'
+      AND "eventName" IN ('DisableKey', 'ScheduleKeyDeletion')
+    LAST 24 HOURS
+  yara_l: "rule aws_kms_key_disable_or_schedule_deletion {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects attempts\
+    \ to disable or schedule deletion of AWS KMS keys (T1600 - Weaken Encryption)\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique\
+    \ = \"T1600\"\n    severity = \"High\"\n    \n  events:\n    $e.metadata.vendor_name = \"AMAZON\"\n    $e.metadata.product_name = \"AWS CloudTrail\"\
+    \n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.metadata.product_event_type = \"AwsApiCall\"\n    (\n      $e.target.resource.name\
+    \ = \"DisableKey\" or\n      $e.target.resource.name = \"ScheduleKeyDeletion\"\n    )\n    $e.principal.user.userid = $user\n    $e.principal.ip\
+    \ = $ip\n    \n  match:\n    $user over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE event.action IN ("DisableKey", "ScheduleKeyDeletion") AND event.type == "AwsApiCall"
+    | KEEP @timestamp, cloud.account.id, user.name, user_identity.arn, event.action, aws.cloudtrail.request_parameters, source.ip, user_agent.original
+  leql: |
+    where(source_json.eventType=AwsApiCall AND source_json.eventName IN [DisableKey, ScheduleKeyDeletion])
+  crowdstrike: |
+    #type=cloudtrail eventType=AwsApiCall (eventName=DisableKey OR eventName=ScheduleKeyDeletion)
+    | table([@timestamp, userIdentity.principalId, eventName, requestParameters.keyId, sourceIPAddress, userAgent, awsRegion])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and event_type = "AwsApiCall" and action_name in ("DisableKey", "ScheduleKeyDeletion")
+    | fields _time, actor_user, action_name, cloud_provider_account, raw_log
+  lucene: |
+    eventType:AwsApiCall AND eventName:(DisableKey OR ScheduleKeyDeletion)
+  sumo: |
+    _sourceCategory=*cloudtrail* (DisableKey OR ScheduleKeyDeletion)
+    | json field=_raw "eventType" as event_type
+    | json field=_raw "eventName" as event_name
+    | where event_type = "AwsApiCall"
+    | where event_name in ("DisableKey", "ScheduleKeyDeletion")
+    | fields _messageTime, event_name, event_type, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +72,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 AWS CloudTrail Event
 

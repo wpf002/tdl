@@ -15,71 +15,69 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=google_workspace sourcetype="google:gws:admin" events.name="ASSIGN_ROLE" events.parameters.ROLE_NAME="_SEED_ADMIN_ROLE"
+  spl: 'index=google_workspace sourcetype="google:gws:admin" events.name="ASSIGN_ROLE" events.parameters.ROLE_NAME="_SEED_ADMIN_ROLE"
+
     | table _time, user, events.actor.email, events.parameters.USER_EMAIL, events.parameters.ROLE_NAME, events.parameters.ORG_UNIT_NAME
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_pe_000297 {\n  meta:\n    author = \"TDL\"\n    description = \"Google Workspace User Assigned to Super Admin Role\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0004\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    GWorkspaceActivityReports
+    | where TimeGenerated > ago(90d)
+    | where RecordType == "admin"
+    | where Operation == "ASSIGN_ROLE"
+    | extend RoleName = tostring(parse_json(tostring(Parameters)).ROLE_NAME)
+    | where RoleName == "_SEED_ADMIN_ROLE"
+    | project TimeGenerated, ActorEmail = Actor, TargetUserEmail = tostring(parse_json(tostring(Parameters)).USER_EMAIL), RoleName, IPAddress, Parameters
+  aql: "SELECT eventtime, username, sourceip, \"ACTOR_EMAIL\", \"ROLE_NAME\", \"USER_EMAIL\", LOGSOURCENAME(logsourceid) AS log_source\nFROM events\n\
+    WHERE \"Event Name\" = 'ASSIGN_ROLE' \n  AND \"ROLE_NAME\" = '_SEED_ADMIN_ROLE'\nLAST 24 HOURS\n"
+  yara_l: |
+    rule google_workspace_seed_admin_role_assignment {
+      meta:
+        author = "TDL"
+        description = "Detects assignment of _SEED_ADMIN_ROLE in Google Workspace"
+        mitre_attack_tactic = "Privilege Escalation"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Google"
+        $e.metadata.product_name = "Google Workspace"
+        $e.metadata.product_event_type = "ASSIGN_ROLE"
+        $e.target.user.userid = $user
+        $e.principal.user.userid = $admin
+        re.regex($e.security_result.summary, `(?i)_SEED_ADMIN_ROLE`)
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-google_workspace*
+    | WHERE event.action == "ASSIGN_ROLE" AND google_workspace.admin.role.name == "_SEED_ADMIN_ROLE"
+    | KEEP @timestamp, user.name, user.email, google_workspace.actor.email, google_workspace.admin.role.name, google_workspace.admin.user.email, event.action, host.name
+  leql: |
+    where(source_json.events.name="ASSIGN_ROLE" AND source_json.ROLE_NAME="_SEED_ADMIN_ROLE")
+  crowdstrike: |
+    #type=GoogleWorkspace events.name="ASSIGN_ROLE" ROLE_NAME="_SEED_ADMIN_ROLE"
+    | table([@timestamp, actor.email, ipAddress, ROLE_NAME, USER_EMAIL])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Google" and cloud_provider = "GCP"
+    | filter event_name = "ASSIGN_ROLE"
+    | filter raw_log contains "_SEED_ADMIN_ROLE"
+    | fields _time, actor_user, event_name, raw_log
+  lucene: |
+    events.name:"ASSIGN_ROLE" AND ROLE_NAME:"_SEED_ADMIN_ROLE"
+  sumo: |
+    _sourceCategory=*Google*Workspace* "ASSIGN_ROLE"
+    | json field=_raw "events[*].name" as event_name
+    | json field=_raw "events[*].parameters[*].name" as param_names
+    | json field=_raw "events[*].parameters[*].value" as param_values
+    | where event_name = "ASSIGN_ROLE"
+    | where param_names matches "*ROLE_NAME*" and param_values matches "*_SEED_ADMIN_ROLE*"
+    | fields _messageTime, _sourceHost, event_name, param_names, param_values
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +87,7 @@ tags:
 - privilege-escalation
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Google Workspace Event
 

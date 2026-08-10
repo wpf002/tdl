@@ -25,68 +25,116 @@ queries:
     \ \"-30d\")\n| eval current_time=now()\n| where _time >= baseline_start AND _time <= current_time\n| stats earliest(_time) as first_seen latest(_time)\
     \ as last_seen dc(src_country) as country_count values(src_country) as countries by user\n| where country_count > 0\n| eval new_countries=mvfilter(match(countries,\
     \ \".+\"))\n| table user, new_countries, first_seen, last_seen\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
+  kql: |
+    let LookbackPeriod = 90d;
+    let BaselinePeriod = 30d;
+    let HVTUsers = dynamic(["admin@contoso.com", "ceo@contoso.com", "cfo@contoso.com"]);
+    let AuthorizedCountries = dynamic(["United States", "US", "Canada", "CA"]);
+    let BaselineCountries = SigninLogs
+        | where TimeGenerated between (ago(LookbackPeriod) .. ago(1d))
+        | where ResultType == 0
+        | where UserPrincipalName in (HVTUsers)
+        | where IPAddress !startswith "10." and IPAddress !startswith "172.16." and IPAddress !startswith "192.168."
+        | summarize KnownCountries = make_set(Location) by UserPrincipalName;
+    SigninLogs
     | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000405 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen HVT User Login from Unauthorized Country\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    | where ResultType == 0
+    | where UserPrincipalName in (HVTUsers)
+    | where IPAddress !startswith "10." and IPAddress !startswith "172.16." and IPAddress !startswith "192.168."
+    | where Location !in (AuthorizedCountries)
+    | join kind=leftanti (
+        BaselineCountries
+        | mv-expand KnownCountries to typeof(string)
+        | project UserPrincipalName, KnownCountries
+    ) on UserPrincipalName, $left.Location == $right.KnownCountries
+    | project TimeGenerated, UserPrincipalName, IPAddress, Location, AppDisplayName, DeviceDetail, LocationDetails, ResultType, ResultDescription
+  aql: |
+    SELECT username, sourceip, "SourceCountry", "LoginMethod", eventtime, LOGSOURCENAME(logsourceid) AS log_source, COUNT(*) AS login_count
+    FROM events
+    WHERE (qidname(qid) ILIKE '%authentication%success%' OR qidname(qid) ILIKE '%login%success%' OR qidname(qid) ILIKE '%logon%success%' OR categoryname(category) ILIKE '%authentication%success%')
+      AND (sourceip NOT INCIDR '10.0.0.0/8' AND sourceip NOT INCIDR '172.16.0.0/12' AND sourceip NOT INCIDR '192.168.0.0/16')
+      AND username IN (SELECT username FROM reference_set WHERE name = 'HVT_Users')
+      AND "SourceCountry" NOT IN (SELECT element FROM reference_set WHERE name = 'Authorized_Countries')
+      AND username IN (SELECT username FROM events WHERE "SourceCountry" IS NOT NULL AND eventtime BETWEEN (CURRENT_TIMESTAMP - 2592000000) AND (CURRENT_TIMESTAMP - 86400000) GROUP BY username, "SourceCountry") = FALSE
+    GROUP BY username, sourceip, "SourceCountry", "LoginMethod", eventtime, logsourceid
+    LAST 90 DAYS
+  yara_l: "rule hvt_login_from_unauthorized_country {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects successful remote\
+    \ login by HVT user from unauthorized country\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1078\"\n  \
+    \  severity = \"HIGH\"\n    \n  events:\n    $login.metadata.event_type = \"USER_LOGIN\"\n    $login.security_result.action = \"ALLOW\"\n\
+    \    $login.principal.ip != \"\"\n    not net.ip_in_range_cidr($login.principal.ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($login.principal.ip,\
+    \ \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($login.principal.ip, \"192.168.0.0/16\")\n    $login.principal.user.userid = $user\n  \
+    \  $login.principal.location.country_or_region = $country\n    \n    // HVT List - adjust userids as needed\n    (\n      $user = \"admin@company.com\"\
+    \ or\n      $user = \"ceo@company.com\" or\n      $user = \"cfo@company.com\" or\n      $user = \"cto@company.com\" or\n      $user = \"domain_admin\"\
+    \ or\n      re.regex($user, `(?i).*admin.*@company\\.com`)\n    )\n    \n    // Authorized Countries List - adjust as needed\n    not (\n\
+    \      $country = \"US\" or\n      $country = \"United States\" or\n      $country = \"USA\" or\n      $country = \"GB\" or\n      $country\
+    \ = \"United Kingdom\" or\n      $country = \"CA\" or\n      $country = \"Canada\"\n    )\n    \n  match:\n    $user over 30d\n    \n  outcome:\n\
+    \    $risk_score = 85\n    $user_name = array_distinct($login.principal.user.userid)\n    $source_country = array_distinct($login.principal.location.country_or_region)\n\
+    \    $source_ip = array_distinct($login.principal.ip)\n    $event_count = count_distinct($login.metadata.id)\n    \n  condition:\n    $login\n\
+    }\n"
+  esql: "FROM logs-azure.signinlogs*, logs-o365.audit*\n| WHERE @timestamp > NOW() - 90 days\n  AND event.outcome == \"success\"\n  AND (event.action\
+    \ == \"UserLoggedIn\" OR azure.signinlogs.properties.status.errorCode == 0)\n  AND NOT CIDR_MATCH(source.ip, \"10.0.0.0/8\", \"172.16.0.0/12\"\
+    , \"192.168.0.0/16\")\n| EVAL is_hvt = CASE(\n    user.name IN (\"admin@company.com\", \"ceo@company.com\", \"cfo@company.com\"), 1,\n   \
+    \ 0\n  )\n| WHERE is_hvt == 1\n| EVAL is_authorized_country = CASE(\n    source.geo.country_iso_code IN (\"US\", \"GB\", \"CA\"), 1,\n   \
+    \ 0\n  )\n| WHERE is_authorized_country == 0\n| EVAL baseline_start = NOW() - 90 days\n| EVAL baseline_end = NOW() - 30 days\n| EVAL is_baseline\
+    \ = CASE(\n    @timestamp >= baseline_start AND @timestamp < baseline_end, 1,\n    0\n  )\n| EVAL is_detection_window = CASE(\n    @timestamp\
+    \ >= baseline_end, 1,\n    0\n  )\n| STATS \n    baseline_countries = VALUES(source.geo.country_iso_code) BY user.name, is_baseline\n| WHERE\
+    \ is_baseline == 0\n| STATS \n    current_country = VALUES(source.geo.country_iso_code),\n    baseline_countries_list = VALUES(baseline_countries)\
+    \ BY user.name\n| WHERE NOT current_country IN (baseline_countries_list)\n| KEEP @timestamp, user.name, source.ip, source.geo.country_iso_code,\
+    \ source.geo.country_name, event.action, host.name\n"
+  leql: |
+    where(result=SUCCESS AND source_address NOT IN [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16] AND user IN [hvt_user1, hvt_user2, hvt_user3] AND source_country NOT IN [US, CA, GB]) groupby(user, source_country) calculate(count)
+  crowdstrike: |
+    (event_simpleName=UserLogon OR event_simpleName=AuthActivityAuditLog OR #type=o365 OR #type=azuread)
+    | case {
+        event_simpleName=UserLogon | RemoteIP=* ;
+        event_simpleName=AuthActivityAuditLog | ipAddress=* ;
+        #type=o365 | ClientIP=* ;
+        #type=azuread | ipAddress=* ;
+        * | drop()
+      }
+    | case {
+        event_simpleName=UserLogon | SourceIP := RemoteIP | Username := UserName ;
+        event_simpleName=AuthActivityAuditLog | SourceIP := ipAddress | Username := UserPrincipalName ;
+        #type=o365 | SourceIP := ClientIP | Username := UserId ;
+        #type=azuread | SourceIP := ipAddress | Username := userPrincipalName ;
+        * | drop()
+      }
+    | !cidr(SourceIP, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+    | ipLocation(SourceIP)
+    | in(field=Username, values=["hvt_user1@company.com", "hvt_user2@company.com", "admin@company.com"])
+    | SourceCountry := SourceIP.country
+    | !in(field=SourceCountry, values=["US", "GB", "CA"])
+    | selfJoinFilter(field=[Username, SourceCountry], where=[{#type=* | timeWindow := @timestamp - 30d}], prefilter=false)
+    | table([@timestamp, Username, SourceIP, SourceCountry, event_simpleName])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter operation_name in ("UserLoggedIn", "UserLoginSuccess") and outcome = "success"
+    | filter not incidr(action_remote_ip, "10.0.0.0/8") and not incidr(action_remote_ip, "172.16.0.0/12") and not incidr(action_remote_ip, "192.168.0.0/16")
+    | alter hvt_list = arrayindex(json_extract_scalar_array(xdm.source.user.identifier, "$"), 0)
+    | filter hvt_list in ("user1@domain.com", "user2@domain.com", "admin@domain.com")
+    | alter authorized_countries = arrayindex(json_extract_scalar_array(xdm.source.location.country, "$"), 0)
+    | filter authorized_countries not in ("US", "GB", "CA")
+    | comp count_distinct(xdm.source.location.country) as new_countries by xdm.source.user.identifier
+    | filter new_countries >= 1
+    | fields _time, xdm.source.user.identifier, xdm.source.ipv4, xdm.source.location.country, action_remote_ip, actor_effective_username
+  lucene: |
+    event.action:"successful login" AND (source.ip:* AND NOT source.ip:10.0.0.0/8 AND NOT source.ip:172.16.0.0/12 AND NOT source.ip:192.168.0.0/16) AND user.name:(hvt_user1 OR hvt_user2 OR hvt_user3) AND NOT source.geo.country_name:(US OR CA OR GB OR authorized_country)
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*Office* OR _sourceCategory=*365*
+    | json field=_raw "ResultType" as result_type
+    | json field=_raw "Operation" as operation
+    | json field=_raw "UserPrincipalName" as user
+    | json field=_raw "ClientIP" as src_ip
+    | json field=_raw "Location" as location
+    | json field=_raw "CountryOrRegion" as country
+    | where (result_type = "0" OR operation matches "*Success*" OR operation matches "*UserLoggedIn*")
+    | where !isPrivateIP(src_ip)
+    | where user matches "*hvt*" OR user in ("admin@*", "executive@*", "ceo@*", "cfo@*", "cto@*")
+    | where !(country in ("US", "United States", "USA", "GB", "United Kingdom", "CA", "Canada"))
+    | timeslice 1d
+    | count_distinct(country) as new_countries by user, _timeslice
+    | where new_countries >= 1
+    | fields _messageTime, user, src_ip, country, location
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -96,7 +144,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Successful Remote Login Event \nWhere the Source IP is an External IP\nWhere the Source User is on the High Value Target (HVT)\
   \ List\nWhere the Source Country is NOT on the Authorized Countries List\n\nBaseline Learning: 30 Days\nRetention: 90 Days\n\nNew Value: Source\

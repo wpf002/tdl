@@ -17,76 +17,103 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    (index=windows (EventCode=592 OR EventCode=4688) Image="*\\powershell.exe" CommandLine IN ("*get-netuser*","*get-netgroup*","*get-netgroupmember*","*get-netlocalgroup*","*get-netsession*","*invoke-userhunter*","*get-netou*","*find-gpolocation*","*get-netgpogroup*","*get-objectacl*","*add-objectacl*","*invoke-aclscanner*","*set-adobject*","*invoke-downgradeaccount*","*get-netforest*","*get-netforesttrust*","*get-netforestdomain*","*get-netdomaintrust*","*get-mapdomaintrust*","*powerview*"))
+  spl: '(index=windows (EventCode=592 OR EventCode=4688) Image="*\\powershell.exe" CommandLine IN ("*get-netuser*","*get-netgroup*","*get-netgroupmember*","*get-netlocalgroup*","*get-netsession*","*invoke-userhunter*","*get-netou*","*find-gpolocation*","*get-netgpogroup*","*get-objectacl*","*add-objectacl*","*invoke-aclscanner*","*set-adobject*","*invoke-downgradeaccount*","*get-netforest*","*get-netforesttrust*","*get-netforestdomain*","*get-netdomaintrust*","*get-mapdomaintrust*","*powerview*"))
+
     OR
+
     (index=windows EventCode=4104 ScriptBlockText IN ("*get-netuser*","*get-netgroup*","*get-netgroupmember*","*get-netlocalgroup*","*get-netsession*","*invoke-userhunter*","*get-netou*","*find-gpolocation*","*get-netgpogroup*","*get-objectacl*","*add-objectacl*","*invoke-aclscanner*","*set-adobject*","*invoke-downgradeaccount*","*get-netforest*","*get-netforesttrust*","*get-netforestdomain*","*get-netdomaintrust*","*get-mapdomaintrust*","*powerview*"))
+
     | table _time, ComputerName, EventCode, User, Image, CommandLine, ScriptBlockText
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("powershell.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('powershell.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000511 {\n  meta:\n    author = \"TDL\"\n    description = \"PowerView Commandlet Activity\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(powershell.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    union
+    (SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (592, 4688)
+    | where Process has "powershell.exe" or NewProcessName has "powershell.exe"
+    | where CommandLine matches regex @".*\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b.*"
+    | project TimeGenerated, Computer, Account, EventID, Process, NewProcessName, CommandLine, EventSourceName),
+    (Event
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4104
+    | where RenderedDescription has "powershell" or EventData has "ScriptBlockText"
+    | extend ScriptBlockText = tostring(EventData)
+    | where ScriptBlockText matches regex @".*\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b.*"
+    | project TimeGenerated, Computer, EventID, ScriptBlockText, EventSourceName)
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "EventID", "Process Name", "Process CommandLine", "ScriptBlockText"
+    FROM events
+    WHERE (
+      ("EventID" IN ('592', '4688') AND "Process Name" ILIKE '%powershell.exe%' AND "Process CommandLine" MATCHES '.*\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b.*')
+      OR
+      ("EventID" = '4104' AND "ScriptBlockText" MATCHES '.*\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b.*')
+    )
+    LAST 1 HOURS
+  yara_l: |
+    rule powerview_execution_t1204 {
+      meta:
+        author = "TDL"
+        description = "Detects PowerView cmdlet execution via process launch or script block logging"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        (
+          $proc.metadata.event_type = "PROCESS_LAUNCH" and
+          (
+            $proc.metadata.product_event_type = "592" or
+            $proc.metadata.product_event_type = "4688"
+          ) and
+          re.regex($proc.principal.process.file.full_path, `(?i)\\powershell\.exe$`) and
+          re.regex($proc.principal.process.command_line, `(?i)\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b`) and
+          $proc.principal.hostname = $host
+        ) or
+        (
+          $script.metadata.product_event_type = "4104" and
+          re.regex($script.target.process.command_line, `(?i)\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b`) and
+          $script.principal.hostname = $host
+        )
 
-    | WHERE event.category == "process" AND process_name IN ("powershell.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [powershell.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $proc or $script
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-system.security*, logs-endpoint.events.process*, winlogbeat-*, logs-windows.powershell_operational*
+    | WHERE (
+        (event.code IN ("592", "4688") AND process.name == "powershell.exe" AND process.command_line RLIKE ".*\\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\\b.*")
+        OR
+        (event.code == "4104" AND powershell.file.script_block_text RLIKE ".*\\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\\b.*")
+      )
+    | KEEP @timestamp, host.name, user.name, event.code, process.name, process.command_line, powershell.file.script_block_text
+  leql: |
+    where((source_json.EventID IN [592, 4688] AND process_name ICONTAINS "powershell.exe" AND process_cmd_line=/(?i).*\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b.*/) OR (source_json.EventID=4104 AND source_json.ScriptBlockText=/(?i).*\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b.*/))
+  crowdstrike: |
+    (EventCode=4688 OR EventCode=592 OR EventCode=4104)
+    (
+      (EventCode IN [4688, 592] FileName=*powershell.exe CommandLine=/.*\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b.*/i)
+      OR
+      (EventCode=4104 ScriptBlockText=/.*\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b.*/i)
+    )
+    | table([@timestamp, ComputerName, EventCode, FileName, CommandLine, ScriptBlockText, UserName])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) and lowercase(action_process_image_name) contains "powershell.exe" and action_process_image_command_line ~= ".*\\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\\b.*") or (action_evtlog_event_id = 4104 and action_evtlog_message ~= ".*\\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\\b.*")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_id, action_process_image_name, action_process_image_command_line, action_evtlog_message
+  lucene: |
+    (event.code:(592 OR 4688) AND process.name:powershell.exe AND process.command_line:/.*\b(get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b.*/) OR (event.code:4104 AND winlog.event_data.ScriptBlockText:/.*\b(get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b.*/)
+  sumo: |
+    _sourceCategory=*Windows* (4688 OR 592 OR 4104)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "ScriptBlockText" as script_block
+    | where (event_id in ("4688", "592") and process_name matches "*powershell.exe" and command_line matches /.*\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b.*/i) OR (event_id = "4104" and script_block matches /.*\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\b.*/i)
+    | fields _messageTime, _sourceHost, event_id, process_name, command_line, script_block
 false_positives:
 - Security software
 - Authorized admin tools
@@ -96,7 +123,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe\nWhere Command\
   \ matches the regex \".*\\b(?:get-netuser|get-netgroup|get-netgroupmember|get-netlocalgroup|get-netsession|invoke-userhunter|get-netou|find-gpolocation|get-netgpogroup|get-objectacl|add-objectacl|invoke-aclscanner|set-adobject|invoke-downgradeaccount|get-netforest|get-netforesttrust|get-netforestdomain|get-netdomaintrust|get-mapdomaintrust|powerview)\\\

@@ -17,82 +17,102 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    (index=firewall (action=allowed OR action=accept OR action=permit) src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) NOT dest_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) (dest_ip IN (lookup crypto_mining_pool_ips ip AS dest_ip OUTPUT ip) OR dest IN (lookup crypto_mining_pool_domains domain AS dest OUTPUT domain)))
+  spl: '(index=firewall (action=allowed OR action=accept OR action=permit) src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) NOT dest_ip IN
+    (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) (dest_ip IN (lookup crypto_mining_pool_ips ip AS dest_ip OUTPUT ip) OR dest IN (lookup crypto_mining_pool_domains
+    domain AS dest OUTPUT domain)))
+
     OR
+
     (index=dns (query IN (lookup crypto_mining_pool_domains domain AS query OUTPUT domain)))
+
     | table _time, src_ip, dest_ip, dest, query, action, index
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "dns"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%dns%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_imp_000034 {\n  meta:\n    author = \"TDL\"\n    description = \"Outbound Crypto Mining Traffic Detected\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0040\"\n    technique = \"T1496\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /dns/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%dns%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/dns/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*dns*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "dns"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*dns*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*dns*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    let CryptoMiningPoolIPs = dynamic(["185.71.66.100", "185.71.67.100", "pool.minexmr.com", "pool.supportxmr.com", "xmr-eu1.nanopool.org", "xmr-us-east1.nanopool.org", "xmr-us-west1.nanopool.org", "xmr-asia1.nanopool.org", "pool.hashvault.pro", "gulf.moneroocean.stream", "mine.xmrpool.net"]);
+    let CryptoMiningPoolDomains = dynamic(["minexmr.com", "supportxmr.com", "nanopool.org", "hashvault.pro", "moneroocean.stream", "xmrpool.net", "minergate.com", "nicehash.com", "pool.minergate.com", "stratum.antpool.com", "eth-eu1.nanopool.org", "eth-us-east1.nanopool.org", "xmr.pool.minergate.com", "monero.crypto-pool.fr", "pool.usxmrpool.com"]);
+    union
+    (CommonSecurityLog
+    | where TimeGenerated > ago(1h)
+    | where DeviceVendor has "Firewall" or DeviceProduct has "Firewall"
+    | where DeviceAction != "Deny" and DeviceAction != "Drop" and DeviceAction != "Block"
+    | where DeviceDirection == "Outbound" or CommunicationDirection == "Outbound"
+    | where DestinationIP in (CryptoMiningPoolIPs) or DestinationHostName has_any (CryptoMiningPoolDomains)
+    | project TimeGenerated, SourceIP, DestinationIP, DestinationHostName, DeviceAction, DeviceVendor, DeviceProduct, Protocol, DestinationPort, Activity
+    | extend DetectionType = "Firewall_CryptoMining"),
+    (DnsEvents
+    | where TimeGenerated > ago(1h)
+    | where Name has_any (CryptoMiningPoolDomains)
+    | project TimeGenerated, ClientIP, Name, QueryType, IPAddresses
+    | extend DetectionType = "DNS_CryptoMining")
+  aql: "SELECT sourceip, destinationip, qidname(qid), LOGSOURCENAME(logsourceid) AS log_source, \"Destination Domain\" AS destination_domain,\
+    \ eventtime\nFROM events\nWHERE (\n  (category IN (SELECT categoryid FROM categories WHERE categoryname ILIKE '%firewall%') \n   AND sourceip\
+    \ IN (SELECT ip FROM network_hierarchy WHERE network IN ('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16'))\n   AND sourceip NOT IN (SELECT ip\
+    \ FROM network_hierarchy WHERE network IN ('224.0.0.0/4','255.255.255.255/32'))\n   AND destinationip NOT IN (SELECT ip FROM network_hierarchy\
+    \ WHERE network IN ('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','224.0.0.0/4','255.255.255.255/32'))\n   AND (destinationip IN (SELECT ip\
+    \ FROM reference_set WHERE name='CryptominingPoolIPs')\n        OR \"Destination Domain\" IN (SELECT element FROM reference_set WHERE name='CryptominingPoolDomains')))\n\
+    \  OR\n  (qidname(qid) ILIKE '%dns%'\n   AND \"Destination Domain\" IN (SELECT element FROM reference_set WHERE name='CryptominingPoolDomains'))\n\
+    )\nLAST 1 HOURS\n"
+  yara_l: "rule crypto_mining_pool_connections {\n  meta:\n    author = \"TDL\"\n    description = \"Detects connections to known cryptocurrency\
+    \ mining pools via firewall or DNS\"\n    mitre_attack_tactic = \"Impact\"\n    mitre_attack_technique = \"T1496\"\n    severity = \"HIGH\"\
+    \n\n  events:\n    // Firewall outbound connections to crypto mining pool IPs\n    ($fw.metadata.event_type = \"NETWORK_CONNECTION\" or \n\
+    \     $fw.metadata.event_type = \"FIREWALL_UNCATEGORIZED\") and\n    $fw.network.direction = \"OUTBOUND\" and\n    $fw.target.ip = $dest_ip\
+    \ and\n    // Reference list for crypto mining pool IPs\n    $dest_ip in %crypto_mining_pool_ips and\n    $fw.principal.ip = $src_ip\n   \
+    \ \n    or\n    \n    // Firewall outbound connections to crypto mining pool domains\n    ($fw2.metadata.event_type = \"NETWORK_CONNECTION\"\
+    \ or \n     $fw2.metadata.event_type = \"FIREWALL_UNCATEGORIZED\") and\n    $fw2.network.direction = \"OUTBOUND\" and\n    $fw2.target.hostname\
+    \ = $dest_domain and\n    // Reference list for crypto mining pool domains\n    $dest_domain in %crypto_mining_pool_domains and\n    $fw2.principal.ip\
+    \ = $src_ip2\n    \n    or\n    \n    // DNS requests to crypto mining pool domains\n    $dns.metadata.event_type = \"NETWORK_DNS\" and\n\
+    \    $dns.network.dns.questions.name = $query_domain and\n    // Reference list for crypto mining pool domains\n    $query_domain in %crypto_mining_pool_domains\
+    \ and\n    $dns.principal.ip = $src_ip3\n\n  match:\n    $src_ip, $src_ip2, $src_ip3 over 5m\n\n  condition:\n    $fw or $fw2 or $dns\n}\n"
+  esql: "FROM logs-network.firewall*, logs-network.dns*\n| WHERE \n  (\n    (event.category == \"network\" AND network.direction == \"outbound\"\
+    \ AND destination.ip IN (\"CRYPTOMINING_POOL_IP_LIST_PLACEHOLDER\"))\n    OR\n    (event.category == \"network\" AND network.direction ==\
+    \ \"outbound\" AND destination.domain IN (\"CRYPTOMINING_POOL_DOMAIN_LIST_PLACEHOLDER\"))\n    OR\n    (event.category == \"dns\" AND dns.question.name\
+    \ IN (\"CRYPTOMINING_POOL_DOMAIN_LIST_PLACEHOLDER\"))\n  )\n| KEEP @timestamp, source.ip, destination.ip, destination.domain, dns.question.name,\
+    \ event.category, network.direction, host.name\n"
+  leql: |
+    where((log_source_type=FIREWALL AND direction=OUTBOUND AND (destination_address IN CRYPTOMINING_POOL_IPS OR destination_domain IN CRYPTOMINING_POOL_DOMAINS)) OR (log_source_type=DNS AND query_name IN CRYPTOMINING_POOL_DOMAINS))
+  crowdstrike: |
+    (#type=firewall OR #type=dns OR event_simpleName=DnsRequest OR event_simpleName=NetworkConnectIP4 OR event_simpleName=FirewallEvent)
+    (
+      (
+        (event_simpleName=FirewallEvent OR #type=firewall)
+        (Direction=outbound OR direction=outbound OR action=allow)
+        (
+          DestinationIP=*stratum* OR DestinationIP=*pool* OR RemoteAddressIP4=*stratum* OR RemoteAddressIP4=*pool*
+          OR DestinationDomain=*stratum* OR DestinationDomain=*pool* OR DestinationDomain=*monero* OR DestinationDomain=*xmr* OR DestinationDomain=*mining* OR DestinationDomain=*minergate* OR DestinationDomain=*cryptonight* OR DestinationDomain=*supportxmr* OR DestinationDomain=*nanopool* OR DestinationDomain=*ethermine*
+          OR DomainName=*stratum* OR DomainName=*pool* OR DomainName=*monero* OR DomainName=*xmr* OR DomainName=*mining* OR DomainName=*minergate* OR DomainName=*cryptonight* OR DomainName=*supportxmr* OR DomainName=*nanopool* OR DomainName=*ethermine*
+        )
+      )
+      OR
+      (
+        (event_simpleName=DnsRequest OR #type=dns)
+        (
+          DomainName=*stratum* OR DomainName=*pool* OR DomainName=*monero* OR DomainName=*xmr* OR DomainName=*mining* OR DomainName=*minergate* OR DomainName=*cryptonight* OR DomainName=*supportxmr* OR DomainName=*nanopool* OR DomainName=*ethermine*
+          OR DestinationDomain=*stratum* OR DestinationDomain=*pool* OR DestinationDomain=*monero* OR DestinationDomain=*xmr* OR DestinationDomain=*mining* OR DestinationDomain=*minergate* OR DestinationDomain=*cryptonight* OR DestinationDomain=*supportxmr* OR DestinationDomain=*nanopool* OR DestinationDomain=*ethermine*
+          OR query=*stratum* OR query=*pool* OR query=*monero* OR query=*xmr* OR query=*mining* OR query=*minergate* OR query=*cryptonight* OR query=*supportxmr* OR query=*nanopool* OR query=*ethermine*
+        )
+      )
+    )
+    | table([@timestamp, event_simpleName, ComputerName, SourceIP, DestinationIP, RemoteAddressIP4, DestinationDomain, DomainName, query, Direction, action])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_source_nat_translated_ip != null and action_destination_translated_ip = null and action_destination_ip not in (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+    | filter (
+        action_destination_ip in ("45.76.241.167", "67.21.83.163", "95.216.164.84", "136.244.68.84", "148.251.39.87", "185.71.65.198", "198.251.89.109", "209.250.240.94", "51.15.51.152", "95.179.143.200", "104.238.171.176", "108.61.122.123", "149.28.60.150", "167.179.114.87", "173.212.214.25", "185.244.192.65", "195.201.191.136", "198.13.44.241", "209.141.40.169")
+        or lowercase(action_destination_host) in ("pool.minexmr.com", "xmr-eu1.nanopool.org", "donate.v2.xmrig.com", "gulf.moneroocean.stream", "crypto-pool.fr", "xmr.pool.minergate.com", "us-east.stratum.slushpool.com", "monerohash.com", "supportxmr.com", "monero.crypto-pool.fr", "xmr.nanopool.org", "pool.supportxmr.com", "mine.xmrpool.net", "xmrpool.eu", "pool.hashvault.pro", "poolto.be")
+    )
+    | fields _time, action_source_ip, action_destination_ip, action_destination_host, action_source_nat_translated_ip, agent_hostname
+  lucene: |
+    (event.type:firewall AND network.direction:outbound AND (destination.ip:(CRYPTOMINING_POOL_IP_LIST) OR destination.domain:(CRYPTOMINING_POOL_DOMAIN_LIST))) OR (event.type:dns AND dns.question.name:(CRYPTOMINING_POOL_DOMAIN_LIST))
+  sumo: |
+    (_sourceCategory=*Firewall* OR _sourceCategory=*DNS*)
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_domain" as dest_domain
+    | json field=_raw "direction" as direction
+    | where (event_type = "firewall" AND direction = "outbound" AND (dest_ip in ("CRYPTOMINING_POOL_IP_LIST") OR dest_domain in ("CRYPTOMINING_POOL_DOMAIN_LIST"))) OR (event_type = "dns" AND dest_domain in ("CRYPTOMINING_POOL_DOMAIN_LIST"))
+    | fields _messageTime, _sourceHost, event_type, src_ip, dest_ip, dest_domain, direction
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -102,7 +122,7 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Firewall Event \nFrom one internal source to one external destination (Outbound)\nOR\n\tWhere the Destination IP is on the Cryptomining\
   \ Pool IP List\n\t\n\tWhere the Destination Domain is on the Cryptomining Pool Domain List\n\n\n---------------------------------------------------------------------\n\

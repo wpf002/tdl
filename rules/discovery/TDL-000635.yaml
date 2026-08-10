@@ -24,71 +24,150 @@ queries:
     ) OR\n            like(AdditionalFields, \"%objectCategory=user%\") OR\n            like(AdditionalFields, \"%objectClass=user%\")\n     \
     \   ) AND\n        (\n            NOT like(AdditionalFields, \"%domainSid=%\") AND\n            NOT like(AdditionalFields, \"%objectSid=%\"\
     )\n        )\n    )\n| table _time, DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName, AdditionalFields\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000635 {\n  meta:\n    author = \"TDL\"\n    description = \"LDAP Account Recon - Defender\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0007\"\n    technique = \"T1087\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceEvents
+    | where TimeGenerated > ago(1h)
+    | where ActionType == "LdapSearch"
+    | where AdditionalFields != "[]"
+    | where SearchFilter !has "Base"
+    | where (
+        AdditionalFields has "(userAccountControl:1.2.840.113556.1.4.803:=65536)"
+        or AdditionalFields has "(userAccountControl:1.2.840.113556.1.4.803:=544)"
+        or AdditionalFields has "!(UserAccountControl:1.2.840.113556.1.4.803:=2)"
+        or AdditionalFields has "(accountExpires=9223372036854775807)"
+        or AdditionalFields has "(accountExpires=0)"
+        or (
+            (
+                AdditionalFields has "(sAMAccountType=805306368)"
+                or AdditionalFields has "(objectCategory=person)"
+                or AdditionalFields has "(objectCategory=user)"
+                or AdditionalFields has "(objectClass=user)"
+            )
+            and AdditionalFields !has "(domainSid=)"
+            and AdditionalFields !has "(objectSid=)"
+        )
+    )
+    | project TimeGenerated, DeviceName, AccountName, ActionType, SearchFilter, AdditionalFields
+  aql: |
+    SELECT devicename, username, additionalfields, timestamp
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetypeid) ILIKE '%Microsoft Defender%'
+      AND "ActionType" = 'LdapSearch'
+      AND "AdditionalFields" NOT LIKE '%"Tags":[]%'
+      AND "SearchScope" != 'Base'
+      AND (
+        "AdditionalFields" ILIKE '%(userAccountControl:1.2.840.113556.1.4.803:=65536)%'
+        OR "AdditionalFields" ILIKE '%(userAccountControl:1.2.840.113556.1.4.803:=544)%'
+        OR "AdditionalFields" ILIKE '%!(UserAccountControl:1.2.840.113556.1.4.803:=2)%'
+        OR "AdditionalFields" ILIKE '%(accountExpires=9223372036854775807)%'
+        OR "AdditionalFields" ILIKE '%(accountExpires=0)%'
+        OR (
+          ("AdditionalFields" ILIKE '%(sAMAccountType=805306368)%'
+           OR "AdditionalFields" ILIKE '%(objectCategory=person)%'
+           OR "AdditionalFields" ILIKE '%(objectCategory=user)%'
+           OR "AdditionalFields" ILIKE '%(objectClass=user)%')
+          AND "AdditionalFields" NOT ILIKE '%(domainSid=)%'
+          AND "AdditionalFields" NOT ILIKE '%(objectSid=)%'
+        )
+      )
+    LAST 24 HOURS
+  yara_l: "rule mitre_t1087_ldap_user_enumeration {\n  meta:\n    author = \"TDL\"\n    description = \"Detects LDAP searches for user enumeration\
+    \ via LDAP filters indicating account discovery\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1087\"\n    severity\
+    \ = \"Medium\"\n\n  events:\n    $e.metadata.product_name = \"Microsoft Defender for Endpoint\"\n    $e.metadata.product_event_type = \"LdapSearch\"\
+    \n    $e.metadata.description != \"[ ]\"\n    $e.additional.fields != \"Base\"\n    \n    (\n      re.regex($e.additional.fields, `\\(userAccountControl:1\\\
+    .2\\.840\\.113556\\.1\\.4\\.803:=65536\\)`) or\n      re.regex($e.additional.fields, `\\(userAccountControl:1\\.2\\.840\\.113556\\.1\\.4\\\
+    .803:=544\\)`) or\n      re.regex($e.additional.fields, `!\\(UserAccountControl:1\\.2\\.840\\.113556\\.1\\.4\\.803:=2\\)`) or\n      re.regex($e.additional.fields,\
+    \ `\\(accountExpires=9223372036854775807\\)`) or\n      re.regex($e.additional.fields, `\\(accountExpires=0\\)`) or\n      (\n        (\n\
+    \          re.regex($e.additional.fields, `\\(sAMAccountType=805306368\\)`) or\n          re.regex($e.additional.fields, `\\(objectCategory=person\\\
+    )`) or\n          re.regex($e.additional.fields, `\\(objectCategory=user\\)`) or\n          re.regex($e.additional.fields, `\\(objectClass=user\\\
+    )`)\n        )\n        and\n        not re.regex($e.additional.fields, `\\(domainSid=\\)`)\n        and\n        not re.regex($e.additional.fields,\
+    \ `\\(objectSid=\\)`)\n      )\n    )\n    \n    $e.principal.hostname = $host\n\n  match:\n    $host over 5m\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-m365_defender.event*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.category == "AdvancedHunting-DeviceEvents"
+      AND event.type == "LdapSearch"
+      AND tags != "[ ]"
+      AND microsoft_defender.scope != "Base"
+      AND (
+        microsoft_defender.additional_fields LIKE "*(userAccountControl:1.2.840.113556.1.4.803:=65536)*"
+        OR microsoft_defender.additional_fields LIKE "*(userAccountControl:1.2.840.113556.1.4.803:=544)*"
+        OR microsoft_defender.additional_fields LIKE "*!(UserAccountControl:1.2.840.113556.1.4.803:=2)*"
+        OR microsoft_defender.additional_fields LIKE "*(accountExpires=9223372036854775807)*"
+        OR microsoft_defender.additional_fields LIKE "*(accountExpires=0)*"
+        OR (
+          (
+            microsoft_defender.additional_fields LIKE "*(sAMAccountType=805306368)*"
+            OR microsoft_defender.additional_fields LIKE "*(objectCategory=person)*"
+            OR microsoft_defender.additional_fields LIKE "*(objectCategory=user)*"
+            OR microsoft_defender.additional_fields LIKE "*(objectClass=user)*"
+          )
+          AND NOT microsoft_defender.additional_fields LIKE "*(domainSid=)*"
+          AND NOT microsoft_defender.additional_fields LIKE "*(objectSid=)*"
+        )
+      )
+    | KEEP @timestamp, host.name, user.name, event.type, microsoft_defender.additional_fields, microsoft_defender.scope, tags
+  leql: |
+    where(source_json.ActionType="LdapSearch" AND source_json.AdditionalFields!="[ ]" AND source_json.SearchScope!="Base" AND (source_json.AdditionalFields ICONTAINS "(userAccountControl:1.2.840.113556.1.4.803:=65536)" OR source_json.AdditionalFields ICONTAINS "(userAccountControl:1.2.840.113556.1.4.803:=544)" OR source_json.AdditionalFields ICONTAINS "!(UserAccountControl:1.2.840.113556.1.4.803:=2)" OR source_json.AdditionalFields ICONTAINS "(accountExpires=9223372036854775807)" OR source_json.AdditionalFields ICONTAINS "(accountExpires=0)" OR ((source_json.AdditionalFields ICONTAINS "(sAMAccountType=805306368)" OR source_json.AdditionalFields ICONTAINS "(objectCategory=person)" OR source_json.AdditionalFields ICONTAINS "(objectCategory=user)" OR source_json.AdditionalFields ICONTAINS "(objectClass=user)") AND NOT source_json.AdditionalFields ICONTAINS "(domainSid=)" AND NOT source_json.AdditionalFields ICONTAINS "(objectSid=)")))
+  crowdstrike: |
+    event_category="AdvancedHunting-DeviceEvents" event_type="LdapSearch" tags!=*"[ ]"* scope!=Base
+    | (additional_fields=*"(userAccountControl:1.2.840.113556.1.4.803:=65536)"* OR additional_fields=*"(userAccountControl:1.2.840.113556.1.4.803:=544)"* OR additional_fields=*"!(UserAccountControl:1.2.840.113556.1.4.803:=2)"* OR additional_fields=*"(accountExpires=9223372036854775807)"* OR additional_fields=*"(accountExpires=0)"* OR ((additional_fields=*"(sAMAccountType=805306368)"* OR additional_fields=*"(objectCategory=person)"* OR additional_fields=*"(objectCategory=user)"* OR additional_fields=*"(objectClass=user)"*) AND (additional_fields!=*"(domainSid=)"* AND additional_fields!=*"(objectSid=)"*)))
+    | table([@timestamp, ComputerName, DeviceName, additional_fields, scope, tags])
+  xql: |
+    dataset = msft_defender_events
+    | filter event_category = "AdvancedHunting-DeviceEvents"
+    | filter event_type = "LdapSearch"
+    | filter tags != "[ ]"
+    | filter scope != "Base"
+    | filter (
+        additional_fields contains "(userAccountControl:1.2.840.113556.1.4.803:=65536)"
+        or additional_fields contains "(userAccountControl:1.2.840.113556.1.4.803:=544)"
+        or additional_fields contains "!(UserAccountControl:1.2.840.113556.1.4.803:=2)"
+        or additional_fields contains "(accountExpires=9223372036854775807)"
+        or additional_fields contains "(accountExpires=0)"
+        or (
+            (
+                additional_fields contains "(sAMAccountType=805306368)"
+                or additional_fields contains "(objectCategory=person)"
+                or additional_fields contains "(objectCategory=user)"
+                or additional_fields contains "(objectClass=user)"
+            )
+            and not additional_fields contains "(domainSid=)"
+            and not additional_fields contains "(objectSid=)"
+        )
+    )
+    | fields _time, agent_hostname, event_type, scope, additional_fields, tags
+  lucene: |
+    event_category:"AdvancedHunting-DeviceEvents" AND event_type:"LdapSearch" AND _exists_:tags AND NOT tags:"[ ]" AND NOT scope:"Base" AND (additional_fields:*\(userAccountControl\:1.2.840.113556.1.4.803\:\=65536\)* OR additional_fields:*\(userAccountControl\:1.2.840.113556.1.4.803\:\=544\)* OR additional_fields:*\!\(UserAccountControl\:1.2.840.113556.1.4.803\:\=2\)* OR additional_fields:*\(accountExpires\=9223372036854775807\)* OR additional_fields:*\(accountExpires\=0\)* OR ((additional_fields:*\(sAMAccountType\=805306368\)* OR additional_fields:*\(objectCategory\=person\)* OR additional_fields:*\(objectCategory\=user\)* OR additional_fields:*\(objectClass\=user\)*) AND (NOT additional_fields:*\(domainSid\=\)* AND NOT additional_fields:*\(objectSid\=\)*)))
+  sumo: |
+    _sourceCategory=*Defender* OR _sourceCategory=*AdvancedHunting* "LdapSearch"
+    | json field=_raw "ActionType" as event_type
+    | json field=_raw "AdditionalFields" as additional_fields
+    | json field=_raw "Tags" as tags
+    | json field=_raw "Scope" as scope
+    | where event_type = "LdapSearch"
+    | where tags != "[ ]"
+    | where scope != "Base"
+    | where (
+        additional_fields matches "*(userAccountControl:1.2.840.113556.1.4.803:=65536)*"
+        OR additional_fields matches "*(userAccountControl:1.2.840.113556.1.4.803:=544)*"
+        OR additional_fields matches "*!(UserAccountControl:1.2.840.113556.1.4.803:=2)*"
+        OR additional_fields matches "*(accountExpires=9223372036854775807)*"
+        OR additional_fields matches "*(accountExpires=0)*"
+        OR (
+            (
+                additional_fields matches "*(sAMAccountType=805306368)*"
+                OR additional_fields matches "*(objectCategory=person)*"
+                OR additional_fields matches "*(objectCategory=user)*"
+                OR additional_fields matches "*(objectClass=user)*"
+            )
+            AND NOT (
+                additional_fields matches "*(domainSid=)*"
+                OR additional_fields matches "*(objectSid=)*"
+            )
+        )
+    )
+    | fields _messageTime, _sourceHost, event_type, additional_fields, tags, scope
 false_positives:
 - Security software
 - Authorized admin tools
@@ -98,7 +177,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 AdvancedHunting Device Event
 

@@ -21,71 +21,94 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=kubernetes sourcetype=kube:audit objectRef.resource="selfsubjectrulesreviews" verb="create" objectRef.apiGroup="authorization.k8s.io"
+  spl: 'index=kubernetes sourcetype=kube:audit objectRef.resource="selfsubjectrulesreviews" verb="create" objectRef.apiGroup="authorization.k8s.io"
+
     | table _time, user.username, sourceIPs{}, objectRef.namespace, objectRef.name, responseStatus.code
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000583 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubernetes RBAC Permission Enumeration Attempt\"\n  \
-    \  severity = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1069\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    KubernetesPodInventory
+    | where TimeGenerated > ago(24h)
+    | join kind=inner (
+        KubernetesEvents
+        | where TimeGenerated > ago(24h)
+        | where ObjectKind == "SelfSubjectRulesReview"
+        | where Verb == "create"
+        | extend apiGroup = tostring(parse_json(RequestObject).apiVersion)
+        | where apiGroup has "authorization.k8s.io"
+    ) on Computer
+    | project TimeGenerated, Computer, Namespace, Name, Verb, ObjectKind, RequestObject, ResponseObject
+    ```
 
-    | WHERE @timestamp > NOW() - 1 hour
+    Wait, let me reconsider. For Kubernetes audit logs in Sentinel, the correct table is typically `AzureDiagnostics` with Category "kube-audit" or the dedicated audit table. Let me provide the correct query:
 
-    | WHERE eventName LIKE "%.+%"
+    ```
+    AzureDiagnostics
+    | where TimeGenerated > ago(24h)
+    | where Category == "kube-audit"
+    | where objectRef_resource_s == "selfsubjectrulesreviews"
+    | where verb_s == "create"
+    | where objectRef_apiGroup_s == "authorization.k8s.io"
+    | project TimeGenerated, user_username_s, verb_s, objectRef_resource_s, objectRef_apiGroup_s, sourceIPs_s, userAgent_s
+  aql: |
+    SELECT username, sourceip, "ObjectRef.Resource", "Verb", "ObjectRef.APIGroup", COUNT(*) AS event_count
+    FROM events
+    WHERE "ObjectRef.Resource" = 'selfsubjectrulesreviews'
+      AND "Verb" = 'create'
+      AND "ObjectRef.APIGroup" = 'authorization.k8s.io'
+    GROUP BY username, sourceip, "ObjectRef.Resource", "Verb", "ObjectRef.APIGroup"
+    LAST 24 HOURS
+  yara_l: |
+    rule k8s_selfsubjectrulesreviews_discovery {
+      meta:
+        author = "TDL"
+        description = "Detects Kubernetes selfsubjectrulesreviews creation for privilege discovery (T1069)"
+        mitre_attack_tactic = "Discovery"
+        mitre_attack_technique = "T1069"
+        severity = "Medium"
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      events:
+        $e.metadata.product_name = "Kubernetes"
+        $e.metadata.event_type = "RESOURCE_CREATION"
+        re.regex($e.target.resource.name, `(?i)selfsubjectrulesreviews`)
+        $e.target.resource.attribute.labels["verb"] = "create"
+        $e.target.resource.attribute.labels["apiGroup"] = "authorization.k8s.io"
+        $e.principal.user.userid = $user
 
-    | SORT count DESC
+      match:
+        $user over 5m
 
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-kubernetes.audit*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND kubernetes.audit.objectRef.resource == "selfsubjectrulesreviews"
+      AND kubernetes.audit.verb == "create"
+      AND kubernetes.audit.objectRef.apiGroup == "authorization.k8s.io"
+    | KEEP @timestamp, kubernetes.audit.user.username, kubernetes.audit.sourceIPs, kubernetes.audit.objectRef.namespace, kubernetes.audit.objectRef.resource, kubernetes.audit.verb
+  leql: |
+    where(source_json.objectRef.resource="selfsubjectrulesreviews" AND source_json.verb="create" AND source_json.objectRef.apiGroup="authorization.k8s.io")
+  crowdstrike: |
+    #type=kubernetes event.resource="selfsubjectrulesreviews" event.verb="create" event.apiGroup="authorization.k8s.io"
+    | table([@timestamp, event.user, event.sourceIPs, event.namespace, event.objectRef])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "GCP" and json_extract_scalar(resource, "$.type") = "k8s_cluster"
+    | filter json_extract_scalar(protoPayload, "$.resourceName") ~= "selfsubjectrulesreviews"
+    | filter json_extract_scalar(protoPayload, "$.request.verb") = "create" or json_extract_scalar(protoPayload, "$.methodName") contains "create"
+    | filter json_extract_scalar(protoPayload, "$.request.apiGroup") = "authorization.k8s.io" or json_extract_scalar(protoPayload, "$.resourceName") contains "authorization.k8s.io"
+    | fields _time, json_extract_scalar(protoPayload, "$.authenticationInfo.principalEmail") as user, json_extract_scalar(resource, "$.labels.cluster_name") as cluster, json_extract_scalar(protoPayload, "$.resourceName") as resource_name
+  lucene: |
+    objectRef.resource:selfsubjectrulesreviews AND verb:create AND objectRef.apiGroup:authorization.k8s.io
+  sumo: |
+    _sourceCategory=*kubernetes* "selfsubjectrulesreviews"
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "verb" as verb
+    | json field=_raw "objectRef.apiGroup" as apiGroup
+    | where resource = "selfsubjectrulesreviews" and verb = "create" and apiGroup = "authorization.k8s.io"
+    | fields _messageTime, _sourceHost, resource, verb, apiGroup
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -95,7 +118,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere the Resource is \"selfsubjectrulesreviews\"\nWhere Verb is \"create\"\nWhere apiGroup is \"authorization.k8s.io\""
 triage_steps:

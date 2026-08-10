@@ -15,79 +15,101 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (http_user_agent="*sqlmap*" OR http_user_agent="*nikto*" OR http_user_agent="*dirbuster*" OR http_user_agent="*hydra*" OR http_user_agent="*masscan*" OR http_user_agent="*nmap*" OR http_user_agent="*metasploit*" OR http_user_agent="*burp*" OR http_user_agent="*acunetix*" OR http_user_agent="*nessus*" OR http_user_agent="*openvas*" OR http_user_agent="*w3af*" OR http_user_agent="*wfuzz*" OR http_user_agent="*gobuster*" OR http_user_agent="*zgrab*" OR http_user_agent="*scanner*") NOT [| inputlookup authorized_scanners.csv | fields src_ip] | stats count dc(dest_ip) as unique_dests sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port | where count >= 1 | dedup src_ip, dest_ip, dest_port | sort - total_bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (http_user_agent="*sqlmap*" OR http_user_agent="*nikto*" OR http_user_agent="*dirbuster*"
+    OR http_user_agent="*hydra*" OR http_user_agent="*masscan*" OR http_user_agent="*nmap*" OR http_user_agent="*metasploit*" OR http_user_agent="*burp*"
+    OR http_user_agent="*acunetix*" OR http_user_agent="*nessus*" OR http_user_agent="*openvas*" OR http_user_agent="*w3af*" OR http_user_agent="*wfuzz*"
+    OR http_user_agent="*gobuster*" OR http_user_agent="*zgrab*" OR http_user_agent="*scanner*") NOT [| inputlookup authorized_scanners.csv |
+    fields src_ip] | stats count dc(dest_ip) as unique_dests sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port | where count >=
+    1 | dedup src_ip, dest_ip, dest_port | sort - total_bytes_out
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000441 {\n  meta:\n    author = \"TDL\"\n    description = \"Hack Tool User Agent\"\n    severity = \"MEDIUM\"\n\
-    \    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    let HackToolUserAgents = dynamic(["sqlmap", "nikto", "dirbuster", "hydra", "masscan", "nmap", "metasploit", "acunetix", "burp", "w3af", "zap", "havij", "nessus", "openvas", "qualys", "nexpose", "netsparker"]);
+    let AuthorizedScannerIPs = dynamic([]);
+    let ApprovedMonitoringHosts = dynamic([]);
+    let ExclusionIPs = array_concat(AuthorizedScannerIPs, ApprovedMonitoringHosts);
+    CommonSecurityLog
+    | where DeviceVendor has_any ("Proxy", "Firewall", "IDS") or DeviceProduct has_any ("Proxy", "Firewall", "IDS")
+    | where Protocol =~ "tcp" or ApplicationProtocol =~ "tcp"
+    | where isnotempty(RequestClientApplication)
+    | where RequestClientApplication has_any (HackToolUserAgents)
+    | where SourceIP !in (ExclusionIPs) and Computer !in (ApprovedMonitoringHosts)
+    | summarize count_connections = count(), unique_dests = dcount(DestinationIP), total_bytes_out = sum(SentBytes) by SourceIP, DestinationIP, DestinationPort
+    | where count_connections >= 1
+    | sort by total_bytes_out desc
+    | project SourceIP, DestinationIP, DestinationPort, count_connections, unique_dests, total_bytes_out
+  aql: "SELECT sourceip, destinationip, destinationport, \n       LOGSOURCENAME(logsourceid) AS log_source,\n       \"User Agent\" AS user_agent,\n\
+    \       COUNT(*) AS connection_count,\n       UNIQUECOUNT(destinationip) AS unique_dests,\n       SUM(bytesout) AS total_bytes_out\nFROM events\n\
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%proxy%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%firewall%' OR category IN (SELECT category FROM\
+    \ categories WHERE low_level_category_name ILIKE '%proxy%'))\n  AND protocolid = 6\n  AND (\"User Agent\" ILIKE '%sqlmap%' \n       OR \"\
+    User Agent\" ILIKE '%nikto%' \n       OR \"User Agent\" ILIKE '%dirbuster%' \n       OR \"User Agent\" ILIKE '%hydra%' \n       OR \"User\
+    \ Agent\" ILIKE '%masscan%' \n       OR \"User Agent\" ILIKE '%nmap%' \n       OR \"User Agent\" ILIKE '%metasploit%'\n       OR \"User Agent\"\
+    \ ILIKE '%burp%'\n       OR \"User Agent\" ILIKE '%w3af%'\n       OR \"User Agent\" ILIKE '%acunetix%'\n       OR \"User Agent\" ILIKE '%nessus%'\n\
+    \       OR \"User Agent\" ILIKE '%openvas%'\n       OR \"User Agent\" ILIKE '%qualys%'\n       OR \"User Agent\" ILIKE '%nexpose%'\n     \
+    \  OR \"User Agent\" ILIKE '%gobuster%'\n       OR \"User Agent\" ILIKE '%wfuzz%'\n       OR \"User Agent\" ILIKE '%zap%')\n  AND sourceip\
+    \ NOT IN ('10.0.1.100', '10.0.1.101', '192.168.10.50')\n  AND LOGSOURCENAME(logsourceid) NOT IN ('AuthorizedScanner1', 'MonitoringAgent1',\
+    \ 'ApprovedSecTool')\nGROUP BY sourceip, destinationip, destinationport, LOGSOURCENAME(logsourceid), \"User Agent\"\nHAVING connection_count\
+    \ >= 1\nORDER BY total_bytes_out DESC\nLAST 24 HOURS\n"
+  yara_l: "rule hack_tool_user_agent_t1190 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects hack tool user agents in network proxy\
+    \ logs - T1190 Initial Access\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1190\"\n    severity = \"HIGH\"\
+    \n\n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.network.ip_protocol = \"TCP\"\n    re.regex($e.network.http.user_agent,\
+    \ `(?i)(sqlmap|nikto|dirbuster|hydra|masscan|nmap|metasploit|burpsuite|acunetix|nessus|w3af|zap|grabber|wfuzz|dirb|gobuster|wpscan|skipfish|havij|pangolin|sqlninja|bbqsql|vega|paros|arachni|openvas)`)\n\
+    \    \n    not re.regex($e.principal.ip, `^(10\\.50\\.1\\.(10|11|12|13|14|15))$`)\n    not re.regex($e.principal.hostname, `(?i)(authorized-scanner|security-monitor|approved-agent)`)\n\
+    \    \n    $e.principal.ip = $src_ip\n    $e.target.ip = $dest_ip\n    $e.target.port = $dest_port\n\n  match:\n    $src_ip, $dest_ip, $dest_port\
+    \ over 1h\n\n  outcome:\n    $risk_score = max(75)\n    $user_agent = array_distinct($e.network.http.user_agent)\n    $connection_count =\
+    \ count_distinct($e.metadata.id)\n    $unique_destinations = count_distinct($dest_ip)\n    $total_bytes_out = sum($e.network.sent_bytes)\n\
+    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-network.firewall*, logs-network.ids*
+    | WHERE network.protocol == "tcp"
+      AND (
+        TO_LOWER(user_agent.original) LIKE "*sqlmap*"
+        OR TO_LOWER(user_agent.original) LIKE "*nikto*"
+        OR TO_LOWER(user_agent.original) LIKE "*dirbuster*"
+        OR TO_LOWER(user_agent.original) LIKE "*hydra*"
+        OR TO_LOWER(user_agent.original) LIKE "*masscan*"
+        OR TO_LOWER(user_agent.original) LIKE "*nmap*"
+        OR TO_LOWER(user_agent.original) LIKE "*metasploit*"
+      )
+      AND source.ip NOT IN ("10.0.0.50", "10.0.0.51", "192.168.1.100")
+      AND host.name NOT IN ("scanner-01", "monitor-agent-02")
+    | STATS count = COUNT(*), unique_dests = COUNT_DISTINCT(destination.ip), bytes_out_sum = SUM(source.bytes) BY source.ip, destination.ip, destination.port
+    | WHERE count >= 1
+    | SORT bytes_out_sum DESC
+    | KEEP source.ip, destination.ip, destination.port, count, unique_dests, bytes_out_sum
+  leql: |
+    where(source_json.user_agent=/(?i)(sqlmap|nikto|dirbuster|hydra|masscan|nmap|metasploit|burp|gobuster|wfuzz|dirb|acunetix|nessus|openvas|qualys|scanner|exploit|payload|shellshock|injection|pentest)/ AND source_address!="10.0.1.50" AND source_address!="10.0.1.51" AND source_address!="192.168.100.10") groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: "#type=firewall OR #type=ids \n| network.protocol=*tcp* \n| (user_agent=*sqlmap* OR user_agent=*nikto* OR user_agent=*dirbuster*\
+    \ OR user_agent=*hydra* OR user_agent=*masscan* OR user_agent=*nmap* OR user_agent=*metasploit* OR user_agent=/(?i)(sqlmap|nikto|dirbuster|hydra|masscan|nmap|metasploit)/)\n\
+    | NOT (src_ip IN [cidr=\"10.0.10.0/24\"] OR ComputerName IN [\"scanner01.corp\", \"monitor.corp\"])\n| groupBy([src_ip, dest_ip, dest_port],\
+    \ function=[count(as=conn_count), count(dest_ip, distinct=true, as=unique_dests), sum(bytes_out, as=total_bytes_out)])\n| conn_count >= 1\n\
+    | sort(total_bytes_out, order=desc)\n| table([src_ip, dest_ip, dest_port, conn_count, unique_dests, total_bytes_out])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter http_user_agent ~= "(?i)(sqlmap|nikto|dirbuster|hydra|masscan|nmap|metasploit|burp|acunetix|nessus|openvas|paros|w3af|havij|grab|curl|wget|python-requests|go-http-client|scanner|exploit|attack|pentest|dirsearch|gobuster|wfuzz|ffuf|nuclei|httpx|jaeles|subfinder|knockpy|sqlninja|pangolin|nosqlmap|commix|xsser|beef|slowhttptest|thc-|aircrack|hashcat|john|cain|metasploit|mimikatz|powersploit|empire|covenant|cobalt)"
+    | filter src_ip not in ("192.168.1.100", "10.0.0.50", "172.16.0.10")
+    | alter dest_port = coalesce(dest_port, 0)
+    | comp count() as cnt, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | filter cnt >= 1
+    | sort desc total_bytes_out
+    | dedup src_ip, dest_ip, dest_port
+    | fields src_ip, dest_ip, dest_port, cnt, unique_dests, total_bytes_out, http_user_agent
+  lucene: |
+    (sourcetype:firewall OR sourcetype:ids) AND network.protocol:*tcp* AND (http.user_agent:*sqlmap* OR http.user_agent:*nikto* OR http.user_agent:*dirbuster* OR http.user_agent:*hydra* OR http.user_agent:*masscan* OR http.user_agent:*nmap* OR http.user_agent:*metasploit* OR http.user_agent:*burp* OR http.user_agent:*acunetix* OR http.user_agent:*nessus* OR http.user_agent:*openvas* OR http.user_agent:*w3af* OR http.user_agent:*ZAP* OR http.user_agent:*havij* OR http.user_agent:*skipfish*) AND NOT (source.ip:(10.50.100.10 OR 10.50.100.11 OR 10.50.100.12) OR host.name:(*scanner* OR *monitor*))
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*ids*
+    | where _sourceCategory matches "*proxy*" OR _raw matches "*tcp*"
+    | parse regex "(?i)(?<user_agent>sqlmap|nikto|dirbuster|hydra|masscan|nmap|metasploit|burp|acunetix|nessus|openvas|w3af|skipfish|wfuzz|gobuster|ffuf|nuclei|jaeles)" nodrop
+    | where !isNull(user_agent)
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dst[_=:](?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dport[_=:](?<dest_port>\d+)" nodrop
+    | parse regex "bytes[_out]*[_=:](?<bytes_out>\d+)" nodrop
+    | where !(src_ip in ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
+    | count as conn_count, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as total_bytes by src_ip, dest_ip, dest_port
+    | where conn_count >= 1
+    | sort by total_bytes desc
+    | fields src_ip, dest_ip, dest_port, conn_count, unique_dests, total_bytes
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -97,7 +119,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

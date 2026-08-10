@@ -24,71 +24,122 @@ queries:
     )))\n  OR\n  ((file_path=\"*\\\\Device\\\\NTPNP_PCI*\" OR object_name=\"*\\\\Device\\\\NTPNP_PCI*\") ioctl_code IN (\"0x22C007\", \"0x22C00B\"\
     , \"0x22000B\") NOT (Image IN (\"*Dell*\", \"*HP*\", \"*Lenovo*\", \"*VendorAgent*\")))\n)\n| table _time, host, ComputerName, process_name,\
     \ Image, CommandLine, parent_process_name, ParentImage, file_path, object_name, ioctl_code, user, User\n"
-  kql: 'DeviceProcessEvents
+  kql: "union \n(DeviceProcessEvents\n| where TimeGenerated > ago(1h)\n| where FileName in~ (\"fwupdmgr\",\"afuwin.exe\",\"AFU.exe\",\"afu.exe\"\
+    ,\"afu64.exe\",\"afuwin64.exe\")\n   or ProcessCommandLine has_any (\"/B\",\"--force\",\"--allow-reinstall\",\"--allow-older\")\n| where InitiatingProcessFileName\
+    \ !in~ (\"fwupdmgr\",\"gnome-software\",\"discover\",\"pamac\",\"software-center\",\"vendorservice.exe\",\"dellcommandupdate.exe\",\"hpfirmwareupdater.exe\"\
+    ,\"lenovosystemupdate.exe\",\"asusupdate.exe\")\n| project TimeGenerated, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName,\
+    \ InitiatingProcessCommandLine, DeviceId\n),\n(DeviceFileEvents\n| where TimeGenerated > ago(1h)\n| where FolderPath matches regex @\"\\\\\
+    Device\\\\NTPNP_PCI[0-9A-F]+\"\n| where InitiatingProcessFileName !in~ (\"vendorservice.exe\",\"dellcommandupdate.exe\",\"hpfirmwareupdater.exe\"\
+    ,\"lenovosystemupdate.exe\",\"asusupdate.exe\",\"nvflash.exe\",\"fwupdate.exe\")\n| project TimeGenerated, DeviceName, AccountName, FileName\
+    \ = InitiatingProcessFileName, ProcessCommandLine = InitiatingProcessCommandLine, InitiatingProcessFileName = InitiatingProcessParentFileName,\
+    \ InitiatingProcessCommandLine = \"\", DeviceId\n)\n| project TimeGenerated, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName,\
+    \ DeviceId\n"
+  aql: "SELECT eventtime, sourceip, destinationip, username, LOGSOURCENAME(logsourceid) AS host, \"Process Name\", \"Process CommandLine\", \"\
+    Image\", \"Device Name\", \"Object Name\", \"Parent Process Name\"\nFROM events\nWHERE (\n    (\"Process Name\" ILIKE '%fwupdmgr%' OR \"Image\"\
+    \ ILIKE '%fwupdmgr%')\n    OR (\"Process Name\" ILIKE '%afuwin.exe%' OR \"Image\" ILIKE '%afuwin.exe%')\n    OR (\"Process CommandLine\" ILIKE\
+    \ '%AFU%/B%' OR \"Process CommandLine\" ILIKE '%AFU.exe%/B%')\n    OR (\"Device Name\" ILIKE '%\\\\Device\\\\NTPNP_PCI%' OR \"Object Name\"\
+    \ ILIKE '%\\\\Device\\\\NTPNP_PCI%')\n)\nAND (\"Parent Process Name\" NOT ILIKE '%fwupd%' \n     AND \"Parent Process Name\" NOT ILIKE '%dell%'\
+    \ \n     AND \"Parent Process Name\" NOT ILIKE '%hp%update%' \n     AND \"Parent Process Name\" NOT ILIKE '%lenovo%' \n     AND \"Parent Process\
+    \ Name\" NOT ILIKE '%vendor%management%'\n     AND \"Process Name\" NOT ILIKE '%dell%service%'\n     AND \"Process Name\" NOT ILIKE '%hp%service%'\n\
+    \     AND \"Process Name\" NOT ILIKE '%lenovo%service%')\nLAST 1 HOURS\n"
+  yara_l: |
+    rule firmware_manipulation_outside_vendor_tools {
+      meta:
+        author = "TDL"
+        description = "Detects firmware manipulation outside vendor management agents - T1495"
+        mitre_attack_tactic = "Impact"
+        mitre_attack_technique = "T1495"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        // fwupdmgr invocation (Linux)
+        (
+          $e.metadata.event_type = "PROCESS_LAUNCH"
+          re.regex($e.target.process.file.full_path, `(?i)fwupdmgr$`)
+          not re.regex($e.principal.process.file.full_path, `(?i)(gnome-software|packagekit|fwupd)`)
+          $e.principal.hostname = $host
+          $e.target.process.file.full_path = $file
+        )
+        or
+        // afuwin.exe invocation (Windows)
+        (
+          $e.metadata.event_type = "PROCESS_LAUNCH"
+          re.regex($e.target.process.file.full_path, `(?i)afuwin\.exe$`)
+          not re.regex($e.principal.process.file.full_path, `(?i)(dell|hp|lenovo|asus|msi).*management`)
+          $e.principal.hostname = $host
+          $e.target.process.file.full_path = $file
+        )
+        or
+        // AFU /B command line pattern (Windows)
+        (
+          $e.metadata.event_type = "PROCESS_LAUNCH"
+          re.regex($e.target.process.command_line, `(?i)afu\s+/[bB]`)
+          not re.regex($e.principal.process.file.full_path, `(?i)(dell|hp|lenovo|asus|msi).*management`)
+          $e.principal.hostname = $host
+          $e.target.process.command_line = $file
+        )
+        or
+        // Write to firmware device path with IOCTL (Windows)
+        (
+          $e.metadata.event_type = "FILE_MODIFICATION"
+          re.regex($e.target.file.full_path, `(?i)\\Device\\NTPNP_PCI`)
+          not re.regex($e.principal.process.file.full_path, `(?i)(dell|hp|lenovo|asus|msi|windows\\system32).*management`)
+          $e.principal.hostname = $host
+          $e.target.file.full_path = $file
+        )
 
-    | where process_name in ("afuwin.exe")
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      outcome:
+        $risk_score = 85
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('afuwin.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_000819 {\n  meta:\n    author = \"TDL\"\n    description = \"BIOS/UEFI Flash Operation From User Context\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0040\"\n    technique = \"T1495\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(afuwin.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint.events.*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("afuwin.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [afuwin.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (afuwin.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("afuwin.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(afuwin.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("afuwin.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      AND (
+        (process.name IN ("fwupdmgr", "afuwin.exe", "afu.exe", "AFU.exe") AND process.parent.name NOT IN ("fwupd", "fwupdate", "gnome-software", "discover", "packagekit", "AsusUpdateService.exe", "AMIDEWINx64.exe", "ASRock.exe", "GigabyteSoftwareUpdate.exe", "MSI.exe"))
+        OR (process.command_line LIKE "*AFU*" AND process.command_line LIKE "*/B*" AND process.parent.name NOT IN ("AsusUpdateService.exe", "AMIDEWINx64.exe"))
+        OR (file.path LIKE "*\\Device\\NTPNP_PCI*" AND event.action IN ("write", "ioctl") AND process.name NOT IN ("fwupd.exe", "AsusUpdateService.exe", "AMIDEWINx64.exe", "DellBIOSUpdate.exe", "HPFirmwareUpdate.exe", "LenovoFirmwareUpdate.exe"))
+      )
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.executable, file.path, event.action
+  leql: |
+    where((process_name ICONTAINS "fwupdmgr" OR process_name ICONTAINS "afuwin.exe" OR process_cmd_line ICONTAINS "AFU /B" OR process_cmd_line ICONTAINS "\Device\NTPNP_PCI") AND NOT (parent_process_name ICONTAINS "dell" OR parent_process_name ICONTAINS "hp" OR parent_process_name ICONTAINS "lenovo" OR parent_process_name ICONTAINS "asus" OR parent_process_name ICONTAINS "vendor" OR parent_process_name ICONTAINS "management")) groupby(asset, process_name, parent_process_name) calculate(count)
+  crowdstrike: |
+    (event_simpleName=ProcessRollup2 (FileName IN [*fwupdmgr*, *afuwin.exe*, *AFU*] OR CommandLine IN [*fwupdmgr*, *afuwin.exe*, *AFU /B*, *AFU.exe /B*]))
+    OR (event_simpleName IN [DeviceControlEvent, RawAccessRead, RawAccessWrite] (TargetFileName=*\\Device\\NTPNP_PCI* OR DeviceName=*\\Device\\NTPNP_PCI*))
+    | regex("(?<VendorAgent>Dell Command|HP Support|Lenovo Vantage|ThinkPad|Surface|ASUS Update|MSI Dragon|Gigabyte|fwupd-refresh)", field=ParentBaseFileName, strict=false)
+    | VendorAgent != "*"
+    | case {
+        event_simpleName=ProcessRollup2 | ComputerName=* ;
+        * | ComputerName=* ;
+      }
+    | groupBy([ComputerName, FileName, CommandLine, ParentBaseFileName, UserName], function=count(as=fw_update_events))
+    | table([@timestamp, ComputerName, event_simpleName, FileName, CommandLine, ParentBaseFileName, UserName, TargetFileName, DeviceName, fw_update_events])
+  xql: "dataset = xdr_data\n| filter (event_type = ENUM.EVENT_TYPE_PROCESS and (\n    lowercase(action_process_image_name) contains \"fwupdmgr\"\
+    \ or\n    lowercase(action_process_image_name) contains \"afuwin.exe\" or\n    (lowercase(action_process_image_name) contains \"afu\" and\
+    \ action_process_image_command_line ~= \"(?i)/B\")\n  )) or (\n    event_type = ENUM.EVENT_TYPE_FILE_WRITE and \n    action_file_path ~= \"\
+    (?i)\\\\\\\\Device\\\\\\\\NTPNP_PCI\"\n  )\n| filter not (\n    lowercase(actor_process_image_name) contains \"dell\" or\n    lowercase(actor_process_image_name)\
+    \ contains \"hp\" or\n    lowercase(actor_process_image_name) contains \"lenovo\" or\n    lowercase(actor_process_image_name) contains \"\
+    microsoft\" or\n    lowercase(actor_process_image_name) contains \"intel\" or\n    lowercase(actor_process_image_name) contains \"asus\" or\n\
+    \    lowercase(actor_process_image_name) contains \"acer\"\n  )\n| fields _time, agent_hostname, os_type, event_type, action_process_image_name,\
+    \ action_process_image_command_line, actor_process_image_name, actor_effective_username, action_file_path\n"
+  lucene: |
+    (process.name:(fwupdmgr OR afuwin.exe OR afu.exe OR afu64.exe) OR process.command_line:(*fwupdmgr* OR *afuwin.exe* OR *AFU\ \/B* OR *AFU.exe\ \/B*) OR (file.path:*\\Device\\NTPNP_PCI* AND event.action:*IOCTL*)) AND NOT (process.parent.name:(dell_firmwareupdateservice.exe OR hpsoftwareinstaller.exe OR lenovosystemupdate.exe OR lenovosystemupdateaddin.exe OR updateservice.exe OR fwupdagent OR fwupd OR firmwareupdatemanager.exe OR vendorfwupdater.exe OR swflash.exe OR managementconsole.exe OR sccm.exe OR ccmexec.exe))
+  sumo: |
+    _sourceCategory=*EDR* OR _sourceCategory=*Firmware* (fwupdmgr OR afuwin.exe OR "AFU /B" OR "\Device\NTPNP_PCI")
+    | json field=_raw "process_name" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "TargetFileName" as target_file
+    | json field=_raw "ParentProcessName" as parent_process
+    | json field=_raw "Image" as image
+    | json field=_raw "device_path" as device_path
+    | json field=_raw "ioctl_code" as ioctl_code
+    | where (process_name matches "*fwupdmgr*" OR process_name matches "*afuwin.exe*" OR command_line matches "*AFU /B*" OR target_file matches "*\\Device\\NTPNP_PCI*" OR device_path matches "*\\Device\\NTPNP_PCI*") AND NOT (parent_process matches "*Dell*" OR parent_process matches "*HP*" OR parent_process matches "*Lenovo*" OR parent_process matches "*OEM*" OR parent_process matches "*ManagementAgent*" OR image matches "*Dell*" OR image matches "*HP*" OR image matches "*Lenovo*" OR image matches "*OEM*" OR image matches "*ManagementAgent*")
+    | fields _messageTime, _sourceHost, process_name, command_line, target_file, device_path, parent_process, image, ioctl_code
 pseudo_logic: Direct invocation of fwupdmgr, afuwin.exe, AFU /B, or write to \Device\NTPNP_PCI* with FW update IOCTL outside vendor management
   agent.
 false_positives:
@@ -106,7 +157,7 @@ references:
 - https://attack.mitre.org/techniques/T1495/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'

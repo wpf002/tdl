@@ -20,68 +20,107 @@ queries:
     \ errorMessage, responseElements, additionalEventData)\n| where match(request_data, \"(?i).*(\\$\\{jndi:|%24%7Bjndi:|%2524%257Bjndi:|\\\\\
     u0024\\\\u007B|\\\\x24\\\\x7B).*\")\n| stats count values(sourceIPAddress) as src_ips by userIdentity.arn, eventName, resources{}.ARN\n| where\
     \ count >= 1\n| sort - count\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(90d)
+    | where EventName matches regex @"\$\{jndi:"
+        or EventName matches regex @"\$\{.*:\w+/.*\}"
+        or EventName matches regex @"\$\{.*lower.*\}"
+        or EventName matches regex @"\$\{.*upper.*\}"
+        or EventName matches regex @"\$\{.*env.*\}"
+        or EventName matches regex @"\$\{.*sys.*\}"
+        or EventName contains "${jndi"
+        or RequestParameters contains "${jndi"
+        or ResponseElements contains "${jndi"
+        or UserAgent contains "${jndi"
+        or RequestParameters matches regex @"\$\{.*:\w+/.*\}"
+        or ResponseElements matches regex @"\$\{.*:\w+/.*\}"
+        or UserAgent matches regex @"\$\{.*:\w+/.*\}"
+    | extend UserArn = tostring(UserIdentityArn)
+    | extend ResourceArn = tostring(parse_json(Resources)[0].ARN)
+    | summarize count(), SourceIPs = make_set(SourceIpAddress) by UserArn, EventName, ResourceArn
+    | where count_ >= 1
+    | sort by count_ desc
+  aql: |
+    SELECT useridentity.arn AS user_arn, eventName, "resources{}.ARN" AS resource_arn, sourceip, COUNT(*) AS event_count
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%cloudtrail%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%aws%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%elb%')
+      AND (UTF8(payload) MATCHES '.*\$\{jndi:.*' OR UTF8(payload) MATCHES '.*\$\{.*:.*\/\/.*' OR UTF8(payload) MATCHES '.*\$\{\$\{.*' OR UTF8(payload) MATCHES '.*\$\{[lL][oO][wW][eE][rR]:.*' OR UTF8(payload) MATCHES '.*\$\{[uU][pP][pP][eE][rR]:.*' OR UTF8(payload) MATCHES '.*\..*\+.*\*.*')
+    GROUP BY useridentity.arn, eventName, "resources{}.ARN", sourceip
+    HAVING event_count >= 1
+    ORDER BY event_count DESC
+    LAST 24 HOURS
+  yara_l: |
+    rule log4j_exploitation_aws_elb {
+      meta:
+        author = "TDL"
+        description = "Detects Log4j exploitation patterns in AWS ELB logs"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.product_name = "AWS ELB"
+        $e.metadata.vendor_name = "AMAZON"
+        re.regex($e.network.http.parsed_user_agent, `\$\{jndi:`) or
+        re.regex($e.network.http.referral_url, `\$\{jndi:`) or
+        re.regex($e.target.url, `\$\{jndi:`) or
+        re.regex($e.network.http.parsed_user_agent, `\$\{.*?\}`) or
+        re.regex($e.network.http.referral_url, `\$\{.*?\}`) or
+        re.regex($e.target.url, `\$\{.*?\}`)
+        $e.principal.ip = $source_ip
+        $e.target.resource.name = $resource
+        $e.principal.user.userid = $user_arn
 
-    | where eventName matches regex ".+"
+      match:
+        $user_arn, $resource over 24h
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+      outcome:
+        $risk_score = 85
+        $source_ips = array_distinct($source_ip)
+        $event_count = count_distinct($e.metadata.id)
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000530 {\n  meta:\n    author = \"TDL\"\n    description = \"Successful Log4j Exploit\"\n    severity = \"HIGH\"\n\
-    \    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: "FROM logs-aws.cloudtrail*\n| WHERE @timestamp > NOW() - 24 hour\n  AND (\n    event.dataset == \"aws.cloudtrail\" \n    OR event.dataset\
+    \ == \"azure.auditlogs\" \n    OR event.dataset == \"gcp.audit\"\n  )\n  AND (\n    http.request.body.content RLIKE \".*\\\\$\\\\{jndi:.*\"\
+    \n    OR http.request.body.content RLIKE \".*\\\\$\\\\{.*:.*\\\\}.*\"\n    OR url.full RLIKE \".*\\\\$\\\\{jndi:.*\"\n    OR url.full RLIKE\
+    \ \".*\\\\$\\\\{.*:.*\\\\}.*\"\n    OR user_agent.original RLIKE \".*\\\\$\\\\{jndi:.*\"\n    OR user_agent.original RLIKE \".*\\\\$\\\\{.*:.*\\\
+    \\}.*\"\n  )\n| EVAL resource_arn = COALESCE(aws.cloudtrail.resources.arn, cloud.instance.id, \"unknown\")\n| STATS \n    event_count = COUNT(*),\n\
+    \    source_ips = VALUES(source.ip)\n  BY \n    cloud.account.id,\n    event.action,\n    resource_arn,\n    user.id\n| WHERE event_count\
+    \ >= 1\n| SORT event_count DESC\n| KEEP cloud.account.id, event.action, resource_arn, user.id, event_count, source_ips\n"
+  leql: |
+    where(log_source="AWS ELB" AND (request ICONTAINS "${jndi:" OR request ICONTAINS "${${" OR request ICONTAINS "${lower:" OR request ICONTAINS "${upper:" OR request ICONTAINS "${env:" OR request ICONTAINS "${sys:" OR request ICONTAINS "ldap://" OR request ICONTAINS "ldaps://" OR request ICONTAINS "rmi://" OR request ICONTAINS "dns://" OR request ICONTAINS "nis://" OR request ICONTAINS "nds://" OR request ICONTAINS "corba://" OR request ICONTAINS "iiop://")) groupby(userIdentity.arn, eventName, resources{}.ARN) calculate(unique:source_address)
+  crowdstrike: |
+    #type=aws:elb
+    | regex(".*(\$\{.*jndi.*\}|\$\{.*:.*:.*\}|\$\%7B.*\}|\$\{lower:.*\}|\$\{upper:.*\}|\$\{::-.*\}|\$\{env:.*\}|\$\{sys:.*\}).*", field=request, flags=i)
+    | groupBy([userIdentity.arn, eventName, resources{}.ARN], function=[count(as=event_count), collect(sourceIPAddress, as=source_ips)])
+    | event_count >= 1
+    | sort(event_count, order=desc, limit=10000)
+    | table([userIdentity.arn, eventName, "resources{}.ARN", event_count, source_ips])
+  xql: "dataset = cloud_audit_logs\n| filter vendor = \"AWS\" and raw_log contains \"*\" and raw_log ~= \"(?i).*(\\$\\{jndi:|\\$\\{.*:.*\\}|%24%7Bjndi|%24%7B.*%3A.*%7D).*\"\
+    \n| alter \n    user_identity = json_extract_scalar(raw_log, \"$.userIdentity.arn\"),\n    event_name = json_extract_scalar(raw_log, \"$.eventName\"\
+    ),\n    resource_arn = json_extract_scalar(raw_log, \"$.resources[0].ARN\"),\n    source_ip = coalesce(json_extract_scalar(raw_log, \"$.sourceIPAddress\"\
+    ), json_extract_scalar(raw_log, \"$.requestParameters.sourceIPAddress\"))\n| filter user_identity != null and event_name != null\n| comp count()\
+    \ as event_count, values(source_ip) as source_ips by user_identity, event_name, resource_arn\n| filter event_count >= 1\n| sort desc event_count\n\
+    | fields user_identity, event_name, resource_arn, event_count, source_ips\n"
+  lucene: |
+    sourcetype:(aws\:cloudtrail OR azure\:auditlogs OR gcp\:audit) AND eventName:*\$\{jndi\:* AND _exists_:userIdentity.arn AND _exists_:resources
+  sumo: |
+    _sourceCategory=*elb* OR _sourceType=*elb* OR _source=*elb*
+    | json field=_raw "userIdentity.arn" as user_arn
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "resources" as resources
+    | json field=_raw "sourceIPAddress" as src_ip
+    | json field=_raw "requestParameters" as request_params
+    | where request_params matches "*$*{*jndi*" OR request_params matches "*$*{*ldap*" OR request_params matches "*$*{*rmi*" OR request_params matches "*${*" OR request_params matches "*.+*"
+    | parse regex field=resources "\[.*?\"ARN\":\"(?<resource_arn>[^\"]+)\"" multi
+    | where !isNull(user_arn) AND !isNull(event_name)
+    | count as event_count, values(src_ip) as source_ips by user_arn, event_name, resource_arn
+    | where event_count >= 1
+    | sort by event_count desc
+    | fields user_arn, event_name, resource_arn, event_count, source_ips
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -91,7 +130,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

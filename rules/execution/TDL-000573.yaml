@@ -19,68 +19,76 @@ queries:
   spl: "index=* sourcetype=kube:* OR sourcetype=kubernetes:* objectRef.resource=pods verb=create requestObject.spec.hostNetwork=true \n| search\
     \ NOT user.username=\"system:serviceaccount:kube-system:replicaset-controller\" NOT user.username=\"system:serviceaccount:kube-system:daemon-set-controller\"\
     \n| table _time, user.username, objectRef.namespace, objectRef.name, verb, requestObject.spec.hostNetwork, sourceIPs{}\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    KubeEvents
+    | where TimeGenerated > ago(1h)
+    | where ObjectKind == "Pod"
+    | where Verb == "create"
+    | extend hostNetwork = tostring(parse_json(RequestObject).spec.hostNetwork)
+    | where hostNetwork == "true"
+    | where UserName !in ("system:serviceaccount:kube-system:replicaset-controller", "system:serviceaccount:kube-system:daemon-set-controller")
+    | project TimeGenerated, Namespace, Name, UserName, SourceIPs, RequestObject, ResponseObject
+  aql: |
+    SELECT username, sourceip, "Resource", "Verb", "requestObject.spec.hostNetwork", COUNT(*) AS event_count
+    FROM events
+    WHERE "Resource" = 'pods'
+      AND "Verb" = 'create'
+      AND "requestObject.spec.hostNetwork" = 'true'
+      AND username != 'system:serviceaccount:kube-system:replicaset-controller'
+      AND username != 'system:serviceaccount:kube-system:daemon-set-controller'
+    GROUP BY username, sourceip, "Resource", "Verb", "requestObject.spec.hostNetwork"
+    LAST 24 HOURS
+  yara_l: |
+    rule kubernetes_pod_hostnetwork_creation {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects Kubernetes pod creation with hostNetwork enabled - MITRE T1611"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1611"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "RESOURCE_CREATION"
+        $e.metadata.product_name = "Kubernetes"
+        $e.target.resource.name = "pods"
+        $e.security_result.action = "create"
+        $e.target.resource.attribute.labels["requestObject.spec.hostNetwork"] = "true"
+        $e.principal.user.userid = $user
+        $user != "system:serviceaccount:kube-system:replicaset-controller"
+        $user != "system:serviceaccount:kube-system:daemon-set-controller"
 
-    | where eventName matches regex ".+"
+      match:
+        $user over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000573 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubernetes Pod Created with hostNetwork\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1611\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-kubernetes.audit*
+    | WHERE kubernetes.audit.objectRef.resource == "pods"
+      AND kubernetes.audit.verb == "create"
+      AND kubernetes.audit.requestObject.spec.hostNetwork == "true"
+      AND kubernetes.audit.user.username != "system:serviceaccount:kube-system:replicaset-controller"
+      AND kubernetes.audit.user.username != "system:serviceaccount:kube-system:daemon-set-controller"
+    | KEEP @timestamp, host.name, kubernetes.audit.user.username, kubernetes.audit.objectRef.name, kubernetes.audit.objectRef.namespace, kubernetes.audit.sourceIPs
+  leql: |
+    where(source_json.objectRef.resource="pods" AND source_json.verb="create" AND source_json.requestObject.spec.hostNetwork=true AND source_json.user.username!="system:serviceaccount:kube-system:replicaset-controller" AND source_json.user.username!="system:serviceaccount:kube-system:daemon-set-controller")
+  crowdstrike: |
+    #type=KubernetesEvent objectRef.resource="pods" verb="create" requestObject.spec.hostNetwork="true"
+    NOT (user.username="system:serviceaccount:kube-system:replicaset-controller" OR user.username="system:serviceaccount:kube-system:daemon-set-controller")
+    | table([@timestamp, user.username, objectRef.name, objectRef.namespace, sourceIPs])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "KUBERNETES" and http_method = "create" and resource_type = "pods" and json_extract_scalar(raw_log, "$.requestObject.spec.hostNetwork") = "true"
+    | filter source_username != "system:serviceaccount:kube-system:replicaset-controller" and source_username != "system:serviceaccount:kube-system:daemon-set-controller"
+    | fields _time, source_username, namespace, resource_type, resource_name, raw_log
+  lucene: |
+    kubernetes.audit.objectRef.resource:pods AND kubernetes.audit.verb:create AND kubernetes.audit.requestObject.spec.hostNetwork:true AND NOT kubernetes.audit.user.username:"system:serviceaccount:kube-system:replicaset-controller" AND NOT kubernetes.audit.user.username:"system:serviceaccount:kube-system:daemon-set-controller"
+  sumo: "_sourceCategory=*Kubernetes* \"pods\" \"create\"\n| json field=_raw \"objectRef.resource\" as resource\n| json field=_raw \"verb\" as\
+    \ verb\n| json field=_raw \"requestObject.spec.hostNetwork\" as hostNetwork\n| json field=_raw \"user.username\" as username\n| where resource\
+    \ = \"pods\" \n  and verb = \"create\" \n  and hostNetwork = \"true\"\n  and username != \"system:serviceaccount:kube-system:replicaset-controller\"\
+    \n  and username != \"system:serviceaccount:kube-system:daemon-set-controller\"\n| fields _messageTime, username, resource, verb, hostNetwork,\
+    \ _sourceHost\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -90,7 +98,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere the Resource is \"pods\"\nWhere Verb is \"create\"\nWhere the requestObject.spec.hostNetwork is \"true\"\
   \nWhere the Source Username is NOT \"system:serviceaccount:kube-system:replicaset-controller\"\nWhere the Source Username is NOT \"system:serviceaccount:kube-system:daemon-set-controller\""

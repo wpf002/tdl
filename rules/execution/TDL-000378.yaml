@@ -16,71 +16,74 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=azure sourcetype=azure:activity:json (operation_name="MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION" OR operation_name="MICROSOFT.COMPUTE/VIRTUALMACHINES/EXTENSIONS/WRITE") status=Success
+  spl: 'index=azure sourcetype=azure:activity:json (operation_name="MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION" OR operation_name="MICROSOFT.COMPUTE/VIRTUALMACHINES/EXTENSIONS/WRITE")
+    status=Success
+
     | table _time, user, resource_group, subscription_id, resource_id, operation_name, status, caller_ip_address, properties
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000378 {\n  meta:\n    author = \"TDL\"\n    description = \"Command Execution on VM - Azure\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0002\"\n    technique = \"T1059\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AzureActivity
+    | where TimeGenerated > ago(1h)
+    | where OperationNameValue in ("MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION", "MICROSOFT.COMPUTE/VIRTUALMACHINES/EXTENSIONS/WRITE")
+    | where ActivityStatusValue =~ "success"
+    | project TimeGenerated, Caller, OperationNameValue, ResourceGroup, SubscriptionId, ResourceId, ActivityStatusValue, Properties
+  aql: |
+    SELECT username, sourceip, "Event Name", "Action", LOGSOURCENAME(logsourceid) AS source, eventtime
+    FROM events
+    WHERE LOGSOURCETYPE(devicetype) ILIKE '%Azure%'
+      AND ("Event Name" = 'MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION' OR "Event Name" = 'MICROSOFT.COMPUTE/VIRTUALMACHINES/EXTENSIONS/WRITE')
+      AND "Action" = 'success'
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_vm_command_execution {
+      meta:
+        author = "TDL"
+        description = "Detects Azure VM command execution via RunCommand or Extensions"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1059"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Microsoft"
+        $e.metadata.product_name = "Azure"
+        (
+          $e.metadata.product_event_type = "MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION" or
+          $e.metadata.product_event_type = "MICROSOFT.COMPUTE/VIRTUALMACHINES/EXTENSIONS/WRITE"
+        )
+        $e.security_result.action = "ALLOW"
+        $e.security_result.summary = "success"
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $resource
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user, $resource over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-azure.activitylogs*
+    | WHERE event.action IN ("MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION", "MICROSOFT.COMPUTE/VIRTUALMACHINES/EXTENSIONS/WRITE") AND event.outcome == "success"
+    | KEEP @timestamp, azure.activitylogs.operation_name, event.action, event.outcome, azure.resource.name, azure.activitylogs.identity.claims_initiated_by_user.name, cloud.account.id, azure.subscription_id
+  leql: |
+    where(source_json.operationName IN ["MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION", "MICROSOFT.COMPUTE/VIRTUALMACHINES/EXTENSIONS/WRITE"] AND source_json.status=success)
+  crowdstrike: |
+    #repo=Azure event_simpleName=AzureActivityLog (operationName=MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION OR operationName=MICROSOFT.COMPUTE/VIRTUALMACHINES/EXTENSIONS/WRITE) status=Success
+    | table([@timestamp, callerIpAddress, identity.claims.name, resourceId, operationName, status])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AZURE" and operation_name in ("MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION", "MICROSOFT.COMPUTE/VIRTUALMACHINES/EXTENSIONS/WRITE") and operation_status = "SUCCESS"
+    | fields _time, operation_name, operation_status, identity_name, resource_name, resource_sub_type, project_id
+  lucene: |
+    OperationName:("MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION" OR "MICROSOFT.COMPUTE/VIRTUALMACHINES/EXTENSIONS/WRITE") AND ActivityStatus:"success"
+  sumo: |
+    _sourceCategory=*Azure* (MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION OR MICROSOFT.COMPUTE/VIRTUALMACHINES/EXTENSIONS/WRITE)
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "resultType" as result_type
+    | where (operation_name = "MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION" OR operation_name = "MICROSOFT.COMPUTE/VIRTUALMACHINES/EXTENSIONS/WRITE")
+    | where result_type matches "*success*" OR result_type = "Success"
+    | fields _messageTime, operation_name, result_type, _sourceHost
 false_positives:
 - Security software
 - Authorized admin tools
@@ -90,7 +93,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure Activity Event
 

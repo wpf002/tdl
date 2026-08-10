@@ -20,77 +20,75 @@ queries:
   spl: "index=network sourcetype=idsips action=blocked OR action=alert \nsrc_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) \nNOT dest_ip IN\
     \ (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)\n| bin _time span=5m\n| stats dc(signature) as unique_sigs values(signature) as signatures values(dest_ip)\
     \ as destinations by _time, src_ip\n| where unique_sigs >= 5\n| table _time, src_ip, unique_sigs, signatures, destinations\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_dis_000148 {\n  meta:\n    author = \"TDL\"\n    description = \"Vulnerability Scan - Outbound\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0007\"\n    technique = \"T1046\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(5m)
+    | where DeviceVendor in ("Palo Alto Networks", "Fortinet", "Check Point", "Cisco", "Snort", "Suricata")
+    | where DeviceEventClassID has_any ("exploit", "Exploit", "EXPLOIT") or Activity has_any ("exploit", "Exploit")
+    | where SourceIP startswith "10." or SourceIP startswith "172.16." or SourceIP startswith "172.17." or SourceIP startswith "172.18." or SourceIP startswith "172.19." or SourceIP startswith "172.20." or SourceIP startswith "172.21." or SourceIP startswith "172.22." or SourceIP startswith "172.23." or SourceIP startswith "172.24." or SourceIP startswith "172.25." or SourceIP startswith "172.26." or SourceIP startswith "172.27." or SourceIP startswith "172.28." or SourceIP startswith "172.29." or SourceIP startswith "172.30." or SourceIP startswith "172.31." or SourceIP startswith "192.168."
+    | where not (DestinationIP startswith "10." or DestinationIP startswith "172.16." or DestinationIP startswith "172.17." or DestinationIP startswith "172.18." or DestinationIP startswith "172.19." or DestinationIP startswith "172.20." or DestinationIP startswith "172.21." or DestinationIP startswith "172.22." or DestinationIP startswith "172.23." or DestinationIP startswith "172.24." or DestinationIP startswith "172.25." or DestinationIP startswith "172.26." or DestinationIP startswith "172.27." or DestinationIP startswith "172.28." or DestinationIP startswith "172.29." or DestinationIP startswith "172.30." or DestinationIP startswith "172.31." or DestinationIP startswith "192.168.")
+    | summarize UniqueSignatures = dcount(DeviceEventClassID), Signatures = make_set(DeviceEventClassID), EventCount = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by SourceIP, DestinationIP
+    | where UniqueSignatures >= 5
+    | where datetime_diff('minute', LastSeen, FirstSeen) <= 5
+  aql: |
+    SELECT sourceip, destinationip, UNIQUECOUNT(qid) AS unique_signatures, COUNT(*) AS total_events
+    FROM events
+    WHERE category IN (SELECT category FROM categories WHERE high_level_category_name = 'Potential Exploit')
+      AND INOFFENSE(sourceip) = true
+      AND INOFFENSE(destinationip) = false
+    GROUP BY sourceip, destinationip
+    HAVING unique_signatures >= 5
+    LAST 5 MINUTES
+  yara_l: "rule network_scanning_exploit_diversity {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects 5+ unique exploit\
+    \ signatures from one internal source to one external destination within 5 minutes\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique\
+    \ = \"T1046\"\n    severity = \"High\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.security_result.category\
+    \ = \"EXPLOIT\"\n    $e.network.direction = \"OUTBOUND\"\n    $e.principal.ip = $source_ip\n    $e.target.ip = $dest_ip\n    $e.security_result.summary\
+    \ = $signature\n    \n    net.ip_in_range_cidr($source_ip, \"10.0.0.0/8\") or\n    net.ip_in_range_cidr($source_ip, \"172.16.0.0/12\") or\n\
+    \    net.ip_in_range_cidr($source_ip, \"192.168.0.0/16\")\n    \n    not net.ip_in_range_cidr($dest_ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($dest_ip,\
+    \ \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($dest_ip, \"192.168.0.0/16\")\n    \n  match:\n    $source_ip, $dest_ip over 5m\n    \n\
+    \  outcome:\n    $risk_score = 75\n    $unique_signatures = count_distinct($signature)\n    \n  condition:\n    #e >= 5 and $unique_signatures\
+    \ >= 5\n}\n"
+  esql: "FROM logs-network_traffic.ips*, logs-network_traffic.ids*, logs-zeek.notice*, logs-suricata.eve*\n| WHERE @timestamp > NOW() - 5 minutes\
+    \ \n  AND event.kind == \"alert\"\n  AND source.ip IS NOT NULL \n  AND destination.ip IS NOT NULL\n  AND NOT CIDR_MATCH(source.ip, \"10.0.0.0/8\"\
+    , \"172.16.0.0/12\", \"192.168.0.0/16\", \"127.0.0.0/8\")\n  AND CIDR_MATCH(destination.ip, \"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"\
+    )\n| STATS event_count = COUNT(*), unique_sigs = COUNT_DISTINCT(event.id) BY source.ip, destination.ip\n| WHERE event_count >= 5 AND unique_sigs\
+    \ >= 5\n| KEEP source.ip, destination.ip, event_count, unique_sigs\n"
+  leql: |
+    where(log_source_type="IDS/IPS" AND direction=OUTBOUND AND event_type="Exploit" AND source_address=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ AND NOT(destination_address=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/)) groupby(source_address, destination_address) calculate(unique:signature)
+  crowdstrike: |
+    #type=ids* OR #type=ips* OR event_simpleName=*IDS* OR event_simpleName=*IPS*
+    | regex("exploit", field=signature, flags=i)
+    | case {
+        src_ip=/(^10\.)|(^172\.(1[6-9]|2[0-9]|3[0-1])\.)|(^192\.168\.)/ | direction := "outbound" ;
+        * | direction := "unknown" ;
+      }
+    | direction="outbound"
+    | bucket(span=5m, field=@timestamp, as=time_bucket)
+    | groupBy([time_bucket, src_ip, dst_ip], function=[count(signature, distinct=true, as=unique_sigs), count(as=total_events)])
+    | unique_sigs >= 5
+    | table([time_bucket, src_ip, dst_ip, unique_sigs, total_events])
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter threat_category = "vulnerability" and direction = "outbound" and incidr(src_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16") and not incidr(dst_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    | bin _time span=5m
+    | comp count_distinct(threat_name) as unique_sigs by _time, src_ip, dst_ip
+    | filter unique_sigs >= 5
+    | fields _time, src_ip, dst_ip, unique_sigs
+  lucene: |
+    event.type:"ids" AND event.category:"intrusion_detection" AND source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)
+  sumo: |
+    _sourceCategory=*IDS* OR _sourceCategory=*IPS*
+    | json field=_raw "signature" as signature
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "category" as category
+    | where category matches "*exploit*"
+    | where (src_ip matches "10.*" OR src_ip matches "172.16.*" OR src_ip matches "172.17.*" OR src_ip matches "172.18.*" OR src_ip matches "172.19.*" OR src_ip matches "172.20.*" OR src_ip matches "172.21.*" OR src_ip matches "172.22.*" OR src_ip matches "172.23.*" OR src_ip matches "172.24.*" OR src_ip matches "172.25.*" OR src_ip matches "172.26.*" OR src_ip matches "172.27.*" OR src_ip matches "172.28.*" OR src_ip matches "172.29.*" OR src_ip matches "172.30.*" OR src_ip matches "172.31.*" OR src_ip matches "192.168.*")
+    | where !(dest_ip matches "10.*" OR dest_ip matches "172.16.*" OR dest_ip matches "172.17.*" OR dest_ip matches "172.18.*" OR dest_ip matches "172.19.*" OR dest_ip matches "172.20.*" OR dest_ip matches "172.21.*" OR dest_ip matches "172.22.*" OR dest_ip matches "172.23.*" OR dest_ip matches "172.24.*" OR dest_ip matches "172.25.*" OR dest_ip matches "172.26.*" OR dest_ip matches "172.27.*" OR dest_ip matches "172.28.*" OR dest_ip matches "172.29.*" OR dest_ip matches "172.30.*" OR dest_ip matches "172.31.*" OR dest_ip matches "192.168.*")
+    | timeslice 5m
+    | count_distinct(signature) as unique_sigs by _timeslice, src_ip, dest_ip
+    | where unique_sigs >= 5
+    | fields _timeslice, src_ip, dest_ip, unique_sigs
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -100,7 +98,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "5 IDS/IPS Exploit Events \nFrom one internal source to one external destination (Outbound)\nWith unique Signatures \nWithin 5 minutes"
 suppression:

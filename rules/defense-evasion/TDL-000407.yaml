@@ -18,68 +18,47 @@ queries:
   spl: "index=aws sourcetype=aws:cloudtrail \n((eventName=DeleteAddon requestParameters.addonName=\"aws-guardduty-agent\") OR (eventSource=\"\
     guardduty.amazonaws.com\" eventName=DeleteDetector))\n| table _time, userIdentity.principalId, userIdentity.arn, eventName, eventSource, sourceIPAddress,\
     \ requestParameters.addonName, requestParameters.detectorId, awsRegion\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000407 {\n  meta:\n    author = \"TDL\"\n    description = \"GuardDuty Detector Disabled or Removed\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1489\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(1h)
+    | where (EventName == "DeleteAddon" and RequestParameters has "aws-guardduty-agent")
+        or (EventSource == "guardduty.amazonaws.com" and EventName == "DeleteDetector")
+    | project TimeGenerated, EventName, EventSource, UserIdentityArn, SourceIpAddress, UserAgent, RequestParameters, ResponseElements, AWSRegion
+  aql: "SELECT eventtime, username, sourceip, \"eventName\" AS event_name, \"addonName\" AS addon_name, \"eventSource\" AS event_source, LOGSOURCENAME(logsourceid)\
+    \ AS log_source\nFROM events\nWHERE ((\"eventName\" = 'DeleteAddon' AND \"addonName\" = 'aws-guardduty-agent') \n   OR (\"eventSource\" =\
+    \ 'guardduty.amazonaws.com' AND \"eventName\" = 'DeleteDetector'))\nLAST 24 HOURS\n"
+  yara_l: "rule aws_guardduty_service_deletion {\n  meta:\n    author = \"TDL\"\n    description = \"Detects deletion of AWS GuardDuty detectors\
+    \ or agents via CloudTrail - T1489 Defense Evasion\"\n    severity = \"HIGH\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique\
+    \ = \"T1489\"\n    \n  events:\n    (\n      $e.metadata.product_name = \"AWS CloudTrail\"\n      $e.metadata.product_event_type = \"DeleteAddon\"\
+    \n      $e.target.resource.attribute.labels[\"addonName\"] = \"aws-guardduty-agent\"\n    ) or (\n      $e.metadata.product_name = \"AWS CloudTrail\"\
+    \n      $e.metadata.product_event_type = \"DeleteDetector\"\n      $e.target.application = \"guardduty.amazonaws.com\"\n    )\n    $e.principal.user.userid\
+    \ = $user\n    \n  match:\n    $user over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (event.action == "DeleteAddon" AND aws.cloudtrail.request_parameters LIKE "*aws-guardduty-agent*")
+        OR
+        (event.action == "DeleteDetector" AND user_agent.original LIKE "*guardduty.amazonaws.com*")
+      )
+    | KEEP @timestamp, event.action, user.name, aws.cloudtrail.user_identity.arn, source.ip, aws.cloudtrail.request_parameters, user_agent.original, cloud.region
+  leql: |
+    where((source_json.eventName=DeleteAddon AND source_json.requestParameters.addonName=aws-guardduty-agent) OR (source_json.eventSource=guardduty.amazonaws.com AND source_json.eventName=DeleteDetector))
+  crowdstrike: |
+    #event_type=cloudtrail (eventName=DeleteAddon addonName="aws-guardduty-agent") OR (eventSource="guardduty.amazonaws.com" eventName=DeleteDetector)
+    | table([@timestamp, userIdentity.principalId, eventName, eventSource, addonName, awsRegion, sourceIPAddress, userAgent])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and cloud_provider_event_name in ("DeleteAddon", "DeleteDetector")
+    | filter (cloud_provider_event_name = "DeleteAddon" and json_extract_scalar(cloud_provider_event_raw_data, "$.requestParameters.addonName") = "aws-guardduty-agent")
+       or (cloud_provider_event_name = "DeleteDetector" and json_extract_scalar(cloud_provider_event_raw_data, "$.eventSource") = "guardduty.amazonaws.com")
+    | fields _time, cloud_provider_event_name, actor_effective_username, cloud_provider_account_id, cloud_region, cloud_provider_event_raw_data
+  lucene: |
+    (eventName:DeleteAddon AND requestParameters.addonName:"aws-guardduty-agent") OR (eventSource:"guardduty.amazonaws.com" AND eventName:DeleteDetector)
+  sumo: "_sourceCategory=*CloudTrail* (DeleteAddon OR DeleteDetector)\n| json field=_raw \"eventName\" as event_name\n| json field=_raw \"requestParameters.addonName\"\
+    \ as addon_name\n| json field=_raw \"eventSource\" as event_source\n| where (event_name = \"DeleteAddon\" and addon_name = \"aws-guardduty-agent\"\
+    ) \n    or (event_source = \"guardduty.amazonaws.com\" and event_name = \"DeleteDetector\")\n| fields _messageTime, event_name, addon_name,\
+    \ event_source, userIdentity.principalId, sourceIPAddress, awsRegion\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +68,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 AWS CloudTrail Event\nWhere the Event is in [\"DeleteAddon\"] AND addonName is in [\"aws-guardduty-agent\"]\nOR \n1 AWS CloudTrail\
   \ Event\nWhere application source is in [\"guardduty.amazonaws.com\"] AND Event is in [\"DeleteDetector\"]"

@@ -16,80 +16,84 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=proxy (http_method=POST OR http_method=GET) (url_category="*file transfer*" OR url IN ("*dropbox.com*","*box.com*","*drive.google.com*","*onedrive.live.com*","*mega.nz*","*wetransfer.com*","*mediafire.com*","*sendspace.com*","*zippyshare.com*","*rapidshare.com*","*filemail.com*","*uploadfiles.io*","*gofile.io*","*anonfiles.com*","*transfer.sh*")) bytes_out>=10000000
+  spl: 'index=proxy (http_method=POST OR http_method=GET) (url_category="*file transfer*" OR url IN ("*dropbox.com*","*box.com*","*drive.google.com*","*onedrive.live.com*","*mega.nz*","*wetransfer.com*","*mediafire.com*","*sendspace.com*","*zippyshare.com*","*rapidshare.com*","*filemail.com*","*uploadfiles.io*","*gofile.io*","*anonfiles.com*","*transfer.sh*"))
+    bytes_out>=10000000
+
     | table _time, src_ip, user, url, http_method, bytes_out, url_category
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(1h)
+    | where DeviceVendor has "Proxy" or DeviceProduct has "Proxy"
+    | where RequestMethod in ("POST", "GET")
+    | where DeviceEventCategory has "file transfer" or DestinationHostName has_any ("dropbox.com", "box.com", "drive.google.com", "onedrive.live.com", "mega.nz", "wetransfer.com", "sendspace.com", "mediafire.com", "rapidshare.com", "4shared.com")
+    | where SentBytes >= 10000000
+    | project TimeGenerated, SourceIP, SourceUserName, DestinationHostName, RequestURL, RequestMethod, SentBytes, DeviceEventCategory, DeviceAction
+  aql: |
+    SELECT sourceip, destinationip, url, CATEGORYNAME(category) AS proxy_category, SUM(bytesout) AS total_bytes, COUNT(*) AS event_count
+    FROM events
+    WHERE (httprequestmethod = 'POST' OR httprequestmethod = 'GET')
+      AND (CATEGORYNAME(category) ILIKE '%file transfer%' OR url ILIKE '%dropbox.com%' OR url ILIKE '%drive.google.com%' OR url ILIKE '%onedrive.live.com%' OR url ILIKE '%box.com%' OR url ILIKE '%mega.nz%' OR url ILIKE '%wetransfer.com%')
+    GROUP BY sourceip, destinationip, url, category
+    HAVING total_bytes >= 10000000
     LAST 1 HOURS
+  yara_l: |
+    rule exfiltration_to_file_storage {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects potential exfiltration via file storage services through proxy logs"
+        mitre_attack_tactic = "Exfiltration"
+        mitre_attack_technique = "T1567"
+        severity = "HIGH"
 
-    '
-  yara_l: "rule tdl_tdl_exf_000428 {\n  meta:\n    author = \"TDL\"\n    description = \"POST Data Exfiltration to File Storage Domain\"\n   \
-    \ severity = \"LOW\"\n    tactic = \"TA0010\"\n    technique = \"T1567\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n\
-    \    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        (
+          $e.network.http.method = "POST" or
+          $e.network.http.method = "GET"
+        )
+        (
+          re.regex($e.security_result.category_details[0], `(?i)file.transfer`) or
+          re.regex($e.target.url, `(?i)(dropbox\.com|box\.com|drive\.google\.com|onedrive\.live\.com|mega\.nz|wetransfer\.com|sendspace\.com|mediafire\.com|rapidshare\.com|4shared\.com|filemail\.com|hightail\.com)`)
+        )
+        $e.network.sent_bytes >= 10000000
+        $e.principal.hostname = $host
 
-    | WHERE @timestamp > NOW() - 1 hour
+      match:
+        $host over 5m
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+      outcome:
+        $risk_score = 75
 
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network.proxy*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND (http.request.method == "POST" OR http.request.method == "GET")
+      AND (network.protocol_category == "file transfer" OR url.domain IN ("dropbox.com", "drive.google.com", "onedrive.live.com", "box.com", "mega.nz", "wetransfer.com", "sendspace.com", "mediafire.com", "4shared.com", "rapidshare.com", "fileserve.com", "uploaded.net", "zippyshare.com"))
+      AND http.response.bytes >= 10000000
+    | KEEP @timestamp, source.ip, user.name, http.request.method, url.full, url.domain, http.response.bytes, host.name
+  leql: |
+    where(request_method IN [POST, GET] AND (proxy_category ICONTAINS "file transfer" OR destination_domain IN [dropbox.com, drive.google.com, onedrive.live.com, box.com, mega.nz, wetransfer.com, sendspace.com, mediafire.com, rapidshare.com, filehosting.com]) AND bytes_out >= 10000000)
+  crowdstrike: |
+    #type=proxy (method=POST OR method=GET) (category=*file?transfer* OR domain=*dropbox.com* OR domain=*box.com* OR domain=*drive.google.com* OR domain=*onedrive.live.com* OR domain=*mega.nz* OR domain=*wetransfer.com* OR domain=*sendspace.com* OR domain=*mediafire.com*) bytes_out>=10000000
+    | table([@timestamp, src_ip, user, domain, url, method, bytes_out, category])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter http_method in ("POST", "GET")
+    | filter (url_category_list contains "file-transfer" or url_category_list contains "file-sharing" or url_category_list contains "file-storage")
+    | filter bytes_sent >= 10000000
+    | fields _time, src_ip, dst_ip, dst_port, http_method, url_category_list, bytes_sent, http_url, action_source_translated_ip, srcuser
+  lucene: |
+    (event.dataset:"proxy" OR event.category:"web") AND (http.request.method:(POST OR GET)) AND (url.category:*file*transfer* OR destination.domain:(*.dropbox.com OR *.box.com OR *.drive.google.com OR *.onedrive.live.com OR *sharepoint.com OR *.wetransfer.com OR *.mega.nz OR *.sendspace.com OR *.mediafire.com OR *.4shared.com OR *.filemail.com OR *.transfernow.net OR *.hightail.com)) AND http.request.bytes:[10000000 TO *]
+  sumo: |
+    _sourceCategory=*Proxy* (method=POST OR method=GET)
+    | where (category matches "*file transfer*" OR dest_host matches "*.dropbox.com" OR dest_host matches "*.box.com" OR dest_host matches "*.drive.google.com" OR dest_host matches "*.onedrive.live.com" OR dest_host matches "*.wetransfer.com" OR dest_host matches "*.mega.nz" OR dest_host matches "*.mediafire.com")
+    | where bytes_sent >= 10000000 OR bytes_out >= 10000000 OR sc_bytes >= 10000000 OR cs_bytes >= 10000000
+    | fields _messageTime, src_ip, dest_host, method, bytes_sent, bytes_out, sc_bytes, cs_bytes, user, url
 false_positives:
 - Whitelist login URLs
 tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
@@ -98,7 +102,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Outbound Proxy Event
 

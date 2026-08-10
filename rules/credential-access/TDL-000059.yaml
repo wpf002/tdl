@@ -20,77 +20,84 @@ queries:
   spl: "index=windows sourcetype=\"WinEventLog:Security\" \n((EventCode=* EventName=\"*deauthentication*\" SourceMac=\"ff:ff:ff:ff:ff:ff\") OR\
     \ (EventCode=* Signature=\"*Broadcast Deauthentication*\"))\n| table _time, ComputerName, EventCode, EventName, SourceMac, Signature, DestMac,\
     \ SSID, Channel\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventData has "deauthentication" or Message has "deauthentication" or RenderedDescription has "deauthentication"
+    | where EventData has "ff:ff:ff:ff:ff:ff" or Message has "ff:ff:ff:ff:ff:ff" or RenderedDescription has "ff:ff:ff:ff:ff:ff"
+    | extend ParsedEventData = parse_xml(EventData)
+    | extend SourceMac = tostring(ParsedEventData.EventData.Data)
+    | where SourceMac has "ff:ff:ff:ff:ff:ff"
+    | project TimeGenerated, Computer, EventID, Message, SourceMac, EventData
+    | union (
+        SecurityEvent
+        | where TimeGenerated > ago(24h)
+        | where EventData has "Broadcast Deauthentication" or Message has "Broadcast Deauthentication" or RenderedDescription has "Broadcast Deauthentication"
+        | project TimeGenerated, Computer, EventID, Message, EventData
+    )
+  aql: |
+    SELECT sourceip, destinationip, sourcemac, destinationmac, qidname(qid), "Event Name", eventtime, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE (categoryname(category) ILIKE '%wireless%' AND "Event Name" ILIKE '%deauthentication%' AND sourcemac = 'ff:ff:ff:ff:ff:ff')
+       OR (categoryname(category) ILIKE '%IDS%' AND qidname(qid) ILIKE '%Broadcast Deauthentication%')
+    LAST 24 HOURS
+  yara_l: |
+    rule wireless_deauth_attack {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects wireless deauthentication attacks (T1557 - Adversary-in-the-Middle)"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1557"
+        severity = "High"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        (
+          $e.metadata.event_type = "NETWORK_CONNECTION"
+          re.regex($e.metadata.description, `(?i)deauthentication`)
+          $e.principal.mac = "ff:ff:ff:ff:ff:ff"
+        ) or (
+          $e.metadata.event_type = "NETWORK_CONNECTION"
+          re.regex($e.security_result.summary, `(?i)Broadcast Deauthentication`)
+        )
+        $e.principal.hostname = $host
 
-    | where network.protocol matches regex "tcp"
+      match:
+        $host over 5m
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+      outcome:
+        $risk_score = 75
 
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_ca_000059 {\n  meta:\n    author = \"TDL\"\n    description = \"Wireless AP Broadcast Deauthentication\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0006\"\n    technique = \"T1557\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.security*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (event.category == "network" AND event.dataset LIKE "*wireless*" AND event.action LIKE "*deauthentication*" AND source.mac == "ff:ff:ff:ff:ff:ff")
+        OR
+        (event.category == "intrusion_detection" AND event.dataset LIKE "*wireless*" AND rule.name LIKE "*Broadcast Deauthentication*")
+      )
+    | KEEP @timestamp, host.name, event.action, event.dataset, source.mac, destination.mac, rule.name, event.original
+  leql: |
+    where(source_json.EventID=5632 AND (source_json.EventData ICONTAINS "deauthentication" OR source_json.Message ICONTAINS "deauthentication") AND (source_json.SourceMACAddress="ff:ff:ff:ff:ff:ff" OR source_json.EventData ICONTAINS "ff:ff:ff:ff:ff:ff"))
+  crowdstrike: |
+    (EventName=*deauthentication* SourceMac="ff:ff:ff:ff:ff:ff") OR (Signature=*"Broadcast Deauthentication"*)
+    | table([@timestamp, ComputerName, EventName, SourceMac, Signature])
+  xql: |
+    dataset = xdr_data
+    | filter (event_type = ENUM.EVENT_TYPE_NETWORK and action_network_connection_direction = "WIRELESS" and lowercase(action_evtlog_message) contains "deauthentication" and action_network_src_mac = "ff:ff:ff:ff:ff:ff")
+       or (event_type = ENUM.EVENT_TYPE_IDS and lowercase(action_evtlog_message) contains "broadcast deauthentication")
+    | fields _time, agent_hostname, event_type, action_network_src_mac, action_evtlog_message
+  lucene: |
+    (event_name:*deauthentication* AND source_mac:"ff:ff:ff:ff:ff:ff") OR (signature:*Broadcast\ Deauthentication*)
+  sumo: |
+    _sourceCategory=*Windows*Security* ("deauthentication" OR "Broadcast Deauthentication")
+    | json field=_raw "EventData" as event_data
+    | json field=event_data "SourceMac" as src_mac
+    | json field=_raw "Message" as message
+    | where (message matches "*deauthentication*" and src_mac = "ff:ff:ff:ff:ff:ff") or message matches "*Broadcast Deauthentication*"
+    | fields _messageTime, _sourceHost, message, src_mac
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -100,7 +107,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Wireless Access Point Event
 

@@ -16,74 +16,63 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=windows (EventCode=592 OR EventCode=4688) (Image="*\\certutil.exe" OR process_name="*certutil.exe" OR Process_Name="*certutil.exe") (CommandLine="*-decode*" OR CommandLine="*-ping*" OR Command_Line="*-decode*" OR Command_Line="*-ping*")
+  spl: 'index=windows (EventCode=592 OR EventCode=4688) (Image="*\\certutil.exe" OR process_name="*certutil.exe" OR Process_Name="*certutil.exe")
+    (CommandLine="*-decode*" OR CommandLine="*-ping*" OR Command_Line="*-decode*" OR Command_Line="*-ping*")
+
     | table _time, ComputerName, User, Image, Process_Name, CommandLine, Command_Line, ParentImage, Parent_Process_Name
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("certutil.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('certutil.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000173 {\n  meta:\n    author = \"TDL\"\n    description = \"Suspicious Certutil Usage\"\n    severity = \"HIGH\"\n\
-    \    tactic = \"TA0005\"\n    technique = \"T1140\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(certutil.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("certutil.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [certutil.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (certutil.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("certutil.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(certutil.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("certutil.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (592, 4688)
+    | where (Process has "certutil.exe" or NewProcessName has "certutil.exe" or ProcessName has "certutil.exe")
+        or (CommandLine has "-decode" and CommandLine has "-ping")
+    | project TimeGenerated, Computer, Account, EventID, Process, NewProcessName, ProcessName, CommandLine, ParentProcessName, SubjectUserName, TargetUserName
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process Name", "Process CommandLine"
+    FROM events
+    WHERE ("EventID" = '592' OR "EventID" = '4688')
+      AND ("Process Name" ILIKE '%certutil.exe%'
+           OR ("Process CommandLine" ILIKE '%-decode%' AND "Process CommandLine" ILIKE '%-ping%'))
+    LAST 24 HOURS
+  yara_l: "rule certutil_defense_evasion {\n  meta:\n    author = \"TDL\"\n    description = \"Detects certutil.exe used for defense evasion via\
+    \ decode or ping flags - MITRE T1140\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1140\"\n    severity\
+    \ = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      $e.metadata.product_event_type = \"592\" or\n\
+    \      $e.metadata.product_event_type = \"4688\"\n    )\n    (\n      re.regex($e.target.process.file.full_path, `(?i)certutil\\.exe$`) or\n\
+    \      (\n        re.regex($e.target.process.command_line, `(?i)-decode`) and\n        re.regex($e.target.process.command_line, `(?i)-ping`)\n\
+    \      )\n    )\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-system.security*, logs-endpoint.events.process*, winlogbeat-*
+    | WHERE (event.code IN ("592", "4688") OR winlog.event_id IN (592, 4688))
+      AND (
+        TO_LOWER(process.name) == "certutil.exe"
+        OR (TO_LOWER(process.command_line) LIKE "*-decode*" AND TO_LOWER(process.command_line) LIKE "*-ping*")
+      )
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, event.code, winlog.event_id
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND (process_name ICONTAINS "certutil.exe" OR (process_cmd_line ICONTAINS "-decode" AND process_cmd_line ICONTAINS "-ping")))
+  crowdstrike: |
+    (EventCode=592 OR EventCode=4688) (FileName=*certutil.exe OR ImageFileName=*certutil.exe OR NewProcessName=*certutil.exe) (CommandLine=*-decode* OR CommandLine=*-ping*)
+    | table([@timestamp, ComputerName, UserName, CommandLine, ParentProcessName, ProcessId])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter lowercase(action_process_image_name) contains "certutil.exe"
+      or (lowercase(action_process_image_command_line) contains "-decode"
+          and lowercase(action_process_image_command_line) contains "-ping")
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, action_evtlog_event_id
+  lucene: |
+    event.code:(592 OR 4688) AND (process.name:*certutil.exe OR (CommandLine:*-decode* AND CommandLine:*-ping*) OR (process.command_line:*-decode* AND process.command_line:*-ping*))
+  sumo: |
+    _sourceCategory=*Windows* (certutil OR "-decode" OR "-ping")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "Process" as process
+    | where (event_id = "592" OR event_id = "4688")
+    | where (process_name matches "*certutil.exe" OR process matches "*certutil.exe" OR command_line matches "*certutil*" OR (command_line matches "*-decode*" AND command_line matches "*-ping*"))
+    | fields _messageTime, _sourceHost, event_id, process_name, process, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +82,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is certutil.exe\nOR\n\tWhere Command\
   \ contains \"-decode\"\n\t\n\tWhere Command contains \"-ping\""

@@ -18,75 +18,84 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=linux sourcetype IN(linux_secure, syslog) (CommandLine="*etc/shadow*" OR CommandLine="*/shadow*" OR CommandLine="*etc\\shadow*" OR CommandLine="*\\shadow*")
+  spl: 'index=linux sourcetype IN(linux_secure, syslog) (CommandLine="*etc/shadow*" OR CommandLine="*/shadow*" OR CommandLine="*etc\\shadow*"
+    OR CommandLine="*\\shadow*")
+
     NOT [| inputlookup high_value_target_hosts.csv | fields host]
+
     | table _time, host, user, CommandLine, process
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000180 {\n  meta:\n    author = \"TDL\"\n    description = \"Shadow File Accessed\"\n    severity = \"HIGH\"\n    tactic\
-    \ = \"TA0006\"\n    technique = \"T1003\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n    $host\
-    \ = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    Syslog
+    | where TimeGenerated > ago(1h)
+    | where Facility == "authpriv" or ProcessName in~ ("bash", "sh", "zsh", "dash", "ksh", "csh", "tcsh", "fish")
+    | where SyslogMessage has_any ("etc/shadow", "shadow")
+    | where Computer !in ((externaldata(HostName:string)[@"https://raw.githubusercontent.com/your-org/hvt-hosts/main/hvt-list.csv"] with (format="csv", ignoreFirstRecord=true)))
+    | project TimeGenerated, Computer, ProcessName, SyslogMessage, Facility, HostIP
+  aql: |
+    SELECT "Command Line", LOGSOURCENAME(logsourceid) AS hostname, username, sourceip, eventtime
+    FROM events
+    WHERE ("Command Line" ILIKE '%/etc/shadow%' OR "Command Line" ILIKE '%shadow%')
+      AND LOGSOURCENAME(logsourceid) NOT IN (SELECT * FROM REFERENCE SET 'High_Value_Target_Host_List')
+    LAST 24 HOURS
+  yara_l: |
+    rule linux_shadow_file_access_t1003 {
+      meta:
+        author = "TDL"
+        description = "Detects potential credential dumping via access to /etc/shadow file on Linux systems"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1003"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.principal.platform = "LINUX"
+        (
+          re.regex($e.principal.process.command_line, `etc/shadow`) or
+          re.regex($e.principal.process.command_line, `etc\\shadow`) or
+          re.regex($e.principal.process.command_line, `shadow`)
+        )
+        $e.principal.hostname = $host
+        not re.regex($e.principal.hostname, `(?i)hvt-|high-value-target|critical-system`)
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint.events.process*, logs-system.auth*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.category == "process"
+      AND (process.command_line LIKE "*etc/shadow*" OR process.command_line LIKE "*shadow*")
+      AND host.name NOT IN ("hvt-host-1", "hvt-host-2", "hvt-host-3")
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.executable
+  leql: |
+    where(source_json.CommandLine ICONTAINS "etc/shadow" OR source_json.CommandLine ICONTAINS "shadow") AND NOT(asset IN HighValueTargetHostList)
+  crowdstrike: |
+    event_platform=Lin (event_simpleName=ProcessRollup2 OR event_simpleName=ProcessRollup2V2 OR event_simpleName=SyntheticProcessRollup2) (CommandLine=*/etc/shadow* OR CommandLine=*shadow*)
+    | !match(file="HighValueTargetHosts.csv", field=ComputerName, strict=false)
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName, aid])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter action_process_image_command_line ~= "(?i)(etc\\shadow|shadow)"
+    | filter agent_hostname not in ("HVT-HOST-1", "HVT-HOST-2", "HVT-HOST-3")
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_command_line
+  lucene: |
+    event.category:process AND event.type:start AND (process.command_line:*etc\/shadow* OR process.command_line:*shadow*) AND NOT host.name:(hvt-* OR critical-* OR prod-db-* OR dc-*)
+  sumo: |
+    _sourceCategory=*Linux* (shadow OR "etc/shadow" OR "/etc/shadow")
+    | json field=_raw "command" as command_line
+    | json field=_raw "hostname" as hostname
+    | where command_line matches "*shadow*" or command_line matches "*etc/shadow*" or command_line matches "*/etc/shadow*"
+    | where !(hostname in ("hvt-host-1", "hvt-host-2", "hvt-host-3"))
+    | fields _messageTime, hostname, command_line, _sourceHost
 false_positives:
 - Security software
 - Authorized admin tools
@@ -96,7 +105,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Linux Command Line Event
 

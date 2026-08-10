@@ -15,78 +15,133 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=azure sourcetype=azure:aad:audit
+  spl: 'index=azure sourcetype=azure:aad:audit
+
     | eval operation_normalized=lower(Operation)
+
     | search (operation_normalized="add user" OR operation_normalized="delete user") ResultStatus=success
+
     | eval dest_user=coalesce(DestinationUserName, properties.targetResources{}.userPrincipalName, properties.targetResources{}.displayName)
+
     | sort 0 _time
+
     | streamstats earliest(_time) as first_time latest(_time) as last_time values(operation_normalized) as ops by dest_user
+
     | where mvcount(ops) >= 2 AND mvfind(ops, "add user") >= 0 AND mvfind(ops, "delete user") >= 0
+
     | where (last_time - first_time) <= 86400
+
     | table _time, dest_user, Operation, ResultStatus, first_time, last_time, Caller
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000643 {\n  meta:\n    author = \"TDL\"\n    description = \"Account Created and Deleted Within 24 Hours - Entra ID\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1136\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AuditLogs
+    | where TimeGenerated > ago(24h)
+    | where OperationName == "Add user" and Result == "success"
+    | extend DestinationUserName = tostring(TargetResources[0].userPrincipalName)
+    | project AddTime = TimeGenerated, AddInitiator = tostring(InitiatedBy.user.userPrincipalName), DestinationUserName, AddCorrelationId = CorrelationId
+    | join kind=inner (
+        AuditLogs
+        | where TimeGenerated > ago(24h)
+        | where OperationName == "Delete user" and Result == "success"
+        | extend DestinationUserName = tostring(TargetResources[0].userPrincipalName)
+        | project DeleteTime = TimeGenerated, DeleteInitiator = tostring(InitiatedBy.user.userPrincipalName), DestinationUserName, DeleteCorrelationId = CorrelationId
+    ) on DestinationUserName
+    | where DeleteTime > AddTime and DeleteTime <= AddTime + 24h
+    | project AddTime, DeleteTime, DestinationUserName, AddInitiator, DeleteInitiator, AddCorrelationId, DeleteCorrelationId
+  aql: "SELECT \n    FIRST(addEvent.eventtime) AS add_time,\n    LAST(delEvent.eventtime) AS delete_time,\n    addEvent.\"Target Username\" AS\
+    \ target_username,\n    addEvent.username AS actor_add,\n    delEvent.username AS actor_delete,\n    addEvent.sourceip AS source_ip_add,\n\
+    \    delEvent.sourceip AS source_ip_delete\nFROM events addEvent\nJOIN events delEvent \n    ON addEvent.\"Target Username\" = delEvent.\"\
+    Target Username\"\nWHERE addEvent.logsourcetypename ILIKE '%Azure%'\n    AND delEvent.logsourcetypename ILIKE '%Azure%'\n    AND (addEvent.\"\
+    Operation\" = 'Add User' OR addEvent.\"Activity\" ILIKE '%Add User%')\n    AND (delEvent.\"Operation\" = 'Delete User' OR delEvent.\"Activity\"\
+    \ ILIKE '%Delete User%')\n    AND addEvent.\"Result Status\" = 'success'\n    AND delEvent.\"Result Status\" = 'success'\n    AND delEvent.eventtime\
+    \ > addEvent.eventtime\n    AND delEvent.eventtime <= addEvent.eventtime + 86400000\nGROUP BY addEvent.\"Target Username\", addEvent.username,\
+    \ delEvent.username, addEvent.sourceip, delEvent.sourceip\nLAST 24 HOURS\n"
+  yara_l: |
+    rule azure_user_add_delete_24h {
+      meta:
+        author = "TDL"
+        description = "Detects Azure user created then deleted within 24 hours - T1136 Persistence"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1136"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $add.metadata.product_name = "Azure"
+        $add.metadata.event_type = "USER_CREATION"
+        $add.security_result.action = "ALLOW"
+        $add.target.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+        $delete.metadata.product_name = "Azure"
+        $delete.metadata.event_type = "USER_DELETION"
+        $delete.security_result.action = "ALLOW"
+        $delete.target.user.userid = $user
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+        $add.metadata.event_timestamp.seconds <= $delete.metadata.event_timestamp.seconds
 
-    | SORT count DESC
+      match:
+        $user over 24h
 
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+      condition:
+        $add and $delete
+    }
+  esql: |
+    FROM logs-azure.auditlogs*
+    | WHERE @timestamp > NOW() - 24 hours
+    | EVAL operation_normalized = TO_LOWER(COALESCE(azure.auditlogs.operation_name, event.action))
+    | EVAL result_status = TO_LOWER(COALESCE(azure.auditlogs.result, event.outcome))
+    | WHERE (operation_normalized LIKE "*add user*" OR operation_normalized LIKE "*delete user*")
+      AND result_status == "success"
+    | EVAL dest_user = COALESCE(azure.auditlogs.properties.targetResources.userPrincipalName, user.target.name, user.name)
+    | STATS add_time = MIN(@timestamp), delete_time = MAX(@timestamp), operations = VALUES(operation_normalized) BY dest_user, azure.auditlogs.properties.initiatedBy.user.userPrincipalName
+    | EVAL time_diff_hours = (delete_time - add_time) / 3600000
+    | WHERE operations LIKE "*add*" AND operations LIKE "*delete*" AND time_diff_hours <= 24 AND time_diff_hours > 0
+    | KEEP dest_user, azure.auditlogs.properties.initiatedBy.user.userPrincipalName, add_time, delete_time, time_diff_hours
+  leql: |
+    where(source_json.operationName="Add user" AND source_json.resultType="Success") groupby(source_json.targetResources{}.userPrincipalName) calculate(count)
+    ```
 
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    ```
+    where(source_json.operationName="Delete user" AND source_json.resultType="Success") groupby(source_json.targetResources{}.userPrincipalName) calculate(count)
+  crowdstrike: |
+    #repo=AzureAuditLogs (Operation="Add user" OR Operation="add user") Result=success
+    | rename(field=DestinationUserName, as=user)
+    | selfJoin(field=[user], where=[{Operation="Delete user" OR Operation="delete user"}, {Result=success}], within=24h)
+    | table([@timestamp, user, Operation, Result, ComputerName, Initiator])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Azure" and result = "SUCCESS" and operation in ("Add User", "Delete User")
+    | alter dest_user = coalesce(json_extract_scalar(raw_log, "$.properties.targetResources[0].userPrincipalName"), json_extract_scalar(raw_log, "$.properties.targetResources[0].displayName"))
+    | alter event_seq = if(operation = "Add User", 1, 2)
+    | sort asc _time
+    | comp values(operation) as ops, values(_time) as times, values(event_seq) as seqs by dest_user
+    | alter add_count = arraycount(arrayfilter(ops, "@element" = "Add User"))
+    | alter del_count = arraycount(arrayfilter(ops, "@element" = "Delete User"))
+    | filter add_count >= 1 and del_count >= 1
+    | alter first_add = arraymin(arraymap(arrayzip(ops, times), if("@e.0" = "Add User", "@e.1", null)))
+    | alter first_del = arraymin(arraymap(arrayzip(ops, times), if("@e.0" = "Delete User", "@e.1", null)))
+    | filter first_del > first_add and timestamp_diff(first_del, first_add, "HOUR") <= 24
+    | fields dest_user, first_add, first_del
+  lucene: |
+    (azure.activitylogs.operation_name:"Add user" AND azure.activitylogs.result_signature:"Success") OR (azure.activitylogs.operation_name:"Delete user" AND azure.activitylogs.result_signature:"Success")
+  sumo: |
+    _sourceCategory=*Azure* (Operation="Add user" OR Operation="Delete user") ResultStatus=Success
+    | json field=_raw "Operation" as operation
+    | json field=_raw "ResultStatus" as result_status
+    | json field=_raw "TargetResources[0].userPrincipalName" as target_user
+    | where result_status = "Success" and (operation = "Add user" or operation = "Delete user")
+    | sort by target_user, _messageTime asc
+    | where operation = "Add user"
+    | join (
+        _sourceCategory=*Azure* Operation="Delete user" ResultStatus=Success
+        | json field=_raw "Operation" as del_operation
+        | json field=_raw "ResultStatus" as del_result_status
+        | json field=_raw "TargetResources[0].userPrincipalName" as del_target_user
+        | json field=_raw "TimeGenerated" as del_time
+        | where del_result_status = "Success" and del_operation = "Delete user"
+    ) as d on target_user = d.del_target_user
+    | where (parseDate(d.del_time) - parseDate(_messageTime)) <= 86400000
+    | fields _messageTime, target_user, operation, d.del_time, d.del_operation
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -96,7 +151,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Azure Audit Event\nWhere the Operation is [Add User]\nAnd the result is successful\n\nFollowed By\n\n1 Azure Audit Event\nWhere\
   \ the Operation is [Delete User]\nAnd the result is successful\nWith the same Destination Username from the previous event\t\nWithin 24 hours"

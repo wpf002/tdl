@@ -23,72 +23,94 @@ queries:
     *create*\"))\n| eval process_name=coalesce(NewProcessName, Image)\n| lookup dnslookup clienthost AS ComputerName OUTPUT clientname AS resolved_name\n\
     | search (UserAccountControl=\"*SERVER_TRUST_ACCOUNT*\" OR ComputerName=\"*DC*\" OR resolved_name=\"*DC*\")\n| table _time, ComputerName,\
     \ User, process_name, CommandLine, ParentProcessName\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where Computer has "DC" or Computer has "DomainController"
+    | where Process has_any ("vssadmin.exe", "ntdsutil.exe", "wmic.exe", "powershell.exe")
+    | where (CommandLine has "create" and CommandLine has "shadow") or (CommandLine has "ntds" and CommandLine has "create")
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Parent Process Name"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND ("Process Name" ILIKE '%vssadmin.exe%' OR "Process Name" ILIKE '%ntdsutil.exe%' OR "Process Name" ILIKE '%wmic.exe%' OR "Process Name" ILIKE '%powershell.exe%')
+      AND (("Process CommandLine" ILIKE '%create%' AND "Process CommandLine" ILIKE '%shadow%') OR ("Process CommandLine" ILIKE '%ntds%' AND "Process CommandLine" ILIKE '%create%'))
+    LAST 24 HOURS
+  yara_l: |
+    rule credential_access_ntds_extraction {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects potential NTDS.dit extraction attempts on Domain Controllers via vssadmin, ntdsutil, wmic, or powershell"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1003"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688"
+        )
+        $e.principal.asset.asset_type = "DOMAIN_CONTROLLER"
+        (
+          re.regex($e.target.process.file.full_path, `(?i)\\vssadmin\.exe$`) or
+          re.regex($e.target.process.file.full_path, `(?i)\\ntdsutil\.exe$`) or
+          re.regex($e.target.process.file.full_path, `(?i)\\wmic\.exe$`) or
+          re.regex($e.target.process.file.full_path, `(?i)\\powershell\.exe$`)
+        )
+        (
+          (
+            re.regex($e.target.process.command_line, `(?i)create`) and
+            re.regex($e.target.process.command_line, `(?i)shadow`)
+          ) or
+          (
+            re.regex($e.target.process.command_line, `(?i)ntds`) and
+            re.regex($e.target.process.command_line, `(?i)create`)
+          )
+        )
+        $e.principal.hostname = $host
 
-    | where process_name in ("vssadmin.exe", "ntdsutil.exe", "wmic.exe", "powershell.exe")
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      outcome:
+        $risk_score = 85
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('vssadmin.exe', 'ntdsutil.exe', 'wmic.exe', 'powershell.exe')\n\
-    LAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000115 {\n  meta:\n    author = \"TDL\"\n    description = \"Windows Shadow Copy Creation\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0006\"\n    technique = \"T1003\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(vssadmin.exe|ntdsutil.exe|wmic.exe|powershell.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("vssadmin.exe", "ntdsutil.exe", "wmic.exe", "powershell.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [vssadmin.exe, ntdsutil.exe, wmic.exe, powershell.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (vssadmin.exe, ntdsutil.exe, wmic.exe, powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("vssadmin.exe", "ntdsutil.exe", "wmic.exe", "powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(vssadmin.exe OR ntdsutil.exe OR wmic.exe OR powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("vssadmin.exe", "ntdsutil.exe", "wmic.exe", "powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-system.security*, logs-windows.sysmon_operational*, winlogbeat-*\n| WHERE @timestamp > NOW() - 24 hour\n  AND (event.code IN\
+    \ (\"592\", \"4688\") OR winlog.event_id IN (592, 4688))\n  AND host.roles == \"domain_controller\"\n  AND (\n    TO_LOWER(process.name) IN\
+    \ (\"vssadmin.exe\", \"ntdsutil.exe\", \"wmic.exe\", \"powershell.exe\")\n    OR TO_LOWER(process.executable) LIKE \"*vssadmin.exe\" \n  \
+    \  OR TO_LOWER(process.executable) LIKE \"*ntdsutil.exe\"\n    OR TO_LOWER(process.executable) LIKE \"*wmic.exe\"\n    OR TO_LOWER(process.executable)\
+    \ LIKE \"*powershell.exe\"\n  )\n  AND (\n    (TO_LOWER(process.command_line) LIKE \"*create*\" AND TO_LOWER(process.command_line) LIKE \"\
+    *shadow*\")\n    OR (TO_LOWER(process.command_line) LIKE \"*ntds*\" AND TO_LOWER(process.command_line) LIKE \"*create*\")\n  )\n| KEEP @timestamp,\
+    \ host.name, user.name, process.name, process.executable, process.command_line, process.parent.name\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND (process_name ICONTAINS "vssadmin.exe" OR process_name ICONTAINS "ntdsutil.exe" OR process_name ICONTAINS "wmic.exe" OR process_name ICONTAINS "powershell.exe") AND ((process_cmd_line ICONTAINS "create" AND process_cmd_line ICONTAINS "shadow") OR (process_cmd_line ICONTAINS "ntds" AND process_cmd_line ICONTAINS "create")))
+  crowdstrike: |
+    EventCode=4688 #path=*DomainController* (FileName=*vssadmin.exe OR FileName=*ntdsutil.exe OR FileName=*wmic.exe OR FileName=*powershell.exe) ((CommandLine=*create* AND CommandLine=*shadow*) OR (CommandLine=*ntds* AND CommandLine=*create*))
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName])
+  xql: "dataset = xdr_data\n| filter action_evtlog_event_id in (592, 4688)\n| filter agent_hostname ~= \"(?i).*dc.*|.*domain.*controller.*\"\n\
+    | filter lowercase(action_process_image_name) contains \"vssadmin.exe\" \n   or lowercase(action_process_image_name) contains \"ntdsutil.exe\"\
+    \ \n   or lowercase(action_process_image_name) contains \"wmic.exe\" \n   or lowercase(action_process_image_name) contains \"powershell.exe\"\
+    \n| filter (lowercase(action_process_image_command_line) contains \"create\" and lowercase(action_process_image_command_line) contains \"\
+    shadow\") \n   or (lowercase(action_process_image_command_line) contains \"ntds\" and lowercase(action_process_image_command_line) contains\
+    \ \"create\")\n| fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line\n"
+  lucene: |
+    event.code:(592 OR 4688) AND (process.name:(*vssadmin.exe* OR *ntdsutil.exe* OR *wmic.exe* OR *powershell.exe*)) AND ((process.command_line:*create* AND process.command_line:*shadow*) OR (process.command_line:*ntds* AND process.command_line:*create*))
+  sumo: |
+    _sourceCategory=*Windows* (EventID=4688 OR EventID=592)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Computer" as computer
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | where (event_id = "4688" OR event_id = "592")
+    | where (process_name matches "*vssadmin.exe" OR process_name matches "*ntdsutil.exe" OR process_name matches "*wmic.exe" OR process_name matches "*powershell.exe")
+    | where ((command_line matches "*create*" AND command_line matches "*shadow*") OR (command_line matches "*ntds*" AND command_line matches "*create*"))
+    | fields _messageTime, computer, process_name, command_line
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -98,7 +120,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Process Creation Event
 

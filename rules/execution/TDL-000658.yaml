@@ -16,74 +16,100 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 95
 queries:
-  spl: |
-    (index=wineventlog sourcetype="WinEventLog:System" EventCode=7045 EventSourceName="Service Control Manager" Service_File_Name="*COMSPEC*" Service_File_Name="*start*" Service_File_Name="*powershell*") OR (index=wineventlog sourcetype="WinEventLog:Security" EventCode=4697 ServiceFileName="*COMSPEC*" ServiceFileName="*start*" ServiceFileName="*powershell*")
+  spl: '(index=wineventlog sourcetype="WinEventLog:System" EventCode=7045 EventSourceName="Service Control Manager" Service_File_Name="*COMSPEC*"
+    Service_File_Name="*start*" Service_File_Name="*powershell*") OR (index=wineventlog sourcetype="WinEventLog:Security" EventCode=4697 ServiceFileName="*COMSPEC*"
+    ServiceFileName="*start*" ServiceFileName="*powershell*")
+
     | table _time, ComputerName, EventCode, Service_Name, Service_File_Name, ServiceFileName, User
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("7045", "4697")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('7045', '4697')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000658 {\n  meta:\n    author = \"TDL\"\n    description = \"Cobalt Strike Installation via Powershell\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0002\"\n    technique = \"T1569\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id\
-    \ = /(7045|4697)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    union
+    (
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 7045
+    | where EventSourceName =~ "Service Control Manager"
+    | where ImagePath has "COMSPEC" and ImagePath has "start" and ImagePath has "powershell"
+    | project TimeGenerated, Computer, EventID, Account, ServiceName = Service, ImagePath
+    ),
+    (
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4697
+    | where ServiceFileName has "COMSPEC" and ServiceFileName has "start" and ServiceFileName has "powershell"
+    | project TimeGenerated, Computer, EventID, Account, ServiceName, ImagePath = ServiceFileName
+    )
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Service Name", "Service File Name", "EventID"
+    FROM events
+    WHERE "EventID" IN ('7045', '4697')
+      AND (
+        ("EventID" = '7045' AND "Service File Name" ILIKE '%COMSPEC%' AND "Service File Name" ILIKE '%start%' AND "Service File Name" ILIKE '%powershell%')
+        OR
+        ("EventID" = '4697' AND "Service File Name" ILIKE '%COMSPEC%' AND "Service File Name" ILIKE '%start%' AND "Service File Name" ILIKE '%powershell%')
+      )
+    LAST 24 HOURS
+  yara_l: |
+    rule mitre_t1569_powershell_service_creation {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects service creation with PowerShell via COMSPEC - MITRE T1569"
+        mitre_attack_technique = "T1569"
+        mitre_attack_tactic = "Execution"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        // Event ID 7045 - Service Control Manager
+        $e1.metadata.product_event_type = "7045"
+        $e1.metadata.product_name = "Microsoft Windows"
+        re.regex($e1.security_result.description, `(?i)Service Control Manager`)
+        re.regex($e1.target.process.command_line, `(?i)COMSPEC`)
+        re.regex($e1.target.process.command_line, `(?i)start`)
+        re.regex($e1.target.process.command_line, `(?i)powershell`)
+        $e1.principal.hostname = $host
 
-    | WHERE event.category == "process" AND event_id IN ("7045", "4697")
+        // Event ID 4697 - A service was installed in the system
+        $e2.metadata.product_event_type = "4697"
+        $e2.metadata.product_name = "Microsoft Windows"
+        re.regex($e2.target.process.file.full_path, `(?i)COMSPEC`)
+        re.regex($e2.target.process.file.full_path, `(?i)start`)
+        re.regex($e2.target.process.file.full_path, `(?i)powershell`)
+        $e2.principal.hostname = $host
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      match:
+        $host over 5m
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [7045, 4697])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (7045, 4697)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("7045", "4697")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(7045 OR 4697)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("7045", "4697")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e1 or $e2
+    }
+  esql: |
+    FROM logs-system.system*, logs-system.security*
+    | WHERE (event.code == "7045" AND winlog.event_data.ImagePath LIKE "*COMSPEC*" AND winlog.event_data.ImagePath LIKE "*start*" AND winlog.event_data.ImagePath LIKE "*powershell*")
+       OR (event.code == "4697" AND winlog.event_data.ServiceFileName LIKE "*COMSPEC*" AND winlog.event_data.ServiceFileName LIKE "*start*" AND winlog.event_data.ServiceFileName LIKE "*powershell*")
+    | KEEP @timestamp, host.name, event.code, winlog.event_data.ServiceName, winlog.event_data.ImagePath, winlog.event_data.ServiceFileName, user.name
+  leql: |
+    where((source_json.EventID=7045 AND source_json.ImagePath ICONTAINS "COMSPEC" AND source_json.ImagePath ICONTAINS "start" AND source_json.ImagePath ICONTAINS "powershell") OR (source_json.EventID=4697 AND source_json.ServiceFileName ICONTAINS "COMSPEC" AND source_json.ServiceFileName ICONTAINS "start" AND source_json.ServiceFileName ICONTAINS "powershell"))
+  crowdstrike: |
+    (EventCode=7045 OR EventCode=4697)
+    | case {
+        EventCode=7045 | ImagePath=*/COMSPEC* ImagePath=*start* ImagePath=*powershell* ;
+        EventCode=4697 | ServiceFileName=*/COMSPEC* ServiceFileName=*start* ServiceFileName=*powershell* ;
+        * | drop();
+      }
+    | table([@timestamp, ComputerName, EventCode, ImagePath, ServiceFileName, ServiceName])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id = 7045 and action_evtlog_source_name = "Service Control Manager" and lowercase(action_evtlog_event_data_ImagePath) contains "comspec" and lowercase(action_evtlog_event_data_ImagePath) contains "start" and lowercase(action_evtlog_event_data_ImagePath) contains "powershell")
+       or (action_evtlog_event_id = 4697 and lowercase(action_evtlog_event_data_ServiceFileName) contains "comspec" and lowercase(action_evtlog_event_data_ServiceFileName) contains "start" and lowercase(action_evtlog_event_data_ServiceFileName) contains "powershell")
+    | fields _time, agent_hostname, action_evtlog_event_id, action_evtlog_event_data_ServiceName, action_evtlog_event_data_ImagePath, action_evtlog_event_data_ServiceFileName, actor_effective_username
+  lucene: |
+    (event.code:7045 AND EventSourceName:"Service Control Manager" AND ImagePath:*COMSPEC* AND ImagePath:*start* AND ImagePath:*powershell*) OR (event.code:4697 AND ServiceFileName:*COMSPEC* AND ServiceFileName:*start* AND ServiceFileName:*powershell*)
+  sumo: "_sourceCategory=*Windows* (EventID=7045 OR EventID=4697)\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"EventSourceName\"\
+    \ as event_source\n| json field=_raw \"ImagePath\" as image_path\n| json field=_raw \"ServiceFileName\" as service_file_name\n| where (event_id\
+    \ = \"7045\" and event_source = \"Service Control Manager\" and image_path matches \"*COMSPEC*\" and image_path matches \"*start*\" and image_path\
+    \ matches \"*powershell*\") \n   or (event_id = \"4697\" and service_file_name matches \"*COMSPEC*\" and service_file_name matches \"*start*\"\
+    \ and service_file_name matches \"*powershell*\")\n| fields _messageTime, _sourceHost, event_id, image_path, service_file_name\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +119,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows System Event \nWhere EventSourceName is \"Service Control Manager\"\nWhere the Event ID is 7045 \nWhere ImagePath contains\
   \ \"COMSPEC\" AND \"start\" AND \"powershell\"\n\n--------------------------------------------------------------------\n\n1 Windows Security\

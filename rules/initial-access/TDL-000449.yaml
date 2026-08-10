@@ -16,83 +16,117 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (uri="*/owa/*" OR url="*/owa/*" OR http_uri="*/owa/*") (uri="*ssrf*" OR url="*ssrf*" OR http_uri="*ssrf*" OR uri="*autodiscover*" OR url="*autodiscover*" OR http_uri="*autodiscover*" OR uri="*X-AnonResource-Backend*" OR url="*X-AnonResource-Backend*" OR http_uri="*X-AnonResource-Backend*" OR uri="*X-BEResource*" OR url="*X-BEResource*" OR http_uri="*X-BEResource*")
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (uri="*/owa/*" OR url="*/owa/*" OR http_uri="*/owa/*") (uri="*ssrf*"
+    OR url="*ssrf*" OR http_uri="*ssrf*" OR uri="*autodiscover*" OR url="*autodiscover*" OR http_uri="*autodiscover*" OR uri="*X-AnonResource-Backend*"
+    OR url="*X-AnonResource-Backend*" OR http_uri="*X-AnonResource-Backend*" OR uri="*X-BEResource*" OR url="*X-BEResource*" OR http_uri="*X-BEResource*")
+
     | stats count dc(dest_ip) as unique_dest_ips sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+
     | where count >= 1
+
     | sort - total_bytes_out
+
     | table src_ip, dest_ip, dest_port, count, unique_dest_ips, total_bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: "CommonSecurityLog\n| where DeviceVendor has_any (\"Proxy\", \"Firewall\") or DeviceProduct has_any (\"Proxy\", \"Firewall\", \"IDS\",\
+    \ \"IPS\")\n| where Protocol =~ \"tcp\"\n| where RequestURL has_any (\"/owa/\", \"/exchange/\", \"/ecp/\") or DestinationHostName has_any\
+    \ (\"outlook\", \"exchange\", \"owa\")\n| where RequestURL has_any (\"__VIEWSTATE\", \"X-AnonResource-Backend\", \"X-BEResource\", \"msExchEcpCanary\"\
+    , \"proxyLogon\", \"autodiscover/autodiscover.json\", \"mapi/nspi\", \"ecp/default.aspx\", \"DLExpansion\", \"/ecp/DDI/\", \"GetMailboxRegionalConfiguration\"\
+    , \"ResetOABVirtualDirectory\", \"RulesEditor/InboxRules.svc\", \"/ews/exchange.asmx\", \"ssrf\", \"X-Rps-CAT\") \n   or RequestURL matches\
+    \ regex @\"(?i)(/owa/auth/[^/]+\\.js|/ecp/[^/]+\\.js|autodiscover/autodiscover\\.json@[^/]+/|__VIEWSTATE|X-AnonResource-Backend:|proxyLogon)\"\
+    \n   or RequestContext has_any (\"ssrf\", \"proxyshell\", \"proxylogon\")\n| summarize \n    EventCount = count(),\n    UniqueDestIPs = dcount(DestinationIP),\n\
+    \    TotalBytesOut = sum(SentBytes)\n    by SourceIP, DestinationIP, DestinationPort\n| where EventCount >= 1\n| sort by TotalBytesOut desc\n\
+    | project SourceIP, DestinationIP, DestinationPort, EventCount, UniqueDestIPs, TotalBytesOut\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_dest_ips, SUM(bytesout) AS total_bytes_out
     FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+    WHERE protocol = 6 AND (payload MATCHES '.*(\\/\\.\\.\\/|%2e%2e%2f|%252e%252e%252f|0x2e0x2e0x2f).*' OR payload MATCHES '.*(cmd\\.exe|/bin/sh|/bin/bash|powershell).*' OR payload MATCHES '.*(etc/passwd|boot\\.ini|win\\.ini).*')
     GROUP BY sourceip, destinationip, destinationport
+    HAVING event_count >= 1
+    ORDER BY total_bytes_out DESC
+    START '1609459200000' STOP '9999999999999'
+  yara_l: |
+    rule owassrf_exploitation_detection {
+      meta:
+        author = "TDL"
+        description = "Detects OWASSRF exploitation patterns in network traffic"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1190"
+        severity = "HIGH"
 
-    LAST 1 HOURS
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.network.ip_protocol = "TCP"
+        (
+          re.regex($e.network.http.parsed_user_agent, `(?i)OWASSRF`) or
+          re.regex($e.target.url, `(?i)owa.*autodiscover`) or
+          re.regex($e.target.url, `(?i)\/owa\/auth\/`) or
+          re.regex($e.network.http.referrer, `(?i)autodiscover`) or
+          re.regex($e.target.url, `(?i)X-AnonResource-Backend`) or
+          re.regex($e.target.url, `(?i)X-BEResource`) or
+          re.regex($e.network.http.parsed_user_agent, `(?i)python-requests`) or
+          re.regex($e.target.url, `(?i)\/ecp\/`) or
+          re.regex($e.target.url, `(?i)\/PowerShell\/`)
+        )
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dest_ip
+        $e.target.port = $dest_port
+        $e.network.sent_bytes = $bytes_out
 
-    '
-  yara_l: "rule tdl_tdl_auth_000449 {\n  meta:\n    author = \"TDL\"\n    description = \"Potential OWASSRF Exploitation Attempt - Proxy\"\n \
-    \   severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      match:
+        $src_ip, $dest_ip, $dest_port over 24h
 
-    | WHERE @timestamp > NOW() - 1 hour
+      outcome:
+        $risk_score = max(75)
+        $total_events = count_distinct($e.metadata.id)
+        $unique_dest_ips = count_distinct($e.target.ip)
+        $total_bytes_out = sum($bytes_out)
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-network*
+    | WHERE @timestamp > NOW() - 24 hour AND network.protocol == "tcp" AND (http.request.body.content LIKE "*_VIEWSTATE*" OR url.path LIKE "*/owa/*" OR url.path LIKE "*/ecp/*" OR url.query LIKE "*__VIEWSTATE*" OR url.query LIKE "*__EVENTVALIDATION*")
+    | STATS event_count = COUNT(*), unique_dest_ips = COUNT_DISTINCT(destination.ip), total_bytes_out = SUM(source.bytes) BY source.ip, destination.ip, destination.port
+    | WHERE event_count >= 1
+    | SORT total_bytes_out DESC
+    | KEEP source.ip, destination.ip, destination.port, event_count, unique_dest_ips, total_bytes_out
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp" AND (source_json.url ICONTAINS "/owassrf" OR source_json.uri ICONTAINS "/owassrf" OR source_json.request ICONTAINS "owassrf" OR source_json.http_method ICONTAINS "owassrf" OR source_json.user_agent ICONTAINS "owassrf")) groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    #type=firewall OR #type=ids network.protocol=*tcp* (url=*/owa/* OR url=*/ecp/* OR url=*/autodiscover/*) (url=*powershell* OR url=*wsman* OR url=*EmailAddress* OR url=*X-AnonResource-Backend* OR url=*X-BEResource* OR url=*msExchEcpCanary*)
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=event_count), count(dest_ip, distinct=true, as=unique_dest_ips), sum(bytes_out, as=total_bytes_out)])
+    | event_count >= 1
+    | sort(field=total_bytes_out, order=desc, limit=10000)
+    | table([src_ip, dest_ip, dest_port, event_count, unique_dest_ips, total_bytes_out])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter action_destination_translated_port in (443, 8443, 8080, 80) and ip_protocol = 6\n| filter http_url_category\
+    \ ~= \"(?i)(.*)(\\.\\.\\/|\\.\\.\\\\|traversal|\\.\\.;|etc\\/passwd|windows\\/win\\.ini|proc\\/self|\\.\\.%2f|\\.\\.%5c|\\/WEB-INF\\/|%c0%ae|%c1%1c|\\\
+    .\\.%252f|%252e%252e|%c0%2e|\\.\\.\\/\\.\\.\\/|\\.\\.\\\\\\.\\.\\\\|%00|%0a|%0d|file:\\/\\/|gopher:\\/\\/|dict:\\/\\/|ssrf|169\\.254\\.169\\\
+    .254|metadata|internal|localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.).*\" \n   or http_url ~=\
+    \ \"(?i)(.*)(\\.\\.\\/|\\.\\.\\\\|traversal|\\.\\.;|etc\\/passwd|windows\\/win\\.ini|proc\\/self|\\.\\.%2f|\\.\\.%5c|\\/WEB-INF\\/|%c0%ae|%c1%1c|\\\
+    .\\.%252f|%252e%252e|%c0%2e|\\.\\.\\/\\.\\.\\/|\\.\\.\\\\\\.\\.\\\\|%00|%0a|%0d|file:\\/\\/|gopher:\\/\\/|dict:\\/\\/|ssrf|169\\.254\\.169\\\
+    .254|metadata|internal|localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.).*\"\n   or http_referrer\
+    \ ~= \"(?i)(.*)(\\.\\.\\/|\\.\\.\\\\|traversal|\\.\\.;|etc\\/passwd|windows\\/win\\.ini|proc\\/self|\\.\\.%2f|\\.\\.%5c|\\/WEB-INF\\/|%c0%ae|%c1%1c|\\\
+    .\\.%252f|%252e%252e|%c0%2e|\\.\\.\\/\\.\\.\\/|\\.\\.\\\\\\.\\.\\\\|%00|%0a|%0d|file:\\/\\/|gopher:\\/\\/|dict:\\/\\/|ssrf|169\\.254\\.169\\\
+    .254|metadata|internal|localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.).*\"\n| comp count() as event_count,\
+    \ count_distinct(action_destination_translated_ip) as unique_dest_ips, sum(bytes_out) as total_bytes_out by action_source_translated_ip, action_destination_translated_ip,\
+    \ action_destination_translated_port\n| filter event_count >= 1\n| sort desc total_bytes_out\n| fields action_source_translated_ip, action_destination_translated_ip,\
+    \ action_destination_translated_port, event_count, unique_dest_ips, total_bytes_out\n"
+  lucene: |
+    sourcetype:(firewall OR ids) AND network.protocol:tcp AND (url:*/owa/auth/* OR url:*/ecp/* OR url:*/Microsoft-Server-ActiveSync* OR url:*/Autodiscover* OR url:*/mapi* OR url:*/EWS* OR url:*/OAB* OR url:*/rpc* OR request:*X-AnonResource-Backend* OR request:*X-BEResource* OR request:*msExchEcpCanary* OR user_agent:*python-requests* OR user_agent:*PowerShell* OR http.method:POST AND url:*/autodiscover.json* OR http.method:POST AND url:*/ecp/*.js OR uri_path:*/powershell* OR (http.status_code:(401 OR 403) AND url:*/owa/*) OR request:*Cookie*ASP.NET_SessionId* AND url:*/ecp/*)
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*ids*
+    | where protocol matches "*tcp*" OR protocol matches "*TCP*"
+    | parse regex "(?<uri_path>/[^\s]*)" nodrop
+    | parse regex "(?<user_agent>User-Agent:\s*[^\r\n]+)" nodrop
+    | where uri_path matches "*autodiscover*" OR uri_path matches "*owa*" OR uri_path matches "*ecp*" OR uri_path matches "*Autodiscover*" OR uri_path matches "*OWA*" OR uri_path matches "*ECP*"
+    | where (uri_path matches "*Email=*@*" AND (uri_path matches "*X-*" OR uri_path matches "*%0d%0a*" OR uri_path matches "*%0a*" OR uri_path matches "*%0D%0A*" OR uri_path matches "*\r\n*")) OR uri_path matches "*autodiscover.json*" OR uri_path matches "*powershell*" OR (user_agent matches "*python*" OR user_agent matches "*curl*" OR user_agent matches "*Invoke-WebRequest*")
+    | count as event_count, count_distinct(dest_ip) as unique_dest_ips, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | where event_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, event_count, unique_dest_ips, total_bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -102,7 +136,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

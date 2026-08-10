@@ -37,71 +37,173 @@ queries:
     *\\\\svchost.exe\"), 1,\n    process_name=\"spoolsv.exe\" AND parent_process_name=\"*\\\\services.exe\", 1,\n    1=1, 0\n)\n| where valid_parent=0\n\
     | stats count by process_name, parent_process_name, command_line, host, user\n| where count >= 1\n| dedup process_name, parent_process_name,\
     \ command_line, host, user\n| table process_name, parent_process_name, command_line, host, user, count\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4688")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000204 {\n  meta:\n    author = \"TDL\"\n    description = \"Non-standard Process Launching Windows Process\"\n  \
-    \  severity = \"HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1569\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n \
-    \   $e.event_id = /(4688)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND event_id IN ("4688")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4688])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4688)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4688")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4688)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4688")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where EventID == 4688
+    | where TimeGenerated > ago(90d)
+    | extend ProcessName = tolower(Process)
+    | extend ParentProcessName = tolower(ParentProcessName)
+    | where ProcessName has_any ("svchost.exe", "lsass.exe", "services.exe", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "explorer.exe", "taskhost.exe", "taskhostw.exe", "RuntimeBroker.exe", "dllhost.exe", "spoolsv.exe")
+    | extend ExpectedParent = case(
+        ProcessName endswith "svchost.exe", "services.exe",
+        ProcessName endswith "lsass.exe", "wininit.exe",
+        ProcessName endswith "services.exe", "wininit.exe",
+        ProcessName endswith "smss.exe", "system",
+        ProcessName endswith "csrss.exe", "smss.exe",
+        ProcessName endswith "wininit.exe", "smss.exe",
+        ProcessName endswith "winlogon.exe", "smss.exe",
+        ProcessName endswith "explorer.exe", "userinit.exe",
+        ProcessName endswith "taskhost.exe", "svchost.exe",
+        ProcessName endswith "taskhostw.exe", "svchost.exe",
+        ProcessName endswith "runtimebroker.exe", "svchost.exe",
+        ProcessName endswith "dllhost.exe", "svchost.exe",
+        ProcessName endswith "spoolsv.exe", "services.exe",
+        "unknown"
+    )
+    | where ParentProcessName !contains ExpectedParent
+    | where ParentProcessName !has_any ("mssense.exe", "msmpeng.exe", "sense.exe", "tanium", "carbon", "cylance", "crowdstrike", "defender", "symantec", "mcafee")
+    | summarize Count = count(), Hosts = make_set(Computer), Users = make_set(Account) by ProcessName, ParentProcessName, CommandLine
+    | where Count >= 1
+    | project ProcessName, ParentProcessName, CommandLine, Count, Hosts, Users
+  aql: |
+    SELECT LOGSOURCENAME(logsourceid) AS host, username, "Process Name" AS process_name, "Parent Process Name" AS parent_process_name, "Process CommandLine" AS command_line, COUNT(*) AS occurrences
+    FROM events
+    WHERE "EventID" = '4688'
+      AND (
+        ("Process Name" ILIKE '%svchost.exe%' AND "Parent Process Name" NOT ILIKE '%services.exe%')
+        OR ("Process Name" ILIKE '%lsass.exe%' AND "Parent Process Name" NOT ILIKE '%wininit.exe%')
+        OR ("Process Name" ILIKE '%csrss.exe%' AND "Parent Process Name" NOT ILIKE '%smss.exe%')
+        OR ("Process Name" ILIKE '%winlogon.exe%' AND "Parent Process Name" NOT ILIKE '%smss.exe%')
+        OR ("Process Name" ILIKE '%explorer.exe%' AND "Parent Process Name" NOT ILIKE '%userinit.exe%')
+        OR ("Process Name" ILIKE '%taskhost.exe%' AND "Parent Process Name" NOT ILIKE '%services.exe%' AND "Parent Process Name" NOT ILIKE '%svchost.exe%')
+        OR ("Process Name" ILIKE '%smss.exe%' AND "Parent Process Name" NOT ILIKE '%System%')
+      )
+      AND "Parent Process Name" NOT ILIKE '%defender%'
+      AND "Parent Process Name" NOT ILIKE '%symantec%'
+      AND "Parent Process Name" NOT ILIKE '%mcafee%'
+      AND "Parent Process Name" NOT ILIKE '%crowdstrike%'
+      AND "Parent Process Name" NOT ILIKE '%carbon%'
+    GROUP BY LOGSOURCENAME(logsourceid), username, "Process Name", "Parent Process Name", "Process CommandLine"
+    HAVING occurrences >= 1
+    LAST 7 DAYS
+  yara_l: "rule windows_process_parent_anomaly {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects Windows processes\
+    \ launched from unexpected parent processes - MITRE T1569\"\n    mitre_attack_technique = \"T1569\"\n    mitre_attack_tactic = \"Execution\"\
+    \n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.metadata.product_event_type = \"4688\"\
+    \n    \n    // Known default Windows processes\n    (\n      re.regex($e.target.process.file.full_path, `(?i)\\\\svchost\\.exe$`) or\n   \
+    \   re.regex($e.target.process.file.full_path, `(?i)\\\\lsass\\.exe$`) or\n      re.regex($e.target.process.file.full_path, `(?i)\\\\services\\\
+    .exe$`) or\n      re.regex($e.target.process.file.full_path, `(?i)\\\\smss\\.exe$`) or\n      re.regex($e.target.process.file.full_path, `(?i)\\\
+    \\csrss\\.exe$`) or\n      re.regex($e.target.process.file.full_path, `(?i)\\\\wininit\\.exe$`) or\n      re.regex($e.target.process.file.full_path,\
+    \ `(?i)\\\\winlogon\\.exe$`) or\n      re.regex($e.target.process.file.full_path, `(?i)\\\\taskhost\\.exe$`) or\n      re.regex($e.target.process.file.full_path,\
+    \ `(?i)\\\\taskhostw\\.exe$`) or\n      re.regex($e.target.process.file.full_path, `(?i)\\\\spoolsv\\.exe$`) or\n      re.regex($e.target.process.file.full_path,\
+    \ `(?i)\\\\dwm\\.exe$`) or\n      re.regex($e.target.process.file.full_path, `(?i)\\\\runtimebroker\\.exe$`)\n    )\n    \n    // Unexpected\
+    \ parent processes - exclude legitimate parents\n    not (\n      re.regex($e.principal.process.file.full_path, `(?i)\\\\services\\.exe$`)\
+    \ or\n      re.regex($e.principal.process.file.full_path, `(?i)\\\\wininit\\.exe$`) or\n      re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\smss\\.exe$`) or\n      re.regex($e.principal.process.file.full_path, `(?i)\\\\svchost\\.exe$`) or\n      re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\winlogon\\.exe$`) or\n      re.regex($e.principal.process.file.full_path, `(?i)\\\\csrss\\.exe$`) or\n      re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\lsm\\.exe$`) or\n      re.regex($e.principal.process.file.full_path, `(?i)\\\\dwm\\.exe$`)\n    )\n    \n    // Exclude known security\
+    \ software and admin tools\n    not (\n      re.regex($e.principal.process.file.full_path, `(?i)\\\\tanium\\\\`) or\n      re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\crowdstrike\\\\`) or\n      re.regex($e.principal.process.file.full_path, `(?i)\\\\mcafee\\\\`) or\n      re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\symantec\\\\`) or\n      re.regex($e.principal.process.file.full_path, `(?i)\\\\carbonblack\\\\`) or\n      re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\sentinelone\\\\`) or\n      re.regex($e.principal.process.file.full_path, `(?i)\\\\cylance\\\\`) or\n      re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\splunk\\\\`) or\n      re.regex($e.principal.process.file.full_path, `(?i)\\\\nessus\\\\`) or\n      re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\qualys\\\\`)\n    )\n    \n    $e.principal.hostname = $host\n    $e.target.user.userid = $user\n    $e.target.process.file.full_path\
+    \ = $process_name\n    $e.principal.process.file.full_path = $parent_process_name\n    $e.target.process.command_line = $command_line\n  \
+    \  \n  match:\n    $host, $user, $process_name, $parent_process_name, $command_line over 24h\n    \n  condition:\n    #e >= 1\n}\n"
+  esql: |
+    FROM logs-system.security*, logs-endpoint.events.process*, winlogbeat-*
+    | WHERE (event.code == "4688" OR winlog.event_id == 4688 OR winlog.event_id == 1)
+    | WHERE process.name IN ("svchost.exe", "lsass.exe", "smss.exe", "csrss.exe", "wininit.exe", "services.exe", "winlogon.exe", "taskhost.exe", "taskhostw.exe", "RuntimeBroker.exe", "dllhost.exe", "spoolsv.exe")
+    | WHERE NOT (
+        (process.name == "svchost.exe" AND process.parent.name IN ("services.exe", "MsMpEng.exe", "rpcss.exe")) OR
+        (process.name == "lsass.exe" AND process.parent.name == "wininit.exe") OR
+        (process.name == "smss.exe" AND process.parent.name IN ("System", "smss.exe")) OR
+        (process.name == "csrss.exe" AND process.parent.name IN ("smss.exe", "svchost.exe")) OR
+        (process.name == "wininit.exe" AND process.parent.name == "smss.exe") OR
+        (process.name == "services.exe" AND process.parent.name == "wininit.exe") OR
+        (process.name == "winlogon.exe" AND process.parent.name IN ("smss.exe", "userinit.exe")) OR
+        (process.name IN ("taskhost.exe", "taskhostw.exe") AND process.parent.name IN ("services.exe", "svchost.exe")) OR
+        (process.name == "RuntimeBroker.exe" AND process.parent.name == "svchost.exe") OR
+        (process.name == "dllhost.exe" AND process.parent.name == "svchost.exe") OR
+        (process.name == "spoolsv.exe" AND process.parent.name == "services.exe")
+      )
+    | WHERE NOT (
+        process.parent.name LIKE "*defender*" OR
+        process.parent.name LIKE "*malwarebytes*" OR
+        process.parent.name LIKE "*carbon*" OR
+        process.parent.name LIKE "*crowdstrike*" OR
+        process.parent.name LIKE "*tanium*" OR
+        process.parent.name LIKE "*splunk*"
+      )
+    | STATS count = COUNT(*) BY process.name, process.parent.name, process.command_line, host.name, user.name
+    | WHERE count >= 1
+    | KEEP process.name, process.parent.name, process.command_line, host.name, user.name, count
+  leql: |
+    where(source_json.EventID=4688 AND (process_name ICONTAINS "svchost.exe" OR process_name ICONTAINS "lsass.exe" OR process_name ICONTAINS "smss.exe" OR process_name ICONTAINS "csrss.exe" OR process_name ICONTAINS "wininit.exe" OR process_name ICONTAINS "services.exe" OR process_name ICONTAINS "winlogon.exe" OR process_name ICONTAINS "spoolsv.exe" OR process_name ICONTAINS "taskhost.exe" OR process_name ICONTAINS "dwm.exe" OR process_name ICONTAINS "rundll32.exe" OR process_name ICONTAINS "dllhost.exe") AND NOT (parent_process_name ICONTAINS "services.exe" OR parent_process_name ICONTAINS "svchost.exe" OR parent_process_name ICONTAINS "smss.exe" OR parent_process_name ICONTAINS "wininit.exe" OR parent_process_name ICONTAINS "winlogon.exe" OR parent_process_name ICONTAINS "csrss.exe" OR parent_process_name ICONTAINS "spoolsv.exe" OR parent_process_name ICONTAINS "lsass.exe" OR parent_process_name ICONTAINS "system" OR parent_process_name ICONTAINS "explorer.exe" OR parent_process_name ICONTAINS "taskhost.exe" OR parent_process_name ICONTAINS "userinit.exe" OR parent_process_name ICONTAINS "dwm.exe") AND NOT (parent_process_name ICONTAINS "defender" OR parent_process_name ICONTAINS "tanium" OR parent_process_name ICONTAINS "crowdstrike" OR parent_process_name ICONTAINS "carbon" OR parent_process_name ICONTAINS "sentinel")) groupby(process_name, parent_process_name, process_cmd_line, asset, user) calculate(count)
+  crowdstrike: |
+    EventCode=4688
+    | in(field=NewProcessName, values=[*\svchost.exe, *\lsass.exe, *\csrss.exe, *\smss.exe, *\wininit.exe, *\services.exe, *\winlogon.exe, *\spoolsv.exe, *\taskhost.exe, *\taskhostw.exe, *\RuntimeBroker.exe, *\dllhost.exe, *\conhost.exe])
+    | regex("(?i)(?<process_name>svchost|lsass|csrss|smss|wininit|services|winlogon|spoolsv|taskhost|taskhostw|runtimebroker|dllhost|conhost)\.exe", field=NewProcessName)
+    | not(ParentProcessName=*\services.exe or ParentProcessName=*\svchost.exe or ParentProcessName=*\wininit.exe or ParentProcessName=*\smss.exe or ParentProcessName=*\MsMpEng.exe or ParentProcessName=*\SenseIR.exe or ParentProcessName=*\tanium*.exe)
+    | case {
+        process_name=svchost and not(ParentProcessName=*\services.exe or ParentProcessName=*\MsMpEng.exe) | include=true;
+        process_name=lsass and not(ParentProcessName=*\wininit.exe) | include=true;
+        process_name=csrss and not(ParentProcessName=*\smss.exe or ParentProcessName=*\svchost.exe) | include=true;
+        process_name=smss and not(ParentProcessName=*\System or ParentProcessName=*\smss.exe) | include=true;
+        process_name=wininit and not(ParentProcessName=*\smss.exe) | include=true;
+        process_name=services and not(ParentProcessName=*\wininit.exe) | include=true;
+        process_name=winlogon and not(ParentProcessName=*\smss.exe) | include=true;
+        * | include=true;
+      }
+    | groupBy([ComputerName, TargetUserName, process_name, ParentProcessName, CommandLine], function=count(as=occurrences))
+    | occurrences >= 1
+    | table([ComputerName, TargetUserName, process_name, ParentProcessName, CommandLine, occurrences])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4688
+    | filter action_process_image_name in ("svchost.exe", "taskeng.exe", "taskhostw.exe", "dllhost.exe", "rundll32.exe", "regsvr32.exe", "mshta.exe", "wscript.exe", "cscript.exe", "wmic.exe", "powershell.exe", "cmd.exe", "lsass.exe", "services.exe", "smss.exe", "csrss.exe", "winlogon.exe", "explorer.exe")
+    | filter not (
+        (action_process_image_name = "svchost.exe" and actor_process_image_name = "services.exe") or
+        (action_process_image_name = "taskeng.exe" and (actor_process_image_name = "svchost.exe" or actor_process_image_name = "services.exe")) or
+        (action_process_image_name = "taskhostw.exe" and (actor_process_image_name = "svchost.exe" or actor_process_image_name = "taskeng.exe")) or
+        (action_process_image_name = "dllhost.exe" and actor_process_image_name = "svchost.exe") or
+        (action_process_image_name = "services.exe" and actor_process_image_name = "wininit.exe") or
+        (action_process_image_name = "lsass.exe" and actor_process_image_name = "wininit.exe") or
+        (action_process_image_name = "smss.exe" and actor_process_image_name = "System") or
+        (action_process_image_name = "csrss.exe" and (actor_process_image_name = "smss.exe" or actor_process_image_name = "System")) or
+        (action_process_image_name = "winlogon.exe" and (actor_process_image_name = "smss.exe" or actor_process_image_name = "System")) or
+        (action_process_image_name = "explorer.exe" and (actor_process_image_name = "userinit.exe" or actor_process_image_name = "winlogon.exe")) or
+        (action_process_image_name = "cmd.exe" and actor_process_image_name = "explorer.exe") or
+        (action_process_image_name = "powershell.exe" and actor_process_image_name = "explorer.exe")
+    )
+    | filter not (actor_process_image_name contains "defender" or actor_process_image_name contains "antivirus" or actor_process_image_name contains "edr" or actor_process_image_name contains "tanium" or actor_process_image_name contains "crowdstrike" or actor_process_image_name contains "carbon" or actor_process_image_name contains "sentinelone")
+    | dedup agent_hostname, actor_effective_username, action_process_image_name, actor_process_image_name, action_process_image_command_line
+    | comp count() as instances by action_process_image_name, actor_process_image_name, action_process_image_command_line
+    | filter instances >= 1
+    | fields action_process_image_name, actor_process_image_name, action_process_image_command_line, instances
+  lucene: |
+    event.code:4688 AND process.name:(svchost.exe OR lsass.exe OR smss.exe OR csrss.exe OR wininit.exe OR services.exe OR lsm.exe OR winlogon.exe OR spoolsv.exe OR taskhost.exe OR taskhostw.exe OR dwm.exe OR explorer.exe OR RuntimeBroker.exe OR dllhost.exe OR conhost.exe OR LogonUI.exe) AND NOT process.parent.name:(System OR smss.exe OR wininit.exe OR services.exe OR lsass.exe OR svchost.exe OR explorer.exe OR userinit.exe OR RuntimeBroker.exe OR sihost.exe OR winlogon.exe OR csrss.exe OR SearchIndexer.exe OR SearchProtocolHost.exe OR taskeng.exe OR taskhostw.exe OR spoolsv.exe OR dwm.exe OR "C:\\Windows\\System32\\svchost.exe" OR "C:\\Windows\\System32\\services.exe" OR "C:\\Windows\\System32\\wininit.exe" OR "C:\\Windows\\System32\\smss.exe" OR "C:\\Windows\\System32\\lsass.exe") AND NOT (process.parent.name:(*defender* OR *symantec* OR *mcafee* OR *crowdstrike* OR *carbon* OR *tanium* OR *qualys*))
+  sumo: |
+    _sourceCategory=*Windows* "4688"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "ParentProcessName" as parent_process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "SubjectUserName" as user
+    | json field=_raw "Computer" as host
+    | where event_id = "4688"
+    | where (process_name matches "*\\svchost.exe" and !(parent_process_name matches "*\\services.exe"))
+       or (process_name matches "*\\lsass.exe" and !(parent_process_name matches "*\\wininit.exe"))
+       or (process_name matches "*\\csrss.exe" and !(parent_process_name matches "*\\smss.exe"))
+       or (process_name matches "*\\winlogon.exe" and !(parent_process_name matches "*\\smss.exe"))
+       or (process_name matches "*\\taskhost.exe" and !(parent_process_name matches "*\\services.exe"))
+       or (process_name matches "*\\spoolsv.exe" and !(parent_process_name matches "*\\services.exe"))
+       or (process_name matches "*\\explorer.exe" and !(parent_process_name matches "*\\userinit.exe" or parent_process_name matches "*\\explorer.exe"))
+       or (process_name matches "*\\smss.exe" and !(parent_process_name matches "*\\System"))
+       or (process_name matches "*\\wininit.exe" and !(parent_process_name matches "*\\smss.exe"))
+       or (process_name matches "*\\services.exe" and !(parent_process_name matches "*\\wininit.exe"))
+    | where !(parent_process_name matches "*\\MsMpEng.exe" or parent_process_name matches "*\\MsSense.exe" or parent_process_name matches "*\\CrowdStrike*" or parent_process_name matches "*\\SentinelAgent*" or parent_process_name matches "*\\tanium*")
+    | dedup host, user, process_name, parent_process_name, command_line
+    | fields _messageTime, host, user, process_name, parent_process_name, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -111,7 +213,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 suppression:
   window: 8 hours

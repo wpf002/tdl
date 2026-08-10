@@ -18,85 +18,96 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    (index=windows (EventCode=592 OR EventCode=4688 OR EventCode=4104))
-    ((EventCode=592 OR EventCode=4688) (Image="*\\powershell.exe" OR process_name="*powershell.exe" OR Process_Name="*powershell.exe") (CommandLine="*vaultcmd*" OR command="*vaultcmd*") (
-        (CommandLine="*/listcreds:*" OR command="*/listcreds:*")
+  spl: "(index=windows (EventCode=592 OR EventCode=4688 OR EventCode=4104))\n((EventCode=592 OR EventCode=4688) (Image=\"*\\\\powershell.exe\"\
+    \ OR process_name=\"*powershell.exe\" OR Process_Name=\"*powershell.exe\") (CommandLine=\"*vaultcmd*\" OR command=\"*vaultcmd*\") (\n    (CommandLine=\"\
+    */listcreds:*\" OR command=\"*/listcreds:*\")\n    OR\n    ((CommandLine=\"*Windows Credentials*\" OR command=\"*Windows Credentials*\") (CommandLine=\"\
+    *Web Credentials*\" OR command=\"*Web Credentials*\"))\n))\nOR\n(EventCode=4104 ScriptBlockText=\"*vaultcmd*\" (\n    ScriptBlockText=\"*/listcreds:*\"\
+    \n    OR\n    (ScriptBlockText=\"*Windows Credentials*\" ScriptBlockText=\"*Web Credentials*\")\n))\n| table _time, ComputerName, User, EventCode,\
+    \ Image, process_name, Process_Name, CommandLine, command, ScriptBlockText\n"
+  kql: |
+    union
+    (SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where Process has "powershell.exe"
+    | where CommandLine has "vaultcmd"
+    | where (CommandLine has "/listcreds:" or (CommandLine has "Windows Credentials" or CommandLine has "Web Credentials"))
+    | project TimeGenerated, Computer, Account, Process, CommandLine, EventID),
+    (Event
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4104
+    | where EventData has "vaultcmd"
+    | extend ScriptBlockText = tostring(EventData.ScriptBlockText)
+    | where ScriptBlockText has "vaultcmd"
+    | where (ScriptBlockText has "/listcreds:" or (ScriptBlockText has "Windows Credentials" or ScriptBlockText has "Web Credentials"))
+    | project TimeGenerated, Computer, UserName, ScriptBlockText, EventID)
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, \"Process Name\", \"Process CommandLine\", \"ScriptBlockText\"\nFROM events\n\
+    WHERE (\n    (\"EventID\" IN ('592', '4688') \n     AND \"Process Name\" ILIKE '%powershell.exe%' \n     AND \"Process CommandLine\" ILIKE\
+    \ '%vaultcmd%'\n     AND (\n         (\"Process CommandLine\" ILIKE '%/listcreds:%')\n         OR \n         (\"Process CommandLine\" ILIKE\
+    \ '%Windows Credentials%' AND \"Process CommandLine\" ILIKE '%Web Credentials%')\n     )\n    )\n    OR\n    (\"EventID\" = '4104'\n     AND\
+    \ \"ScriptBlockText\" ILIKE '%vaultcmd%'\n     AND (\n         (\"ScriptBlockText\" ILIKE '%/listcreds:%')\n         OR\n         (\"ScriptBlockText\"\
+    \ ILIKE '%Windows Credentials%' AND \"ScriptBlockText\" ILIKE '%Web Credentials%')\n     )\n    )\n)\nLAST 1 HOURS\n"
+  yara_l: "rule mitre_t1204_vaultcmd_credential_dumping {\n  meta:\n    author = \"TDL\"\n    description = \"Detects execution of vaultcmd to\
+    \ list credentials via PowerShell process or script block\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1204\"\
+    \n    severity = \"HIGH\"\n  \n  events:\n    // Windows Process Execution (4688, 592)\n    ($e1.metadata.event_type = \"PROCESS_LAUNCH\"\
+    \ and\n     ($e1.metadata.product_event_type = \"4688\" or $e1.metadata.product_event_type = \"592\") and\n     re.regex($e1.principal.process.file.full_path,\
+    \ `(?i)powershell\\.exe$`) and\n     re.regex($e1.principal.process.command_line, `(?i)vaultcmd`) and\n     (\n       re.regex($e1.principal.process.command_line,\
+    \ `(?i)/listcreds:`) or\n       (re.regex($e1.principal.process.command_line, `(?i)Windows Credentials`) and re.regex($e1.principal.process.command_line,\
+    \ `(?i)Web Credentials`))\n     ) and\n     $e1.principal.hostname = $host\n    ) or\n    \n    // PowerShell Script Block (4104)\n    ($e2.metadata.event_type\
+    \ = \"PROCESS_LAUNCH\" and\n     $e2.metadata.product_event_type = \"4104\" and\n     re.regex($e2.principal.process.command_line, `(?i)vaultcmd`)\
+    \ and\n     (\n       re.regex($e2.principal.process.command_line, `(?i)/listcreds:`) or\n       (re.regex($e2.principal.process.command_line,\
+    \ `(?i)Windows Credentials`) and re.regex($e2.principal.process.command_line, `(?i)Web Credentials`))\n     ) and\n     $e2.principal.hostname\
+    \ = $host\n    )\n  \n  match:\n    $host over 5m\n  \n  outcome:\n    $risk_score = 75\n  \n  condition:\n    $e1 or $e2\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.process*, logs-system.security*, winlogbeat-*, logs-windows.powershell_operational*
+    | WHERE (
+        (winlog.event_id IN (592, 4688) AND TO_LOWER(process.name) == "powershell.exe" AND TO_LOWER(process.command_line) LIKE "*vaultcmd*" AND (TO_LOWER(process.command_line) LIKE "*/listcreds:*" OR (TO_LOWER(process.command_line) LIKE "*windows credentials*" AND TO_LOWER(process.command_line) LIKE "*web credentials*")))
         OR
-        ((CommandLine="*Windows Credentials*" OR command="*Windows Credentials*") (CommandLine="*Web Credentials*" OR command="*Web Credentials*"))
-    ))
-    OR
-    (EventCode=4104 ScriptBlockText="*vaultcmd*" (
-        ScriptBlockText="*/listcreds:*"
-        OR
-        (ScriptBlockText="*Windows Credentials*" ScriptBlockText="*Web Credentials*")
-    ))
-    | table _time, ComputerName, User, EventCode, Image, process_name, Process_Name, CommandLine, command, ScriptBlockText
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("powershell.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('powershell.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000515 {\n  meta:\n    author = \"TDL\"\n    description = \"Enumerating Credentials from Windows Credential Manager\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
-    \n    $e.process_name = /(powershell.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("powershell.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [powershell.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+        (winlog.event_id == 4104 AND TO_LOWER(winlog.event_data.ScriptBlockText) LIKE "*vaultcmd*" AND (TO_LOWER(winlog.event_data.ScriptBlockText) LIKE "*/listcreds:*" OR (TO_LOWER(winlog.event_data.ScriptBlockText) LIKE "*windows credentials*" AND TO_LOWER(winlog.event_data.ScriptBlockText) LIKE "*web credentials*")))
+      )
+    | KEEP @timestamp, host.name, user.name, winlog.event_id, process.name, process.command_line, winlog.event_data.ScriptBlockText
+  leql: |
+    where((source_json.EventID IN [592, 4688] AND process_name ICONTAINS "powershell.exe" AND process_cmd_line ICONTAINS "vaultcmd" AND (process_cmd_line ICONTAINS "/listcreds:" OR (process_cmd_line ICONTAINS "Windows Credentials" AND process_cmd_line ICONTAINS "Web Credentials"))) OR (source_json.EventID=4104 AND source_json.ScriptBlockText ICONTAINS "vaultcmd" AND (source_json.ScriptBlockText ICONTAINS "/listcreds:" OR (source_json.ScriptBlockText ICONTAINS "Windows Credentials" AND source_json.ScriptBlockText ICONTAINS "Web Credentials"))))
+  crowdstrike: |
+    (EventCode=4688 OR EventCode=592 OR EventCode=4104)
+    (
+      (
+        (EventCode=4688 OR EventCode=592)
+        (FileName=powershell.exe OR NewProcessName=*powershell.exe)
+        CommandLine=*vaultcmd*
+        (
+          (CommandLine=*/listcreds:*)
+          OR
+          (CommandLine=*"Windows Credentials"* CommandLine=*"Web Credentials"*)
+        )
+      )
+      OR
+      (
+        EventCode=4104
+        ScriptBlockText=*vaultcmd*
+        (
+          (ScriptBlockText=*/listcreds:*)
+          OR
+          (ScriptBlockText=*"Windows Credentials"* ScriptBlockText=*"Web Credentials"*)
+        )
+      )
+    )
+    | table([@timestamp, ComputerName, UserName, EventCode, CommandLine, ScriptBlockText, ParentProcessName])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) and lowercase(actor_process_image_name) contains "powershell.exe" and lowercase(action_process_image_command_line) contains "vaultcmd" and (lowercase(action_process_image_command_line) contains "/listcreds:" or (lowercase(action_process_image_command_line) contains "windows credentials" and lowercase(action_process_image_command_line) contains "web credentials")))
+        or (action_evtlog_event_id = 4104 and lowercase(action_evtlog_message) contains "vaultcmd" and (lowercase(action_evtlog_message) contains "/listcreds:" or (lowercase(action_evtlog_message) contains "windows credentials" and lowercase(action_evtlog_message) contains "web credentials")))
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_id, actor_process_image_name, action_process_image_command_line, action_evtlog_message
+  lucene: |
+    (event.code:(592 OR 4688) AND process.name:powershell.exe AND process.command_line:*vaultcmd* AND (process.command_line:*/listcreds\:* OR (process.command_line:*Windows\ Credentials* AND process.command_line:*Web\ Credentials*))) OR (event.code:4104 AND winlog.event_data.ScriptBlockText:*vaultcmd* AND (winlog.event_data.ScriptBlockText:*/listcreds\:* OR (winlog.event_data.ScriptBlockText:*Windows\ Credentials* AND winlog.event_data.ScriptBlockText:*Web\ Credentials*)))
+  sumo: "_sourceCategory=*Windows* (4688 OR 4104)\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"NewProcessName\" as process_name\n\
+    | json field=_raw \"CommandLine\" as command_line\n| json field=_raw \"ScriptBlockText\" as script_block\n| where (event_id in (\"592\", \"\
+    4688\") and process_name matches \"*powershell.exe\" and command_line matches \"*vaultcmd*\" and command_line matches \"*/listcreds:*\") \n\
+    \    OR (event_id in (\"592\", \"4688\") and process_name matches \"*powershell.exe\" and command_line matches \"*vaultcmd*\" and command_line\
+    \ matches \"*Windows Credentials*\" and command_line matches \"*Web Credentials*\")\n    OR (event_id = \"4104\" and script_block matches\
+    \ \"*vaultcmd*\" and script_block matches \"*/listcreds:*\")\n    OR (event_id = \"4104\" and script_block matches \"*vaultcmd*\" and script_block\
+    \ matches \"*Windows Credentials*\" and script_block matches \"*Web Credentials*\")\n| fields _messageTime, _sourceHost, event_id, process_name,\
+    \ command_line, script_block\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -106,7 +117,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe\nWhere Command\
   \ contains \"vaultcmd\"\nWhere Command contains \"/listcreds:\"\nOR\n    Where Command contains \"Windows Credentials\"\n    Where Command contains\

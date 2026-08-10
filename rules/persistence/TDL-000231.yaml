@@ -18,74 +18,85 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=windows (EventCode=567 OR EventCode=4657) (Object_Name="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\*" OR Object_Name="*\\SYSTEM\\ControlSet*\\Control\\Lsa\\*") Object_Value_Name="Authentication Packages"
+  spl: 'index=windows (EventCode=567 OR EventCode=4657) (Object_Name="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\*" OR Object_Name="*\\SYSTEM\\ControlSet*\\Control\\Lsa\\*")
+    Object_Value_Name="Authentication Packages"
+
     | table _time, ComputerName, EventCode, Object_Name, Object_Value_Name, Process_Name, SubjectUserName
-  kql: 'DeviceRegistryEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where registry_key matches regex ".+"
-
-    | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Registry Key\", \"Registry Value Name\", \"Registry Value Data\", \"Process Name\"\nFROM events\nWHERE\
-    \ LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n  AND \"EventID\" IN ('12','13','14')\n  AND \"registry_key\" LIKE '%.+%'\n\
-    LAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000231 {\n  meta:\n    author = \"TDL\"\n    description = \"Authentication Package DLL Injection\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1574\"\n  events:\n    $e.metadata.event_type = \"REGISTRY_MODIFICATION\"\n  \
-    \  $e.registry_key = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4657
+    | where ObjectName has "SYSTEM\\CurrentControlSet\\Control\\Lsa"
+    | where ObjectValueName =~ "Authentication Packages"
+    | project TimeGenerated, Computer, Account, SubjectUserName, ObjectName, ObjectValueName, OperationType, NewValue, OldValue
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Object Name" AS registry_key, "Object Value Name" AS value_name, "New Value"
+    FROM events
+    WHERE "EventID" IN ('567', '4657')
+      AND ("Object Name" ILIKE '%HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\%' OR "Object Name" ILIKE '%REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\%')
+      AND "Object Value Name" = 'Authentication Packages'
+    LAST 24 HOURS
+  yara_l: |
+    rule lsa_auth_packages_modification {
+      meta:
+        author = "TDL"
+        description = "Detects modification of LSA Authentication Packages registry key - T1574 Persistence"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1574"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "REGISTRY_MODIFICATION"
+        $e.metadata.product_event_type = "4657"
+        (
+          re.regex($e.target.registry.registry_key, `(?i)HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\`) or
+          re.regex($e.target.registry.registry_key, `(?i)REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\`)
+        )
+        re.regex($e.target.registry.registry_value_name, `(?i)Authentication Packages`)
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "registry" AND registry_key LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/.+/)
-
-    groupby(asset, registry_key, registry_value)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*.+*
-
-    | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
-
-    | sort -changes
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.REGISTRY AND registry_key ~= ".+"
-
-    | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
-
-    | sort desc changes
-
-    '
-  lucene: 'event.category:"registry" AND registry_key:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id IN ("12","13","14") AND registry_key matches "*.+*"
-
-    | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code IN ("567", "4657")
+      AND (
+        winlog.event_data.ObjectName LIKE "*HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\*"
+        OR winlog.event_data.ObjectName LIKE "*REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\*"
+      )
+      AND winlog.event_data.ObjectValueName == "Authentication Packages"
+    | KEEP @timestamp, host.name, user.name, winlog.event_data.ObjectName, winlog.event_data.ObjectValueName, winlog.event_data.NewValue, process.name, process.executable
+  leql: |
+    where(source_json.EventID IN [567, 4657] AND (source_json.ObjectName ICONTAINS "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\" OR source_json.ObjectName ICONTAINS "REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\") AND source_json.ObjectValueName="Authentication Packages")
+  crowdstrike: |
+    EventCode=4657 (RegistryKeyPath=*HKLM\SYSTEM\CurrentControlSet\Control\Lsa\* OR RegistryKeyPath=*REGISTRY\MACHINE\SYSTEM\CurrentControlSet\Control\Lsa\*) ObjectValueName="Authentication Packages"
+    | table([@timestamp, ComputerName, RegistryKeyPath, ObjectValueName, NewValue, ProcessName, SubjectUserName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (567, 4657)
+    | filter (action_evtlog_event_data_ObjectName contains "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\" or action_evtlog_event_data_ObjectName contains "REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\")
+    | filter action_evtlog_event_data_ObjectValueName = "Authentication Packages"
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_data_ObjectName, action_evtlog_event_data_ObjectValueName, action_evtlog_event_data_NewValue, action_evtlog_event_data_OldValue
+  lucene: |
+    event.code:4657 AND (registry.path:*SYSTEM\\CurrentControlSet\\Control\\Lsa\\* OR registry.path:*SYSTEM\\ControlSet001\\Control\\Lsa\\* OR registry.path:*\\Control\\Lsa\\*) AND registry.value:"Authentication Packages"
+  sumo: |
+    _sourceCategory=*Windows* ("4657" OR "567")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ObjectName" as registry_key
+    | json field=_raw "ObjectValueName" as value_name
+    | where event_id in ("4657", "567")
+    | where (registry_key matches "*HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\*" OR registry_key matches "*REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\*")
+    | where value_name matches "*Authentication Packages*"
+    | fields _messageTime, _sourceHost, event_id, registry_key, value_name
 false_positives:
 - Security software
 - Authorized admin tools
@@ -95,7 +106,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Windows Registry Modification Event
 

@@ -16,73 +16,70 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=varonis sourcetype=varonis:datalert Alert_Name IN ("File encrypted by ransomware", "Immediate pattern detected: user actions resemble ransomware", "Suspected ransomware intrusion activity", "Potential encryption of multiple files")
+  spl: 'index=varonis sourcetype=varonis:datalert Alert_Name IN ("File encrypted by ransomware", "Immediate pattern detected: user actions resemble
+    ransomware", "Suspected ransomware intrusion activity", "Potential encryption of multiple files")
+
     | table _time, Alert_Name, User, host, src, Object_Name, Object_Type
-  kql: 'DeviceFileEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where file_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, InitiatingProcessFileName, FolderPath, FileName
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"File Path\", \"Process Name\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n\
-    \  AND \"EventID\" IN ('11','23','26')\n  AND \"file_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_000645 {\n  meta:\n    author = \"TDL\"\n    description = \"Possible Ransomware Detected - Varonis\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0040\"\n    technique = \"T1486\"\n  events:\n    $e.metadata.event_type = \"FILE_CREATION\"\n    $e.file_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*
+  kql: |
+    VaronisDatAdvantage
+    | where TimeGenerated > ago(1h)
+    | where AlertName in ("File encrypted by ransomware","Immediate pattern detected: user actions resemble ransomware","Suspected ransomware intrusion activity","Potential encryption of multiple files")
+    | project TimeGenerated, AlertName, UserName, DeviceName, FilePath, Severity, Description
+  aql: "SELECT DATEFORMAT(eventtime, 'yyyy-MM-dd HH:mm:ss') AS alert_time, \n       LOGSOURCENAME(logsourceid) AS log_source, \n       \"Alert\
+    \ Name\", \n       username, \n       sourceip, \n       \"File Path\", \n       \"Affected Resource\",\n       COUNT(*) AS alert_count\n\
+    FROM events\nWHERE LOGSOURCENAME(logsourceid) ILIKE '%Varonis%'\n  AND \"Alert Name\" IN ('File encrypted by ransomware', \n             \
+    \          'Immediate pattern detected: user actions resemble ransomware', \n                       'Suspected ransomware intrusion activity',\
+    \ \n                       'Potential encryption of multiple files')\nGROUP BY \"Alert Name\", username, sourceip, \"File Path\", \"Affected\
+    \ Resource\", logsourceid, eventtime\nORDER BY eventtime DESC\nLAST 24 HOURS\n"
+  yara_l: |
+    rule varonis_ransomware_alerts {
+      meta:
+        author = "TDL"
+        description = "Detects Varonis DatAdvantage ransomware-related alerts (T1486 - Data Encrypted for Impact)"
+        mitre_attack_tactic = "Impact"
+        mitre_attack_technique = "T1486"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $alert.metadata.vendor_name = "Varonis"
+        $alert.metadata.product_name = "DatAdvantage"
+        (
+          $alert.security_result.summary = "File encrypted by ransomware" or
+          $alert.security_result.summary = "Immediate pattern detected: user actions resemble ransomware" or
+          $alert.security_result.summary = "Suspected ransomware intrusion activity" or
+          $alert.security_result.summary = "Potential encryption of multiple files"
+        )
+        $alert.principal.hostname = $host
 
-    | WHERE event.category == "file" AND file_name LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, file.path, process.name
+      outcome:
+        $risk_score = 95
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND log_type = "file" AND file_name=/.+/)
-
-    groupby(asset, file_path, process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (FileWritten, NewExecutableWritten) AND file_name=*.+*
-
-    | stats count as writes by ComputerName, UserName, FileName, ImageFileName
-
-    | sort -writes
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.FILE AND file_name ~= ".+"
-
-    | comp count() as writes by agent_hostname, actor_effective_username, action_file_name, action_file_path
-
-    | sort desc writes
-
-    '
-  lucene: 'event.category:"file" AND file_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id IN ("11","23","26") AND file_name matches "*.+*"
-
-    | count by host, user, target_filename, image
-
-    | sort by _count desc
-
-    '
+      condition:
+        $alert
+    }
+  esql: |
+    FROM logs-varonis.datadvantage*
+    | WHERE varonis.alert.name IN ("File encrypted by ransomware", "Immediate pattern detected: user actions resemble ransomware", "Suspected ransomware intrusion activity", "Potential encryption of multiple files")
+    | KEEP @timestamp, host.name, user.name, varonis.alert.name, varonis.alert.severity, source.ip, file.path
+  leql: |
+    where(source_json.AlertName IN ["File encrypted by ransomware","Immediate pattern detected: user actions resemble ransomware","Suspected ransomware intrusion activity","Potential encryption of multiple files"])
+  crowdstrike: "#type=VaronisDatAdvantage \n| AlertName in [\"File encrypted by ransomware\",\"Immediate pattern detected: user actions resemble\
+    \ ransomware\",\"Suspected ransomware intrusion activity\",\"Potential encryption of multiple files\"]\n| table([@timestamp, ComputerName,\
+    \ UserName, AlertName, AlertDescription, FileName, FilePath])\n"
+  xql: |
+    dataset = varonis_datadvantage_raw
+    | filter alert_name in ("File encrypted by ransomware", "Immediate pattern detected: user actions resemble ransomware", "Suspected ransomware intrusion activity", "Potential encryption of multiple files")
+    | fields _time, alert_name, alert_severity, user_name, affected_resource, host_name, alert_description
+  lucene: |
+    Alert_Name:("File encrypted by ransomware" OR "Immediate pattern detected: user actions resemble ransomware" OR "Suspected ransomware intrusion activity" OR "Potential encryption of multiple files")
+  sumo: "_sourceCategory=*Varonis* \n| json field=_raw \"AlertName\" as alert_name\n| where alert_name in (\"File encrypted by ransomware\", \"\
+    Immediate pattern detected: user actions resemble ransomware\", \"Suspected ransomware intrusion activity\", \"Potential encryption of multiple\
+    \ files\")\n| fields _messageTime, _sourceHost, alert_name\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -92,7 +89,7 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 VaronisDatAdvantage Alert
 

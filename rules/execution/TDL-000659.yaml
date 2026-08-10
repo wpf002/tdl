@@ -16,74 +16,88 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 95
 queries:
-  spl: |
-    (index=wineventlog sourcetype=WinEventLog:System EventCode=7045 Service_File_Name="*powershell -nop -w hidden -encodedcommand*") OR (index=wineventlog sourcetype=WinEventLog:Security EventCode=4697 Service_File_Name="*powershell -nop -w hidden -encodedcommand*")
+  spl: '(index=wineventlog sourcetype=WinEventLog:System EventCode=7045 Service_File_Name="*powershell -nop -w hidden -encodedcommand*") OR (index=wineventlog
+    sourcetype=WinEventLog:Security EventCode=4697 Service_File_Name="*powershell -nop -w hidden -encodedcommand*")
+
     | table _time, ComputerName, EventCode, Service_Name, Service_File_Name, ServiceName, ServiceFileName
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("7045", "4697")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('7045', '4697')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000659 {\n  meta:\n    author = \"TDL\"\n    description = \"Cobalt Strike Installation via Hidden Powershell\"\n\
-    \    severity = \"CRITICAL\"\n    tactic = \"TA0002\"\n    technique = \"T1569\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
-    \n    $e.event_id = /(7045|4697)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    union
+    (SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 7045
+    | where EventSourceName =~ "Service Control Manager"
+    | where ParameterXml has "powershell -nop -w hidden -encodedcommand"
+    | extend ImagePath = extract(@"<Data Name=""ImagePath"">([^<]+)</Data>", 1, ParameterXml)
+    | where ImagePath has "powershell -nop -w hidden -encodedcommand"
+    | project TimeGenerated, Computer, EventID, ServiceName = extract(@"<Data Name=""ServiceName"">([^<]+)</Data>", 1, ParameterXml), ImagePath, Account),
+    (SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4697
+    | where ParameterXml has "powershell -nop -w hidden -encodedcommand"
+    | extend ServiceFileName = extract(@"<Data Name=""ServiceFileName"">([^<]+)</Data>", 1, ParameterXml)
+    | where ServiceFileName has "powershell -nop -w hidden -encodedcommand"
+    | project TimeGenerated, Computer, EventID, ServiceName = extract(@"<Data Name=""ServiceName"">([^<]+)</Data>", 1, ParameterXml), ServiceFileName, Account)
+    | project TimeGenerated, Computer, EventID, ServiceName, ImagePath = coalesce(ImagePath, ServiceFileName), Account
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, "EventID", "Service Name", COALESCE("Service File Name", "ImagePath") AS service_path, username
+    FROM events
+    WHERE ("EventID" = '7045' AND "ImagePath" ILIKE '%powershell -nop -w hidden -encodedcommand%')
+       OR ("EventID" = '4697' AND "Service File Name" ILIKE '%powershell -nop -w hidden -encodedcommand%')
+    LAST 24 HOURS
+  yara_l: |
+    rule suspicious_service_encoded_powershell {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects service creation with encoded PowerShell command - MITRE T1569"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1569"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        // Event ID 7045 - Service Control Manager
+        $e1.metadata.event_type = "SERVICE_CREATION"
+        $e1.metadata.product_event_type = "7045"
+        re.regex($e1.target.process.command_line, `(?i)powershell\s+-nop\s+-w\s+hidden\s+-encodedcommand`) or
+        re.regex($e1.target.process.file.full_path, `(?i)powershell\s+-nop\s+-w\s+hidden\s+-encodedcommand`)
+        $e1.principal.hostname = $host
 
-    | WHERE event.category == "process" AND event_id IN ("7045", "4697")
+        // Event ID 4697 - Security Auditing
+        $e2.metadata.event_type = "SERVICE_CREATION"
+        $e2.metadata.product_event_type = "4697"
+        re.regex($e2.target.process.command_line, `(?i)powershell\s+-nop\s+-w\s+hidden\s+-encodedcommand`) or
+        re.regex($e2.target.process.file.full_path, `(?i)powershell\s+-nop\s+-w\s+hidden\s+-encodedcommand`)
+        $e2.principal.hostname = $host
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      match:
+        $host over 5m
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [7045, 4697])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (7045, 4697)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("7045", "4697")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(7045 OR 4697)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("7045", "4697")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e1 or $e2
+    }
+  esql: |
+    FROM logs-system.system*, logs-system.security*
+    | WHERE (event.code == "7045" AND winlog.event_data.ImagePath LIKE "*powershell -nop -w hidden -encodedcommand*")
+       OR (event.code == "4697" AND winlog.event_data.ServiceFileName LIKE "*powershell -nop -w hidden -encodedcommand*")
+    | KEEP @timestamp, host.name, event.code, winlog.event_data.ServiceName, winlog.event_data.ImagePath, winlog.event_data.ServiceFileName
+  leql: |
+    where((source_json.EventID=7045 AND source_json.ImagePath ICONTAINS "powershell -nop -w hidden -encodedcommand") OR (source_json.EventID=4697 AND source_json.ServiceFileName ICONTAINS "powershell -nop -w hidden -encodedcommand"))
+  crowdstrike: |
+    (EventCode=7045 ImagePath=*powershell*-nop*-w*hidden*-encodedcommand*) OR (EventCode=4697 ServiceFileName=*powershell*-nop*-w*hidden*-encodedcommand*)
+    | table([@timestamp, ComputerName, EventCode, ImagePath, ServiceFileName, ServiceName])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id = 7045 and action_evtlog_data_EventSourceName = "Service Control Manager" and action_evtlog_event_data_ImagePath contains "powershell -nop -w hidden -encodedcommand")
+       or (action_evtlog_event_id = 4697 and action_evtlog_event_data_ServiceFileName contains "powershell -nop -w hidden -encodedcommand")
+    | fields _time, agent_hostname, action_evtlog_event_id, actor_effective_username, action_evtlog_event_data_ServiceName, action_evtlog_event_data_ImagePath, action_evtlog_event_data_ServiceFileName
+  lucene: |
+    (event.code:7045 AND winlog.event_data.ServiceName:* AND winlog.event_data.ImagePath:*powershell*-nop*-w*hidden*-encodedcommand*) OR (event.code:4697 AND winlog.event_data.ServiceFileName:*powershell*-nop*-w*hidden*-encodedcommand*)
+  sumo: "(_sourceCategory=*Windows*System* OR _sourceCategory=*Windows*Security*)\n| json field=_raw \"EventID\" as event_id\n| json field=_raw\
+    \ \"EventSourceName\" as event_source\n| json field=_raw \"ImagePath\" as image_path\n| json field=_raw \"ServiceFileName\" as service_file_name\n\
+    | where (event_id = \"7045\" and event_source = \"Service Control Manager\" and image_path matches \"*powershell -nop -w hidden -encodedcommand*\"\
+    ) \n    OR (event_id = \"4697\" and service_file_name matches \"*powershell -nop -w hidden -encodedcommand*\")\n| fields _messageTime, _sourceHost,\
+    \ event_id, image_path, service_file_name\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +107,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows System Event \nWhere EventSourceName is \"Service Control Manager\"\nWhere the Event ID is 7045 \nWhere ImagePath contains\
   \ \"powershell -nop -w hidden -encodedcommand\"\n\n--------------------------------------------------------------------\n\n1 Windows Security\

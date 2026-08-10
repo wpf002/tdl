@@ -17,76 +17,79 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=windows (EventCode=592 OR EventCode=4688) (ParentProcessName="*\\firefox.exe" OR ParentProcessName="*\\chrome.exe" OR ParentProcessName="*\\microsoftedge.exe" OR ParentProcessName="*\\safari.exe" OR ParentProcessName="*\\opera.exe" OR ParentProcessName="*\\iexplore.exe" OR ParentProcessName="*\\vivaldi.exe" OR ParentProcessName="*\\brave.exe") ProcessName="*\\cmd.exe"
+  spl: 'index=windows (EventCode=592 OR EventCode=4688) (ParentProcessName="*\\firefox.exe" OR ParentProcessName="*\\chrome.exe" OR ParentProcessName="*\\microsoftedge.exe"
+    OR ParentProcessName="*\\safari.exe" OR ParentProcessName="*\\opera.exe" OR ParentProcessName="*\\iexplore.exe" OR ParentProcessName="*\\vivaldi.exe"
+    OR ParentProcessName="*\\brave.exe") ProcessName="*\\cmd.exe"
+
     | table _time, ComputerName, User, ParentProcessName, ProcessName, CommandLine
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("firefox.exe", "chrome.exe", "microsoftedge.exe", "safari.exe", "opera.exe", "iexplore.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('firefox.exe', 'chrome.exe', 'microsoftedge.exe', 'safari.exe',\
-    \ 'opera.exe', 'iexplore.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000172 {\n  meta:\n    author = \"TDL\"\n    description = \"Browser Spawning Command Line Tools\"\n    severity =\
-    \ \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1202\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(firefox.exe|chrome.exe|microsoftedge.exe|safari.exe|opera.exe|iexplore.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host\
-    \ over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where ParentProcessName has_any ("firefox.exe", "chrome.exe", "microsoftedge.exe", "safari.exe", "opera.exe", "iexplore.exe", "vivaldi.exe", "brave.exe")
+    | where Process has "cmd.exe"
+    | project TimeGenerated, Computer, Account, ParentProcessName, Process, CommandLine, NewProcessName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Parent Process Name", "Process Name", "Process CommandLine", COUNT(*) AS executions
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Parent Process Name" IN ('firefox.exe', 'chrome.exe', 'microsoftedge.exe', 'safari.exe', 'opera.exe', 'iexplore.exe', 'vivaldi.exe', 'brave.exe')
+      AND "Process Name" = 'cmd.exe'
+    GROUP BY eventtime, LOGSOURCENAME(logsourceid), username, "Parent Process Name", "Process Name", "Process CommandLine"
+    LAST 1 HOURS
+  yara_l: |
+    rule browser_spawning_cmd {
+      meta:
+        author = "TDL"
+        description = "Detects browsers spawning cmd.exe - T1202 Indirect Command Execution"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1202"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688"
+        )
+        re.regex($e.principal.process.file.full_path, `(?i)(firefox|chrome|microsoftedge|safari|opera|iexplore|vivaldi|brave)\.exe$`)
+        re.regex($e.target.process.file.full_path, `(?i)\\cmd\.exe$`)
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name IN ("firefox.exe", "chrome.exe", "microsoftedge.exe", "safari.exe", "opera.exe", "iexplore.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [firefox.exe, chrome.exe, microsoftedge.exe, safari.exe, opera.exe, iexplore.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (firefox.exe, chrome.exe, microsoftedge.exe, safari.exe, opera.exe, iexplore.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("firefox.exe", "chrome.exe", "microsoftedge.exe", "safari.exe", "opera.exe", "iexplore.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(firefox.exe OR chrome.exe OR microsoftedge.exe OR safari.exe OR opera.exe OR iexplore.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("firefox.exe", "chrome.exe", "microsoftedge.exe", "safari.exe", "opera.exe", "iexplore.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-system.security*, logs-windows.security*, winlogbeat-*\n| WHERE event.code IN (\"592\", \"4688\") \n  AND TO_LOWER(process.parent.name)\
+    \ IN (\"firefox.exe\", \"chrome.exe\", \"microsoftedge.exe\", \"safari.exe\", \"opera.exe\", \"iexplore.exe\", \"vivaldi.exe\", \"brave.exe\"\
+    )\n  AND TO_LOWER(process.name) == \"cmd.exe\"\n| KEEP @timestamp, host.name, user.name, process.parent.name, process.name, process.command_line,\
+    \ process.executable\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND parent_process_name IN [firefox.exe, chrome.exe, microsoftedge.exe, safari.exe, opera.exe, iexplore.exe, vivaldi.exe, brave.exe] AND process_name=cmd.exe)
+  crowdstrike: |
+    EventCode=4688 ParentProcessName IN [firefox.exe, chrome.exe, microsoftedge.exe, safari.exe, opera.exe, iexplore.exe, vivaldi.exe, brave.exe] NewProcessName=*cmd.exe
+    | table([@timestamp, ComputerName, SubjectUserName, ParentProcessName, NewProcessName, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter lowercase(actor_process_image_name) in ("firefox.exe", "chrome.exe", "microsoftedge.exe", "safari.exe", "opera.exe", "iexplore.exe", "vivaldi.exe", "brave.exe")
+    | filter lowercase(action_process_image_name) = "cmd.exe"
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:4688 AND process.parent.name:(firefox.exe OR chrome.exe OR microsoftedge.exe OR safari.exe OR opera.exe OR iexplore.exe OR vivaldi.exe OR brave.exe) AND process.name:cmd.exe
+  sumo: |
+    _sourceCategory=*Windows* ("4688" OR "592")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ParentProcessName" as parent_process
+    | json field=_raw "NewProcessName" as process_name
+    | where event_id in ("4688", "592")
+    | where (parent_process matches "*firefox.exe" OR parent_process matches "*chrome.exe" OR parent_process matches "*microsoftedge.exe" OR parent_process matches "*safari.exe" OR parent_process matches "*opera.exe" OR parent_process matches "*iexplore.exe" OR parent_process matches "*vivaldi.exe" OR parent_process matches "*brave.exe")
+    | where process_name matches "*cmd.exe"
+    | fields _messageTime, _sourceHost, event_id, parent_process, process_name
 false_positives:
 - Security software
 - Authorized admin tools
@@ -96,7 +99,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Parent Process Name is in [firefox.exe, chrome.exe,\
   \ microsoftedge.exe, safari.exe, opera.exe, iexplore.exe, vivaldi.exe, brave.exe]\nWhere the Process Name is cmd.exe"

@@ -16,80 +16,73 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 Image="*\\wmic.exe" (CommandLine="*/format:*http://*" OR CommandLine="*/format:*https://*" OR (CommandLine="*/format:*.xsl*" NOT CommandLine="*\\system32\\*"))
+  spl: 'index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 Image="*\\wmic.exe" (CommandLine="*/format:*http://*"
+    OR CommandLine="*/format:*https://*" OR (CommandLine="*/format:*.xsl*" NOT CommandLine="*\\system32\\*"))
+
     | table _time, ComputerName, User, ParentImage, CommandLine
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "http"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: "SecurityEvent\n| where TimeGenerated > ago(24h)\n| where EventID == 1\n| extend ProcessName = extract(@\"([^\\\\]+)$\", 1, tolower(Process))\n\
+    | where ProcessName == \"wmic.exe\"\n| where CommandLine has \"/format\"\n| where (CommandLine matches regex @\"/format:\\s*[\"\"']?https?://\"\
+    \ or \n         (CommandLine has \".xsl\" and CommandLine !contains \"system32\"))\n| project TimeGenerated, Computer, Account, Process, CommandLine,\
+    \ ParentProcess = ParentProcessName\n"
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, \"Process Name\", \"Process CommandLine\", \"Parent Process Name\"\nFROM\
+    \ events\nWHERE \"Process Name\" ILIKE '%wmic.exe%'\n  AND (\"Process CommandLine\" ILIKE '%/format:%http://%' \n       OR \"Process CommandLine\"\
+    \ ILIKE '%/format:%https://%'\n       OR (\"Process CommandLine\" ILIKE '%.xsl%' AND \"Process CommandLine\" NOT ILIKE '%system32%'))\nLAST\
+    \ 24 HOURS\n"
+  yara_l: |
+    rule squiblytwo_xsl_proxy_execution {
+      meta:
+        author = "TDL"
+        description = "Detects WMIC.exe execution with remote XSL scripts or XSL files outside system32 (T1220 - Squiblytwo)"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1220"
+        severity = "High"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        re.regex($e.principal.process.file.full_path, `(?i)\\wmic\.exe$`)
+        (
+          re.regex($e.principal.process.command_line, `(?i)/format:\s*"?https?://`) or
+          (
+            re.regex($e.principal.process.command_line, `(?i)/format:.*\.xsl`) and
+            not re.regex($e.principal.process.command_line, `(?i)\\system32\\`)
+          )
+        )
+        $e.principal.hostname = $host
 
-    WHERE "network.protocol" LIKE ''%http%''
+      match:
+        $host over 5m
 
-    GROUP BY sourceip, destinationip, destinationport
+      condition:
+        $e
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_de_000745 {\n  meta:\n    author = \"TDL\"\n    description = \"wmic format:xsl Loading Remote XSL\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1220\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /http/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%http%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/http/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*http*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "http"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*http*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*http*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      outcome:
+        $risk_score = 75
+    }
+  esql: "FROM logs-windows.sysmon_operational*\n| WHERE winlog.event_id == 1 \n  AND TO_LOWER(process.name) == \"wmic.exe\"\n  AND (\n    process.command_line\
+    \ RLIKE \".*[/\\\\-]format:.*https?://.*\"\n    OR (\n      process.command_line RLIKE \".*[/\\\\-]format:.*\\\\.xsl.*\"\n      AND NOT process.command_line\
+    \ RLIKE \"(?i).*[/\\\\-]format:.*\\\\\\\\windows\\\\\\\\system32\\\\\\\\.*\\\\.xsl.*\"\n    )\n  )\n| KEEP @timestamp, host.name, user.name,\
+    \ process.command_line, process.parent.name, process.parent.command_line\n"
+  leql: |
+    where(process_name ICONTAINS "wmic.exe" AND (process_cmd_line ICONTAINS "/format:\"http://" OR process_cmd_line ICONTAINS "/format:\"https://" OR (process_cmd_line ICONTAINS "/format:" AND process_cmd_line ICONTAINS ".xsl" AND NOT process_cmd_line ICONTAINS "system32")))
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 FileName=wmic.exe (CommandLine=*/format:*http://* OR CommandLine=*/format:*https://* OR (CommandLine=*/format:*.xsl* NOT CommandLine=*system32*.xsl*))
+    | table([@timestamp, ComputerName, UserName, ParentBaseFileName, CommandLine, SHA256HashData])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+      and lowercase(actor_process_image_name) contains "wmic.exe"
+      and (action_process_image_command_line ~= "(?i)/format:.*https?://"
+           or (action_process_image_command_line ~= "(?i)/format:.*\\.xsl"
+               and action_process_image_command_line !~= "(?i)\\\\system32\\\\"))
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_command_line, action_process_image_path
+  lucene: |
+    (process.name:wmic.exe OR process.parent.name:wmic.exe) AND (process.command_line:*/format\:\"http* OR (process.command_line:*/format\:* AND process.command_line:*.xsl* AND NOT process.command_line:*system32*))
+  sumo: "_sourceCategory=*Sysmon* \"1\"\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"Image\" as image\n| json field=_raw \"\
+    CommandLine\" as command_line\n| where event_id = \"1\" \n| where image matches \"*wmic.exe\"\n| where (command_line matches \"*/format:*http://*\"\
+    \ or command_line matches \"*/format:*https://*\" or (command_line matches \"*/format:*.xsl*\" and !(command_line matches \"*system32*\")))\n\
+    | fields _messageTime, _sourceHost, image, command_line\n"
 pseudo_logic: wmic.exe with /format:"http(s)://" or any .xsl path outside system32. Squiblytwo XSL-based proxy execution.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -107,7 +100,7 @@ references:
 - https://attack.mitre.org/techniques/T1220/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

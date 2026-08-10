@@ -19,68 +19,55 @@ queries:
   spl: "index=salesforce EventType=\"LoginAs\" \n| lookup salesforce_admins.csv username as SourceUsername OUTPUT is_admin as source_is_admin\n\
     | lookup salesforce_admins.csv username as TargetUsername OUTPUT is_admin as target_is_admin\n| where isnull(source_is_admin) OR source_is_admin=\"\
     false\"\n| where target_is_admin=\"true\"\n| table _time, SourceUsername, TargetUsername, src_ip, LoginUrl\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000421 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized User Login As HVT Account - Salesforce\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SalesforceEventLogFile
+    | where TimeGenerated > ago(24h)
+    | where EVENT_TYPE == "LoginAs"
+    | where USER_ID_DERIVED !in (SalesforceAdmins)
+    | join kind=inner (
+        SalesforceAdmins
+        | project TargetUserId = UserId
+    ) on $left.DELEGATED_USER_ID == $right.TargetUserId
+    | project TimeGenerated, SourceUsername = USER_ID_DERIVED, TargetUsername = DELEGATED_USER_NAME, SessionKey = SESSION_KEY, SourceIp = CLIENT_IP
+  aql: |
+    SELECT sourceip, "Source Username", "Target Username", "Event Type", eventtime, COUNT(*) AS event_count
+    FROM events
+    WHERE "Event Type" = 'LoginAs'
+      AND "Source Username" NOT IN ('admin1@company.com', 'admin2@company.com', 'serviceaccount@company.com')
+      AND "Target Username" IN ('hvt1@company.com', 'hvt2@company.com', 'admin3@company.com')
+    GROUP BY sourceip, "Source Username", "Target Username", "Event Type", eventtime
+    LAST 24 HOURS
+  yara_l: "rule salesforce_login_as_by_non_admin {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects LoginAs event\
+    \ where non-admin user impersonates admin/HVT account\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1078\"\
+    \n    severity = \"HIGH\"\n\n  events:\n    $e.metadata.product_name = \"Salesforce\"\n    $e.metadata.product_event_type = \"LoginAs\"\n\
+    \    $e.principal.user.userid = $source_user\n    $e.target.user.userid = $target_user\n    \n    not re.regex($e.principal.user.userid, `(?i)(admin|administrator|salesforce_admin)`)\n\
+    \    re.regex($e.target.user.userid, `(?i)(admin|administrator|hvt|executive|c-level)`)\n\n  match:\n    $source_user, $target_user over 5m\n\
+    \n  outcome:\n    $risk_score = 85\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-salesforce*
+    | WHERE event.action == "LoginAs" AND user.name NOT IN ("admin1", "admin2", "admin3") AND user.target.name IN ("salesforce_admin1", "salesforce_admin2", "hvt_account1")
+    | KEEP @timestamp, user.name, user.target.name, source.ip, event.action, host.name
+  leql: |
+    where(source_json.EVENT_TYPE="LoginAs" AND source_user NOT IN [salesforce_admins_list] AND destination_user IN [salesforce_hvt_accounts])
+  crowdstrike: "#type=salesforce EventType=\"LoginAs\" \n| !in(field=SourceUsername, values=[SalesforceAdminsList])\n| in(field=TargetUsername,\
+    \ values=[SalesforceAdminsList])\n| table([@timestamp, SourceUsername, TargetUsername, SourceIP, SessionKey, ComputerName])\n"
+  xql: |
+    dataset = salesforce_audit_logs
+    | filter event_type = "LoginAs"
+    | filter actor_user not in ("approved_admin1", "approved_admin2", "approved_admin3")
+    | filter target_user in ("salesforce_admin1", "salesforce_admin2", "hvt_user1", "hvt_user2")
+    | fields _time, actor_user, target_user, source_ip, session_key
+  lucene: |
+    event.type:"LoginAs" AND NOT source.user.name:(admin1 OR admin2 OR admin3) AND target.user.roles:("Salesforce Admin" OR "HVT")
+  sumo: |
+    _sourceCategory=*Salesforce* "LoginAs"
+    | json field=_raw "EVENT_TYPE" as event_type
+    | json field=_raw "DELEGATED_USER_NAME" as source_username
+    | json field=_raw "USER_NAME" as target_username
+    | where event_type = "LoginAs"
+    | where !(source_username in ("admin1@company.com", "admin2@company.com", "serviceaccount@company.com"))
+    | where target_username in ("hvt1@company.com", "hvt2@company.com", "admin3@company.com")
+    | fields _messageTime, source_username, target_username, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +77,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Salseforce Event  \nWhere the Event Type is 'LoginAs'\nWhere the Source Username is NOT on the Salesforce Admins List\nWhere\
   \ the Target Username is a Salesforce Admin/HVT Account"

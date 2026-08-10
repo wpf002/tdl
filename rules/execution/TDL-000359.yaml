@@ -17,82 +17,113 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=windows sourcetype=WinEventLog:Security (EventCode=592 OR EventCode=4688)
+  spl: 'index=windows sourcetype=WinEventLog:Security (EventCode=592 OR EventCode=4688)
+
     | eval Parent_Process_Name=coalesce(Parent_Process_Name, ParentImage, Creator_Process_Name)
+
     | eval Process_Name=coalesce(Process_Name, Image, New_Process_Name)
+
     | eval Command_Line=coalesce(CommandLine, Process_Command_Line)
+
     | eval match1=if(like(lower(Parent_Process_Name), "c:\\temp\\%") AND like(lower(Command_Line), "%cmd.exe /c whoami%"), 1, 0)
-    | eval match2=if(like(lower(Process_Name), "%dllhost.exe") AND (like(lower(Command_Line), "%cmd.exe /c echo%") OR like(lower(Command_Line), "%> \\\\.\\pipe%") OR like(lower(Command_Line), "%whoami.exe%")), 1, 0)
-    | eval match3=if((like(lower(Parent_Process_Name), "%dllhost.exe") OR like(lower(Parent_Process_Name), "%runonce.exe")) AND like(lower(Command_Line), "%cmd.exe /c echo%") AND like(lower(Command_Line), "%> \\\\.\\pipe%"), 1, 0)
+
+    | eval match2=if(like(lower(Process_Name), "%dllhost.exe") AND (like(lower(Command_Line), "%cmd.exe /c echo%") OR like(lower(Command_Line),
+    "%> \\\\.\\pipe%") OR like(lower(Command_Line), "%whoami.exe%")), 1, 0)
+
+    | eval match3=if((like(lower(Parent_Process_Name), "%dllhost.exe") OR like(lower(Parent_Process_Name), "%runonce.exe")) AND like(lower(Command_Line),
+    "%cmd.exe /c echo%") AND like(lower(Command_Line), "%> \\\\.\\pipe%"), 1, 0)
+
     | where match1=1 OR match2=1 OR match3=1
+
     | table _time, ComputerName, EventCode, Parent_Process_Name, Process_Name, Command_Line, User
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("cmd.exe", "dllhost.exe", "whoami.exe", "runonce.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('cmd.exe', 'dllhost.exe', 'whoami.exe', 'runonce.exe')\n\
-    LAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000359 {\n  meta:\n    author = \"TDL\"\n    description = \"Cobalt Strike Process Patterns\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1059\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(cmd.exe|dllhost.exe|whoami.exe|runonce.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("cmd.exe", "dllhost.exe", "whoami.exe", "runonce.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [cmd.exe, dllhost.exe, whoami.exe, runonce.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (cmd.exe, dllhost.exe, whoami.exe, runonce.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("cmd.exe", "dllhost.exe", "whoami.exe", "runonce.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(cmd.exe OR dllhost.exe OR whoami.exe OR runonce.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("cmd.exe", "dllhost.exe", "whoami.exe", "runonce.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (592, 4688)
+    | where (
+        (ParentProcessName startswith "C:\\Temp" and CommandLine contains "cmd.exe /c whoami")
+        or
+        (NewProcessName endswith "\\dllhost.exe" and (CommandLine contains "cmd.exe /c echo" or CommandLine contains "> \\\\.\\pipe" or CommandLine contains "whoami.exe"))
+        or
+        ((ParentProcessName endswith "\\dllhost.exe" or ParentProcessName endswith "\\runonce.exe") and CommandLine contains "cmd.exe /c echo" and CommandLine contains "> \\\\.\\pipe")
+    )
+    | project TimeGenerated, Computer, Account, ParentProcessName, NewProcessName, CommandLine, EventID
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Parent Process Name", "Process CommandLine"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND (
+        ("Parent Process Name" ILIKE 'C:\Temp%' AND "Process CommandLine" ILIKE '%cmd.exe /c whoami%')
+        OR
+        ("Process Name" ILIKE '%dllhost.exe%' AND ("Process CommandLine" ILIKE '%cmd.exe /c echo%' OR "Process CommandLine" ILIKE '%> \\.\pipe%' OR "Process CommandLine" ILIKE '%whoami.exe%'))
+        OR
+        (("Parent Process Name" ILIKE '%dllhost.exe%' OR "Parent Process Name" ILIKE '%runonce.exe%') AND ("Process CommandLine" ILIKE '%cmd.exe /c echo%' AND "Process CommandLine" ILIKE '%> \\.\pipe%'))
+      )
+    LAST 24 HOURS
+  yara_l: "rule suspicious_execution_t1059 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects suspicious process execution patterns\
+    \ associated with T1059\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1059\"\n    severity = \"HIGH\"\n\n  events:\n\
+    \    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      $e.metadata.product_event_type = \"592\" or\n      $e.metadata.product_event_type\
+    \ = \"4688\"\n    )\n    $e.principal.hostname = $host\n    \n    (\n      (\n        re.regex($e.principal.process.parent_process.file.full_path,\
+    \ `(?i)^C:\\\\Temp`) and\n        re.regex($e.principal.process.command_line, `(?i)cmd\\.exe /c whoami`)\n      )\n      or\n      (\n   \
+    \     re.regex($e.principal.process.file.full_path, `(?i)\\\\dllhost\\.exe$`) and\n        (\n          re.regex($e.principal.process.command_line,\
+    \ `(?i)cmd\\.exe /c echo`) or\n          re.regex($e.principal.process.command_line, `(?i)> \\\\\\\\\\.\\\\pipe`) or\n          re.regex($e.principal.process.command_line,\
+    \ `(?i)whoami\\.exe`)\n        )\n      )\n      or\n      (\n        (\n          re.regex($e.principal.process.parent_process.file.full_path,\
+    \ `(?i)\\\\dllhost\\.exe$`) or\n          re.regex($e.principal.process.parent_process.file.full_path, `(?i)\\\\runonce\\.exe$`)\n       \
+    \ ) and\n        re.regex($e.principal.process.command_line, `(?i)cmd\\.exe /c echo`) and\n        re.regex($e.principal.process.command_line,\
+    \ `(?i)> \\\\\\\\\\.\\\\pipe`)\n      )\n    )\n\n  match:\n    $host over 5m\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code IN ("592", "4688")
+      AND (
+        (process.parent.name LIKE "C:\\Temp*" AND process.command_line LIKE "*cmd.exe /c whoami*")
+        OR
+        (process.name == "dllhost.exe" AND (process.command_line LIKE "*cmd.exe /c echo*" OR process.command_line LIKE "*> \\\\\.\\pipe*" OR process.command_line LIKE "*whoami.exe*"))
+        OR
+        (process.parent.name IN ("dllhost.exe", "runonce.exe") AND process.command_line LIKE "*cmd.exe /c echo*" AND process.command_line LIKE "*> \\\\\.\\pipe*")
+      )
+    | KEEP @timestamp, host.name, user.name, process.name, process.parent.name, process.command_line
+  leql: |
+    where((source_json.EventID=4688 OR source_json.EventID=592) AND ((parent_process_name STARTS-WITH "C:\Temp" AND process_cmd_line ICONTAINS "cmd.exe /c whoami") OR (process_name ICONTAINS "dllhost.exe" AND (process_cmd_line ICONTAINS "cmd.exe /c echo" OR process_cmd_line ICONTAINS "> \\.\pipe" OR process_cmd_line ICONTAINS "whoami.exe")) OR ((parent_process_name ICONTAINS "dllhost.exe" OR parent_process_name ICONTAINS "runonce.exe") AND process_cmd_line ICONTAINS "cmd.exe /c echo" AND process_cmd_line ICONTAINS "> \\.\pipe")))
+  crowdstrike: |
+    EventCode=4688
+    | (
+        (ParentProcessName=C:\\Temp* CommandLine=*cmd.exe /c whoami*)
+        OR
+        (ProcessName=*dllhost.exe* (CommandLine=*cmd.exe /c echo* OR CommandLine=*> \\\\\.\\pipe* OR CommandLine=*whoami.exe*))
+        OR
+        ((ParentProcessName=*dllhost.exe* OR ParentProcessName=*runonce.exe*) (CommandLine=*cmd.exe /c echo* AND CommandLine=*> \\\\\.\\pipe*))
+      )
+    | table([@timestamp, ComputerName, ProcessName, ParentProcessName, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter (
+        (lowercase(actor_process_image_name) ~= "^c:\\\\temp\\\\" and action_process_image_command_line contains "cmd.exe /c whoami")
+        or
+        (lowercase(action_process_image_name) contains "dllhost.exe" and (action_process_image_command_line contains "cmd.exe /c echo" or action_process_image_command_line contains "> \\.\pipe" or action_process_image_command_line contains "whoami.exe"))
+        or
+        (lowercase(actor_process_image_name) in ("dllhost.exe", "runonce.exe") and action_process_image_command_line contains "cmd.exe /c echo" and action_process_image_command_line contains "> \\.\pipe")
+    )
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:(592 OR 4688) AND ((process.parent.name:C\:\\Temp* AND process.command_line:*cmd.exe\ \/c\ whoami*) OR (process.name:dllhost.exe AND process.command_line:(*cmd.exe\ \/c\ echo* OR *\>\ \\\\\.\\pipe* OR *whoami.exe*)) OR (process.parent.name:(dllhost.exe OR runonce.exe) AND process.command_line:*cmd.exe\ \/c\ echo* AND process.command_line:*\>\ \\\\\.\\pipe*))
+  sumo: |
+    _sourceCategory=*Windows* ("4688" OR "592")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ParentProcessName" as parent_process
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "NewProcessName" as process_name
+    | where event_id in ("4688", "592")
+    | where (
+        (parent_process matches "C:\\Temp*" AND command_line matches "*cmd.exe /c whoami*")
+        OR
+        (process_name matches "*dllhost.exe" AND (command_line matches "*cmd.exe /c echo*" OR command_line matches "*> \\.\pipe*" OR command_line matches "*whoami.exe*"))
+        OR
+        ((parent_process matches "*dllhost.exe" OR parent_process matches "*runonce.exe") AND command_line matches "*cmd.exe /c echo*" AND command_line matches "*> \\.\pipe*")
+    )
+    | fields _messageTime, _sourceHost, event_id, parent_process, process_name, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -102,7 +133,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows Process Creation Event\nWhere the Event ID is in [592, 4688]\nWhere\n\tParent Process Name starts with \"C:\\Temp\"\n\
   \tAND Command Line contains \"cmd.exe /c whoami\"\nOR\n\tProcess Name is dllhost.exe\n\tAND Command Line contains any of [\"cmd.exe /c echo\"\

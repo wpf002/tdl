@@ -41,71 +41,263 @@ queries:
     hkey_local_machine\\\\security\") OR\n            match(RegistryKey, \"registry\\\\machine\\\\system\") OR\n            match(RegistryKey,\
     \ \"registry\\\\machine\\\\sam\") OR\n            match(RegistryKey, \"registry\\\\machine\\\\security\")\n        )\n    )\n| table _time,\
     \ ComputerName, EventCode, ProcessName, CommandLine, RegistryKey, User\n"
-  kql: 'DeviceRegistryEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where registry_key matches regex "save hklm\system"
-
-    | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Registry Key\", \"Registry Value Name\", \"Registry Value Data\", \"Process Name\"\nFROM events\nWHERE\
-    \ LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n  AND \"EventID\" IN ('12','13','14')\n  AND \"registry_key\" LIKE '%save hklm\\\
-    system%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000202 {\n  meta:\n    author = \"TDL\"\n    description = \"Credential Dumping\"\n    severity = \"HIGH\"\n    tactic\
-    \ = \"TA0006\"\n    technique = \"T1003\"\n  events:\n    $e.metadata.event_type = \"REGISTRY_MODIFICATION\"\n    $e.registry_key = /save\
-    \ hklm\\system/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "registry" AND registry_key LIKE "%save hklm\system%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/save hklm\system/)
-
-    groupby(asset, registry_key, registry_value)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*save hklm\system*
-
-    | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
-
-    | sort -changes
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.REGISTRY AND registry_key ~= "save hklm\system"
-
-    | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
-
-    | sort desc changes
-
-    '
-  lucene: 'event.category:"registry" AND registry_key:*save hklm\system*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id IN ("12","13","14") AND registry_key matches "*save hklm\system*"
-
-    | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where EventID in (592, 4688, 4657)
+    | extend IsDomainController = iff(Computer has_any ("DC", "DomainController"), true, false)
+    | where (EventID in (592, 4688) and (
+        IsDomainController or
+        (Process =~ "reg.exe" and (
+            CommandLine has_any ("save hklm\\system", "save hklm\\sam", "save hklm\\security",
+                                 "save hkey_local_machine\\system", "save hkey_local_machine\\sam", "save hkey_local_machine\\security",
+                                 "save registry\\machine\\system", "save registry\\machine\\sam", "save registry\\machine\\security",
+                                 "export hklm\\system", "export hklm\\sam", "export hklm\\security",
+                                 "export hkey_local_machine\\system", "export hkey_local_machine\\sam", "export hkey_local_machine\\security",
+                                 "export registry\\machine\\system", "export registry\\machine\\sam", "export registry\\machine\\security")
+        )) or
+        (Process =~ "powershell.exe" and CommandLine has "Invoke-Mimikatz") or
+        (Process =~ "procdump.exe" and CommandLine has "lsass.exe") or
+        (Process =~ "taskmgr.exe" and CommandLine has "lsass")
+    )) or
+    (EventID == 4657 and IsDomainController and (
+        RegistryKey has_any ("hklm\\system", "hklm\\sam", "hkey_local_machine\\system", "hklm\\security",
+                             "hkey_local_machine\\sam", "hkey_local_machine\\security",
+                             "registry\\machine\\system", "registry\\machine\\sam", "registry\\machine\\security")
+    ))
+    | project TimeGenerated, Computer, Account, EventID, Process, CommandLine, RegistryKey, ParentProcessName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "EventID"
+    FROM events
+    WHERE "EventID" IN ('592', '4688', '4657')
+      AND (
+        ("EventID" IN ('592', '4688') AND (
+          ("Process Name" ILIKE '%reg.exe%' AND (
+            "Process CommandLine" ILIKE '%save%hklm\system%'
+            OR "Process CommandLine" ILIKE '%save%hklm\sam%'
+            OR "Process CommandLine" ILIKE '%save%hklm\security%'
+            OR "Process CommandLine" ILIKE '%save%hkey_local_machine\system%'
+            OR "Process CommandLine" ILIKE '%save%hkey_local_machine\sam%'
+            OR "Process CommandLine" ILIKE '%save%hkey_local_machine\security%'
+            OR "Process CommandLine" ILIKE '%save%registry\machine\system%'
+            OR "Process CommandLine" ILIKE '%save%registry\machine\sam%'
+            OR "Process CommandLine" ILIKE '%save%registry\machine\security%'
+            OR "Process CommandLine" ILIKE '%export%hklm\system%'
+            OR "Process CommandLine" ILIKE '%export%hklm\sam%'
+            OR "Process CommandLine" ILIKE '%export%hklm\security%'
+            OR "Process CommandLine" ILIKE '%export%hkey_local_machine\system%'
+            OR "Process CommandLine" ILIKE '%export%hkey_local_machine\sam%'
+            OR "Process CommandLine" ILIKE '%export%hkey_local_machine\security%'
+            OR "Process CommandLine" ILIKE '%export%registry\machine\system%'
+            OR "Process CommandLine" ILIKE '%export%registry\machine\sam%'
+            OR "Process CommandLine" ILIKE '%export%registry\machine\security%'
+          ))
+          OR ("Process Name" ILIKE '%powershell.exe%' AND "Process CommandLine" ILIKE '%Invoke-Mimikatz%')
+          OR ("Process Name" ILIKE '%procdump.exe%' AND "Process CommandLine" ILIKE '%lsass.exe%')
+          OR ("Process Name" ILIKE '%taskmgr.exe%' AND "Process CommandLine" ILIKE '%lsass%')
+        ))
+        OR ("EventID" = '4657' AND (
+          "Registry Key" ILIKE '%hklm\system%'
+          OR "Registry Key" ILIKE '%hklm\sam%'
+          OR "Registry Key" ILIKE '%hklm\security%'
+          OR "Registry Key" ILIKE '%hkey_local_machine\system%'
+          OR "Registry Key" ILIKE '%hkey_local_machine\sam%'
+          OR "Registry Key" ILIKE '%hkey_local_machine\security%'
+          OR "Registry Key" ILIKE '%registry\machine\system%'
+          OR "Registry Key" ILIKE '%registry\machine\sam%'
+          OR "Registry Key" ILIKE '%registry\machine\security%'
+        ))
+      )
+    LAST 24 HOURS
+  yara_l: "rule credential_access_registry_dump {\n  meta:\n    author = \"Chronicle Detection Engineering\"\n    description = \"Detects potential\
+    \ credential dumping via registry save/export or process dumping (MITRE T1003)\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique\
+    \ = \"T1003\"\n    severity = \"HIGH\"\n\n  events:\n    // Process Creation Events (4688)\n    $proc.metadata.event_type = \"PROCESS_LAUNCH\"\
+    \n    $proc.metadata.product_event_type = \"4688\"\n    $proc.principal.hostname = $host\n    \n    (\n      (\n        re.regex($proc.target.process.file.full_path,\
+    \ `(?i)\\\\reg\\.exe$`) and\n        (\n          re.regex($proc.target.process.command_line, `(?i)save\\s+hklm\\\\system`) or\n         \
+    \ re.regex($proc.target.process.command_line, `(?i)save\\s+hklm\\\\sam`) or\n          re.regex($proc.target.process.command_line, `(?i)save\\\
+    s+hklm\\\\security`) or\n          re.regex($proc.target.process.command_line, `(?i)save\\s+hkey_local_machine\\\\system`) or\n          re.regex($proc.target.process.command_line,\
+    \ `(?i)save\\s+hkey_local_machine\\\\sam`) or\n          re.regex($proc.target.process.command_line, `(?i)save\\s+hkey_local_machine\\\\security`)\
+    \ or\n          re.regex($proc.target.process.command_line, `(?i)save\\s+registry\\\\machine\\\\system`) or\n          re.regex($proc.target.process.command_line,\
+    \ `(?i)save\\s+registry\\\\machine\\\\sam`) or\n          re.regex($proc.target.process.command_line, `(?i)save\\s+registry\\\\machine\\\\\
+    security`) or\n          re.regex($proc.target.process.command_line, `(?i)export\\s+hklm\\\\system`) or\n          re.regex($proc.target.process.command_line,\
+    \ `(?i)export\\s+hklm\\\\sam`) or\n          re.regex($proc.target.process.command_line, `(?i)export\\s+hklm\\\\security`) or\n          re.regex($proc.target.process.command_line,\
+    \ `(?i)export\\s+hkey_local_machine\\\\system`) or\n          re.regex($proc.target.process.command_line, `(?i)export\\s+hkey_local_machine\\\
+    \\sam`) or\n          re.regex($proc.target.process.command_line, `(?i)export\\s+hkey_local_machine\\\\security`) or\n          re.regex($proc.target.process.command_line,\
+    \ `(?i)export\\s+registry\\\\machine\\\\system`) or\n          re.regex($proc.target.process.command_line, `(?i)export\\s+registry\\\\machine\\\
+    \\sam`) or\n          re.regex($proc.target.process.command_line, `(?i)export\\s+registry\\\\machine\\\\security`)\n        )\n      ) or\n\
+    \      (\n        re.regex($proc.target.process.file.full_path, `(?i)\\\\powershell\\.exe$`) and\n        re.regex($proc.target.process.command_line,\
+    \ `(?i)Invoke-Mimikatz`)\n      ) or\n      (\n        re.regex($proc.target.process.file.full_path, `(?i)\\\\procdump\\.exe$`) and\n    \
+    \    re.regex($proc.target.process.command_line, `(?i)lsass\\.exe`)\n      ) or\n      (\n        re.regex($proc.target.process.file.full_path,\
+    \ `(?i)\\\\taskmgr\\.exe$`) and\n        re.regex($proc.target.process.command_line, `(?i)lsass`)\n      )\n    )\n\n    // Registry Modification\
+    \ Events (4657)\n    $reg.metadata.event_type = \"REGISTRY_MODIFICATION\"\n    $reg.metadata.product_event_type = \"4657\"\n    $reg.principal.hostname\
+    \ = $host\n    (\n      re.regex($reg.target.registry.registry_key, `(?i)hklm\\\\system`) or\n      re.regex($reg.target.registry.registry_key,\
+    \ `(?i)hklm\\\\sam`) or\n      re.regex($reg.target.registry.registry_key, `(?i)hklm\\\\security`) or\n      re.regex($reg.target.registry.registry_key,\
+    \ `(?i)hkey_local_machine\\\\system`) or\n      re.regex($reg.target.registry.registry_key, `(?i)hkey_local_machine\\\\sam`) or\n      re.regex($reg.target.registry.registry_key,\
+    \ `(?i)hkey_local_machine\\\\security`) or\n      re.regex($reg.target.registry.registry_key, `(?i)registry\\\\machine\\\\system`) or\n  \
+    \    re.regex($reg.target.registry.registry_key, `(?i)registry\\\\machine\\\\sam`) or\n      re.regex($reg.target.registry.registry_key, `(?i)registry\\\
+    \\machine\\\\security`)\n    )\n\n  match:\n    $host over 5m\n\n  outcome:\n    $risk_score = max(85)\n\n  condition:\n    $proc or $reg\n\
+    }\n"
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code IN ("592", "4688", "4657")
+    | WHERE (
+        (event.code IN ("592", "4688") AND (
+          (TO_LOWER(process.name) == "reg.exe" AND (
+            TO_LOWER(process.command_line) LIKE "*save hklm\\system*" OR
+            TO_LOWER(process.command_line) LIKE "*save hklm\\sam*" OR
+            TO_LOWER(process.command_line) LIKE "*save hklm\\security*" OR
+            TO_LOWER(process.command_line) LIKE "*save hkey_local_machine\\system*" OR
+            TO_LOWER(process.command_line) LIKE "*save hkey_local_machine\\sam*" OR
+            TO_LOWER(process.command_line) LIKE "*save hkey_local_machine\\security*" OR
+            TO_LOWER(process.command_line) LIKE "*save registry\\machine\\system*" OR
+            TO_LOWER(process.command_line) LIKE "*save registry\\machine\\sam*" OR
+            TO_LOWER(process.command_line) LIKE "*save registry\\machine\\security*" OR
+            TO_LOWER(process.command_line) LIKE "*export hklm\\system*" OR
+            TO_LOWER(process.command_line) LIKE "*export hklm\\sam*" OR
+            TO_LOWER(process.command_line) LIKE "*export hklm\\security*" OR
+            TO_LOWER(process.command_line) LIKE "*export hkey_local_machine\\system*" OR
+            TO_LOWER(process.command_line) LIKE "*export hkey_local_machine\\sam*" OR
+            TO_LOWER(process.command_line) LIKE "*export hkey_local_machine\\security*" OR
+            TO_LOWER(process.command_line) LIKE "*export registry\\machine\\system*" OR
+            TO_LOWER(process.command_line) LIKE "*export registry\\machine\\sam*" OR
+            TO_LOWER(process.command_line) LIKE "*export registry\\machine\\security*"
+          )) OR
+          (TO_LOWER(process.name) == "powershell.exe" AND TO_LOWER(process.command_line) LIKE "*invoke-mimikatz*") OR
+          (TO_LOWER(process.name) == "procdump.exe" AND TO_LOWER(process.command_line) LIKE "*lsass.exe*") OR
+          (TO_LOWER(process.name) == "taskmgr.exe" AND TO_LOWER(process.command_line) LIKE "*lsass*")
+        )) OR
+        (event.code == "4657" AND (
+          TO_LOWER(registry.path) LIKE "*hklm\\system*" OR
+          TO_LOWER(registry.path) LIKE "*hklm\\sam*" OR
+          TO_LOWER(registry.path) LIKE "*hklm\\security*" OR
+          TO_LOWER(registry.path) LIKE "*hkey_local_machine\\system*" OR
+          TO_LOWER(registry.path) LIKE "*hkey_local_machine\\sam*" OR
+          TO_LOWER(registry.path) LIKE "*hkey_local_machine\\security*" OR
+          TO_LOWER(registry.path) LIKE "*registry\\machine\\system*" OR
+          TO_LOWER(registry.path) LIKE "*registry\\machine\\sam*" OR
+          TO_LOWER(registry.path) LIKE "*registry\\machine\\security*"
+        ))
+      )
+    | KEEP @timestamp, host.name, user.name, event.code, process.name, process.command_line, registry.path
+  leql: |
+    where(source_json.EventID IN [592, 4688, 4657] AND ((source_json.EventID IN [592, 4688] AND ((process_name="reg.exe" AND (process_cmd_line ICONTAINS "save hklm\\system" OR process_cmd_line ICONTAINS "save hklm\\sam" OR process_cmd_line ICONTAINS "save hklm\\security" OR process_cmd_line ICONTAINS "save hkey_local_machine\\system" OR process_cmd_line ICONTAINS "save hkey_local_machine\\sam" OR process_cmd_line ICONTAINS "save hkey_local_machine\\security" OR process_cmd_line ICONTAINS "save registry\\machine\\system" OR process_cmd_line ICONTAINS "save registry\\machine\\sam" OR process_cmd_line ICONTAINS "save registry\\machine\\security" OR process_cmd_line ICONTAINS "export hklm\\system" OR process_cmd_line ICONTAINS "export hklm\\sam" OR process_cmd_line ICONTAINS "export hklm\\security" OR process_cmd_line ICONTAINS "export hkey_local_machine\\system" OR process_cmd_line ICONTAINS "export hkey_local_machine\\sam" OR process_cmd_line ICONTAINS "export hkey_local_machine\\security" OR process_cmd_line ICONTAINS "export registry\\machine\\system" OR process_cmd_line ICONTAINS "export registry\\machine\\sam" OR process_cmd_line ICONTAINS "export registry\\machine\\security")) OR (process_name="powershell.exe" AND process_cmd_line ICONTAINS "Invoke-Mimikatz") OR (process_name="procdump.exe" AND process_cmd_line ICONTAINS "lsass.exe") OR (process_name="taskmgr.exe" AND process_cmd_line ICONTAINS "lsass"))) OR (source_json.EventID=4657 AND (source_json.ObjectName ICONTAINS "hklm\\system" OR source_json.ObjectName ICONTAINS "hklm\\sam" OR source_json.ObjectName ICONTAINS "hklm\\security" OR source_json.ObjectName ICONTAINS "hkey_local_machine\\system" OR source_json.ObjectName ICONTAINS "hkey_local_machine\\sam" OR source_json.ObjectName ICONTAINS "hkey_local_machine\\security" OR source_json.ObjectName ICONTAINS "registry\\machine\\system" OR source_json.ObjectName ICONTAINS "registry\\machine\\sam" OR source_json.ObjectName ICONTAINS "registry\\machine\\security"))))
+  crowdstrike: |
+    (EventCode=4688 OR EventCode=592 OR EventCode=4657)
+    | (
+        (EventCode=4688 OR EventCode=592) (
+            (NewProcessName=*reg.exe (
+                CommandLine IN [*"save hklm\system"*, *"save hklm\sam"*, *"save hklm\security"*, *"save hkey_local_machine\system"*, *"save hkey_local_machine\sam"*, *"save hkey_local_machine\security"*, *"save registry\machine\system"*, *"save registry\machine\sam"*, *"save registry\machine\security"*, *"export hklm\system"*, *"export hklm\sam"*, *"export hklm\security"*, *"export hkey_local_machine\system"*, *"export hkey_local_machine\sam"*, *"export hkey_local_machine\security"*, *"export registry\machine\system"*, *"export registry\machine\sam"*, *"export registry\machine\security"*]
+            ))
+            OR (NewProcessName=*powershell.exe CommandLine=*Invoke-Mimikatz*)
+            OR (NewProcessName=*procdump.exe CommandLine=*lsass.exe*)
+            OR (NewProcessName=*taskmgr.exe CommandLine=*lsass*)
+        )
+        OR (
+            EventCode=4657 (
+                ObjectName IN [*hklm\system*, *hklm\sam*, *hklm\security*, *hkey_local_machine\system*, *hkey_local_machine\sam*, *hkey_local_machine\security*, *registry\machine\system*, *registry\machine\sam*, *registry\machine\security*]
+            )
+        )
+    )
+    | table([@timestamp, ComputerName, EventCode, NewProcessName, CommandLine, ObjectName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688, 4657)
+    | filter (
+        (action_evtlog_event_id in (592, 4688) and (
+            (lowercase(action_process_image_name) contains "reg.exe" and (
+                lowercase(action_process_image_command_line) contains "save hklm\\system" or
+                lowercase(action_process_image_command_line) contains "save hklm\\sam" or
+                lowercase(action_process_image_command_line) contains "save hklm\\security" or
+                lowercase(action_process_image_command_line) contains "save hkey_local_machine\\system" or
+                lowercase(action_process_image_command_line) contains "save hkey_local_machine\\sam" or
+                lowercase(action_process_image_command_line) contains "save hkey_local_machine\\security" or
+                lowercase(action_process_image_command_line) contains "save registry\\machine\\system" or
+                lowercase(action_process_image_command_line) contains "save registry\\machine\\sam" or
+                lowercase(action_process_image_command_line) contains "save registry\\machine\\security" or
+                lowercase(action_process_image_command_line) contains "export hklm\\system" or
+                lowercase(action_process_image_command_line) contains "export hklm\\sam" or
+                lowercase(action_process_image_command_line) contains "export hklm\\security" or
+                lowercase(action_process_image_command_line) contains "export hkey_local_machine\\system" or
+                lowercase(action_process_image_command_line) contains "export hkey_local_machine\\sam" or
+                lowercase(action_process_image_command_line) contains "export hkey_local_machine\\security" or
+                lowercase(action_process_image_command_line) contains "export registry\\machine\\system" or
+                lowercase(action_process_image_command_line) contains "export registry\\machine\\sam" or
+                lowercase(action_process_image_command_line) contains "export registry\\machine\\security"
+            )) or
+            (lowercase(action_process_image_name) contains "powershell.exe" and lowercase(action_process_image_command_line) contains "invoke-mimikatz") or
+            (lowercase(action_process_image_name) contains "procdump.exe" and lowercase(action_process_image_command_line) contains "lsass.exe") or
+            (lowercase(action_process_image_name) contains "taskmgr.exe" and lowercase(action_process_image_command_line) contains "lsass")
+        )) or
+        (action_evtlog_event_id = 4657 and (
+            lowercase(action_evtlog_message) contains "hklm\\system" or
+            lowercase(action_evtlog_message) contains "hklm\\sam" or
+            lowercase(action_evtlog_message) contains "hklm\\security" or
+            lowercase(action_evtlog_message) contains "hkey_local_machine\\system" or
+            lowercase(action_evtlog_message) contains "hkey_local_machine\\sam" or
+            lowercase(action_evtlog_message) contains "hkey_local_machine\\security" or
+            lowercase(action_evtlog_message) contains "registry\\machine\\system" or
+            lowercase(action_evtlog_message) contains "registry\\machine\\sam" or
+            lowercase(action_evtlog_message) contains "registry\\machine\\security"
+        ))
+    )
+    | fields _time, agent_hostname, action_evtlog_event_id, action_process_image_name, action_process_image_command_line, actor_effective_username
+  lucene: |
+    event.code:(4688 OR 592 OR 4657) AND (
+      (event.code:(4688 OR 592) AND (
+        (process.name:reg.exe AND process.command_line:(*save\ hklm\\system* OR *save\ hklm\\sam* OR *save\ hklm\\security* OR *save\ hkey_local_machine\\system* OR *save\ hkey_local_machine\\sam* OR *save\ hkey_local_machine\\security* OR *save\ registry\\machine\\system* OR *save\ registry\\machine\\sam* OR *save\ registry\\machine\\security* OR *export\ hklm\\system* OR *export\ hklm\\sam* OR *export\ hklm\\security* OR *export\ hkey_local_machine\\system* OR *export\ hkey_local_machine\\sam* OR *export\ hkey_local_machine\\security* OR *export\ registry\\machine\\system* OR *export\ registry\\machine\\sam* OR *export\ registry\\machine\\security*)) OR
+        (process.name:powershell.exe AND process.command_line:*Invoke\-Mimikatz*) OR
+        (process.name:procdump.exe AND process.command_line:*lsass.exe*) OR
+        (process.name:taskmgr.exe AND process.command_line:*lsass*)
+      )) OR
+      (event.code:4657 AND (winlog.event_data.ObjectName:(*hklm\\system* OR *hklm\\sam* OR *hklm\\security* OR *hkey_local_machine\\system* OR *hkey_local_machine\\sam* OR *hkey_local_machine\\security* OR *registry\\machine\\system* OR *registry\\machine\\sam* OR *registry\\machine\\security*) OR registry.path:(*hklm\\system* OR *hklm\\sam* OR *hklm\\security* OR *hkey_local_machine\\system* OR *hkey_local_machine\\sam* OR *hkey_local_machine\\security* OR *registry\\machine\\system* OR *registry\\machine\\sam* OR *registry\\machine\\security*)))
+    )
+  sumo: |
+    _sourceCategory=*Windows* (EventID=4688 OR EventID=592 OR EventID=4657)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Computer" as computer
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "ProcessName" as process_name2
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "ObjectName" as registry_key
+    | where event_id in ("4688", "592", "4657")
+    | where (
+        (event_id in ("4688", "592") and (
+            (process_name matches "*\\reg.exe" or process_name2 matches "*\\reg.exe") and (
+                command_line matches "*save*hklm\\system*" or
+                command_line matches "*save*hklm\\sam*" or
+                command_line matches "*save*hklm\\security*" or
+                command_line matches "*save*hkey_local_machine\\system*" or
+                command_line matches "*save*hkey_local_machine\\sam*" or
+                command_line matches "*save*hkey_local_machine\\security*" or
+                command_line matches "*save*registry\\machine\\system*" or
+                command_line matches "*save*registry\\machine\\sam*" or
+                command_line matches "*save*registry\\machine\\security*" or
+                command_line matches "*export*hklm\\system*" or
+                command_line matches "*export*hklm\\sam*" or
+                command_line matches "*export*hklm\\security*" or
+                command_line matches "*export*hkey_local_machine\\system*" or
+                command_line matches "*export*hkey_local_machine\\sam*" or
+                command_line matches "*export*hkey_local_machine\\security*" or
+                command_line matches "*export*registry\\machine\\system*" or
+                command_line matches "*export*registry\\machine\\sam*" or
+                command_line matches "*export*registry\\machine\\security*"
+            )
+        ) or
+        (event_id in ("4688", "592") and (process_name matches "*\\powershell.exe" or process_name2 matches "*\\powershell.exe") and command_line matches "*Invoke-Mimikatz*") or
+        (event_id in ("4688", "592") and (process_name matches "*\\procdump.exe" or process_name2 matches "*\\procdump.exe") and command_line matches "*lsass.exe*") or
+        (event_id in ("4688", "592") and (process_name matches "*\\taskmgr.exe" or process_name2 matches "*\\taskmgr.exe") and command_line matches "*lsass*") or
+        (event_id = "4657" and (
+            registry_key matches "*hklm\\system*" or
+            registry_key matches "*hklm\\sam*" or
+            registry_key matches "*hklm\\security*" or
+            registry_key matches "*hkey_local_machine\\system*" or
+            registry_key matches "*hkey_local_machine\\sam*" or
+            registry_key matches "*hkey_local_machine\\security*" or
+            registry_key matches "*registry\\machine\\system*" or
+            registry_key matches "*registry\\machine\\sam*" or
+            registry_key matches "*registry\\machine\\security*"
+        ))
+    )
+    | fields _messageTime, computer, event_id, process_name, process_name2, command_line, registry_key
 false_positives:
 - Security software
 - Authorized admin tools
@@ -115,7 +307,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Creation Event\nWhere the Event ID is in [592, 4688]\nWhere Destination Host is a Domain Controller\nOR\n   \
   \ Where Process Name equals \"reg.exe\"\n\tOR\n\t\tWhere Command Line contains \"save hklm\\system\"\n\t\tWhere Command Line contains \"save\

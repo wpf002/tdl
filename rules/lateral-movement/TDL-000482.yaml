@@ -15,85 +15,75 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=firewall action=allowed direction=inbound src_ip!="10.0.0.0/8" src_ip!="172.16.0.0/12" src_ip!="192.168.0.0/16" dest_ip="10.0.0.0/8" OR dest_ip="172.16.0.0/12" OR dest_ip="192.168.0.0/16" (dest_port IN ("139", "445") OR app="*smb*" OR app="*samba*")
+  spl: 'index=firewall action=allowed direction=inbound src_ip!="10.0.0.0/8" src_ip!="172.16.0.0/12" src_ip!="192.168.0.0/16" dest_ip="10.0.0.0/8"
+    OR dest_ip="172.16.0.0/12" OR dest_ip="192.168.0.0/16" (dest_port IN ("139", "445") OR app="*smb*" OR app="*samba*")
+
     | eval src_ip_dest_combo=src_ip.":".dest_ip
+
     | eventstats earliest(_time) as first_seen by src_ip
+
     | where (now() - first_seen) < (30*86400)
-    | stats earliest(_time) as detection_time, latest(_time) as last_seen, dc(dest_ip) as unique_destinations, values(dest_port) as ports, values(app) as applications by src_ip
+
+    | stats earliest(_time) as detection_time, latest(_time) as last_seen, dc(dest_ip) as unique_destinations, values(dest_port) as ports, values(app)
+    as applications by src_ip
+
     | where (now() - detection_time) < (30*86400)
+
     | table src_ip, detection_time, last_seen, unique_destinations, ports, applications
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where application matches regex "smb"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "application" LIKE ''%smb%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_lm_000482 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Allowed Inbound SMB Traffic\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0008\"\n    technique = \"T1021\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.application\
-    \ = /smb/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND application LIKE "%smb%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND application=/smb/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND application=*smb*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND application ~= "smb"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND application:*smb*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where application matches "*smb*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: "let baseline_period = 30d;\nlet detection_period = 1d;\nlet baseline_ips = \n    CommonSecurityLog\n    | where TimeGenerated between\
+    \ (ago(baseline_period + detection_period) .. ago(detection_period))\n    | where DeviceAction =~ \"Allow\"\n    | where (DestinationPort\
+    \ in (\"139\", \"445\") or ApplicationProtocol contains \"smb\" or ApplicationProtocol contains \"samba\")\n    | where DeviceDirection =~\
+    \ \"Inbound\"\n    | distinct SourceIP;\nCommonSecurityLog\n| where TimeGenerated > ago(detection_period)\n| where DeviceAction =~ \"Allow\"\
+    \n| where (DestinationPort in (\"139\", \"445\") or ApplicationProtocol contains \"smb\" or ApplicationProtocol contains \"samba\")\n| where\
+    \ DeviceDirection =~ \"Inbound\"\n| where SourceIP !in (baseline_ips)\n| project TimeGenerated, SourceIP, DestinationIP, DestinationPort,\
+    \ ApplicationProtocol, DeviceAction, DeviceDirection, DeviceVendor, DeviceProduct\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, application, COUNT(*) AS event_count, FIRST(eventtime) AS first_seen, LAST(eventtime) AS last_seen
+    FROM events
+    WHERE (categoryname(category) ILIKE '%firewall%' OR categoryname(category) ILIKE '%network%')
+      AND INOFFENSE(sourceip) = 'false'
+      AND INOFFENSE(destinationip) = 'true'
+      AND (qidname(qid) ILIKE '%accept%' OR qidname(qid) ILIKE '%allow%' OR qidname(qid) ILIKE '%permit%')
+      AND (destinationport IN ('139','445') OR application ILIKE '%smb%' OR application ILIKE '%samba%')
+    GROUP BY sourceip, destinationip, destinationport, application
+    LAST 90 DAYS
+  yara_l: "rule lateral_movement_smb_new_external_source {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects new external\
+    \ source IPs connecting inbound to SMB ports (139/445) or SMB applications - MITRE T1021\"\n    mitre_attack_tactic = \"Lateral Movement\"\
+    \n    mitre_attack_technique = \"T1021\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n\
+    \    $e.security_result.action = \"ALLOW\"\n    $e.network.direction = \"INBOUND\"\n    (\n      $e.target.port = \"139\" or\n      $e.target.port\
+    \ = \"445\" or\n      re.regex($e.network.application_protocol, `(?i)smb`) or\n      re.regex($e.network.application_protocol, `(?i)samba`)\n\
+    \    )\n    $e.principal.ip = $source_ip\n    $e.target.ip = $target_ip\n    \n  match:\n    $source_ip over 90d\n    \n  outcome:\n    $risk_score\
+    \ = 65\n    $first_seen_time = min($e.metadata.event_timestamp.seconds)\n    $last_seen_time = max($e.metadata.event_timestamp.seconds)\n\
+    \    $target_ips = array_distinct($e.target.ip)\n    $target_ports = array_distinct($e.target.port)\n    \n  condition:\n    $e and #e >=\
+    \ 1\n}\n"
+  esql: "FROM logs-network.firewall*\n| WHERE @timestamp > NOW() - 90 days\n  AND network.direction == \"inbound\"\n  AND event.action == \"allowed\"\
+    \n  AND (\n    destination.port IN (\"139\", \"445\")\n    OR TO_LOWER(network.application) LIKE \"*smb*\"\n    OR TO_LOWER(network.application)\
+    \ LIKE \"*samba*\"\n  )\n| EVAL baseline_period = @timestamp < NOW() - 30 days\n| STATS \n    first_seen = MIN(@timestamp),\n    baseline_count\
+    \ = SUM(CASE(baseline_period == true, 1, 0)),\n    recent_count = SUM(CASE(baseline_period == false, 1, 0))\n  BY source.ip, destination.ip\n\
+    | WHERE baseline_count == 0 AND recent_count > 0\n| KEEP source.ip, destination.ip, first_seen\n"
+  leql: |
+    where(direction=INBOUND AND action=ALLOW AND (destination_port IN [139, 445] OR application ICONTAINS "smb" OR application ICONTAINS "samba")) groupby(source_address) calculate(count)
+  crowdstrike: |
+    #type=firewall (Direction=inbound OR Direction=Inbound) (Action=allow OR Action=allowed OR Action=Allow OR Action=Allowed)
+    (DestinationPort=139 OR DestinationPort=445 OR Application=*smb* OR Application=*samba*)
+    | groupBy([SourceIP, DestinationIP], function=count(as=events))
+    | table([SourceIP, DestinationIP, events])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_source = "from-zone" and dest_location = "private" and source_location = "public" and action = "allow"
+    | filter dest_port in ("139", "445") or lowercase(app) contains "smb" or lowercase(app) contains "samba"
+    | alter source_ip_key = source_ip
+    | comp count() as event_count by source_ip_key
+    | filter event_count > 0
+  lucene: |
+    (firewall.direction:inbound OR network.direction:inbound OR direction:inbound) AND (firewall.action:allowed OR action:allowed OR firewall.action:allow OR action:allow) AND (_exists_:source.ip OR _exists_:src_ip OR _exists_:sourceip) AND (_exists_:destination.ip OR _exists_:dest_ip OR _exists_:destinationip) AND (destination.port:("139" OR "445") OR dest_port:("139" OR "445") OR application:*smb* OR application:*samba*)
+  sumo: "_sourceCategory=*Firewall* \n| json field=_raw \"action\" as action\n| json field=_raw \"src_ip\" as src_ip\n| json field=_raw \"dest_ip\"\
+    \ as dest_ip\n| json field=_raw \"dest_port\" as dest_port\n| json field=_raw \"application\" as application\n| json field=_raw \"direction\"\
+    \ as direction\n| where direction = \"Inbound\" \n  and (action matches \"*allow*\" or action matches \"*permit*\")\n  and (dest_port in (\"\
+    139\", \"445\") or application matches \"*smb*\" or application matches \"*samba*\")\n| where !isPrivateIP(src_ip) and isPrivateIP(dest_ip)\n\
+    | count by src_ip, dest_ip\n| fields src_ip, dest_ip\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -103,7 +93,7 @@ tags:
 - lateral-movement
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Firewall Event \nFrom one external source to one internal destination (Inbound)\nWhere the Action is Allowed\nOR\n    Where the\
   \ Destination Port IN (\"139\", \"445\")\n\n    Where the Application contains \"smb\"\n\n    Where the Application contains \"samba\"\n\nBaseline\

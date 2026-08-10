@@ -20,71 +20,66 @@ queries:
   spl: "index=web OR index=webserver \n(uri_path=\"*.html\" OR uri_path=\"*.htm\" OR uri_path=\"*.php\" OR uri_path=\"*.aspx\" OR uri_path=\"\
     *.asp\" OR uri_path=\"*.jsp\")\nNOT [| inputlookup observed_scripts.csv | fields uri_path]\n| table _time, src_ip, dest, uri_path, status,\
     \ method, user_agent\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000233 {\n  meta:\n    author = \"TDL\"\n    description = \"New Webserver Scripts\"\n    severity = \"MEDIUM\"\n \
-    \   tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    W3CIISLog
+    | where TimeGenerated > ago(1h)
+    | where csUriStem endswith ".html" or csUriStem endswith ".htm" or csUriStem endswith ".php" or csUriStem endswith ".aspx" or csUriStem endswith ".asp" or csUriStem endswith ".jsp"
+    | extend FileName = tostring(split(csUriStem, "/")[-1])
+    | join kind=leftanti (
+        W3CIISLog
+        | where TimeGenerated between (ago(30d) .. ago(1h))
+        | where csUriStem endswith ".html" or csUriStem endswith ".htm" or csUriStem endswith ".php" or csUriStem endswith ".aspx" or csUriStem endswith ".asp" or csUriStem endswith ".jsp"
+        | extend FileName = tostring(split(csUriStem, "/")[-1])
+        | distinct FileName
+    ) on FileName
+    | project TimeGenerated, csUriStem, FileName, cIP, csMethod, scStatus, csUserAgent, Computer
+  aql: |
+    SELECT sourceip, destinationip, URL, "Web Script File Name", LOGSOURCENAME(logsourceid) AS host, COUNT(*) AS requests
+    FROM events
+    WHERE category IN (SELECT category FROM categories WHERE name ILIKE '%web%' OR name ILIKE '%http%')
+      AND (URL ILIKE '%.html' OR URL ILIKE '%.htm' OR URL ILIKE '%.php' OR URL ILIKE '%.aspx' OR URL ILIKE '%.asp' OR URL ILIKE '%.jsp')
+      AND "Web Script File Name" IS NOT NULL
+    GROUP BY sourceip, destinationip, URL, "Web Script File Name", LOGSOURCENAME(logsourceid)
+    LAST 1 HOURS
+  yara_l: "rule suspicious_web_script_access {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects access to web scripts\
+    \ not in observed baseline - potential T1078 Valid Accounts abuse\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique\
+    \ = \"T1078\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    (\n      re.regex($e.target.url,\
+    \ `\\.html$`) or\n      re.regex($e.target.url, `\\.htm$`) or\n      re.regex($e.target.url, `\\.php$`) or\n      re.regex($e.target.url,\
+    \ `\\.aspx$`) or\n      re.regex($e.target.url, `\\.asp$`) or\n      re.regex($e.target.url, `\\.jsp$`)\n    )\n    not re.regex($e.target.file.full_path,\
+    \ `(?i)(index\\.html|home\\.php|login\\.aspx|default\\.asp|main\\.jsp|index\\.htm)`)\n    $e.target.hostname = $webserver\n    \n  match:\n\
+    \    $webserver over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-web* \n| WHERE url.path RLIKE \".*\\\\.(html|htm|php|aspx|asp|jsp)$\"\n| EVAL script_name = REPLACE(url.path, \".*/\", \"\"\
+    )\n| WHERE script_name NOT IN (\"index.html\", \"index.htm\", \"index.php\", \"default.aspx\", \"default.asp\", \"index.jsp\", \"login.html\"\
+    , \"login.php\", \"home.html\", \"home.php\", \"admin.php\", \"dashboard.php\", \"main.html\")\n| KEEP @timestamp, source.ip, url.path, script_name,\
+    \ host.name, user.name, http.request.method, http.response.status_code\n"
+  leql: |
+    where(url_path ENDS-WITH ".html" OR url_path ENDS-WITH ".htm" OR url_path ENDS-WITH ".php" OR url_path ENDS-WITH ".aspx" OR url_path ENDS-WITH ".asp" OR url_path ENDS-WITH ".jsp")
+  crowdstrike: |
+    #type=webserver url_path=/*.html OR url_path=/*.htm OR url_path=/*.php OR url_path=/*.aspx OR url_path=/*.asp OR url_path=/*.jsp
+    | regex("(?<script_name>[^/]+\.(html|htm|php|aspx|asp|jsp))$", field=url_path)
+    | !in(field=script_name, values=[/* Add your observed scripts whitelist here */])
+    | table([@timestamp, ComputerName, url_path, script_name, src_ip, user_agent])
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter http_method != null and url_path != null
+    | alter web_script = arrayindex(regextract(url_path, "([^/]+)$"), 0)
+    | filter web_script ~= "(?i)\\.(html|htm|php|aspx|asp|jsp)$"
+    | alter script_lower = lowercase(web_script)
+    | comp count() as request_count by script_lower, dest_ip, url_path
+    | comp values(dest_ip) as servers, sum(request_count) as total_requests by script_lower
+    | comp count_distinct(script_lower) as unique_scripts
+    | join type=left (dataset = panw_ngfw_threat_raw | filter http_method != null | alter web_script = arrayindex(regextract(url_path, "([^/]+)$"), 0) | filter web_script ~= "(?i)\\.(html|htm|php|aspx|asp|jsp)$" | alter script_lower = lowercase(web_script) | comp count() as baseline_count by script_lower | filter baseline_count >= 10 | fields script_lower | alter is_observed = "true") as observed script_lower = observed.script_lower
+    | filter observed.is_observed = null
+    | fields script_lower, servers, total_requests
+  lucene: |
+    _exists_:url.path AND (url.path:*.html OR url.path:*.htm OR url.path:*.php OR url.path:*.aspx OR url.path:*.asp OR url.path:*.jsp) AND NOT _exists_:file.name
+  sumo: |
+    _sourceCategory=*Web* OR _sourceCategory=*IIS* OR _sourceCategory=*Apache* OR _sourceCategory=*nginx*
+    | json field=_raw "url" as url_path
+    | parse regex field=url_path "(?<script_name>[^\/\?]+\.(html|htm|php|aspx|asp|jsp))(\?.*)?$"
+    | where !isNull(script_name)
+    | where !(script_name in ("index.html", "index.htm", "home.html", "home.htm", "default.aspx", "default.asp", "index.php", "login.html", "login.php", "login.aspx", "main.html", "main.htm"))
+    | fields _messageTime, _sourceHost, url_path, script_name
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -94,7 +89,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Webserver Request Event
 

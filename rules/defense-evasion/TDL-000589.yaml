@@ -19,84 +19,188 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=4769 OR EventCode=4768)
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=4769 OR EventCode=4768)
+
     | eval timewindow=relative_time(_time, "-5h")
-    | eventstats min(_time) as first_event, max(_time) as last_event, values(EventCode) as all_event_codes, dc(eval(if(EventCode=4769, Service_Name, null()))) as unique_services, count(eval(if(EventCode=4769, 1, null()))) as ticket_count by Source_Network_Address, Account_Name
+
+    | eventstats min(_time) as first_event, max(_time) as last_event, values(EventCode) as all_event_codes, dc(eval(if(EventCode=4769, Service_Name,
+    null()))) as unique_services, count(eval(if(EventCode=4769, 1, null()))) as ticket_count by Source_Network_Address, Account_Name
+
     | where EventCode=4769
+
     | where NOT match(Account_Name, "\$$")
+
     | where NOT match(Service_Name, "\$$")
+
     | where Service_Name!="krbtgt"
+
     | where (last_event - first_event) <= 18000
+
     | where ticket_count >= 5
+
     | where unique_services >= 5
+
     | where NOT match(all_event_codes, "4768")
+
     | stats count, values(Service_Name) as service_names, min(_time) as first_seen, max(_time) as last_seen by Source_Network_Address, Account_Name
+
     | table first_seen, last_seen, Source_Network_Address, Account_Name, count, service_names
-  kql: 'SecurityEvent
 
-    | where TimeGenerated > ago(1d)
+    '
+  kql: |
+    let timeframe = 5h;
+    let threshold = 5;
+    let suspiciousActivity = SecurityEvent
+    | where TimeGenerated > ago(timeframe)
+    | where EventID == 4769
+    | where Account !endswith "$"
+    | extend ServiceName = extract(@"Service Name:\s+(\S+)", 1, EventData)
+    | where ServiceName !endswith "$"
+    | where ServiceName != "krbtgt"
+    | extend SrcIP = IpAddress
+    | summarize ServiceNames = make_set(ServiceName), EventCount = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by SrcIP, Account
+    | where EventCount >= threshold
+    | where array_length(ServiceNames) >= threshold
+    | project SrcIP, Account, ServiceNames, EventCount, FirstSeen, LastSeen;
+    let tgsWithoutTgt = suspiciousActivity
+    | join kind=leftanti (
+        SecurityEvent
+        | where TimeGenerated > ago(timeframe)
+        | where EventID == 4768
+        | extend SrcIP = IpAddress
+        | project SrcIP, Account
+        | distinct SrcIP, Account
+    ) on SrcIP, Account;
+    tgsWithoutTgt
+  aql: |
+    SELECT sourceip, username, UNIQUECOUNT("Service Name") AS unique_services, COUNT(*) AS event_count
+    FROM events
+    WHERE "EventID" = '4769'
+      AND username NOT LIKE '%$'
+      AND "Service Name" NOT LIKE '%$'
+      AND "Service Name" != 'krbtgt'
+      AND sourceip NOT IN (
+        SELECT sourceip FROM events WHERE "EventID" = '4768' LAST 5 HOURS
+      )
+    GROUP BY sourceip, username
+    HAVING unique_services >= 5 AND event_count >= 5
+    LAST 5 HOURS
+  yara_l: |
+    rule mitre_t1550_kerberoasting_activity {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects potential Kerberoasting via multiple TGS requests without TGT from same source"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1550"
+        severity = "HIGH"
 
+      events:
+        $tgs.metadata.event_type = "USER_UNCATEGORIZED"
+        $tgs.metadata.product_event_type = "4769"
+        $tgs.principal.user.userid = $user
+        $tgs.principal.ip = $src_ip
+        $tgs.target.resource.name = $service_name
+        not re.regex($tgs.principal.user.userid, `\$$`)
+        not re.regex($tgs.target.resource.name, `\$$`)
+        $tgs.target.resource.name != "krbtgt"
+
+        $tgt.metadata.event_type = "USER_UNCATEGORIZED"
+        $tgt.metadata.product_event_type = "4768"
+        $tgt.principal.user.userid = $user
+        $tgt.principal.ip = $src_ip
+
+      match:
+        $src_ip, $user over 5h
+
+      outcome:
+        $risk_score = 85
+        $unique_services = count_distinct($tgs.target.resource.name)
+
+      condition:
+        #tgs >= 5 and
+        $unique_services >= 5 and
+        #tgt = 0
+    }
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE @timestamp > NOW() - 5 hours
+      AND event.code IN ("4768", "4769")
+    | EVAL is_4768 = CASE(event.code == "4768", 1, 0),
+           is_4769 = CASE(event.code == "4769", 1, 0),
+           src_user = COALESCE(winlog.event_data.TargetUserName, user.name),
+           src_ip = COALESCE(winlog.event_data.IpAddress, source.ip),
+           service_name = winlog.event_data.ServiceName
+    | WHERE NOT (src_user LIKE "*$")
+    | STATS count_4769 = SUM(is_4769),
+            count_4768 = SUM(is_4768),
+            unique_services = COUNT_DISTINCT(service_name)
+      BY src_ip, src_user, service_name
+    | WHERE service_name IS NOT NULL
+      AND NOT (service_name LIKE "*$")
+      AND service_name != "krbtgt"
+    | STATS total_4769 = SUM(count_4769),
+            total_4768 = SUM(count_4768),
+            distinct_services = COUNT_DISTINCT(service_name)
+      BY src_ip, src_user
+    | WHERE total_4769 >= 5
+      AND distinct_services >= 5
+      AND total_4768 == 0
+    | KEEP src_ip, src_user, total_4769, distinct_services
+  leql: |
+    where(source_json.EventID=4769 AND source_user NOT ENDS-WITH "$" AND source_json.ServiceName NOT ENDS-WITH "$" AND source_json.ServiceName != "krbtgt") groupby(source_address, source_user) calculate(unique:source_json.ServiceName)
+  crowdstrike: |
+    EventCode=4769
+    | !match(field="TargetUserName", regex=".*\$$")
+    | !match(field="ServiceName", regex=".*\$$")
+    | ServiceName!=krbtgt
+    | groupBy([IpAddress, TargetUserName], function=[count(as=event_count), count(ServiceName, distinct=true, as=unique_services)])
+    | event_count >= 5
+    | unique_services >= 5
+    | join({EventCode=4768 | groupBy([IpAddress, TargetUserName], function=count(as=tgt_count))}, field=[IpAddress, TargetUserName], include=[tgt_count], mode=left)
+    | default(field=tgt_count, value=0)
+    | tgt_count = 0
+    | table([IpAddress, TargetUserName, event_count, unique_services])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (4768, 4769)
+    | alter src_user = coalesce(action_evtlog_event_data_TargetUserName, ""),
+            src_ip = coalesce(action_evtlog_event_data_IpAddress, ""),
+            service_name = coalesce(action_evtlog_event_data_ServiceName, "")
+    | filter src_user != "" and src_ip != ""
+    | bin _time span = 5h
+    | alter is_4769 = if(action_evtlog_event_id = 4769, 1, 0),
+            is_4768 = if(action_evtlog_event_id = 4768, 1, 0)
+    | comp sum(is_4769) as total_4769,
+            sum(is_4768) as total_4768,
+            count_distinct(if(is_4769 = 1 and not src_user ~= "\$$" and not service_name ~= "\$$" and service_name != "krbtgt", service_name, null)) as unique_services
+      by _time, src_ip, src_user
+    | filter total_4769 >= 5 and unique_services >= 5 and total_4768 = 0
+    | fields _time, src_ip, src_user, total_4769, unique_services
+  lucene: |
+    event.code:4769 AND NOT winlog.event_data.TargetUserName:*$ AND NOT winlog.event_data.ServiceName:*$ AND NOT winlog.event_data.ServiceName:krbtgt
+  sumo: |
+    _sourceCategory=*Windows* ("4769" OR "4768")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "IpAddress" as src_ip
+    | json field=_raw "TargetUserName" as src_user
+    | json field=_raw "ServiceName" as service_name
     | where event_id in ("4768", "4769")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4768', '4769')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000589 {\n  meta:\n    author = \"TDL\"\n    description = \"Pass the Ticket Attack Activity\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0005\"\n    technique = \"T1550\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(4768|4769)/\n\
-    \    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("4768", "4769")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4768, 4769])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4768, 4769)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4768", "4769")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4768 OR 4769)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4768", "4769")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+    | where !(src_user matches "*$")
+    | timeslice 5h
+    | where event_id = "4769" and !(service_name matches "*$") and service_name != "krbtgt"
+    | count as event_count, count_distinct(service_name) as unique_services by _timeslice, src_ip, src_user
+    | where event_count >= 5 and unique_services >= 5
+    | join (
+        _sourceCategory=*Windows* "4768"
+        | json field=_raw "EventID" as event_id
+        | json field=_raw "IpAddress" as src_ip_tgt
+        | json field=_raw "TargetUserName" as src_user_tgt
+        | where event_id = "4768"
+        | timeslice 5h
+        | count by _timeslice, src_ip_tgt, src_user_tgt
+    ) as tgt on _timeslice = tgt._timeslice and src_ip = tgt.src_ip_tgt and src_user = tgt.src_user_tgt
+    | where isNull(tgt._timeslice)
+    | fields _timeslice, src_ip, src_user, event_count, unique_services
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -106,7 +210,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '5 Windows Events
 

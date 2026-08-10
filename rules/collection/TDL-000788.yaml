@@ -16,85 +16,131 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=network sourcetype=cisco:ios (("copy" AND "running-config" AND "tftp://") OR ("snmp" AND "bulk"))
+  spl: 'index=network sourcetype=cisco:ios (("copy" AND "running-config" AND "tftp://") OR ("snmp" AND "bulk"))
+
     | rex field=_raw "tftp://(?<tftp_dest>\d+\.\d+\.\d+\.\d+)"
+
     | rex field=_raw "snmp.*(?<snmp_source>\d+\.\d+\.\d+\.\d+)"
+
     | eval suspicious_ip=coalesce(tftp_dest, snmp_source)
-    | where isnotnull(suspicious_ip) AND NOT (match(suspicious_ip, "^10\.") OR match(suspicious_ip, "^172\.(1[6-9]|2[0-9]|3[0-1])\.") OR match(suspicious_ip, "^192\.168\."))
+
+    | where isnotnull(suspicious_ip) AND NOT (match(suspicious_ip, "^10\.") OR match(suspicious_ip, "^172\.(1[6-9]|2[0-9]|3[0-1])\.") OR match(suspicious_ip,
+    "^192\.168\."))
+
     | stats count values(_raw) as command_details by _time, host, suspicious_ip
+
     | table _time, host, suspicious_ip, command_details
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "snmp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: |
+    let ManagementSubnets = dynamic(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]);
+    let ManagementIPs = dynamic(["10.1.1.0/24", "192.168.100.0/24"]);
+    CommonSecurityLog
+    | where TimeGenerated > ago(1h)
+    | where DeviceVendor in~ ("Cisco", "Juniper", "Palo Alto Networks", "Fortinet", "Arista")
+    | where (Message has_any ("copy running-config tftp", "copy startup-config tftp", "copy run tftp", "copy start tftp") and Message has "://")
+        or (Activity has_any ("SNMP", "snmp") and Message has_any ("GetBulk", "bulkwalk", "GETBULK"))
+    | extend DestIP = coalesce(DestinationIP, extract(@"tftp://([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})", 1, Message))
+    | extend SourceIPPrefix = strcat(split(SourceIP, ".")[0], ".", split(SourceIP, ".")[1], ".", split(SourceIP, ".")[2], ".0/24")
+    | extend DestIPPrefix = strcat(split(DestIP, ".")[0], ".", split(DestIP, ".")[1], ".", split(DestIP, ".")[2], ".0/24")
+    | where (Message has_any ("copy running-config tftp", "copy startup-config tftp", "copy run tftp", "copy start tftp") and DestIPPrefix !in (ManagementIPs))
+        or (Activity has_any ("SNMP", "snmp") and SourceIPPrefix !in (ManagementIPs) and Message has_any ("1.3.6.1.4.1", "private"))
+    | project TimeGenerated, DeviceVendor, DeviceName, SourceIP, DestIP, Activity, Message, SourceUserName
+  aql: "SELECT sourceip, destinationip, username, CATEGORYNAME(category) AS event_category, \"Command\" AS command_text, LOGSOURCENAME(logsourceid)\
+    \ AS device, COUNT(*) AS occurrences\nFROM events\nWHERE (logsourceid IN (SELECT logsourceid FROM events WHERE LOGSOURCENAME(logsourceid)\
+    \ ILIKE '%cisco%' OR LOGSOURCENAME(logsourceid) ILIKE '%juniper%' OR LOGSOURCENAME(logsourceid) ILIKE '%router%' OR LOGSOURCENAME(logsourceid)\
+    \ ILIKE '%switch%' OR categoryname(category) ILIKE '%network%device%') \n  AND ((\"Command\" ILIKE '%copy%running-config%tftp%' OR \"Command\"\
+    \ ILIKE '%copy%startup-config%tftp%' OR \"Command\" ILIKE '%write%net%' OR \"Command\" ILIKE '%archive%config%')\n    AND destinationip NOT\
+    \ IN ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))\n  OR (\"Command\" ILIKE '%snmp%walk%' OR \"Command\" ILIKE '%snmpbulkwalk%' OR categoryname(category)\
+    \ ILIKE '%snmp%')\n    AND sourceip NOT INCIDR '10.0.0.0/8' AND sourceip NOT INCIDR '172.16.0.0/12' AND sourceip NOT INCIDR '192.168.0.0/16')\n\
+    GROUP BY sourceip, destinationip, username, category, \"Command\", logsourceid\nLAST 24 HOURS\n"
+  yara_l: |
+    rule network_device_config_exfiltration {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects network device configuration exfiltration via TFTP copy or SNMP bulk-walk from non-management IPs"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1602"
+        severity = "HIGH"
 
-    FROM flows
+      events:
+        // TFTP copy of running-config to non-management IP
+        $tftp.metadata.event_type = "NETWORK_CONNECTION"
+        (
+          re.regex($tftp.metadata.description, `(?i)copy\s+running-config\s+tftp:`) or
+          re.regex($tftp.security_result.summary, `(?i)copy\s+running-config\s+tftp:`) or
+          re.regex($tftp.metadata.product_log_id, `(?i)copy.*running.*config.*tftp`)
+        )
+        $tftp.target.port = 69
+        not net.ip_in_range_cidr($tftp.target.ip, "10.0.0.0/8")
+        not net.ip_in_range_cidr($tftp.target.ip, "172.16.0.0/12")
+        not net.ip_in_range_cidr($tftp.target.ip, "192.168.0.0/16")
+        $tftp.principal.hostname = $device
 
-    WHERE "network.protocol" LIKE ''%snmp%''
+        // SNMP bulk-walk from non-management subnet
+        $snmp.metadata.event_type = "NETWORK_CONNECTION"
+        (
+          re.regex($snmp.metadata.description, `(?i)snmp.*(bulk|walk)`) or
+          re.regex($snmp.security_result.summary, `(?i)snmp.*(bulk|walk)`) or
+          $snmp.target.port = 161
+        )
+        (
+          re.regex($snmp.metadata.description, `(?i)1\.3\.6\.1\.4\.1\.`) or
+          re.regex($snmp.security_result.summary, `(?i)1\.3\.6\.1\.4\.1\.`)
+        )
+        not net.ip_in_range_cidr($snmp.principal.ip, "10.0.0.0/8")
+        not net.ip_in_range_cidr($snmp.principal.ip, "172.16.0.0/12")
+        not net.ip_in_range_cidr($snmp.principal.ip, "192.168.0.0/16")
+        $snmp.target.hostname = $device
 
-    GROUP BY sourceip, destinationip, destinationport
+      match:
+        $device over 1h
 
-    LAST 1 HOURS
+      outcome:
+        $risk_score = max(85)
 
-    '
-  yara_l: "rule tdl_tdl_col_000788 {\n  meta:\n    author = \"TDL\"\n    description = \"TFTP Transfer of running-config or startup-config\"\n\
-    \    severity = \"HIGH\"\n    tactic = \"TA0009\"\n    technique = \"T1602\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /snmp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
+      condition:
+        $tftp or $snmp
+    }
+  esql: |
+    FROM logs-network.device*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%snmp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/snmp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*snmp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "snmp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*snmp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*snmp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      AND (
+        (event.action IN ("copy", "tftp") AND TO_LOWER(event.outcome) LIKE "*running-config*" AND NOT CIDR_MATCH(destination.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+        OR
+        (network.protocol == "snmp" AND event.action == "bulk-walk" AND NOT CIDR_MATCH(source.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+      )
+    | KEEP @timestamp, host.name, source.ip, destination.ip, event.action, network.protocol, message
+  leql: |
+    where((source_json.command ICONTAINS "copy running-config tftp" OR source_json.command ICONTAINS "copy run tftp" OR source_json.message ICONTAINS "copy running-config tftp" OR source_json.message ICONTAINS "copy run tftp" OR source_json.command ICONTAINS "snmpwalk" OR source_json.command ICONTAINS "snmpbulkwalk" OR source_json.message ICONTAINS "snmpwalk" OR source_json.message ICONTAINS "snmpbulkwalk") AND NOT (source_address=10.0.0.0/8 OR source_address=172.16.0.0/12 OR source_address=192.168.0.0/16)) groupby(asset, source_address, destination_address) calculate(count)
+  crowdstrike: |
+    #type=network-device (event_simpleName=NetworkDeviceCommand OR event_simpleName=NetworkDeviceLog OR event_simpleName=SNMPRequest)
+    (
+      (CommandLine=*"copy running-config tftp://"* OR CommandLine=*"copy startup-config tftp://"* OR message=*"copy running-config tftp://"* OR message=*"copy startup-config tftp://"*)
+      OR
+      (event_simpleName=SNMPRequest operation=*bulk* (oid=1.3.6.1.4.1.* OR oid=/^1\.3\.6\.1\.4\..*/))
+    )
+    | case {
+        CommandLine=*tftp* OR message=*tftp* | regex("tftp://(?<dest_ip>[\d\.]+)", field=CommandLine, strict=false) | regex("tftp://(?<dest_ip>[\d\.]+)", field=message, strict=false);
+        event_simpleName=SNMPRequest | dest_ip:=source_ip;
+        * | dest_ip:="unknown";
+      }
+    | cidr(dest_ip, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10"], as=is_rfc1918)
+    | regex("^(10\.(?:0|1|2|3|4|5)\.|192\.168\.(?:0|1|2|3|4|5)\.|172\.16\.(?:0|1)\.)", field=dest_ip, as=is_mgmt_subnet)
+    | (is_mgmt_subnet != "true" OR !is_mgmt_subnet)
+    | table([@timestamp, ComputerName, DeviceName, event_simpleName, CommandLine, message, dest_ip, source_ip, oid, operation])
+  xql: "dataset = network_device_logs\n| filter (action_command contains \"copy running-config tftp://\" or action_command contains \"copy startup-config\
+    \ tftp://\") \n  or (action_command contains \"snmpwalk\" and action_command contains \"-v bulk\")\n| filter dest_ip not in (\"10.0.0.0/8\"\
+    , \"172.16.0.0/12\", \"192.168.0.0/16\")\n| fields _time, agent_hostname, src_ip, dest_ip, action_command, actor_username\n"
+  lucene: |
+    (event.action:"copy running-config" AND destination.protocol:tftp AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)) OR (event.action:snmp AND (snmp.operation:"bulkwalk" OR snmp.operation:"getbulk") AND snmp.oid:/1\.3\.6\.1\.4\.1\.\d+.*/ AND NOT source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16))
+  sumo: |
+    _sourceCategory=*Network* OR _sourceCategory=*Device* (("copy" AND "running-config" AND "tftp://") OR ("snmp" AND "bulk"))
+    | parse regex "copy\s+running-config\s+tftp://(?<tftp_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?:snmp|SNMP).*(?:bulk|walk).*?(?:from|source)\s+(?<snmp_src>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?:device|host|Device)[\s:]+(?<device_name>[^\s,]+)" nodrop
+    | where (isNotNull(tftp_ip) AND NOT (tftp_ip matches "10.*" OR tftp_ip matches "172.16.*" OR tftp_ip matches "172.17.*" OR tftp_ip matches "172.18.*" OR tftp_ip matches "172.19.*" OR tftp_ip matches "172.20.*" OR tftp_ip matches "172.21.*" OR tftp_ip matches "172.22.*" OR tftp_ip matches "172.23.*" OR tftp_ip matches "172.24.*" OR tftp_ip matches "172.25.*" OR tftp_ip matches "172.26.*" OR tftp_ip matches "172.27.*" OR tftp_ip matches "172.28.*" OR tftp_ip matches "172.29.*" OR tftp_ip matches "172.30.*" OR tftp_ip matches "172.31.*" OR tftp_ip matches "192.168.*")) OR (isNotNull(snmp_src) AND NOT (snmp_src matches "10.*" OR snmp_src matches "172.16.*" OR snmp_src matches "172.17.*" OR snmp_src matches "172.18.*" OR snmp_src matches "172.19.*" OR snmp_src matches "172.20.*" OR snmp_src matches "172.21.*" OR snmp_src matches "172.22.*" OR snmp_src matches "172.23.*" OR snmp_src matches "172.24.*" OR snmp_src matches "172.25.*" OR snmp_src matches "172.26.*" OR snmp_src matches "172.27.*" OR snmp_src matches "172.28.*" OR snmp_src matches "172.29.*" OR snmp_src matches "172.30.*" OR snmp_src matches "172.31.*" OR snmp_src matches "192.168.*"))
+    | fields _messageTime, _sourceHost, device_name, tftp_ip, snmp_src, _raw
 pseudo_logic: Network device emits copy running-config tftp:// to a non-management IP, or SNMP bulk-walk against private OIDs from outside management
   subnet.
 false_positives:
@@ -113,7 +159,7 @@ references:
 - https://attack.mitre.org/techniques/T1602/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'

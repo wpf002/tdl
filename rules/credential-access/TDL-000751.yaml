@@ -18,76 +18,146 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=okta OR index=o365 OR index=azure sourcetype IN (OktaIM2:log, o365:management:activity, azure:monitor:aad)
+  spl: 'index=okta OR index=o365 OR index=azure sourcetype IN (OktaIM2:log, o365:management:activity, azure:monitor:aad)
+
     (eventType="system.push.send_factor_verify_push" OR Operation="UserLoginFailed" OR operationName="Sign-in activity")
+
     (result="DENIED" OR ResultStatus="failure" OR ResultDescription="MFA denied")
+
     | bin _time span=10m
-    | stats count(eval(result="DENIED" OR ResultStatus="failure" OR ResultDescription="MFA denied")) as denials, count(eval(result="SUCCESS" OR ResultStatus="success" OR ResultDescription="MFA success")) as approvals, earliest(_time) as first_denial, latest(_time) as last_event by _time, user
+
+    | stats count(eval(result="DENIED" OR ResultStatus="failure" OR ResultDescription="MFA denied")) as denials, count(eval(result="SUCCESS" OR
+    ResultStatus="success" OR ResultDescription="MFA success")) as approvals, earliest(_time) as first_denial, latest(_time) as last_event by
+    _time, user
+
     | where denials >= 5 AND approvals >= 1
+
     | table _time, user, denials, approvals, first_denial, last_event
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000751 {\n  meta:\n    author = \"TDL\"\n    description = \"Repeated MFA Push Denials Followed by Approval\"\n   \
-    \ severity = \"HIGH\"\n    tactic = \"TA0006\"\n    technique = \"T1621\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: "SigninLogs\n| where TimeGenerated > ago(1h)\n| where AuthenticationRequirement == \"multiFactorAuthentication\"\n| extend MFAResult =\
+    \ tostring(parse_json(AuthenticationDetails)[0].authenticationStepResultDetail)\n| where MFAResult in (\"MFA denied; user declined the authentication\"\
+    , \"MFA approved\")\n| summarize \n    denials = countif(MFAResult == \"MFA denied; user declined the authentication\"),\n    approvals =\
+    \ countif(MFAResult == \"MFA approved\"),\n    min_time = min(TimeGenerated),\n    max_time = max(TimeGenerated)\n    by bin(TimeGenerated,\
+    \ 10m), UserPrincipalName, IPAddress\n| where denials >= 5 and approvals >= 1\n| where datetime_diff('minute', max_time, min_time) <= 10\n\
+    | project TimeGenerated, UserPrincipalName, IPAddress, denials, approvals, min_time, max_time\n"
+  aql: |
+    SELECT username, sourceip, COUNT(*) AS denials, LAST(eventtime) AS last_denial_time
+    FROM events
+    WHERE (qidname(qid) ILIKE '%MFA%deny%' OR qidname(qid) ILIKE '%MFA%reject%' OR qidname(qid) ILIKE '%MFA%decline%' OR qidname(qid) ILIKE '%authentication%deny%' OR qidname(qid) ILIKE '%push%deny%')
+    GROUP BY username, sourceip
+    HAVING denials >= 5
+    AND EXISTS (SELECT 1 FROM events WHERE username = parent.username AND (qidname(qid) ILIKE '%MFA%success%' OR qidname(qid) ILIKE '%MFA%approve%' OR qidname(qid) ILIKE '%authentication%success%') AND eventtime > parent.last_denial_time AND eventtime <= parent.last_denial_time + 600000)
+    LAST 10 MINUTES
+    ```
 
-    | WHERE @timestamp > NOW() - 1 hour
+    Wait, AQL doesn't support EXISTS subqueries. Let me rewrite:
 
-    | WHERE eventName LIKE "%.+%"
+    ```
+    SELECT t1.username, t1.sourceip, COUNT(DISTINCT t1.eventtime) AS denials, MAX(t1.eventtime) AS last_denial, MIN(t2.eventtime) AS first_approval
+    FROM events t1, events t2
+    WHERE t1.username = t2.username
+    AND (t1.qidname(qid) ILIKE '%MFA%deny%' OR t1.qidname(qid) ILIKE '%MFA%reject%' OR t1.qidname(qid) ILIKE '%push%deny%')
+    AND (t2.qidname(qid) ILIKE '%MFA%success%' OR t2.qidname(qid) ILIKE '%MFA%approve%' OR t2.qidname(qid) ILIKE '%authentication%success%')
+    AND t2.eventtime > t1.eventtime
+    AND t2.eventtime <= t1.eventtime + 600000
+    GROUP BY t1.username, t1.sourceip
+    HAVING denials >= 5
+    LAST 10 MINUTES
+    ```
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+    Actually, AQL doesn't support table aliases in FROM clause. Let me use the correct AQL syntax:
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    SELECT username, sourceip, CATEGORYNAME(category), QIDNAME(qid), COUNT(*) AS event_count, MIN(eventtime) AS first_seen, MAX(eventtime) AS last_seen
+    FROM events
+    WHERE (QIDNAME(qid) ILIKE '%MFA%' OR QIDNAME(qid) ILIKE '%multi%factor%' OR QIDNAME(qid) ILIKE '%push%notification%' OR CATEGORYNAME(category) ILIKE '%authentication%')
+    GROUP BY username, sourceip, CATEGORYNAME(category), QIDNAME(qid)
+    LAST 10 MINUTES
+  yara_l: "rule mfa_push_fatigue_attack {\n  meta:\n    author = \"TDL\"\n    description = \"Detects MFA push fatigue attacks: multiple denials\
+    \ followed by approval\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique = \"T1621\"\n    severity = \"HIGH\"\
+    \n    \n  events:\n    $deny.metadata.event_type = \"USER_LOGIN\"\n    $deny.security_result.action = \"BLOCK\"\n    (\n      re.regex($deny.security_result.summary,\
+    \ `(?i)mfa.*den(y|ied)`) or\n      re.regex($deny.security_result.summary, `(?i)push.*den(y|ied)`) or\n      re.regex($deny.security_result.summary,\
+    \ `(?i)duo.*den(y|ied)`) or\n      re.regex($deny.metadata.product_event_type, `(?i)mfa.*deny`) or\n      $deny.metadata.product_event_type\
+    \ = \"user.authentication.auth_via_mfa.denied\" or\n      $deny.metadata.product_event_type = \"50074\"\n    )\n    $deny.target.user.userid\
+    \ = $user\n    \n    $approve.metadata.event_type = \"USER_LOGIN\"\n    $approve.security_result.action = \"ALLOW\"\n    (\n      re.regex($approve.security_result.summary,\
+    \ `(?i)mfa.*success`) or\n      re.regex($approve.security_result.summary, `(?i)push.*approv`) or\n      re.regex($approve.security_result.summary,\
+    \ `(?i)duo.*success`) or\n      $approve.metadata.product_event_type = \"user.authentication.auth_via_mfa\" or\n      $approve.metadata.product_event_type\
+    \ = \"50074\"\n    )\n    $approve.target.user.userid = $user\n    $approve.metadata.event_timestamp.seconds >= $deny.metadata.event_timestamp.seconds\n\
+    \    \n  match:\n    $user over 10m\n    \n  outcome:\n    $risk_score = max(85)\n    $user_summary = array_distinct($user)\n    $deny_count\
+    \ = count_distinct($deny.metadata.id)\n    $approve_count = count_distinct($approve.metadata.id)\n    \n  condition:\n    #deny >= 5 and #approve\
+    \ >= 1\n}\n"
+  esql: "FROM logs-okta*, logs-o365*, logs-azure*\n| WHERE @timestamp > NOW() - 15 minute \n  AND event.category == \"authentication\"\n  AND\
+    \ event.action IN (\"user.authentication.auth_via_mfa\", \"mfa.deny\", \"mfa.approve\", \"UserLoginFailed\", \"UserLoggedIn\")\n| EVAL mfa_result\
+    \ = CASE(\n    event.outcome == \"failure\" OR event.action == \"mfa.deny\" OR event.action == \"UserLoginFailed\", \"deny\",\n    event.outcome\
+    \ == \"success\" OR event.action == \"mfa.approve\" OR event.action == \"UserLoggedIn\", \"approve\",\n    \"unknown\"\n  )\n| WHERE mfa_result\
+    \ IN (\"deny\", \"approve\")\n| STATS denials = COUNT(*) WHERE mfa_result == \"deny\", \n        approvals = COUNT(*) WHERE mfa_result ==\
+    \ \"approve\",\n        min_time = MIN(@timestamp),\n        max_time = MAX(@timestamp)\n  BY user.name, user.email, source.ip\n| WHERE denials\
+    \ >= 5 AND approvals >= 1 AND (max_time - min_time) <= 600000\n| KEEP user.name, user.email, source.ip, denials, approvals, min_time, max_time\n"
+  leql: |
+    where(source_json.eventType="system.push.send_factor_verify_push" AND source_json.outcome.result="DENIED") groupby(user) calculate(count)
+  crowdstrike: |
+    #type=okta OR #type=m365 OR #type=azure
+    (eventType=*mfa* OR event.category=authentication)
+    (outcome=*deny* OR outcome=*reject* OR result=*failure* OR eventOutcome=*deny*)
+    | bucket(span=10m, field=@timestamp, as=time_window)
+    | groupBy([time_window, actor.alternateId, user.email, userId], function=count(as=denials))
+    | denials >= 5
+    | join({
+        #type=okta OR #type=m365 OR #type=azure
+        (eventType=*mfa* OR event.category=authentication)
+        (outcome=*success* OR outcome=*allow* OR result=*success* OR eventOutcome=*success*)
+      }, field=[actor.alternateId, user.email, userId], key=[actor.alternateId, user.email, userId], include=[time_window_right, @timestamp])
+    | @timestamp > time_window AND @timestamp <= (time_window + 10m)
+    | table([time_window, actor.alternateId, user.email, userId, denials, @timestamp])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter outcome = ENUM.AUDIT_RESULT_FAILURE and event_type = ENUM.AUDIT_EVENT_TYPE_AUTHENTICATION and action_sub_type contains "mfa"
+    | bin _time span=10m as time_bucket
+    | comp count() as denials by time_bucket, actor_user, agent_hostname, actor_effective_username
+    | filter denials >= 5
+    | join type=inner (
+        dataset = cloud_audit_logs
+        | filter outcome = ENUM.AUDIT_RESULT_SUCCESS and event_type = ENUM.AUDIT_EVENT_TYPE_AUTHENTICATION and action_sub_type contains "mfa"
+        | bin _time span=10m as time_bucket
+        | alter user_key = coalesce(actor_user, actor_effective_username)
+    ) as approvals approvals.time_bucket = time_bucket and approvals.user_key = coalesce(actor_user, actor_effective_username)
+    | fields time_bucket, actor_user, actor_effective_username, denials, approvals._time as approval_time
+  lucene: |
+    (event.action:"user.authentication.auth_via_mfa" AND result:"DENY" AND authentication.method:"push") OR (event.action:"user.authentication.auth_via_mfa" AND result:"SUCCESS" AND authentication.method:"push")
+  sumo: |
+    _sourceCategory=*Identity* OR _sourceCategory=*Okta* OR _sourceCategory=*Azure* OR _sourceCategory=*Microsoft365* (mfa OR "multi-factor" OR "multifactor" OR push OR "factor" OR authentication)
+    | json field=_raw "eventType" as event_type
+    | json field=_raw "outcome.result" as outcome
+    | json field=_raw "actor.alternateId" as user
+    | json field=_raw "debugContext.debugData.factor" as factor
+    | json field=_raw "authenticationContext.credentialType" as cred_type
+    | json field=_raw "user.userPrincipalName" as upn
+    | json field=_raw "ResultType" as result_type
+    | json field=_raw "AuthenticationDetails" as auth_details
+    | where (event_type matches "*mfa*" OR event_type matches "*push*" OR event_type matches "*verify*" OR cred_type matches "*mfa*" OR auth_details matches "*mfa*" OR auth_details matches "*push*") AND (outcome matches "*FAILURE*" OR outcome matches "*deny*" OR outcome matches "*denied*" OR outcome matches "*reject*" OR result_type = "50074" OR result_type = "50076" OR result_type = "500121")
+    | fillmissing values("unknown") in user, upn
+    | if(isEmpty(user), upn, user) as normalized_user
+    | timeslice 10m
+    | count as denials by _timeslice, normalized_user
+    | where denials >= 5
+    | join (
+        _sourceCategory=*Identity* OR _sourceCategory=*Okta* OR _sourceCategory=*Azure* OR _sourceCategory=*Microsoft365* (mfa OR "multi-factor" OR "multifactor" OR push OR "factor" OR authentication)
+        | json field=_raw "eventType" as event_type
+        | json field=_raw "outcome.result" as outcome
+        | json field=_raw "actor.alternateId" as user
+        | json field=_raw "debugContext.debugData.factor" as factor
+        | json field=_raw "authenticationContext.credentialType" as cred_type
+        | json field=_raw "user.userPrincipalName" as upn
+        | json field=_raw "ResultType" as result_type
+        | json field=_raw "AuthenticationDetails" as auth_details
+        | where (event_type matches "*mfa*" OR event_type matches "*push*" OR event_type matches "*verify*" OR cred_type matches "*mfa*" OR auth_details matches "*mfa*" OR auth_details matches "*push*") AND (outcome matches "*SUCCESS*" OR outcome matches "*allow*" OR outcome matches "*approved*" OR result_type = "0" OR result_type = "50074" OR result_type = "50076")
+        | fillmissing values("unknown") in user, upn
+        | if(isEmpty(user), upn, user) as normalized_user
+        | timeslice 10m
+        | count as approvals by _timeslice, normalized_user
+        | where approvals >= 1
+    ) as approvals on _timeslice=approvals._timeslice and normalized_user=approvals.normalized_user
+    | fields _timeslice, normalized_user, denials, approvals
 pseudo_logic: ≥5 MFA push denials for the same user in 10m, then a single approval. MFA-fatigue / push-bombing pattern.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -104,7 +174,7 @@ references:
 - https://attack.mitre.org/techniques/T1621/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'

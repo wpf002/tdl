@@ -18,71 +18,49 @@ queries:
   spl: "index=dlp sourcetype=dlp* \n| search policy IN (\"Sensitive Data Transfer\", \"PII Protection\", \"Confidential Documents\", \"Financial\
     \ Data\", \"Intellectual Property\", \"Customer Data\", \"HIPAA\", \"PCI-DSS\", \"Export Control\", \"Trade Secrets\")\n| table _time, user,\
     \ src, dest, policy, action, file_name, file_size, severity, dlp_rule\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exf_000096 {\n  meta:\n    author = \"TDL\"\n    description = \"DLP Detection for Sensitive Data\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0010\"\n    technique = \"T1048\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DLPEvents
+    | where TimeGenerated > ago(24h)
+    | where PolicyName in ("Confidential Data Transfer", "PII Protection", "Financial Data", "Intellectual Property", "Customer Data Protection", "HIPAA Data", "PCI DSS", "Export Control", "Trade Secrets")
+    | project TimeGenerated, UserPrincipalName, PolicyName, PolicyMatchInfo, FileName, FileSize, Action, Severity, DestinationDomain, DestinationIP, Computer, DeviceName
+  aql: |
+    SELECT eventtime, username, sourceip, destinationip, "DLP Policy Name", "DLP Severity", "DLP Action", "DLP Rule Name", "File Name", QIDNAME(qid), CATEGORYNAME(category)
+    FROM events
+    WHERE CATEGORYNAME(category) ILIKE '%DLP%' OR CATEGORYNAME(category) ILIKE '%Data Loss%' OR QIDNAME(qid) ILIKE '%DLP%'
+    LAST 24 HOURS
+  yara_l: "rule dlp_exfiltration_t1048 {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects potential data exfiltration\
+    \ via DLP policy violations - MITRE T1048\"\n    mitre_attack_tactic = \"Exfiltration\"\n    mitre_attack_technique = \"T1048\"\n    severity\
+    \ = \"High\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.security_result.summary != \"\"\n    re.regex($e.security_result.summary,\
+    \ `(?i)(DLP|Data Loss Prevention|Data Leakage)`)\n    $e.security_result.action = \"BLOCK\" or $e.security_result.action = \"ALLOW\"\n   \
+    \ $e.principal.hostname = $host\n    $e.principal.user.userid = $user\n    \n  match:\n    $host, $user over 5m\n    \n  outcome:\n    $risk_score\
+    \ = max(75)\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-dlp* \n| WHERE @timestamp > NOW() - 24 hour \n  AND event.kind == \"alert\" \n  AND dlp.policy.name IN (\"Confidential Data\
+    \ Transfer\", \"PII Exfiltration\", \"Sensitive File Upload\", \"Data Loss Prevention\", \"Critical Information Leak\")\n| KEEP @timestamp,\
+    \ host.name, user.name, source.ip, destination.ip, destination.domain, dlp.policy.name, dlp.rule.name, file.name, file.path, event.action,\
+    \ event.outcome\n"
+  leql: |
+    where(source_json.policy IN ["DLP_Policy_1", "DLP_Policy_2", "DLP_Policy_3"])
+  crowdstrike: |
+    #type=DLP event_simpleName=DlpDetection
+    | table([@timestamp, ComputerName, UserName, PolicyName, FileName, FilePath, Action, Severity])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter action_type = "DLP_DETECTION"
+    | filter policy_name in ("Sensitive Data Exfiltration", "PII Transfer", "Financial Data Loss", "Intellectual Property", "Regulated Data Movement")
+    | fields _time, agent_hostname, actor_effective_username, policy_name, action_description, action_file_name, action_remote_ip, severity
+  lucene: |
+    event_type:"DLP Detection" AND dlp_policy:("Sensitive Data Transfer" OR "Confidential Document Upload" OR "PII Exfiltration" OR "Financial Data Loss" OR "Intellectual Property Transfer")
+  sumo: |
+    _sourceCategory=*DLP*
+    | json field=_raw "EventType" as event_type
+    | json field=_raw "Policy" as policy
+    | json field=_raw "Action" as action
+    | json field=_raw "User" as user
+    | json field=_raw "Destination" as destination
+    | json field=_raw "FileName" as file_name
+    | where event_type matches "*Detection*" or event_type matches "*Violation*" or action matches "*Block*" or action matches "*Alert*"
+    | where policy in ("Confidential Data Transfer", "PII Exfiltration", "Intellectual Property", "Financial Data", "Customer Data", "Sensitive Documents")
+    | fields _messageTime, _sourceHost, user, policy, action, destination, file_name
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -92,7 +70,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 DLP Detection Event
 

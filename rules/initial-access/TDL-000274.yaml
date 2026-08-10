@@ -20,68 +20,118 @@ queries:
     \ IN (\"*Compromised*\", \"*Phishing*\", \"*Suspicious*\", \"*Botnet*\")) AND url=\"*\" AND action!=\"Block\" AND action!=\"block\" AND action!=\"\
     blocked\")\n| stats count by _time, recipient, sender, subject, action, label, category, url\n| where count > 0\n| table _time, recipient,\
     \ sender, subject, action, label, category, url\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: "union \n(CommonSecurityLog\n| where DeviceVendor == \"Mimecast\"\n| where DeviceEventCategory has_any (\"Malware\", \"Phish\")\n| where\
+    \ AdditionalExtensions has \"url\" or Message has \"http\"\n| where DeviceAction !in~ (\"blocked\", \"block\", \"quarantined\")\n| project\
+    \ TimeGenerated, DeviceVendor, DeviceEventCategory, DeviceAction, SenderAddress = SourceUserName, RecipientAddress = DestinationUserName,\
+    \ Subject = Message, URL = AdditionalExtensions, Computer),\n(CommonSecurityLog\n| where DeviceVendor == \"Proofpoint\"\n| where DeviceEventCategory\
+    \ has_any (\"Malware\", \"Phish\")\n| where AdditionalExtensions has \"url\" or Message has \"http\"\n| where DeviceAction !in~ (\"blocked\"\
+    , \"block\", \"quarantined\")\n| project TimeGenerated, DeviceVendor, DeviceEventCategory, DeviceAction, SenderAddress = SourceUserName, RecipientAddress\
+    \ = DestinationUserName, Subject = Message, URL = AdditionalExtensions, Computer),\n(CommonSecurityLog\n| where DeviceVendor == \"Mimecast\"\
+    \n| where AdditionalExtensions has_any (\"Malware\", \"Compromised\", \"Phishing\", \"Suspicious\", \"Botnet\")\n| where DeviceAction !in~\
+    \ (\"blocked\", \"block\")\n| project TimeGenerated, DeviceVendor, URLCategory = DeviceEventCategory, DeviceAction, SenderAddress = SourceUserName,\
+    \ RecipientAddress = DestinationUserName, Subject = Message, URL = AdditionalExtensions, Computer)\n"
+  aql: "SELECT DATEFORMAT(eventtime, 'yyyy-MM-dd HH:mm:ss') AS event_time, \n       LOGSOURCENAME(logsourceid) AS log_source,\n       \"Sender\
+    \ Address\" AS sender,\n       \"Recipient Address\" AS recipient,\n       \"Subject\" AS subject,\n       \"URL\" AS url,\n       \"Category\"\
+    \ AS category,\n       \"Action\" AS action,\n       \"Detection\" AS detection\nFROM events\nWHERE (logsourceid IN (SELECT logsourceid FROM\
+    \ events WHERE LOGSOURCENAME(logsourceid) ILIKE '%mimecast%' OR LOGSOURCENAME(logsourceid) ILIKE '%proofpoint%'))\n  AND ((\"Detection\" ILIKE\
+    \ '%malware%' OR \"Detection\" ILIKE '%phish%' OR \"Threat\" ILIKE '%malware%' OR \"Threat\" ILIKE '%phish%' OR \"Category\" ILIKE '%malware%'\
+    \ OR \"Category\" ILIKE '%phish%' OR \"Category\" ILIKE '%compromised%' OR \"Category\" ILIKE '%suspicious%' OR \"Category\" ILIKE '%botnet%')\n\
+    \       AND (\"URL\" IS NOT NULL OR \"Link\" IS NOT NULL OR \"URLs\" IS NOT NULL)\n       AND (\"Action\" ILIKE '%allow%' OR \"Action\" NOT\
+    \ ILIKE '%block%'))\nLAST 24 HOURS\n"
+  yara_l: |
+    rule email_malicious_url_allowed {
+      meta:
+        author = "TDL"
+        description = "Detects malicious or phishing emails with URLs that were allowed through email security"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1566"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        // Email security events from Mimecast or Proofpoint
+        $email.metadata.event_type = "EMAIL_TRANSACTION"
+        (
+          $email.security_result.summary = "Malware" or
+          $email.security_result.summary = "Phish" or
+          re.regex($email.security_result.category_details, `(?i)(malware|phishing|compromised|suspicious|botnet)`)
+        )
+        $email.security_result.action != "BLOCK"
+        $email.security_result.action = "ALLOW"
+        $email.network.email.from = $sender
+        $email.network.email.to = $recipient
+        // Ensure email contains URL
+        (
+          $email.network.http.parsed_user_agent != "" or
+          arrays.length($email.security_result.url_back_to_product) > 0 or
+          re.regex($email.about.labels.value, `(?i)url`)
+        )
 
-    | where eventName matches regex ".+"
+      match:
+        $recipient over 1h
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000274 {\n  meta:\n    author = \"TDL\"\n    description = \"Email Delivered Containing Malicious URL\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1566\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $email
+    }
+  esql: |
+    FROM logs-mimecast*, logs-proofpoint*
+    | WHERE (event.category == "email" OR event.dataset LIKE "*email*")
+      AND (
+        (threat.indicator.type == "url" OR url.original IS NOT NULL OR email.message_id IS NOT NULL)
+        AND (
+          TO_LOWER(event.action) NOT IN ("block", "blocked", "deny", "denied", "quarantine", "quarantined")
+          OR event.action IS NULL
+        )
+        AND (
+          TO_LOWER(labels.classification) IN ("malware", "phish", "phishing")
+          OR TO_LOWER(threat.enrichments.indicator.type) IN ("malware", "phish", "phishing")
+          OR TO_LOWER(email.direction) == "inbound"
+          AND (
+            TO_LOWER(mimecast.url_category) IN ("malware", "phishing", "suspicious", "botnet")
+            OR TO_LOWER(mimecast.url_category) LIKE "*compromised*"
+            OR TO_LOWER(mimecast.url_category) LIKE "*phishing*"
+            OR TO_LOWER(mimecast.url_category) LIKE "*suspicious*"
+            OR TO_LOWER(mimecast.url_category) LIKE "*botnet*"
+            OR TO_LOWER(threat.feed.name) LIKE "*malware*"
+            OR TO_LOWER(threat.feed.name) LIKE "*phish*"
+          )
+        )
+      )
+    | KEEP @timestamp, email.message_id, email.from.address, email.to.address, email.subject, url.original, event.action, mimecast.url_category, threat.enrichments.indicator.type, labels.classification, host.name
+  leql: |
+    where((source_json.disposition ICONTAINS "malware" OR source_json.disposition ICONTAINS "phish" OR source_json.verdict ICONTAINS "malware" OR source_json.verdict ICONTAINS "phish" OR source_json.category IN ["Malware", "Phishing", "Compromised"] OR source_json.category ICONTAINS "Compromised" OR source_json.category ICONTAINS "Phishing" OR source_json.category ICONTAINS "Suspicious" OR source_json.category ICONTAINS "Botnet") AND (source_json.url EXISTS OR source_json.link EXISTS OR source_json.urls EXISTS) AND (source_json.action!="block" AND source_json.action!="blocked" AND source_json.action ICONTAINS "allow"))
+  crowdstrike: |
+    (#type=mimecast OR #type=proofpoint OR #type=email_security)
+    (
+      (Verdict=*Malware* OR Verdict=*Phish* OR Category=*Malware* OR Category=*Compromised* OR Category=*Phishing* OR Category=*Suspicious* OR Category=*Botnet* OR threat_type=*malware* OR threat_type=*phish*)
+      AND (url=* OR URL=* OR urls=* OR link=*)
+      AND (Action=Allow OR Action=Permit OR Action=Deliver OR Action=Delivered OR action=allow OR action=permit OR action=deliver OR action=delivered)
+    )
+    AND NOT (Action=*Block* OR action=*block* OR Action=*Quarantine* OR action=*quarantine*)
+    | table([@timestamp, sender, recipient, subject, Action, Verdict, Category, url, URL])
+  xql: |
+    dataset = email_security_logs
+    | filter (vendor = "Mimecast" or vendor = "Proofpoint")
+    | filter (
+        (to_string(action) != "Block" and to_string(action) != "block" and to_string(action) != "blocked")
+        and (
+            lowercase(threat_category) in ("malware", "phish", "phishing")
+            or lowercase(url_category) ~= "(?i)(malware|compromised|phishing|suspicious|botnet)"
+            or lowercase(threat_type) in ("malware", "phish", "phishing")
+        )
+        and url_count > 0
+    )
+    | fields _time, recipient_email, sender_email, subject, url_category, threat_category, action, url_count, vendor
+  lucene: |
+    (data_source:Mimecast OR data_source:Proofpoint) AND (email.threat_label:Malware OR email.threat_label:Phish OR url.category:Malware OR url.category:*Compromised* OR url.category:*Phishing* OR url.category:*Suspicious* OR url.category:*Botnet*) AND _exists_:email.url AND email.action:Allow AND NOT url.action:Block
+  sumo: |
+    _sourceCategory=*mimecast* OR _sourceCategory=*proofpoint*
+    | json field=_raw "category" as url_category
+    | json field=_raw "action" as action
+    | json field=_raw "url" as url
+    | json field=_raw "threat" as threat_label
+    | where (threat_label matches "*Malware*" OR threat_label matches "*Phish*") AND url != "" AND (action matches "*Allow*" OR action matches "*allow*")
+       OR (url_category matches "*Malware*" OR url_category matches "*Compromised*" OR url_category matches "*Phishing*" OR url_category matches "*Suspicious*" OR url_category matches "*Botnet*") AND action != "Block"
+    | fields _messageTime, _sourceCategory, _sourceHost, threat_label, url_category, url, action
 false_positives:
 - Authorized pen testing
 - Security research
@@ -91,7 +141,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Email Security Event
 

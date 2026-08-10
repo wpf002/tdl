@@ -19,68 +19,77 @@ queries:
   spl: "index=gcp sourcetype=gcp:cloudaudit protoPayload.methodName=\"storage.setIamPermissions\" \n| search NOT (protoPayload.authenticationInfo.principalEmail=\"\
     *@gserviceaccount.com\" OR protoPayload.authenticationInfo.principalEmail=\"*admin*\")\n| table _time, protoPayload.authenticationInfo.principalEmail,\
     \ protoPayload.resourceName, protoPayload.methodName, protoPayload.request.policy\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    GCPAuditLogs
+    | where TimeGenerated > ago(1h)
+    | where MethodName contains "storage.setIamPermissions"
+    | extend SourceUser = tostring(AuthenticationInfo.principalEmail)
+    | where SourceUser !endswith "gserviceaccount.com"
+    | where SourceUser !has "admin"
+    | project TimeGenerated, SourceUser, MethodName, ResourceName, ServiceName, RequestMetadata, AuthorizationInfo
+  aql: |
+    SELECT "protoPayload.authenticationInfo.principalEmail" AS source_user, "protoPayload.methodName" AS method, "protoPayload.resourceName" AS resource, sourceip, eventtime, LOGSOURCENAME(logsourceid) AS source
+    FROM events
+    WHERE LOWER("protoPayload.methodName") LIKE '%storage.setiampermissions%'
+      AND "protoPayload.authenticationInfo.principalEmail" NOT ILIKE '%@gserviceaccount.iam.gserviceaccount.com%'
+      AND "protoPayload.authenticationInfo.principalEmail" NOT ILIKE '%admin%'
+    LAST 24 HOURS
+  yara_l: |
+    rule gcp_storage_iam_permission_modification {
+      meta:
+        author = "TDL"
+        description = "Detects non-admin users modifying GCP storage IAM permissions (T1530)"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1530"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.vendor_name = "Google Cloud Platform"
+        $e.metadata.product_name = "GCP"
+        re.regex($e.metadata.product_log_id, `(?i)cloudaudit`)
+        re.regex($e.target.resource.attribute.labels.value, `(?i)storage\.setIamPermissions`) or
+        re.regex($e.about.labels.value, `(?i)storage\.setIamPermissions`)
+        $e.principal.user.userid = $user
+        not re.regex($e.principal.user.userid, `(?i)gserviceaccount\.com$`)
+        not re.regex($e.principal.user.userid, `(?i)admin`)
 
-    | where eventName matches regex ".+"
+      match:
+        $user over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000315 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized Bucket IAM Modification - GCP\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1530\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-gcp.audit*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND message.data.protoPayload.methodName LIKE "*storage.setIamPermissions*"
+      AND NOT (user.name LIKE "*@gserviceaccount.com" OR user.name LIKE "*admin*")
+    | STATS event_count = COUNT(*) BY user.name, host.name, message.data.protoPayload.resourceName, bucket = BUCKET(@timestamp, 1 hour)
+    | WHERE event_count >= 1
+    | KEEP @timestamp, user.name, host.name, message.data.protoPayload.resourceName, message.data.protoPayload.methodName, event_count
+  leql: |
+    where(source_json.protoPayload.methodName ICONTAINS "storage.setIamPermissions" AND NOT (source_user ICONTAINS "admin" OR source_user ICONTAINS "gserviceaccount"))
+  crowdstrike: |
+    #type=gcp_audit message.data.protoPayload.methodName=*storage.setIamPermissions*
+    | message.data.protoPayload.authenticationInfo.principalEmail != *@gserviceaccount.com AND message.data.protoPayload.authenticationInfo.principalEmail != *admin*
+    | table([@timestamp, message.data.protoPayload.authenticationInfo.principalEmail, message.data.protoPayload.methodName, message.data.protoPayload.resourceName, message.data.resource.labels.bucket_name])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = GCP
+    | filter json_extract_scalar(raw_log, "$.protoPayload.methodName") contains "storage.setIamPermissions"
+    | alter source_user = coalesce(json_extract_scalar(raw_log, "$.protoPayload.authenticationInfo.principalEmail"), actor_effective_username)
+    | filter source_user != null
+    | filter not (source_user ~= ".*admin.*" or source_user contains "gserviceaccount")
+    | fields _time, source_user, json_extract_scalar(raw_log, "$.protoPayload.methodName") as method_name, json_extract_scalar(raw_log, "$.protoPayload.resourceName") as resource_name, json_extract_scalar(raw_log, "$.protoPayload.request") as request_details
+  lucene: |
+    message.data.protoPayload.methodName:*storage.setIamPermissions* AND NOT (message.data.protoPayload.authenticationInfo.principalEmail:*@gserviceaccount.iam.gserviceaccount.com OR message.data.protoPayload.authenticationInfo.principalEmail:*admin*)
+  sumo: |
+    _sourceCategory=*GCP* OR _sourceCategory=*gcp* OR _sourceCategory=*cloudaudit*
+    | json field=_raw "protoPayload.methodName" as method_name
+    | json field=_raw "protoPayload.authenticationInfo.principalEmail" as principal_email
+    | where method_name matches "*storage.setIamPermissions*"
+    | where !(principal_email matches "*@gserviceaccount.com" OR principal_email matches "*admin*")
+    | fields _messageTime, principal_email, method_name, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +99,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Cloud Audit event
 

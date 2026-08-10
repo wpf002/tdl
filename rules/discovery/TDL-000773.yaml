@@ -25,71 +25,78 @@ queries:
     ,\"*Stop-Service*\",\"*New-Service*\",\"*systemctl*start*\",\"*systemctl*stop*\",\"*systemctl*enable*\"))\n     | eval proc_guid=coalesce(ProcessGuid,process_guid)\n\
     \     | stats earliest(_time) as prior_service_time by proc_guid]\n| where isnull(prior_service_time)\n| table _time, ComputerName, User,\
     \ Image, CommandLine, ParentImage\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("sc.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('sc.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000773 {\n  meta:\n    author = \"TDL\"\n    description = \"sc query / Get-Service Burst\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0007\"\n    technique = \"T1007\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(sc.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
+  kql: "union \n(SecurityEvent\n| where TimeGenerated > ago(1h)\n| where EventID == 1\n| where (Process endswith \"\\\\sc.exe\" and CommandLine\
+    \ has \"query\")\n    or (Process endswith \"\\\\powershell.exe\" and CommandLine has \"Get-Service\")\n| extend IsAdmin = iff(SubjectUserName\
+    \ has \"$\" or SubjectUserName in~ (\"SYSTEM\",\"LOCAL SERVICE\",\"NETWORK SERVICE\"), true, false)\n| where IsAdmin == false\n| extend ServiceInteractionKey\
+    \ = strcat(Computer, \"_\", SubjectUserName)\n| project TimeGenerated, Computer, Account = SubjectUserName, Process, CommandLine, ServiceInteractionKey\n\
+    ),\n(Event\n| where TimeGenerated > ago(1h)\n| where Source == \"Microsoft-Windows-Sysmon\" and EventID == 1\n| extend CommandLine = EventData.CommandLine\n\
+    | extend User = EventData.User\n| extend Image = EventData.Image\n| where (Image endswith \"/systemctl\" and CommandLine has \"list-units\"\
+    )\n    or (Image endswith \"/sc\" and CommandLine has \"query\")\n| extend IsRoot = iff(User == \"root\", true, false)\n| where IsRoot ==\
+    \ false\n| extend ServiceInteractionKey = strcat(Computer, \"_\", User)\n| project TimeGenerated, Computer, Account = User, Process = Image,\
+    \ CommandLine, ServiceInteractionKey\n)\n| join kind=leftanti (\n    union\n    (SecurityEvent\n    | where TimeGenerated > ago(2h)\n    |\
+    \ where EventID == 7045 or EventID == 7040 or EventID == 7036\n    | extend ServiceInteractionKey = strcat(Computer, \"_\", SubjectUserName)\n\
+    \    | project ServiceInteractionKey, InteractionTime = TimeGenerated\n    ),\n    (Event\n    | where TimeGenerated > ago(2h)\n    | where\
+    \ Source == \"Microsoft-Windows-Sysmon\" and EventID == 1\n    | extend User = EventData.User\n    | extend Image = EventData.Image\n    |\
+    \ where Image has_any (\"systemctl\",\"service\")\n    | extend ServiceInteractionKey = strcat(Computer, \"_\", User)\n    | project ServiceInteractionKey,\
+    \ InteractionTime = TimeGenerated\n    )\n    | where InteractionTime < ago(1h)\n) on ServiceInteractionKey\n| project TimeGenerated, Computer,\
+    \ Account, Process, CommandLine\n"
+  aql: |
+    SELECT username, LOGSOURCENAME(logsourceid) AS host, "Process CommandLine", "Parent Process Name", COUNT(*) AS executions
+    FROM events
+    WHERE ("Process Name" ILIKE '%sc.exe%' AND "Process CommandLine" ILIKE '%query%')
+       OR ("Process Name" ILIKE '%powershell.exe%' AND "Process CommandLine" ILIKE '%Get-Service%')
+       OR ("Process Name" ILIKE '%systemctl%' AND "Process CommandLine" ILIKE '%list-units%')
+    GROUP BY username, LOGSOURCENAME(logsourceid), "Process CommandLine", "Parent Process Name"
+    LAST 1 HOURS
+  yara_l: "rule service_enumeration_non_admin {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects T1007 System Service\
+    \ Discovery from non-admin context\"\n    mitre_attack_technique = \"T1007\"\n    mitre_attack_tactic = \"Discovery\"\n    \n  events:\n \
+    \   $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      (\n        re.regex($e.principal.process.file.full_path, `(?i)\\\\sc\\.exe$`)\
+    \ and\n        re.regex($e.principal.process.command_line, `(?i)\\bquery\\b`)\n      ) or\n      (\n        re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\powershell\\.exe$`) and\n        re.regex($e.principal.process.command_line, `(?i)Get-Service`)\n      ) or\n      (\n        re.regex($e.principal.process.file.full_path,\
+    \ `(?i)/systemctl$`) and\n        re.regex($e.principal.process.command_line, `(?i)list-units`)\n      )\n    )\n    not re.regex($e.principal.user.userid,\
+    \ `(?i)(administrator|admin|root|system|NT AUTHORITY)`)\n    $e.principal.hostname = $host\n    $e.principal.user.userid = $user\n    \n \
+    \ match:\n    $host, $user over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.process*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("sc.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [sc.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (sc.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("sc.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(sc.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("sc.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      AND (
+        (process.name == "sc.exe" AND process.command_line LIKE "*query*")
+        OR (process.name == "powershell.exe" AND process.command_line LIKE "*Get-Service*")
+        OR (process.name == "systemctl" AND process.command_line LIKE "*list-units*")
+      )
+    | EVAL is_admin = CASE(
+        user.name LIKE "*admin*" OR user.name LIKE "*root*" OR user.name LIKE "*SYSTEM*", 1,
+        0
+      )
+    | WHERE is_admin == 0
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.executable
+  leql: |
+    where(source_json.EventID=1 AND (process_name ICONTAINS "sc.exe" OR process_name ICONTAINS "powershell.exe" OR process_name ICONTAINS "systemctl") AND (process_cmd_line ICONTAINS "sc.exe query" OR process_cmd_line ICONTAINS "Get-Service" OR process_cmd_line ICONTAINS "systemctl list-units")) groupby(asset, user, process_cmd_line) calculate(count)
+  crowdstrike: |
+    (event_simpleName=ProcessRollup2 OR EventCode=1)
+    (
+      (FileName=sc.exe CommandLine=*query*)
+      OR (FileName=powershell.exe (CommandLine=*Get-Service* OR CommandLine=*gsv*))
+      OR (FileName=systemctl CommandLine=*list-units*)
+    )
+    NOT (UserName=*admin* OR UserName=*root* OR UserName=*SYSTEM* OR UserName=*Administrator*)
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter (action_process_image_name ~= "(?i)sc\.exe" and action_process_image_command_line contains "query")
+       or (action_process_image_name ~= "(?i)powershell\.exe" and action_process_image_command_line ~= "(?i)Get-Service")
+       or (action_process_image_name ~= "(?i)systemctl" and action_process_image_command_line contains "list-units")
+    | alter is_admin = if(actor_effective_username ~= "(?i)(administrator|root|SYSTEM)", true, false)
+    | filter is_admin = false
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, actor_process_image_name
+  lucene: |
+    (process.name:(sc.exe OR powershell.exe OR pwsh.exe OR systemctl) AND (process.command_line:(*sc* AND *query*) OR process.command_line:(*Get-Service*) OR process.command_line:(*systemctl* AND *list-units*))) AND NOT user.name:(SYSTEM OR root OR Administrator OR *admin*)
+  sumo: "_sourceCategory=*Sysmon* \"1\"\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"Image\" as image\n| json field=_raw \"\
+    CommandLine\" as cmd\n| json field=_raw \"User\" as user\n| json field=_raw \"Computer\" as computer\n| where event_id = \"1\"\n| where (image\
+    \ matches \"*\\\\sc.exe\" and cmd matches \"*query*\") \n   or (image matches \"*\\\\powershell.exe\" and cmd matches \"*Get-Service*\") \n\
+    \   or (image matches \"*/systemctl*\" and cmd matches \"*list-units*\")\n| where !(user matches \"*SYSTEM*\" or user matches \"*Administrator*\"\
+    \ or user matches \"*root*\" or user matches \"*admin*\")\n| fields _messageTime, computer, user, image, cmd\n"
 pseudo_logic: sc.exe query, Get-Service, systemctl list-units invoked from non-admin context with no preceding service interaction.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -106,7 +113,7 @@ references:
 - https://attack.mitre.org/techniques/T1007/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

@@ -24,77 +24,103 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=* sourcetype IN (WinEventLog:Security, linux_secure, aws:cloudtrail, azure:signinlogs, o365:management:activity, okta:system) (EventCode=4624 OR EventCode=4625 OR action=success OR action=failure OR eventName=ConsoleLogin OR eventName=AssumeRole OR Category=SignInLogs OR Operation=UserLoggedIn OR eventType="user.session.start")
+  spl: 'index=* sourcetype IN (WinEventLog:Security, linux_secure, aws:cloudtrail, azure:signinlogs, o365:management:activity, okta:system) (EventCode=4624
+    OR EventCode=4625 OR action=success OR action=failure OR eventName=ConsoleLogin OR eventName=AssumeRole OR Category=SignInLogs OR Operation=UserLoggedIn
+    OR eventType="user.session.start")
+
     | eval user=coalesce(Account_Name, TargetUserName, user, userIdentity.userName, userPrincipalName, User, actor.alternateId, actor.displayName)
+
     | eval auth_time=_time
+
     | streamstats latest(auth_time) as last_auth by user
+
     | eval time_since_last=auth_time - last_auth
+
     | where time_since_last >= 7776000
+
     | eval dormancy_days=round(time_since_last/86400,0)
+
     | table _time, user, host, src, sourcetype, dormancy_days, action, EventCode
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000716 {\n  meta:\n    author = \"TDL\"\n    description = \"Dormant Account Reactivated and Used Within 1 Hour\"\n\
-    \    severity = \"HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "let LookbackPeriod = 90d;\nlet RecentWindow = 1d;\nlet DormantAccounts = \n    union isfuzzy=true\n        (SecurityEvent | where TimeGenerated\
+    \ between (ago(LookbackPeriod) .. ago(RecentWindow)) and EventID == 4624 | extend Account = TargetAccount),\n        (SigninLogs | where TimeGenerated\
+    \ between (ago(LookbackPeriod) .. ago(RecentWindow)) and ResultType == 0 | extend Account = UserPrincipalName),\n        (OfficeActivity |\
+    \ where TimeGenerated between (ago(LookbackPeriod) .. ago(RecentWindow)) and Operation == \"UserLoggedIn\" | extend Account = UserId),\n \
+    \       (AWSCloudTrail | where TimeGenerated between (ago(LookbackPeriod) .. ago(RecentWindow)) and EventName in (\"ConsoleLogin\",\"AssumeRole\"\
+    ) | extend Account = UserIdentityPrincipalid),\n        (AzureActivity | where TimeGenerated between (ago(LookbackPeriod) .. ago(RecentWindow))\
+    \ and OperationNameValue =~ \"Microsoft.Authorization/authenticate/action\" | extend Account = Caller)\n    | summarize LastSeenDormant =\
+    \ max(TimeGenerated) by Account;\nlet RecentActivity = \n    union isfuzzy=true\n        (SecurityEvent | where TimeGenerated > ago(RecentWindow)\
+    \ and EventID == 4624 | extend Account = TargetAccount, Source = \"SecurityEvent\", Computer = Computer, IpAddress = IpAddress),\n       \
+    \ (SigninLogs | where TimeGenerated > ago(RecentWindow) and ResultType == 0 | extend Account = UserPrincipalName, Source = \"SigninLogs\"\
+    , Computer = DeviceDetail.displayName, IpAddress = IPAddress),\n        (OfficeActivity | where TimeGenerated > ago(RecentWindow) and Operation\
+    \ == \"UserLoggedIn\" | extend Account = UserId, Source = \"OfficeActivity\", Computer = ClientIP, IpAddress = ClientIP),\n        (AWSCloudTrail\
+    \ | where TimeGenerated > ago(RecentWindow) and EventName in (\"ConsoleLogin\",\"AssumeRole\") | extend Account = UserIdentityPrincipalid,\
+    \ Source = \"AWSCloudTrail\", Computer = SourceIpAddress, IpAddress = SourceIpAddress),\n        (AzureActivity | where TimeGenerated > ago(RecentWindow)\
+    \ and OperationNameValue =~ \"Microsoft.Authorization/authenticate/action\" | extend Account = Caller, Source = \"AzureActivity\", Computer\
+    \ = CallerIpAddress, IpAddress = CallerIpAddress)\n    | summarize FirstSeenRecent = min(TimeGenerated), RecentSources = make_set(Source),\
+    \ RecentComputers = make_set(Computer), RecentIPs = make_set(IpAddress) by Account;\nDormantAccounts\n| join kind=inner (RecentActivity) on\
+    \ Account\n| where FirstSeenRecent > LastSeenDormant\n| project Account, DormantSince = LastSeenDormant, ReactivatedAt = FirstSeenRecent,\
+    \ DaysDormant = datetime_diff('day', FirstSeenRecent, LastSeenDormant), RecentSources, RecentComputers, RecentIPs\n| where DaysDormant >=\
+    \ 90\n"
+  aql: "SELECT \n    username,\n    sourceip,\n    LOGSOURCENAME(logsourceid) AS log_source,\n    MIN(eventtime) AS first_auth_time,\n    COUNT(*)\
+    \ AS auth_count\nFROM events\nWHERE \n    (categoryname(category) ILIKE '%authentication%' OR categoryname(category) ILIKE '%logon%' OR qidname(qid)\
+    \ ILIKE '%login%' OR qidname(qid) ILIKE '%authentication%')\n    AND username IS NOT NULL\n    AND username NOT IN (\n        SELECT DISTINCT\
+    \ username \n        FROM events \n        WHERE (categoryname(category) ILIKE '%authentication%' OR categoryname(category) ILIKE '%logon%'\
+    \ OR qidname(qid) ILIKE '%login%' OR qidname(qid) ILIKE '%authentication%')\n        START UNIX_TIMESTAMP(CURRENT_TIMESTAMP - 90 DAYS) * 1000\n\
+    \        STOP UNIX_TIMESTAMP(CURRENT_TIMESTAMP - 1 DAYS) * 1000\n    )\nGROUP BY username, sourceip, logsourceid\nLAST 24 HOURS\n"
+  yara_l: "rule dormant_account_reactivation {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects authentication from\
+    \ accounts dormant for 90+ days - T1078 Persistence\"\n    mitre_attack_tactic = \"Persistence\"\n    mitre_attack_technique = \"T1078\"\n\
+    \    severity = \"Medium\"\n    \n  events:\n    $auth.metadata.event_type = \"USER_LOGIN\"\n    $auth.security_result.action = \"ALLOW\"\n\
+    \    $auth.target.user.userid = $user\n    \n  match:\n    $user over 24h\n    \n  outcome:\n    $risk_score = max(65)\n    $first_auth_time\
+    \ = min($auth.metadata.event_timestamp.seconds)\n    $hostname = array_distinct($auth.principal.hostname)\n    $source_ip = array_distinct($auth.principal.ip)\n\
+    \    \n  condition:\n    $auth and #auth >= 1\n}\n"
+  esql: |
+    FROM logs-system.security*, logs-*auth*, logs-okta*, logs-aws.cloudtrail*, logs-azure.*, logs-o365.audit*
+    | WHERE event.category == "authentication" AND event.outcome == "success"
+    | STATS last_auth = MAX(@timestamp), first_auth = MIN(@timestamp), auth_count = COUNT(*) BY user.name, user.id, source.ip
+    | WHERE auth_count == 1 AND last_auth == first_auth AND first_auth > NOW() - 7 days
+    | EVAL account_inactive_days = (first_auth - NOW() + 97 days) / 1 day
+    | WHERE account_inactive_days >= 90
+    | KEEP user.name, user.id, source.ip, first_auth, account_inactive_days
+  leql: |
+    where(result="SUCCESS") groupby(user) calculate(count)
+  crowdstrike: |
+    #type=auth OR event_simpleName=UserIdentity* OR event_simpleName=UserLogon* OR event.category=authentication
+    | groupBy([user, UserName, user.name, TargetUserName], function=[min(@timestamp, as=first_seen), max(@timestamp, as=last_seen), count(as=auth_count)])
+    | test(last_seen < (now() - 90d))
+    | sleep_duration := last_seen - first_seen
+    | test(sleep_duration >= 90d)
+    | recent_auth := now() - last_seen
+    | test(recent_auth <= 1d)
+    | table([user, UserName, user.name, TargetUserName, first_seen, last_seen, sleep_duration, recent_auth, auth_count])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_AUTHENTICATION and action_result = ENUM.ACTION_RESULT_SUCCESS
+    | alter user_key = coalesce(actor_effective_username, action_evtlog_event_data_TargetUserName, dst_user_username)
+    | fields _time, user_key, agent_hostname, action_remote_ip
+    | sort user_key, _time asc
+    | comp min(_time) as first_seen, max(_time) as last_seen, count() as total_auths by user_key
+    | alter days_since_first = to_epoch(last_seen, "MILLIS") - to_epoch(first_seen, "MILLIS") / 86400000
+    | filter days_since_first >= 90 and total_auths >= 2
+    | join type=inner (dataset = xdr_data | filter event_type = ENUM.EVENT_TYPE_AUTHENTICATION and action_result = ENUM.ACTION_RESULT_SUCCESS | alter user_key = coalesce(actor_effective_username, action_evtlog_event_data_TargetUserName, dst_user_username) | fields _time, user_key, agent_hostname, action_remote_ip | sort user_key, _time asc) as recent on user_key = recent.user_key
+    | alter time_gap_days = to_epoch(recent._time, "MILLIS") - to_epoch(first_seen, "MILLIS") / 86400000
+    | filter time_gap_days >= 90
+    | comp min(recent._time) as reactivation_time by user_key, agent_hostname, action_remote_ip
+    | fields user_key, reactivation_time, agent_hostname, action_remote_ip
+  lucene: |
+    (event.action:(login OR logon OR authentication OR signin OR "user-login") OR event.category:authentication) AND NOT (service_account:true OR user.name:(*$@* OR *service* OR *svc* OR *admin*))
+  sumo: |
+    _sourceCategory=*auth* OR _sourceCategory=*azure* OR _sourceCategory=*aws* OR _sourceCategory=*okta* OR _sourceCategory=*365*
+    | json field=_raw "user" as user
+    | json field=_raw "username" as username
+    | json field=_raw "userPrincipalName" as upn
+    | json field=_raw "actor.alternateId" as okta_user
+    | json field=_raw "UserId" as m365_user
+    | json field=_raw "userIdentity.principalId" as aws_user
+    | first(_messageTime) as first_seen, last(_messageTime) as last_seen by coalesce(user, username, upn, okta_user, m365_user, aws_user) as account
+    | where (last_seen - first_seen) / 86400000 >= 90
+    | fields account, first_seen, last_seen
 pseudo_logic: Account with no auth in ≥90 days reactivated and immediately used to authenticate. Adversaries revive forgotten accounts as quiet
   persistence.
 false_positives:
@@ -113,7 +139,7 @@ references:
 - https://attack.mitre.org/techniques/T1078/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'

@@ -17,83 +17,127 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    (index=windows (EventCode=592 OR EventCode=4688 OR EventCode=4104))
-    ((EventCode=592 OR EventCode=4688) (Image="*\\powershell.exe" OR Process_Name="*powershell.exe") CommandLine="*Invoke-DNSExfiltrator*" CommandLine="* -i *" CommandLine="* -d *" CommandLine="* -p *" CommandLine="* -doh *" CommandLine="* -t *")
+  spl: '(index=windows (EventCode=592 OR EventCode=4688 OR EventCode=4104))
+
+    ((EventCode=592 OR EventCode=4688) (Image="*\\powershell.exe" OR Process_Name="*powershell.exe") CommandLine="*Invoke-DNSExfiltrator*" CommandLine="*
+    -i *" CommandLine="* -d *" CommandLine="* -p *" CommandLine="* -doh *" CommandLine="* -t *")
+
     OR
-    (EventCode=4104 ScriptBlockText="*Invoke-DNSExfiltrator*" ScriptBlockText="* -i *" ScriptBlockText="* -d *" ScriptBlockText="* -p *" ScriptBlockText="* -doh *" ScriptBlockText="* -t *")
+
+    (EventCode=4104 ScriptBlockText="*Invoke-DNSExfiltrator*" ScriptBlockText="* -i *" ScriptBlockText="* -d *" ScriptBlockText="* -p *" ScriptBlockText="*
+    -doh *" ScriptBlockText="* -t *")
+
     | table _time, ComputerName, EventCode, User, Image, Process_Name, CommandLine, ScriptBlockText
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: |
+    union
+    (
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where Process has "powershell.exe"
+    | where CommandLine has "Invoke-DNSExfiltrator"
+    | where CommandLine has " -i "
+    | where CommandLine has " -d "
+    | where CommandLine has " -p "
+    | where CommandLine has " -doh "
+    | where CommandLine has " -t "
+    | project TimeGenerated, Computer, Account, Process, CommandLine, EventID
+    ),
+    (
+    Event
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4104
+    | where RenderedDescription has "Invoke-DNSExfiltrator"
+    | where RenderedDescription has " -i "
+    | where RenderedDescription has " -d "
+    | where RenderedDescription has " -p "
+    | where RenderedDescription has " -doh "
+    | where RenderedDescription has " -t "
+    | project TimeGenerated, Computer, EventID, ScriptBlock = RenderedDescription
+    )
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, \"EventID\", \"Process Name\", \"Process CommandLine\", \"ScriptBlockText\"\
+    \nFROM events\nWHERE (\n    (\"EventID\" IN ('592', '4688') \n     AND \"Process Name\" ILIKE '%powershell.exe%' \n     AND \"Process CommandLine\"\
+    \ ILIKE '%Invoke-DNSExfiltrator%'\n     AND \"Process CommandLine\" ILIKE '% -i %'\n     AND \"Process CommandLine\" ILIKE '% -d %'\n    \
+    \ AND \"Process CommandLine\" ILIKE '% -p %'\n     AND \"Process CommandLine\" ILIKE '% -doh %'\n     AND \"Process CommandLine\" ILIKE '%\
+    \ -t %')\n    OR\n    (\"EventID\" = '4104'\n     AND \"ScriptBlockText\" ILIKE '%Invoke-DNSExfiltrator%'\n     AND \"ScriptBlockText\" ILIKE\
+    \ '% -i %'\n     AND \"ScriptBlockText\" ILIKE '% -d %'\n     AND \"ScriptBlockText\" ILIKE '% -p %'\n     AND \"ScriptBlockText\" ILIKE '%\
+    \ -doh %'\n     AND \"ScriptBlockText\" ILIKE '% -t %')\n)\nLAST 1 HOURS\n"
+  yara_l: |
+    rule dns_exfiltrator_execution {
+      meta:
+        author = "TDL"
+        description = "Detects Invoke-DNSExfiltrator usage via process execution or PowerShell script block logging"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "HIGH"
 
-    FROM flows
+      events:
+        // Process execution event
+        ($proc.metadata.event_type = "PROCESS_LAUNCH" and
+         ($proc.metadata.product_event_type = "592" or $proc.metadata.product_event_type = "4688") and
+         re.regex($proc.principal.process.file.full_path, `(?i)powershell\.exe$`) and
+         re.regex($proc.principal.process.command_line, `(?i)Invoke-DNSExfiltrator`) and
+         re.regex($proc.principal.process.command_line, `\s-i\s`) and
+         re.regex($proc.principal.process.command_line, `\s-d\s`) and
+         re.regex($proc.principal.process.command_line, `\s-p\s`) and
+         re.regex($proc.principal.process.command_line, `\s-doh\s`) and
+         re.regex($proc.principal.process.command_line, `\s-t\s`) and
+         $proc.principal.hostname = $host)
+        or
+        // PowerShell script block event
+        ($script.metadata.event_type = "PROCESS_LAUNCH" and
+         $script.metadata.product_event_type = "4104" and
+         re.regex($script.principal.process.command_line, `(?i)Invoke-DNSExfiltrator`) and
+         re.regex($script.principal.process.command_line, `\s-i\s`) and
+         re.regex($script.principal.process.command_line, `\s-d\s`) and
+         re.regex($script.principal.process.command_line, `\s-p\s`) and
+         re.regex($script.principal.process.command_line, `\s-doh\s`) and
+         re.regex($script.principal.process.command_line, `\s-t\s`) and
+         $script.principal.hostname = $host)
 
-    WHERE "network.protocol" LIKE ''%tcp%''
+      match:
+        $host over 5m
 
-    GROUP BY sourceip, destinationip, destinationport
+      outcome:
+        $risk_score = 85
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exe_000521 {\n  meta:\n    author = \"TDL\"\n    description = \"PowerShell DNSExfiltration\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $proc or $script
+    }
+  esql: |
+    FROM logs-system.security*, logs-windows.sysmon_operational*, logs-endpoint.events.process*, winlogbeat-*, logs-windows.powershell_operational*
+    | WHERE (
+        (event.code IN ("592", "4688") AND process.name == "powershell.exe" AND process.command_line LIKE "*Invoke-DNSExfiltrator*" AND process.command_line LIKE "* -i *" AND process.command_line LIKE "* -d *" AND process.command_line LIKE "* -p *" AND process.command_line LIKE "* -doh *" AND process.command_line LIKE "* -t *")
+        OR
+        (event.code == "4104" AND powershell.file.script_block_text LIKE "*Invoke-DNSExfiltrator*" AND powershell.file.script_block_text LIKE "* -i *" AND powershell.file.script_block_text LIKE "* -d *" AND powershell.file.script_block_text LIKE "* -p *" AND powershell.file.script_block_text LIKE "* -doh *" AND powershell.file.script_block_text LIKE "* -t *")
+      )
+    | KEEP @timestamp, host.name, user.name, event.code, process.name, process.command_line, powershell.file.script_block_text
+  leql: |
+    where((source_json.EventID=4688 AND process_name ICONTAINS "powershell.exe" AND process_cmd_line ICONTAINS "Invoke-DNSExfiltrator" AND process_cmd_line ICONTAINS " -i " AND process_cmd_line ICONTAINS " -d " AND process_cmd_line ICONTAINS " -p " AND process_cmd_line ICONTAINS " -doh " AND process_cmd_line ICONTAINS " -t ") OR (source_json.EventID=4104 AND source_json.ScriptBlockText ICONTAINS "Invoke-DNSExfiltrator" AND source_json.ScriptBlockText ICONTAINS " -i " AND source_json.ScriptBlockText ICONTAINS " -d " AND source_json.ScriptBlockText ICONTAINS " -p " AND source_json.ScriptBlockText ICONTAINS " -doh " AND source_json.ScriptBlockText ICONTAINS " -t "))
+  crowdstrike: |
+    (EventCode=4688 OR EventCode=592 OR EventCode=4104)
+    (
+      (EventCode IN [592, 4688] FileName=*powershell.exe CommandLine=*Invoke-DNSExfiltrator* CommandLine=* -i * CommandLine=* -d * CommandLine=* -p * CommandLine=* -doh * CommandLine=* -t *)
+      OR
+      (EventCode=4104 ScriptBlockText=*Invoke-DNSExfiltrator* ScriptBlockText=* -i * ScriptBlockText=* -d * ScriptBlockText=* -p * ScriptBlockText=* -doh * ScriptBlockText=* -t *)
+    )
+    | table([@timestamp, ComputerName, UserName, EventCode, FileName, CommandLine, ScriptBlockText])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) and lowercase(actor_process_image_name) contains "powershell.exe" and action_process_image_command_line contains "Invoke-DNSExfiltrator" and action_process_image_command_line contains " -i " and action_process_image_command_line contains " -d " and action_process_image_command_line contains " -p " and action_process_image_command_line contains " -doh " and action_process_image_command_line contains " -t ")
+        or (action_evtlog_event_id = 4104 and action_evtlog_message contains "Invoke-DNSExfiltrator" and action_evtlog_message contains " -i " and action_evtlog_message contains " -d " and action_evtlog_message contains " -p " and action_evtlog_message contains " -doh " and action_evtlog_message contains " -t ")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_id, actor_process_image_name, action_process_image_command_line, action_evtlog_message
+  lucene: |
+    (event.code:(592 OR 4688) AND process.name:powershell.exe AND process.command_line:*Invoke-DNSExfiltrator* AND process.command_line:*\ -i\ * AND process.command_line:*\ -d\ * AND process.command_line:*\ -p\ * AND process.command_line:*\ -doh\ * AND process.command_line:*\ -t\ *) OR (event.code:4104 AND powershell.file.script_block_text:*Invoke-DNSExfiltrator* AND powershell.file.script_block_text:*\ -i\ * AND powershell.file.script_block_text:*\ -d\ * AND powershell.file.script_block_text:*\ -p\ * AND powershell.file.script_block_text:*\ -doh\ * AND powershell.file.script_block_text:*\ -t\ *)
+  sumo: "_sourceCategory=*Windows* (EventID=4688 OR EventID=592 OR EventID=4104)\n| json field=_raw \"EventID\" as event_id\n| json field=_raw\
+    \ \"NewProcessName\" as process_name\n| json field=_raw \"CommandLine\" as command_line\n| json field=_raw \"ScriptBlockText\" as script_block\n\
+    | where (event_id in (\"4688\", \"592\") and process_name matches \"*powershell.exe\" and command_line matches \"*Invoke-DNSExfiltrator*\"\
+    \ and command_line matches \"* -i *\" and command_line matches \"* -d *\" and command_line matches \"* -p *\" and command_line matches \"\
+    * -doh *\" and command_line matches \"* -t *\") \n    OR (event_id = \"4104\" and script_block matches \"*Invoke-DNSExfiltrator*\" and script_block\
+    \ matches \"* -i *\" and script_block matches \"* -d *\" and script_block matches \"* -p *\" and script_block matches \"* -doh *\" and script_block\
+    \ matches \"* -t *\")\n| fields _messageTime, _sourceHost, event_id, process_name, command_line, script_block\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -103,7 +147,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe\nWhere Command\
   \ contains \"Invoke-DNSExfiltrator\"\nWhere Command contains \" -i \"\nWhere Command contains \" -d \"\nWhere Command contains \" -p \"\nWhere\

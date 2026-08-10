@@ -15,82 +15,99 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) network.protocol=tcp NOT (src_ip IN ("10.0.0.5", "10.0.0.10", "192.168.1.100"))
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) network.protocol=tcp NOT (src_ip IN ("10.0.0.5", "10.0.0.10", "192.168.1.100"))
+
     | stats count dc(dest_ip) as unique_dests sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+
     | where count >= 1
+
     | sort - total_bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000443 {\n  meta:\n    author = \"TDL\"\n    description = \"Inbound IDS Detection\"\n    severity = \"MEDIUM\"\n \
-    \   tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
+  kql: |
+    CommonSecurityLog
+    | where DeviceVendor has_any ("Palo Alto", "Fortinet", "Check Point", "Cisco", "Snort", "Suricata") or DeviceProduct has_any ("IDS", "IPS", "Firewall")
+    | where TimeGenerated > ago(90d)
+    | where DeviceEventClassID has_any ("intrusion", "ids", "ips") or Activity has_any ("intrusion", "detected", "alert")
+    | where Protocol =~ "tcp" or toupper(Protocol) == "TCP" or ApplicationProtocol =~ "tcp"
+    | where CommunicationDirection =~ "Inbound" or DeviceDirection =~ "Inbound"
+    | where SourceIP !in ("10.0.0.5", "192.168.1.100", "172.16.0.10")
+    | summarize event_count = count(), unique_dests = dcount(DestinationIP), bytes_out = sum(SentBytes) by SourceIP, DestinationIP, DestinationPort
+    | where event_count >= 1
     | sort by bytes_out desc
+  aql: "SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_dests, SUM(bytesout) AS\
+    \ total_bytes_out\nFROM events\nWHERE LOWER(protocolname) = 'tcp' \n  AND (LOWER(CATEGORYNAME(category)) LIKE '%ids%' OR LOWER(CATEGORYNAME(category))\
+    \ LIKE '%ips%' OR LOWER(CATEGORYNAME(category)) LIKE '%intrusion%')\n  AND sourceip NOT IN ('10.0.0.100', '10.0.0.101', '192.168.1.50')\n\
+    GROUP BY sourceip, destinationip, destinationport\nHAVING event_count >= 1\nORDER BY total_bytes_out DESC\nLAST 24 HOURS\n"
+  yara_l: |
+    rule mitre_t1078_inbound_ids_detection {
+      meta:
+        author = "TDL"
+        description = "Detects inbound IDS detection events over TCP, excluding authorized scanners"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    '
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.ip_protocol = "TCP"
+        $e.network.direction = "INBOUND"
+        (
+          $e.security_result.action = "ALERT" or
+          $e.security_result.action = "BLOCK" or
+          $e.security_result.category_details != ""
+        )
+        not re.regex($e.principal.ip, `^(10\.50\.100\.|192\.168\.254\.)`) // exclude authorized scanners/monitoring
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dest_ip
+        $e.target.port = $dest_port
+
+      match:
+        $src_ip, $dest_ip, $dest_port over 24h
+
+      outcome:
+        $risk_score = max(35)
+        $event_count = count_distinct($e.metadata.id)
+        $total_bytes_out = sum($e.network.sent_bytes)
+        $unique_dest_ips = count_distinct($dest_ip)
+
+      condition:
+        #e >= 1
+    }
+  esql: "FROM logs-network.ids*, logs-network.firewall*\n| WHERE network.transport == \"tcp\" \n  AND event.kind == \"alert\" \n  AND network.direction\
+    \ == \"inbound\"\n  AND NOT CIDR_MATCH(source.ip, \"10.50.0.0/24\", \"192.168.100.0/24\")\n| STATS event_count = COUNT(*), unique_dests =\
+    \ COUNT_DISTINCT(destination.ip), bytes_out = SUM(source.bytes) BY source.ip, destination.ip, destination.port\n| WHERE event_count >= 1\n\
+    | SORT bytes_out DESC\n| KEEP source.ip, destination.ip, destination.port, event_count, unique_dests, bytes_out\n"
+  leql: |
+    where(event_type="IDS Detection" AND direction=INBOUND AND network.protocol ICONTAINS "tcp" AND source_address NOT IN ["authorized_scanner_ip1", "authorized_scanner_ip2"]) groupby(source_address, destination_address, destination_port) calculate(count), calculate(unique:destination_address), calculate(sum:bytes_out)
+  crowdstrike: |
+    #type=firewall OR #type=ids network.protocol=*tcp*
+    | !in(field=src_ip, values=["10.0.0.100", "10.0.0.101", "192.168.1.50"])
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=event_count), count(dest_ip, distinct=true, as=unique_dests), sum(bytes_out, as=total_bytes_out)])
+    | event_count >= 1
+    | sort(total_bytes_out, order=desc)
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter action_threat_matched = "true" and lowercase(threat_category) in ("ids", "intrusion", "exploit") and traffic_direction = "inbound" and lowercase(protocol) = "tcp"
+    | alter src_ip = coalesce(action_source_translated_ip, action_source_ip), dest_ip = coalesce(action_destination_translated_ip, action_destination_ip), dest_port = action_destination_port, bytes_out = to_number(action_upload_bytes)
+    | comp count() as event_count, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | filter event_count >= 1 and src_ip not in ("10.0.0.100", "10.0.0.101", "172.16.1.50")
+    | sort desc total_bytes_out
+    | fields src_ip, dest_ip, dest_port, event_count, unique_dests, total_bytes_out
+  lucene: |
+    (sourcetype:(firewall OR ids) AND network.protocol:tcp AND _exists_:event.category) AND NOT (source.ip:(10.0.0.50 OR 10.0.0.51 OR 192.168.1.100))
+  sumo: |
+    _sourceCategory=*network* OR _sourceCategory=*ids* OR _sourceCategory=*firewall*
+    | where protocol = "tcp" OR protocol matches "*tcp*"
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dest[ination]*[_:\s]+(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dest[ination]*[_\s]*port[:\s]+(?<dest_port>\d+)" nodrop
+    | parse regex "bytes[_\s]*out[:\s]+(?<bytes_out>\d+)" nodrop
+    | where src_ip != "10.0.0.100" AND src_ip != "192.168.1.50"
+    | sum(bytes_out) as total_bytes_out, count_distinct(dest_ip) as unique_dests, count as event_count by src_ip, dest_ip, dest_port
+    | where event_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, event_count, unique_dests, total_bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -100,7 +117,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

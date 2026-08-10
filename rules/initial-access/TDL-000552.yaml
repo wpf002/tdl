@@ -16,83 +16,131 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network sourcetype IN (firewall, ids) protocol="*tcp*" (signature="*code injection*" OR signature="*SQL injection*" OR signature="*command injection*" OR signature="*script injection*" OR uri_path IN ("*union+select*", "*;+drop+table*", "*exec(*", "*<script*", "*javascript:*", "*eval(*", "*system(*", "*cmd.exe*", "*powershell*", "*../", "*%00*")) NOT (src_ip IN ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
+  spl: 'index=network sourcetype IN (firewall, ids) protocol="*tcp*" (signature="*code injection*" OR signature="*SQL injection*" OR signature="*command
+    injection*" OR signature="*script injection*" OR uri_path IN ("*union+select*", "*;+drop+table*", "*exec(*", "*<script*", "*javascript:*",
+    "*eval(*", "*system(*", "*cmd.exe*", "*powershell*", "*../", "*%00*")) NOT (src_ip IN ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
+
     | stats count dc(dest_ip) as unique_dests sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
+
     | where count >= 1
+
     | sort - bytes_out
+
     | table src_ip, dest_ip, dest_port, count, unique_dests, bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(24h)\n| where DeviceVendor has_any (\"Palo Alto\", \"Fortinet\", \"Check Point\", \"Cisco\"\
+    , \"Barracuda\", \"F5\", \"Imperva\", \"ModSecurity\", \"Cloudflare\")\n| where Protocol has \"tcp\"\n| where (DeviceEventCategory has_any\
+    \ (\"code-injection\", \"sql-injection\", \"command-injection\", \"script-injection\") \n    or Message has_any (\"code injection\", \"sql\
+    \ injection\", \"command injection\", \"script injection\", \"'; exec\", \"'; drop\", \"union select\", \"../\", \"eval(\", \"base64_decode\"\
+    , \"system(\", \"exec(\", \"shell_exec\", \"passthru(\"))\n| where DeviceAction !in~ (\"block\", \"blocked\", \"deny\", \"denied\", \"drop\"\
+    , \"dropped\")\n| where SourceIP !in (\"10.0.0.100\", \"10.0.0.101\", \"192.168.1.50\")\n| summarize \n    event_count = count(),\n    unique_dests\
+    \ = dcount(DestinationIP),\n    bytes_out = sum(SentBytes)\n    by SourceIP, DestinationIP, DestinationPort\n| where event_count >= 1\n| sort\
+    \ by bytes_out desc\n| project TimeGenerated = now(), SourceIP, DestinationIP, DestinationPort, event_count, unique_dests, bytes_out\n"
+  aql: "SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_dests, SUM(sourcebytes)\
+    \ AS bytes_out\nFROM events\nWHERE (categoryname(category) ILIKE '%intrusion%' OR categoryname(category) ILIKE '%ids%' OR categoryname(category)\
+    \ ILIKE '%ips%' OR categoryname(category) ILIKE '%web application firewall%' OR categoryname(category) ILIKE '%waf%')\n  AND protocolid =\
+    \ '6'\n  AND (payload MATCHES '.*(\\bselect\\b|\\bunion\\b|\\binsert\\b|\\bupdate\\b|\\bdelete\\b|\\bdrop\\b|\\bexec\\b|\\bscript\\b|<script|javascript:|onerror=|onload=|eval\\\
+    (|base64|\\.\\.\\/|\\.\\.\\\\|;ls|;cat|;wget|;curl|\\$\\{|\\%7B|\\%24\\{).*' \n       OR \"Request\" MATCHES '.*(\\bselect\\b|\\bunion\\b|\\\
+    binsert\\b|\\bupdate\\b|\\bdelete\\b|\\bdrop\\b|\\bexec\\b|\\bscript\\b|<script|javascript:|onerror=|onload=|eval\\(|base64|\\.\\.\\/|\\.\\\
+    .\\\\|;ls|;cat|;wget|;curl|\\$\\{|\\%7B|\\%24\\{).*'\n       OR categoryname(category) ILIKE '%injection%' \n       OR categoryname(category)\
+    \ ILIKE '%sql injection%'\n       OR categoryname(category) ILIKE '%command injection%'\n       OR categoryname(category) ILIKE '%code injection%'\n\
+    \       OR qidname(qid) ILIKE '%injection%'\n       OR qidname(qid) ILIKE '%exploit%')\n  AND sourceip NOT IN ('10.0.0.100', '10.0.0.101',\
+    \ '172.16.1.50')\nGROUP BY sourceip, destinationip, destinationport\nHAVING event_count >= 1\nORDER BY bytes_out DESC\nLAST 7 DAYS\n"
+  yara_l: |
+    rule code_injection_attempt {
+      meta:
+        author = "TDL"
+        description = "Detects allowed network traffic with code injection signatures - T1190"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1190"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        (
+          $e.metadata.product_name = "firewall" or
+          $e.metadata.product_name = "ids" or
+          $e.metadata.product_name = "ips" or
+          $e.metadata.product_name = "waf"
+        )
+        re.regex($e.network.ip_protocol, `(?i)tcp`)
+        (
+          re.regex($e.network.http.parsed_user_agent, `(?i)(union\s+select|exec\s*\(|<script|javascript:|eval\(|base64|cmd\.exe|/bin/bash|\/etc\/passwd)`) or
+          re.regex($e.network.http.referrer, `(?i)(union\s+select|exec\s*\(|<script|javascript:|eval\(|base64|cmd\.exe|/bin/bash|\/etc\/passwd)`) or
+          re.regex($e.network.http.method, `(?i)(union\s+select|exec\s*\(|<script|javascript:|eval\(|base64)`) or
+          re.regex($e.about.url, `(?i)(union\s+select|exec\s*\(|<script|javascript:|eval\(|base64|\.\.\/|cmd\.exe|/bin/bash|\/etc\/passwd)`) or
+          re.regex($e.security_result.detection_fields["signature"], `(?i)(code\s*injection|sql\s*injection|command\s*injection|script\s*injection|xss|remote\s*code)`) or
+          re.regex($e.security_result.summary, `(?i)(code\s*injection|sql\s*injection|command\s*injection|script\s*injection|xss|remote\s*code)`)
+        )
+        $e.security_result.action = "ALLOW"
+        not re.regex($e.principal.ip, `(?i)(scanner|monitor|authorized)`)
+        not net.ip_in_range_cidr($e.principal.ip, "10.0.1.0/24")
+        not net.ip_in_range_cidr($e.principal.ip, "192.168.100.0/24")
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dest_ip
+        $e.target.port = $dest_port
 
-    WHERE "network.protocol" LIKE ''%tcp%''
+      match:
+        $src_ip, $dest_ip, $dest_port over 24h
 
-    GROUP BY sourceip, destinationip, destinationport
+      outcome:
+        $risk_score = max(75)
+        $bytes_out = sum($e.network.sent_bytes)
+        $event_count = count_distinct($e.metadata.id)
+        $unique_dests = count_distinct($e.target.ip)
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000552 {\n  meta:\n    author = \"TDL\"\n    description = \"Allowed Code Injection Traffic\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-network.firewall*, logs-network.ids*
+    | WHERE network.protocol LIKE "*tcp*"
+      AND (http.request.body.content LIKE "*exec(*" OR http.request.body.content LIKE "*eval(*" OR http.request.body.content LIKE "*system(*" OR http.request.body.content LIKE "*cmd(*" OR http.request.body.content LIKE "*<script*" OR http.request.body.content LIKE "*javascript:*" OR http.request.body.content LIKE "*onerror=*" OR http.request.body.content LIKE "*onload=*" OR url.query LIKE "*exec(*" OR url.query LIKE "*eval(*" OR url.query LIKE "*system(*" OR url.query LIKE "*cmd(*" OR url.query LIKE "*<script*" OR url.query LIKE "*javascript:*" OR url.query LIKE "*onerror=*" OR url.query LIKE "*onload=*" OR url.path LIKE "*../*" OR url.path LIKE "*;*" OR url.path LIKE "*|*" OR event.action == "allowed" OR event.outcome == "success")
+      AND NOT (source.ip IN ("10.0.0.100", "10.0.0.101", "192.168.1.50") OR host.name LIKE "*scanner*" OR host.name LIKE "*monitor*")
+    | STATS count = COUNT(*), unique_dests = COUNT_DISTINCT(destination.ip), bytes_out = SUM(source.bytes) BY source.ip, destination.ip, destination.port
+    | WHERE count >= 1
     | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    | KEEP source.ip, destination.ip, destination.port, count, unique_dests, bytes_out
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp" AND (source_json.signature ICONTAINS "code injection" OR source_json.message ICONTAINS "code injection" OR source_json.alert ICONTAINS "code injection" OR source_json.event_type ICONTAINS "code injection" OR source_json.attack_type ICONTAINS "code injection" OR source_json.threat_type ICONTAINS "code injection" OR source_json.rule_name ICONTAINS "code injection" OR source_json.action=ALLOW OR source_json.action=ALLOWED OR source_json.disposition=ALLOW OR source_json.disposition=ALLOWED) AND source_address NOT IN ["10.0.0.100", "10.0.0.101", "192.168.1.50"]) groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    #type=network (sourcetype=firewall OR sourcetype=ids) protocol=*tcp* (signature=*injection* OR signature=*code?injection* OR url=*union*select* OR url=*exec* OR url=*script* OR url=*javascript* OR url=*<script* OR url=*eval(* OR url=*system(* OR url=*cmd* OR url=*../../* OR url=*..//* OR url=*.php?* OR url=*.asp?* OR url=*.jsp?* OR request=*union*select* OR request=*exec* OR request=*<script* OR request=*eval(* OR request=*system(* OR payload=*injection* OR http.request.body=*union*select* OR http.request.body=*exec* OR http.request.body=*<script* OR http.request.body=*eval(*)
+    | !in(field=src_ip, values=["10.0.0.10", "10.0.0.11", "192.168.1.100", "scanner.internal"])
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=event_count), count(dest_ip, distinct=true, as=unique_dests), sum(bytes_out, as=bytes_out)])
+    | event_count >= 1
+    | sort(bytes_out, order=desc, limit=10000)
+    | table([src_ip, dest_ip, dest_port, event_count, unique_dests, bytes_out])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter action = \"allow\" and lowercase(proto) contains \"tcp\"\n| filter (lowercase(app_category)\
+    \ contains \"code-injection\" \n         or lowercase(threat_name) contains \"code-injection\" \n         or lowercase(threat_category) contains\
+    \ \"code-injection\"\n         or lowercase(url_category_list) contains \"command-and-control\"\n         or lowercase(misc) ~= \"(?i)(union\\\
+    \\s+select|<script|javascript:|eval\\\\(|exec\\\\(|cmd\\\\.exe|/bin/sh|base64_decode)\")\n| filter src_ip not in (\"10.0.0.100\", \"10.0.0.101\"\
+    , \"192.168.1.50\")\n| comp count() as cnt, count_distinct(dst_ip) as unique_dests, sum(bytes_sent) as bytes_out by src_ip, dst_ip, dst_port\n\
+    | filter cnt >= 1\n| sort desc bytes_out\n| fields src_ip, dst_ip, dst_port, cnt, unique_dests, bytes_out\n"
+  lucene: |
+    network.protocol:*tcp* AND (http.request.body:(*<script* OR *javascript:* OR *onerror=* OR *onload=* OR *eval(* OR *union*select* OR *'OR'1'='1* OR *exec(* OR *system(* OR *cmd.exe* OR *powershell* OR *base64* OR *../../* OR *%00* OR *%27* OR *%3Cscript*) OR url.path:(*<script* OR *javascript:* OR *onerror=* OR *onload=* OR *eval(* OR *union*select* OR *'OR'1'='1* OR *exec(* OR *system(* OR *../../* OR *%00* OR *%27* OR *%3Cscript*) OR http.request.method:(PUT OR DELETE OR PATCH) OR url.query:(*<script* OR *javascript:* OR *union*select* OR *'OR'1'='1* OR *exec(* OR *eval(* OR *../../*)) AND NOT source.ip:(10.0.0.100 OR 10.0.0.101 OR 172.16.1.50)
+  sumo: |
+    _sourceCategory=*network* OR _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*waf*
+    | where protocol matches "*tcp*" or protocol matches "*TCP*"
+    | parse regex "(?i)(union.*select|select.*from|insert.*into|delete.*from|drop.*table|exec.*xp_|<script|javascript:|onerror=|onload=|eval\(|base64|cmd\.exe|/bin/sh|/bin/bash|\.\./\.\./|etc/passwd)" as injection_pattern
+    | where !isNull(injection_pattern)
+    | parse "src_ip=*" as src_ip nodrop
+    | parse "dest_ip=*" as dest_ip nodrop
+    | parse "destination_ip=*" as dest_ip nodrop
+    | parse "dest_port=*" as dest_port nodrop
+    | parse "destination_port=*" as dest_port nodrop
+    | parse "bytes_out=*" as bytes_out nodrop
+    | json field=_raw "src_ip" as src_ip nodrop
+    | json field=_raw "source_ip" as src_ip nodrop
+    | json field=_raw "dest_ip" as dest_ip nodrop
+    | json field=_raw "destination_ip" as dest_ip nodrop
+    | json field=_raw "dest_port" as dest_port nodrop
+    | json field=_raw "destination_port" as dest_port nodrop
+    | json field=_raw "bytes_out" as bytes_out nodrop
+    | json field=_raw "bytes" as bytes_out nodrop
+    | where !(src_ip in ("10.0.0.100", "192.168.1.50", "172.16.0.10"))
+    | count as event_count, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | where event_count >= 1
+    | sort by total_bytes_out desc
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -102,7 +150,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

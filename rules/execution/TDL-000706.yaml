@@ -29,71 +29,80 @@ queries:
     \ parent_process), child_proc=coalesce(Image, process_name), cmdline=coalesce(CommandLine, command_line), system=coalesce(ComputerName, host)\n\
     | stats count values(cmdline) as command_lines earliest(_time) as first_seen latest(_time) as last_seen by system, parent_proc, child_proc,\
     \ user\n| table first_seen, last_seen, system, user, parent_proc, child_proc, command_lines, count\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000706 {\n  meta:\n    author = \"TDL\"\n    description = \"RMM Agent Spawning Interactive Shell\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1072\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceProcessEvents
+    | where TimeGenerated > ago(24h)
+    | where InitiatingProcessFileName in~("ScreenConnect.WindowsClient.exe","ScreenConnect.ClientService.exe","AgentMon.exe","KaseyaD.exe","KaseyaR.exe","NinjaRMMAgent.exe","NinjaRMMAgentPatcher.exe","TeamViewer.exe","TeamViewer_Service.exe")
+    | where FileName in~("cmd.exe","powershell.exe","pwsh.exe")
+    | where ProcessCommandLine !has_any ("Windows\\ccmcache","SoftwareDistribution","WindowsUpdate")
+    | project TimeGenerated, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, InitiatingProcessFolderPath, FolderPath
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Parent Process Name", "Process Name", "Process CommandLine", COUNT(*) AS executions
+    FROM events
+    WHERE ("Parent Process Name" ILIKE '%connectwisecontrol%' OR "Parent Process Name" ILIKE '%connectwise%' OR "Parent Process Name" ILIKE '%kaseya%' OR "Parent Process Name" ILIKE '%ninjarmm%' OR "Parent Process Name" ILIKE '%ninjaone%' OR "Parent Process Name" ILIKE '%teamviewer%')
+      AND ("Process Name" ILIKE '%cmd.exe%' OR "Process Name" ILIKE '%powershell.exe%' OR "Process Name" ILIKE '%pwsh.exe%')
+    GROUP BY eventtime, LOGSOURCENAME(logsourceid), username, "Parent Process Name", "Process Name", "Process CommandLine"
+    LAST 1 HOURS
+  yara_l: "rule remote_management_tool_spawns_shell {\n  meta:\n    author = \"TDL\"\n    description = \"Detects RMM tools spawning command-line\
+    \ shells indicating potential abuse of deployment tooling\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1072\"\
+    \n    severity = \"MEDIUM\"\n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    \n    (\n      re.regex($e.principal.process.file.full_path,\
+    \ `(?i)connectwise`) or\n      re.regex($e.principal.process.file.full_path, `(?i)kaseya`) or\n      re.regex($e.principal.process.file.full_path,\
+    \ `(?i)ninjaone`) or\n      re.regex($e.principal.process.file.full_path, `(?i)teamviewer`) or\n      re.regex($e.principal.process.file.full_path,\
+    \ `(?i)screenconnect`) or\n      re.regex($e.principal.process.file.full_path, `(?i)labtech`) or\n      re.regex($e.principal.process.file.full_path,\
+    \ `(?i)agentmon\\.exe`) or\n      re.regex($e.principal.process.file.full_path, `(?i)ninjarmm`)\n    )\n    \n    (\n      re.regex($e.target.process.file.full_path,\
+    \ `(?i)\\\\cmd\\.exe$`) or\n      re.regex($e.target.process.file.full_path, `(?i)\\\\powershell\\.exe$`) or\n      re.regex($e.target.process.file.full_path,\
+    \ `(?i)\\\\pwsh\\.exe$`) or\n      re.regex($e.target.process.file.full_path, `(?i)/bin/(ba)?sh$`)\n    )\n    \n    not re.regex($e.target.process.command_line,\
+    \ `(?i)(windows.*update|patch|wsus|wuauclt)`)\n    \n    $e.principal.hostname = $host\n    $e.principal.process.file.full_path = $rmm_tool\n\
+    \    $e.target.process.file.full_path = $shell\n    \n  match:\n    $host over 5m\n    \n  outcome:\n    $risk_score = 65\n    \n  condition:\n\
+    \    $e\n}\n"
+  esql: |
+    FROM logs-endpoint.events.process*, logs-*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        process.parent.name IN ("ScreenConnect.ClientService.exe", "ScreenConnect.WindowsClient.exe", "AgentMonitor.exe", "KaseyaD.exe", "NinjaRMMAgent.exe", "NinjaRMMAgentPatcher.exe", "TeamViewer.exe", "TeamViewer_Service.exe", "tvnserver.exe", "ConnectWiseControl.Client.exe", "ConnectWiseControl.ClientService.exe")
+        OR TO_LOWER(process.parent.executable) LIKE "*connectwise*"
+        OR TO_LOWER(process.parent.executable) LIKE "*screenconnect*"
+        OR TO_LOWER(process.parent.executable) LIKE "*kaseya*"
+        OR TO_LOWER(process.parent.executable) LIKE "*ninjaone*"
+        OR TO_LOWER(process.parent.executable) LIKE "*ninjarmm*"
+        OR TO_LOWER(process.parent.executable) LIKE "*teamviewer*"
+      )
+      AND process.name IN ("cmd.exe", "powershell.exe", "pwsh.exe", "pwsh", "bash", "sh", "zsh")
+      AND NOT (
+        process.command_line LIKE "*Windows\\ccmcache\\*"
+        OR process.command_line LIKE "*patch*"
+        OR process.command_line LIKE "*update*"
+        OR process.command_line LIKE "*SCCM*"
+      )
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.parent.executable, process.executable
+    | SORT @timestamp DESC
+    | LIMIT 1000
+  leql: |
+    where((parent_process_name ICONTAINS "connectwise" OR parent_process_name ICONTAINS "kaseya" OR parent_process_name ICONTAINS "ninjaone" OR parent_process_name ICONTAINS "teamviewer") AND (process_name ICONTAINS "cmd.exe" OR process_name ICONTAINS "powershell.exe" OR process_name ICONTAINS "pwsh.exe"))
+  crowdstrike: "event_simpleName=ProcessRollup2 \n(ParentBaseFileName=*connectwise* OR ParentBaseFileName=*kaseya* OR ParentBaseFileName=*ninjaone*\
+    \ OR ParentBaseFileName=*teamviewer* OR ParentBaseFileName=*screenconnect* OR ParentBaseFileName=*nable*)\n(FileName=cmd.exe OR FileName=powershell.exe\
+    \ OR FileName=pwsh.exe OR FileName=bash OR FileName=sh OR FileName=zsh)\n| table([@timestamp, ComputerName, UserName, ParentBaseFileName,\
+    \ FileName, CommandLine, SHA256HashData])\n"
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_PROCESS\n| filter (lowercase(actor_process_image_name) contains \"connectwisecontrol\"\
+    \ \n         or lowercase(actor_process_image_name) contains \"screenconnect\"\n         or lowercase(actor_process_image_name) contains \"\
+    kaseya\"\n         or lowercase(actor_process_image_name) contains \"agentmon.exe\"\n         or lowercase(actor_process_image_name) contains\
+    \ \"ninjaone\"\n         or lowercase(actor_process_image_name) contains \"ninjarmm\"\n         or lowercase(actor_process_image_name) contains\
+    \ \"teamviewer\")\n| filter (lowercase(action_process_image_name) contains \"cmd.exe\"\n         or lowercase(action_process_image_name) contains\
+    \ \"powershell.exe\"\n         or lowercase(action_process_image_name) contains \"pwsh.exe\"\n         or lowercase(action_process_image_name)\
+    \ contains \"pwsh\")\n| fields _time, agent_hostname, actor_process_image_name, action_process_image_name, action_process_image_command_line,\
+    \ actor_effective_username\n"
+  lucene: |
+    (process.parent.name:(ScreenConnect.ClientService.exe OR ScreenConnect.WindowsClient.exe OR AgentMon.exe OR "Kaseya Agent.exe" OR NinjaRMMAgent.exe OR TeamViewer_Service.exe) OR process.parent.executable:(*ScreenConnect* OR *Kaseya* OR *NinjaRMM* OR *TeamViewer*)) AND (process.name:(cmd.exe OR powershell.exe OR pwsh.exe OR bash OR sh) OR process.executable:(*cmd.exe OR *powershell.exe OR *pwsh.exe OR *bash OR */sh))
+  sumo: |
+    _sourceCategory=*EDR* OR _sourceCategory=*RMM* OR _sourceCategory=*MDM*
+    | json field=_raw "ParentProcessName" as parent_process
+    | json field=_raw "ProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "Computer" as host
+    | where (parent_process matches "*ConnectWiseControl*" OR parent_process matches "*Kaseya*" OR parent_process matches "*NinjaRMM*" OR parent_process matches "*TeamViewer*" OR parent_process matches "*ScreenConnect*" OR parent_process matches "*AgentMon.exe*" OR parent_process matches "*CWControl*")
+    | where (process_name matches "*cmd.exe" OR process_name matches "*powershell.exe" OR process_name matches "*pwsh.exe")
+    | where !(command_line matches "*Windows\\CCM\\*" OR command_line matches "*patch*" OR command_line matches "*update*")
+    | fields _messageTime, host, parent_process, process_name, command_line
 pseudo_logic: ConnectWise / Kaseya / NinjaOne / TeamViewer agent process spawns cmd, powershell or pwsh. Outside known patch workflows this signals
   abused deployment tooling.
 false_positives:
@@ -113,7 +122,7 @@ references:
 - https://attack.mitre.org/techniques/T1072/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'

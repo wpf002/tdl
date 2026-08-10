@@ -17,77 +17,80 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=edr (process_name="*" OR Image="*") (api_call="EnumWindows" OR api_call="GetForegroundWindow" OR api_call="GetWindowText" OR function_name="EnumWindows" OR function_name="GetForegroundWindow" OR function_name="GetWindowText")
+  spl: 'index=edr (process_name="*" OR Image="*") (api_call="EnumWindows" OR api_call="GetForegroundWindow" OR api_call="GetWindowText" OR function_name="EnumWindows"
+    OR function_name="GetForegroundWindow" OR function_name="GetWindowText")
+
     | bin _time span=10s
-    | stats count dc(api_call) as unique_apis values(api_call) as apis earliest(_time) as first_seen latest(_time) as last_seen by _time, host, process_id, process_name, user
+
+    | stats count dc(api_call) as unique_apis values(api_call) as apis earliest(_time) as first_seen latest(_time) as last_seen by _time, host,
+    process_id, process_name, user
+
     | where count > 50 AND (last_seen - first_seen) <= 10
+
     | table _time, host, user, process_name, process_id, count, unique_apis, apis, first_seen, last_seen
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000754 {\n  meta:\n    author = \"TDL\"\n    description = \"Process Enumerating Foreground Windows via EnumWindows\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1010\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: "DeviceEvents\n| where TimeGenerated > ago(1h)\n| where ActionType in (\"GetForegroundWindow\", \"GetWindowText\", \"EnumWindows\")\n|\
+    \ extend ProcessLifetime = datetime_diff('second', ProcessTerminationTime, ProcessCreationTime)\n| where ProcessLifetime <= 10 or isempty(ProcessTerminationTime)\n\
+    | summarize \n    CallCount = count(),\n    FirstSeen = min(TimeGenerated),\n    LastSeen = max(TimeGenerated),\n    Actions = make_set(ActionType)\n\
+    \    by DeviceId, DeviceName, InitiatingProcessId, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessFolderPath, AccountName\n\
+    | extend TimeWindow = datetime_diff('second', LastSeen, FirstSeen)\n| where CallCount > 50 and TimeWindow <= 10\n| project TimeGenerated =\
+    \ FirstSeen, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessFolderPath, CallCount, TimeWindow,\
+    \ Actions\n"
+  aql: |
+    SELECT "Process Name", "Process CommandLine", sourceip, LOGSOURCENAME(logsourceid) AS host, COUNT(*) AS api_calls, MIN(eventtime) AS first_call, MAX(eventtime) AS last_call
+    FROM events
+    WHERE ("Function Name" IN ('EnumWindows', 'GetForegroundWindow', 'GetWindowText') OR "API Call" IN ('EnumWindows', 'GetForegroundWindow', 'GetWindowText'))
+    GROUP BY "Process Name", "Process CommandLine", sourceip, LOGSOURCENAME(logsourceid)
+    HAVING api_calls > 50 AND (last_call - first_call) <= 10000
+    LAST 10 MINUTES
+  yara_l: "rule application_window_discovery_rapid_enumeration {\n  meta:\n    author = \"TDL\"\n    description = \"Detects T1010 Application\
+    \ Window Discovery via rapid EnumWindows/GetForegroundWindow/GetWindowText API calls from short-lived process\"\n    mitre_attack_tactic =\
+    \ \"Discovery\"\n    mitre_attack_technique = \"T1010\"\n    severity = \"Medium\"\n\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
+    \ or\n    $e.metadata.event_type = \"PROCESS_TERMINATION\" or\n    $e.metadata.event_type = \"GENERIC_EVENT\"\n    \n    (\n      re.regex($e.metadata.description,\
+    \ `(?i)(EnumWindows|GetForegroundWindow|GetWindowText)`) or\n      re.regex($e.principal.process.command_line, `(?i)(EnumWindows|GetForegroundWindow|GetWindowText)`)\
+    \ or\n      re.regex($e.security_result.description, `(?i)(EnumWindows|GetForegroundWindow|GetWindowText)`)\n    )\n    \n    $e.principal.process.pid\
+    \ = $pid\n    $e.principal.hostname = $host\n    $e.principal.process.file.full_path = $process_path\n\n  match:\n    $host, $pid, $process_path\
+    \ over 10s\n\n  condition:\n    #e >= 50\n}\n"
+  esql: "FROM logs-endpoint.events.library*\n| WHERE @timestamp > NOW() - 1 hour \n  AND (dll.name == \"user32.dll\" OR dll.name == \"User32.dll\"\
+    )\n  AND (process.Ext.api.name IN (\"EnumWindows\", \"GetForegroundWindow\", \"GetWindowText\") \n       OR event.action == \"load\" AND process.Ext.api.behaviors\
+    \ IN (\"EnumWindows\", \"GetForegroundWindow\", \"GetWindowText\"))\n| EVAL process_lifetime = process.end - process.start\n| WHERE process_lifetime\
+    \ <= 10000\n| STATS api_calls = COUNT(*) BY process.entity_id, process.name, process.executable, host.name, user.name, bucket = BUCKET(@timestamp,\
+    \ 10 seconds)\n| WHERE api_calls > 50\n| KEEP @timestamp, bucket, host.name, user.name, process.name, process.executable, api_calls\n"
+  leql: |
+    where(process_cmd_line CONTAINS "EnumWindows" OR process_cmd_line CONTAINS "GetForegroundWindow" OR process_cmd_line CONTAINS "GetWindowText" OR source_json.CallTrace ICONTAINS "EnumWindows" OR source_json.CallTrace ICONTAINS "GetForegroundWindow" OR source_json.CallTrace ICONTAINS "GetWindowText" OR source_json.TargetObject ICONTAINS "EnumWindows" OR source_json.TargetObject ICONTAINS "GetForegroundWindow" OR source_json.TargetObject ICONTAINS "GetWindowText") groupby(process_name, asset) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 event_platform IN [Win, Mac]
+    | case {
+        event_platform=Win | regex("(?i)(EnumWindows|GetForegroundWindow|GetWindowText)", field=CommandLine, as=api_match);
+        event_platform=Mac | regex("(?i)(CGWindowListCopyWindowInfo|NSWindow)", field=CommandLine, as=api_match);
+        * | api_match := "";
+      }
+    | api_match != ""
+    | bucket(limit=10s, field=@timestamp, function=[count(as=api_calls), selectLast([ContextProcessId, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName])])
+    | api_calls > 50
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName, ContextProcessId, api_calls])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_API_CALL
+      and (action_api_name in ("EnumWindows", "GetForegroundWindow", "GetWindowText"))
+    | bin _time span=10s
+    | comp count() as api_calls by _time, agent_hostname, action_process_image_name, action_process_image_path, actor_process_pid
+    | filter api_calls > 50
+    | fields _time, agent_hostname, action_process_image_name, action_process_image_path, actor_process_pid, api_calls
+  lucene: |
+    (event.action:"api_call" OR event.category:"process" OR event.type:"info") AND (process.name:(*.exe OR *) AND process.duration:[0 TO 10000]) AND (api.name:("EnumWindows" OR "GetForegroundWindow" OR "GetWindowText") OR function.name:("EnumWindows" OR "GetForegroundWindow" OR "GetWindowText") OR event.action:("EnumWindows" OR "GetForegroundWindow" OR "GetWindowText"))
+  sumo: |
+    _sourceCategory=*EDR* (EnumWindows OR GetForegroundWindow OR GetWindowText)
+    | json field=_raw "process_name" as process_name
+    | json field=_raw "process_id" as process_id
+    | json field=_raw "api_call" as api_call
+    | json field=_raw "timestamp" as event_time
+    | where api_call in ("EnumWindows", "GetForegroundWindow", "GetWindowText")
+    | timeslice 10s
+    | count as call_count by _timeslice, process_id, process_name, _sourceHost
+    | where call_count > 50
+    | fields _timeslice, _sourceHost, process_name, process_id, call_count
 pseudo_logic: Short-lived process calling EnumWindows / GetForegroundWindow / GetWindowText >50 times within 10s. Common screen-aware malware
   staging.
 false_positives:
@@ -105,7 +108,7 @@ references:
 - https://attack.mitre.org/techniques/T1010/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

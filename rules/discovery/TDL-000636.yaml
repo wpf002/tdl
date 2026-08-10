@@ -20,71 +20,68 @@ queries:
     \ AdditionalFields!=\"[]\" \n| where NOT match(AdditionalFields, \"\\\"Scope\\\":\\s*\\\"Base\\\"\") \n| where (match(AdditionalFields, \"\
     DC=,DC=\") OR match(AdditionalFields, \"CN=AdminSDHolder\")) \n| where match(AdditionalFields, \"nTSecurityDescriptor\") \n| table _time,\
     \ DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, AdditionalFields\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000636 {\n  meta:\n    author = \"TDL\"\n    description = \"LDAP ACL Recon - Defender\"\n    severity = \"LOW\"\n\
-    \    tactic = \"TA0007\"\n    technique = \"T1069\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceEvents
+    | where TimeGenerated > ago(24h)
+    | where ActionType == "LdapSearch"
+    | where AdditionalFields != "[]"
+    | where AdditionalFields !has "\"Scope\":\"Base\""
+    | where (AdditionalFields has "DC=,DC=" or AdditionalFields has "CN=AdminSDHolder")
+    | where AdditionalFields has "nTSecurityDescriptor"
+    | project TimeGenerated, DeviceName, AccountName, ActionType, AdditionalFields
+  aql: |
+    SELECT username, sourceip, destinationip, "AdditionalFields", COUNT(*) AS search_count
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%Microsoft Defender%'
+      AND "EventType" = 'LdapSearch'
+      AND "Tags" != '[ ]'
+      AND "Scope" != 'Base'
+      AND ("AdditionalFields" ILIKE '%DC=,DC=%' OR "AdditionalFields" ILIKE '%CN=AdminSDHolder%')
+      AND "AdditionalFields" ILIKE '%nTSecurityDescriptor%'
+    GROUP BY username, sourceip, destinationip, "AdditionalFields"
+    LAST 1 HOURS
+  yara_l: "rule mitre_t1069_ldap_enumeration {\n  meta:\n    author = \"TDL\"\n    description = \"Detects LDAP searches for domain admin groups\
+    \ and security descriptors via Microsoft Defender\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1069\"\n   \
+    \ severity = \"Medium\"\n    \n  events:\n    $e.metadata.product_name = \"Microsoft Defender for Endpoint\"\n    $e.metadata.product_event_type\
+    \ = \"LdapSearch\"\n    \n    // tags != \"[ ]\" means tags field should exist and not be empty array\n    $e.security_result.summary != \"\
+    [ ]\"\n    \n    // scope != \"Base\"\n    $e.security_result.detection_fields.value != \"Base\"\n    \n    // additional_fields contains\
+    \ conditions\n    (\n      re.regex($e.additional.fields, `DC=,DC=`) or\n      re.regex($e.additional.fields, `CN=AdminSDHolder`)\n    )\n\
+    \    \n    // AND nTSecurityDescriptor\n    re.regex($e.additional.fields, `nTSecurityDescriptor`)\n    \n    $e.principal.hostname = $host\n\
+    \    $e.principal.user.userid = $user\n    \n  match:\n    $host, $user over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-microsoft.defender_endpoint* \n| WHERE @timestamp > NOW() - 24 hour \n  AND event.category == \"AdvancedHunting-DeviceEvents\"\
+    \ \n  AND event.type == \"LdapSearch\" \n  AND microsoft.defender.tags != \"[ ]\" \n  AND microsoft.defender.scope != \"Base\"\n  AND (microsoft.defender.additional_fields\
+    \ LIKE \"*DC=,DC=*\" OR microsoft.defender.additional_fields LIKE \"*CN=AdminSDHolder*\")\n  AND microsoft.defender.additional_fields LIKE\
+    \ \"*nTSecurityDescriptor*\"\n| KEEP @timestamp, host.name, user.name, microsoft.defender.additional_fields, event.type, microsoft.defender.scope\n"
+  leql: |
+    where(source_json.event_category="AdvancedHunting-DeviceEvents" AND source_json.event_type="LdapSearch" AND source_json.tags!="[ ]" AND source_json.scope!="Base" AND (source_json.additional_fields ICONTAINS "DC=,DC=" OR source_json.additional_fields ICONTAINS "CN=AdminSDHolder") AND source_json.additional_fields ICONTAINS "nTSecurityDescriptor")
+  crowdstrike: |
+    #type="AdvancedHunting-DeviceEvents" event_type="LdapSearch" scope!="Base" tags!="[ ]"
+    (additional_fields=*DC=,DC=* OR additional_fields=*CN=AdminSDHolder*)
+    additional_fields=*nTSecurityDescriptor*
+    | table([@timestamp, ComputerName, UserName, additional_fields, scope, tags])
+  xql: |
+    dataset = msft_defender_event
+    | filter event_category = "AdvancedHunting-DeviceEvents"
+    | filter event_type = "LdapSearch"
+    | filter tags != "[ ]"
+    | filter scope != "Base"
+    | filter (additional_fields contains "DC=,DC=" or additional_fields contains "CN=AdminSDHolder")
+    | filter additional_fields contains "nTSecurityDescriptor"
+    | fields _time, device_name, additional_fields, scope, tags
+  lucene: |
+    event_category:"AdvancedHunting-DeviceEvents" AND event_type:"LdapSearch" AND NOT tags:"[ ]" AND NOT scope:"Base" AND (additional_fields:*DC=,DC=* OR additional_fields:*CN=AdminSDHolder*) AND additional_fields:*nTSecurityDescriptor*
+  sumo: |
+    _sourceCategory=*AdvancedHunting* OR _sourceCategory=*DeviceEvents* OR _sourceCategory=*Defender*
+    | json field=_raw "ActionType" as action_type
+    | json field=_raw "AdditionalFields" as additional_fields
+    | json field=_raw "Tags" as tags
+    | where action_type = "LdapSearch"
+    | where tags != "[ ]" and tags != "[]"
+    | parse regex field=additional_fields "\"Scope\":\"(?<scope>[^\"]+)\""
+    | where scope != "Base"
+    | where (additional_fields matches "*DC=,DC=*" OR additional_fields matches "*CN=AdminSDHolder*")
+    | where additional_fields matches "*nTSecurityDescriptor*"
+    | fields _messageTime, _sourceHost, action_type, additional_fields, tags, scope
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +91,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 AdvancedHunting Device Event\nWhere event_category = \"AdvancedHunting-DeviceEvents\"\nWhere event_type = \"LdapSearch\"\nWhere\
   \ tags != \"[ ]\"\nWhere scope != \"Base\"\n\nWhere (\n    additional_fields contains \"DC=,DC=\"\n    OR additional_fields contains \"CN=AdminSDHolder\"\

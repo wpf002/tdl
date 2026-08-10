@@ -17,68 +17,60 @@ risk_score: 30
 queries:
   spl: "index=aws sourcetype=aws:cloudwatch:guardduty \n(type=\"Discovery:S3/TorIPCaller\" OR type=\"UnauthorizedAccess:S3/TorIPCaller\")\n| table\
     \ _time, type, region, accountId, resource.resourceType, resource.s3BucketDetails.name, service.action.actionType, severity, title, description\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(24h)
+    | where Title in ("Discovery:S3/TorIPCaller", "UnauthorizedAccess:S3/TorIPCaller")
+    | project TimeGenerated, Title, Description, AccountId, Region, ResourceType, Severity, SourceIpAddress = tostring(parse_json(tostring(AdditionalData)).remoteIpDetails.ipAddressV4), UserName = tostring(parse_json(tostring(AdditionalData)).principalId)
+  aql: "SELECT eventtime, sourceip, destinationip, QIDNAME(qid), CATEGORYNAME(category), LOGSOURCENAME(logsourceid), username, \"eventType\" AS\
+    \ event_type, \"resource.resourceType\" AS resource_type, \"service.serviceName\" AS service_name\nFROM events\nWHERE LOGSOURCENAME(logsourceid)\
+    \ ILIKE '%guardduty%' \n  AND (\"eventType\" = 'Discovery:S3/TorIPCaller' OR \"eventType\" = 'UnauthorizedAccess:S3/TorIPCaller')\nLAST 24\
+    \ HOURS\n"
+  yara_l: |
+    rule aws_s3_access_from_tor {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects AWS S3 access attempts from Tor exit nodes via GuardDuty"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1580"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $guardduty.metadata.vendor_name = "Amazon AWS"
+        $guardduty.metadata.product_name = "GuardDuty"
+        (
+          $guardduty.metadata.product_event_type = "Discovery:S3/TorIPCaller" or
+          $guardduty.metadata.product_event_type = "UnauthorizedAccess:S3/TorIPCaller"
+        )
+        $guardduty.principal.ip = $source_ip
 
-    | where eventName matches regex "GuardDuty"
+      match:
+        $source_ip over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000336 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS S3 Activity from TOR Exit Node - GuardDuty\"\n \
-    \   severity = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1580\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $guardduty
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("Discovery:S3/TorIPCaller", "UnauthorizedAccess:S3/TorIPCaller")
+    | KEEP @timestamp, cloud.account.id, cloud.region, event.type, source.ip, aws.guardduty.resource.resource_type, aws.guardduty.severity
+  leql: |
+    where(source_json.type IN ["Discovery:S3/TorIPCaller", "UnauthorizedAccess:S3/TorIPCaller"])
+  crowdstrike: |
+    #repo=guardduty (eventType="Discovery:S3/TorIPCaller" OR eventType="UnauthorizedAccess:S3/TorIPCaller")
+    | table([@timestamp, eventType, accountId, region, resource.resourceType, resource.s3BucketDetails.name, service.action.actionType, severity])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and vendor = "AWS" and product = "GuardDuty"
+    | filter finding_type in ("Discovery:S3/TorIPCaller", "UnauthorizedAccess:S3/TorIPCaller")
+    | fields _time, cloud_provider, vendor, product, finding_type, severity, resource_name, actor_user_name, src_ip_address, region
+  lucene: |
+    event.type:("Discovery:S3/TorIPCaller" OR "UnauthorizedAccess:S3/TorIPCaller")
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*aws* ("Discovery:S3/TorIPCaller" OR "UnauthorizedAccess:S3/TorIPCaller")
+    | json field=_raw "type" as event_type
+    | where event_type in ("Discovery:S3/TorIPCaller", "UnauthorizedAccess:S3/TorIPCaller")
+    | fields _messageTime, _sourceHost, event_type, _raw
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -88,7 +80,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Discovery:S3/TorIPCaller\", \"UnauthorizedAccess:S3/TorIPCaller\"]"
 suppression:

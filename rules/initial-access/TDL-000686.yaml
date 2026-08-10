@@ -15,70 +15,81 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=slack (action IN ("role_change_to_admin", "role_change_to_owner") OR (action="role_assigned" AND (entity.name="*admin*" OR entity.name="*owner*"))) NOT [| inputlookup slack_admins_list.csv | fields user | rename user as source_user] | table _time, source_user, action, entity.name, user, role
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+  spl: 'index=slack (action IN ("role_change_to_admin", "role_change_to_owner") OR (action="role_assigned" AND (entity.name="*admin*" OR entity.name="*owner*")))
+    NOT [| inputlookup slack_admins_list.csv | fields user | rename user as source_user] | table _time, source_user, action, entity.name, user,
+    role
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000686 {\n  meta:\n    author = \"TDL\"\n    description = \"Privilege Escalation via HVT Role - Slack\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    Slack_CL
+    | where TimeGenerated > ago(24h)
+    | where (Action_s in ("role_change_to_admin", "role_change_to_owner"))
+        or (Action_s == "role_assigned" and (entity_name_s contains "admin" or entity_name_s contains "owner"))
+    | where SourceUser_s !in ((externaldata(SlackAdmin: string) [@"https://raw.githubusercontent.com/your-org/watchlists/main/slack_admins.csv"] with (format="csv", ignoreFirstRecord=true)))
+    | project TimeGenerated, SourceUser_s, Action_s, entity_name_s, TargetUser_s, Computer
+  aql: "SELECT \n    DATEFORMAT(eventtime, 'YYYY-MM-dd HH:mm:ss') AS event_time,\n    LOGSOURCENAME(logsourceid) AS log_source,\n    \"Action\"\
+    \ AS action,\n    \"Source User\" AS source_user,\n    \"entity.name\" AS entity_name,\n    username\nFROM events\nWHERE \n    (\n       \
+    \ \"Action\" IN ('role_change_to_admin', 'role_change_to_owner')\n        OR \n        (\n            \"Action\" = 'role_assigned' \n    \
+    \        AND (\"entity.name\" ILIKE '%admin%' OR \"entity.name\" ILIKE '%owner%')\n        )\n    )\n    AND \"Source User\" NOT IN ('slack_admin_user1',\
+    \ 'slack_admin_user2', 'slack_admin_user3')\nLAST 24 HOURS\n"
+  yara_l: |
+    rule slack_unauthorized_privilege_escalation {
+      meta:
+        author = "TDL"
+        description = "Detects unauthorized elevation to admin or owner roles in Slack"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        (
+          $e.metadata.product_name = "Slack"
+          (
+            $e.metadata.product_event_type = "role_change_to_admin" or
+            $e.metadata.product_event_type = "role_change_to_owner" or
+            (
+              $e.metadata.product_event_type = "role_assigned" and
+              (
+                re.regex($e.target.resource.name, `(?i)admin`) or
+                re.regex($e.target.resource.name, `(?i)owner`)
+              )
+            )
+          )
+          $e.principal.user.userid = $source_user
+          not $source_user in %slack_admins_list
+        )
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $source_user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-slack*\n| WHERE (action IN (\"role_change_to_admin\", \"role_change_to_owner\")) \n    OR (action == \"role_assigned\" AND\
+    \ (TO_LOWER(entity.name) LIKE \"*admin*\" OR TO_LOWER(entity.name) LIKE \"*owner*\"))\n| WHERE user.name NOT IN (\"approved_admin_1\", \"\
+    approved_admin_2\", \"approved_admin_3\")\n| KEEP @timestamp, user.name, action, entity.name, host.name, source.ip\n"
+  leql: |
+    where((source_json.action IN ["role_change_to_admin", "role_change_to_owner"]) OR (source_json.action="role_assigned" AND (source_json.entity.name ICONTAINS "admin" OR source_json.entity.name ICONTAINS "owner"))) AND source_user NOT IN [<slack_admin_list>]
+  crowdstrike: |
+    #type=slack (action IN ["role_change_to_admin", "role_change_to_owner"] OR (action="role_assigned" AND (entity.name=*admin* OR entity.name=*owner*)))
+    | NOT source_user IN ["slack_admin_1", "slack_admin_2", "slack_admin_3"]
+    | table([@timestamp, source_user, action, entity.name, user, workspace])
+  xql: "dataset = slack_audit_logs\n| filter action in (\"role_change_to_admin\", \"role_change_to_owner\") \n  or (action = \"role_assigned\"\
+    \ and (lowercase(entity_name) contains \"admin\" or lowercase(entity_name) contains \"owner\"))\n| filter actor_user_email not in (\"admin1@company.com\"\
+    , \"admin2@company.com\", \"admin3@company.com\")\n| fields _time, action, actor_user_email, entity_name, entity_id, context_ip_address\n"
+  lucene: |
+    (action:(role_change_to_admin OR role_change_to_owner) OR (action:role_assigned AND entity.name:(*admin* OR *owner*))) AND NOT source_user:(slack_admin_user1 OR slack_admin_user2 OR slack_admin_user3)
+  sumo: |
+    _sourceCategory=*Slack* (role_change_to_admin OR role_change_to_owner OR role_assigned)
+    | json field=_raw "action" as action
+    | json field=_raw "actor.user.email" as source_user
+    | json field=_raw "entity.name" as entity_name
+    | where (action = "role_change_to_admin" OR action = "role_change_to_owner") OR (action = "role_assigned" AND (entity_name matches "*admin*" OR entity_name matches "*owner*"))
+    | where !(source_user in ("admin1@company.com", "admin2@company.com", "admin3@company.com"))
+    | fields _messageTime, source_user, action, entity_name, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -88,7 +99,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Slack Event\nOR\n    Where the Action is IN (\"role_change_to_admin\", \"role_change_to_owner\")\n\n    Where the Action is role_assigned\"\
   \ \n    Where the \"entity.name\" contains \"admin\" OR \"owner\"\n\nWhere the Source User is NOT on the Slack Admins List"

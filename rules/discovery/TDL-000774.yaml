@@ -22,71 +22,72 @@ queries:
     *\\\\w32tm.exe\" CommandLine=\"*/query*\" CommandLine=\"*/status*\") OR\n     (Image=\"*\\\\w32tm.exe\" CommandLine=\"*/query*status*\")\n\
     \   )\n   User!=\"*SYSTEM*\" User!=\"*AUTHORITY*\" User!=\"*Administrator*\"\n  ) OR\n  (process_name IN (\"date\", \"hwclock\") user!=\"\
     root\")\n)\n| table _time, host, ComputerName, User, user, Image, process_name, CommandLine, ParentImage, parent_process\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000774 {\n  meta:\n    author = \"TDL\"\n    description = \"net time / w32tm Probed by Unusual Process\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1124\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 1
+    | where ProcessCommandLine has_any ("net time", "w32tm", "date", "hwclock")
+    | where ProcessCommandLine has_any ("/query", "/status", "\\\\") or (ProcessCommandLine has "date" and ProcessCommandLine !has "update") or ProcessCommandLine has "hwclock"
+    | where AccountType != "Machine" and SubjectUserName !endswith "$"
+    | where SubjectUserSid !contains "-500" and SubjectUserSid !contains "S-1-5-18" and SubjectUserSid !contains "S-1-5-19" and SubjectUserSid !contains "S-1-5-20"
+    | project TimeGenerated, Computer, SubjectUserName, SubjectDomainName, ProcessCommandLine, Process, ParentProcessName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Parent Process Name"
+    FROM events
+    WHERE ("EventID" = '1')
+      AND (
+        ("Process Name" ILIKE '%net.exe%' AND "Process CommandLine" ILIKE '%time%' AND "Process CommandLine" MATCHES '.*\\\\\\\\.*')
+        OR ("Process Name" ILIKE '%w32tm.exe%' AND ("Process CommandLine" ILIKE '%/query%' OR "Process CommandLine" ILIKE '%-query%') AND ("Process CommandLine" ILIKE '%status%'))
+        OR ("Process Name" ILIKE '%date%' OR "Process Name" ILIKE '%hwclock%')
+      )
+      AND username NOT IN ('NT AUTHORITY\\SYSTEM', 'SYSTEM', 'root')
+      AND "IntegrityLevel" NOT ILIKE '%High%'
+      AND "IntegrityLevel" NOT ILIKE '%System%'
+    LAST 1 HOURS
+  yara_l: "rule system_time_discovery_non_admin {\n  meta:\n    author = \"TDL\"\n    description = \"Detects system time discovery commands from\
+    \ non-admin users - T1124\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1124\"\n    severity = \"Medium\"\n\
+    \  \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      re.regex($e.principal.process.command_line, `(?i)net\\s+time\\\
+    s+\\\\\\\\`) or\n      re.regex($e.principal.process.command_line, `(?i)w32tm\\s+/query\\s+/status`) or\n      re.regex($e.principal.process.command_line,\
+    \ `(?i)^\\s*date\\s*$`) or\n      re.regex($e.principal.process.command_line, `(?i)hwclock`)\n    )\n    not re.regex($e.principal.user.userid,\
+    \ `(?i)(admin|root|system|administrator)`)\n    $e.principal.hostname = $host\n    $e.principal.user.userid = $user\n  \n  match:\n    $host,\
+    \ $user over 5m\n  \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.process*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      AND (
+        (process.name IN ("net.exe", "net1.exe") AND process.command_line LIKE "*time*" AND process.command_line LIKE "*\\\\*")
+        OR (process.name == "w32tm.exe" AND (process.command_line LIKE "*/query*" OR process.command_line LIKE "*/status*"))
+        OR (process.name IN ("date", "hwclock") AND process.command_line RLIKE ".*")
+      )
+      AND NOT user.name IN ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "root")
+    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.command_line, process.parent.name
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, count
+  leql: |
+    where((process_cmd_line ICONTAINS "net time" OR process_cmd_line ICONTAINS "w32tm" AND process_cmd_line ICONTAINS "/query" OR process_cmd_line ICONTAINS "hwclock" OR (process_name ICONTAINS "date" AND NOT process_cmd_line ICONTAINS "update"))) groupby(asset, user, process_name, process_cmd_line) calculate(count)
+  crowdstrike: |
+    (event_simpleName=ProcessRollup2 OR EventCode=1)
+    (
+      (CommandLine=*net* AND CommandLine=*time* AND CommandLine=*\\\\*)
+      OR (CommandLine=*w32tm* AND (CommandLine=*/query* OR CommandLine=*/status*))
+      OR FileName=/^(date|hwclock)$/
+    )
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter (
+        (action_process_image_command_line ~= "net\\s+time\\s+\\\\" or action_process_image_command_line ~= "w32tm\\s+/query\\s+/status" or action_process_image_command_line ~= "\\bhwclock\\b" or action_process_image_command_line ~= "\\bdate\\b")
+        and actor_effective_username not in ("SYSTEM", "root", "LOCAL SERVICE", "NETWORK SERVICE")
+        and actor_effective_username != null
+    )
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line
+  lucene: |
+    (process.command_line:(*net*time* OR *w32tm*\/query* OR *w32tm*query* OR *date* OR *hwclock*) AND NOT (user.name:(*admin* OR *system* OR *SYSTEM* OR *Administrator* OR root))) OR (process.name:(net.exe OR net1.exe OR w32tm.exe OR date OR hwclock) AND process.command_line:(*time* OR *\/query* OR *query* OR *\/status* OR *status*) AND NOT (user.name:(*admin* OR *system* OR *SYSTEM* OR *Administrator* OR root)))
+  sumo: "_sourceCategory=*Sysmon* (\"net time\" OR \"w32tm\" OR \"date\" OR \"hwclock\")\n| json field=_raw \"EventID\" as event_id\n| json field=_raw\
+    \ \"CommandLine\" as cmd\n| json field=_raw \"User\" as user\n| json field=_raw \"Image\" as process_name\n| where event_id = \"1\" \n| where\
+    \ (cmd matches \"*net*time*\" OR cmd matches \"*w32tm*/query*\" OR cmd matches \"*w32tm* /query*\" OR cmd matches \"*date*\" OR cmd matches\
+    \ \"*hwclock*\")\n| where !(user matches \"*SYSTEM*\" OR user matches \"*Administrator*\" OR user matches \"*root*\")\n| fields _messageTime,\
+    \ _sourceHost, user, process_name, cmd\n"
 pseudo_logic: net time \\<host>, w32tm /query /status, or date / hwclock from a non-admin user-context process.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -103,7 +104,7 @@ references:
 - https://attack.mitre.org/techniques/T1124/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

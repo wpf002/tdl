@@ -16,74 +16,68 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Windows Defender/Operational" EventCode=15 EventData="*SECURITY_PRODUCT_STATE_OFF*"
+  spl: 'index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Windows Defender/Operational" EventCode=15 EventData="*SECURITY_PRODUCT_STATE_OFF*"
+
     | table _time, ComputerName, User, EventData
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000674 {\n  meta:\n    author = \"TDL\"\n    description = \"Defendnot TPM Alteration\"\n    severity = \"HIGH\"\n\
-    \    tactic = \"TA0005\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    Event
+    | where TimeGenerated > ago(24h)
+    | where EventID == 15
+    | where RenderedDescription has "SECURITY_PRODUCT_STATE_OFF" or EventData has "SECURITY_PRODUCT_STATE_OFF"
+    | project TimeGenerated, Computer, EventID, RenderedDescription, EventData, ParameterXml
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Image", "TargetObject"
+    FROM events
+    WHERE "EventID" = '15'
+      AND ("TargetObject" ILIKE '%SECURITY_PRODUCT_STATE_OFF%' OR "Details" ILIKE '%SECURITY_PRODUCT_STATE_OFF%')
+    LAST 24 HOURS
+  yara_l: |
+    rule windows_defender_disabled_via_wmi {
+      meta:
+        author = "Chronicle Detection Engineering"
+        description = "Detects Windows Defender being disabled via WMI FileCreate event (Event ID 15) with SECURITY_PRODUCT_STATE_OFF"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1078"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "FILE_CREATION"
+        $e.metadata.product_event_type = "15"
+        re.regex($e.metadata.description, `SECURITY_PRODUCT_STATE_OFF`) or
+        re.regex($e.target.file.full_path, `SECURITY_PRODUCT_STATE_OFF`) or
+        re.regex($e.principal.process.command_line, `SECURITY_PRODUCT_STATE_OFF`)
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, winlogbeat-*
+    | WHERE winlog.event_id == "15" AND winlog.event_data.State LIKE "*SECURITY_PRODUCT_STATE_OFF*"
+    | KEEP @timestamp, host.name, user.name, winlog.event_data.State, winlog.event_data.TargetObject
+  leql: |
+    where(source_json.EventID=15 AND source_json.RawEventData ICONTAINS "SECURITY_PRODUCT_STATE_OFF")
+  crowdstrike: |
+    EventCode=15 event.data=*SECURITY_PRODUCT_STATE_OFF*
+    | table([@timestamp, ComputerName, UserName, event.data])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 15 and action_evtlog_message contains "SECURITY_PRODUCT_STATE_OFF"
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_message, action_evtlog_event_data
+  lucene: |
+    event.code:15 AND *SECURITY_PRODUCT_STATE_OFF*
+  sumo: |
+    _sourceCategory=*Windows* "15" "SECURITY_PRODUCT_STATE_OFF"
+    | json field=_raw "EventID" as event_id
+    | where event_id = "15"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +87,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows event ID 15
 

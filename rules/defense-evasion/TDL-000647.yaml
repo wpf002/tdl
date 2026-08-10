@@ -16,71 +16,46 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=varonis sourcetype=varonis:datalert Alert_Name="Abnormal service behavior: access to atypical folders"
+  spl: 'index=varonis sourcetype=varonis:datalert Alert_Name="Abnormal service behavior: access to atypical folders"
+
     | table _time, Alert_Name, User, Computer, Resource, Severity, Description
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000647 {\n  meta:\n    author = \"TDL\"\n    description = \"Service Accessing Atypical Folders - Varonis\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0005\"\n    technique = \"T1083\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    VaronisAlerts
+    | where TimeGenerated > ago(1h)
+    | where AlertName in ("Abnormal service behavior: access to atypical folders")
+    | project TimeGenerated, AlertName, AlertSeverity, UserName, DeviceName, ResourceName, Description, RawEventData
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS source, username, sourceip, "Alert Name", "Alert Details"
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%Varonis%'
+      AND "Alert Name" = 'Abnormal service behavior: access to atypical folders'
+    LAST 24 HOURS
+  yara_l: "rule varonis_abnormal_service_behavior_t1083 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects abnormal service behavior\
+    \ accessing atypical folders via Varonis DatAdvantage\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1083\"\
+    \n    mitre_attack_technique_name = \"File and Directory Discovery\"\n    severity = \"Medium\"\n    \n  events:\n    $alert.metadata.vendor_name\
+    \ = \"Varonis\"\n    $alert.metadata.product_name = \"DatAdvantage\"\n    $alert.security_result.summary = \"Abnormal service behavior: access\
+    \ to atypical folders\"\n    $alert.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n  condition:\n    $alert\n}\n"
+  esql: "FROM logs-varonis.datadvantage*\n| WHERE @timestamp > NOW() - 24 hour \n  AND event.action == \"alert\" \n  AND TO_LOWER(varonis.alert.name)\
+    \ == \"abnormal service behavior: access to atypical folders\"\n| KEEP @timestamp, host.name, user.name, varonis.alert.name, varonis.alert.severity,\
+    \ varonis.alert.description, source.ip, file.path\n"
+  leql: |
+    where(source_json.AlertName="Abnormal service behavior: access to atypical folders")
+  crowdstrike: |
+    #type=varonis alert_name="Abnormal service behavior: access to atypical folders"
+    | table([@timestamp, alert_name, ComputerName, UserName, affected_resource, severity])
+  xql: |
+    dataset = varonis_datadvantage_alert_raw
+    | filter alert_name in ("Abnormal service behavior: access to atypical folders")
+    | fields _time, alert_name, alert_severity, source_host, source_user, target_resource, alert_description
+  lucene: |
+    alert_name:"Abnormal service behavior: access to atypical folders"
+  sumo: |
+    _sourceCategory=*Varonis* OR _sourceCategory=*DatAdvantage*
+    | json field=_raw "AlertName" as alert_name
+    | where alert_name in ("Abnormal service behavior: access to atypical folders")
+    | fields _messageTime, _sourceHost, alert_name
 false_positives:
 - Security software
 - Authorized admin tools
@@ -90,7 +65,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Varonis DatAdvantage Alert \nWhere the Alert Name is in [\"Abnormal service behavior: access to atypical folders\"]"
 tuning_period: 30 days

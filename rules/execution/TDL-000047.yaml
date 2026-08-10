@@ -23,71 +23,134 @@ queries:
     \ OR action_lower=\"*clear*\"\n    | eval remediation_time=_time\n    | rename ComputerName as ComputerName, Signature as Signature, file_hash\
     \ as file_hash]\n| where isnull(remediation_time) OR remediation_time > (event_time + 3600)\n| table _time, ComputerName, Signature, file_hash,\
     \ Action, FileName, User\n"
-  kql: 'DeviceProcessEvents
+  kql: "let HighValueTargets = dynamic([\"DC01\", \"DC02\", \"SQL01\", \"EXCH01\"]);\nlet malwareDetections = \n    CommonSecurityLog\n    | where\
+    \ TimeGenerated > ago(1h)\n    | where DeviceVendor has \"antivirus\" or DeviceProduct has \"antivirus\" or DeviceEventClassID has_any (\"\
+    malware\", \"threat\", \"virus\")\n    | extend Action = coalesce(DeviceAction, Activity, \"\")\n    | extend SourceHost = coalesce(SourceHostName,\
+    \ Computer, DeviceName)\n    | extend Signature = coalesce(Message, DeviceCustomString1, DeviceCustomString2, \"\")\n    | extend FileHash\
+    \ = coalesce(FileHash, SourceUserName, DeviceCustomString3, \"\")\n    | where isnotempty(SourceHost) and isnotempty(Signature)\n    | where\
+    \ SourceHost !in (HighValueTargets);\nlet initialDetections = \n    malwareDetections\n    | where Action !has_any (\"Clean\", \"Delete\"\
+    , \"Quarantine\", \"Clear\")\n    | project TimeGenerated, SourceHost, Signature, FileHash, Action, DeviceVendor, DeviceProduct, Message;\n\
+    let remediations = \n    malwareDetections\n    | where Action has_any (\"Clean\", \"Delete\", \"Quarantine\", \"Clear\")\n    | project RemediationTime\
+    \ = TimeGenerated, SourceHost, Signature, FileHash;\ninitialDetections\n| join kind=leftanti (\n    remediations\n) on SourceHost, Signature,\
+    \ FileHash\n| where not(isnotempty(RemediationTime) and RemediationTime between (TimeGenerated .. (TimeGenerated + 1h)))\n| project TimeGenerated,\
+    \ SourceHost, Signature, FileHash, Action, DeviceVendor, DeviceProduct, Message\n"
+  aql: |
+    SELECT sourceip, LOGSOURCENAME(logsourceid) AS hostname, "Malware Name" AS signature, "File Hash", "Action", eventtime
+    FROM events
+    WHERE category IN (SELECT categoryid FROM categories WHERE categoryname ILIKE '%malware%' OR categoryname ILIKE '%antivirus%')
+      AND "Action" NOT ILIKE '%Clean%'
+      AND "Action" NOT ILIKE '%Delete%'
+      AND "Action" NOT ILIKE '%Quarantine%'
+      AND "Action" NOT ILIKE '%Clear%'
+      AND sourceip NOT IN (SELECT sourceip FROM reference_set WHERE name = 'High_Value_Target_Hosts')
+      AND sourceip NOT IN (
+        SELECT sourceip
+        FROM events
+        WHERE category IN (SELECT categoryid FROM categories WHERE categoryname ILIKE '%malware%' OR categoryname ILIKE '%antivirus%')
+          AND ("Action" ILIKE '%Clean%' OR "Action" ILIKE '%Delete%' OR "Action" ILIKE '%Quarantine%' OR "Action" ILIKE '%Clear%')
+          AND eventtime > (DATEFORMAT(NOW() - 3600000, 'YYYY-MM-dd HH:mm:ss'))
+      )
+    LAST 1 HOURS
+  yara_l: |
+    rule malicious_user_execution_av_unresolved {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects malware that was not cleaned, deleted, quarantined, or cleared within 1 hour"
+        mitre_attack_technique = "T1204"
+        mitre_attack_tactic = "Execution"
+        severity = "High"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $detection.metadata.event_type = "SCAN_UNCATEGORIZED"
+        $detection.security_result.detection_fields["action"] = $action
+        not re.regex($action, `(?i)(clean|delete|quarantine|clear)`)
+        $detection.principal.hostname = $host
+        $detection.security_result.detection_fields["signature"] = $signature
+        $detection.target.file.sha256 = $hash
 
-    | where process_name matches regex ".+"
+        $remediation.metadata.event_type = "SCAN_UNCATEGORIZED"
+        $remediation.security_result.detection_fields["action"] = $remediation_action
+        re.regex($remediation_action, `(?i)(clean|delete|quarantine|clear)`)
+        $remediation.principal.hostname = $host
+        $remediation.security_result.detection_fields["signature"] = $signature
+        $remediation.target.file.sha256 = $hash
+        $remediation.metadata.event_timestamp.seconds > $detection.metadata.event_timestamp.seconds
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      match:
+        $host, $signature, $hash over 1h
 
-    | order by Count desc
+      outcome:
+        $risk_score = 75
+        $detection_time = $detection.metadata.event_timestamp.seconds
+        $detected_signature = $signature
+        $file_hash = $hash
 
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000047 {\n  meta:\n    author = \"TDL\"\n    description = \"Malware Not Cleaned\"\n    severity = \"MEDIUM\"\n  \
-    \  tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $detection and not $remediation
+    }
+  esql: |
+    FROM logs-*
+    | WHERE event.category == "malware" AND event.type == "info"
+      AND @timestamp > NOW() - 1 hour
+      AND NOT (event.action LIKE "*Clean*" OR event.action LIKE "*Delete*" OR event.action LIKE "*Quarantine*" OR event.action LIKE "*Clear*")
+    | EVAL detection_time = @timestamp
+    | EVAL signature = COALESCE(threat.indicator.name, threat.software.name)
+    | EVAL file_hash = COALESCE(file.hash.sha256, file.hash.md5)
+    | STATS initial_detection = MIN(detection_time), remediated = MAX(CASE(event.action LIKE "*Clean*" OR event.action LIKE "*Delete*" OR event.action LIKE "*Quarantine*" OR event.action LIKE "*Clear*", 1, 0)) BY host.name, signature, file_hash
+    | WHERE remediated == 0
+    | KEEP host.name, signature, file_hash, initial_detection
+  leql: |
+    where(log_source_type=ANTIVIRUS AND action NOT IN [Clean, Delete, Quarantine, Clear] AND asset NOT IN high_value_targets)
+  crowdstrike: |
+    event_simpleName=DetectionSummaryEvent
+    | Action != /(?i)(Clean|Delete|Quarantine|Clear)/
+    | groupBy([aid, SHA256String, PatternDispositionDescription], function=[selectLast([ComputerName, FileName, FilePath, Action, @timestamp], as=initial)])
+    | join({
+        event_simpleName=DetectionSummaryEvent
+        | Action = /(?i)(Clean|Delete|Quarantine|Clear)/
+        | rename(field=@timestamp, as=remediation_time)
+      }, field=[aid, SHA256String, PatternDispositionDescription], include=[remediation_time], mode=left)
+    | case {
+        remediation_time=* | test((initial_@timestamp + 3600000) > remediation_time) | drop([remediation_time]);
+        * | initial_@timestamp=*;
+      }
+    | !remediation_time=*
+    | table([initial_@timestamp, initial_ComputerName, initial_FileName, initial_FilePath, PatternDispositionDescription, SHA256String, initial_Action])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_MALWARE and event_sub_type = ENUM.EVENT_SUB_TYPE_MALWARE_DETECTED
+    | filter action_process_image_name not in ("Clean", "Delete", "Quarantine", "Clear")
+    | alter detection_time = _time, detection_host = agent_hostname, detection_signature = action_evtlog_message, detection_hash = action_file_sha256
+    | join type=left (
+        dataset = xdr_data
+        | filter event_type = ENUM.EVENT_TYPE_MALWARE and event_sub_type = ENUM.EVENT_SUB_TYPE_MALWARE_DETECTED
+        | filter action_process_image_name in ("Clean", "Delete", "Quarantine", "Clear")
+        | alter remediation_time = _time, remediation_host = agent_hostname, remediation_signature = action_evtlog_message, remediation_hash = action_file_sha256
+    ) as remediation remediation.remediation_host = detection_host and remediation.remediation_signature = detection_signature and remediation.remediation_hash = detection_hash and remediation.remediation_time >= detection_time and remediation.remediation_time <= arraymax(array(detection_time + 3600000))
+    | filter remediation.remediation_time = null
+    | fields _time, agent_hostname, action_evtlog_message, action_file_sha256, action_process_image_name
+  lucene: |
+    _exists_:malware.action AND NOT malware.action:(Clean OR Delete OR Quarantine OR Clear) AND NOT host.name:high_value_target_*
+  sumo: |
+    _sourceCategory=*antivirus* OR _sourceCategory=*av* OR _sourceCategory=*malware*
+    | parse regex "(?i)(?<action>clean|delete|quarantine|clear|detected|blocked|found|alert)" nodrop
+    | parse regex "(?<source_host>[^\s]+)" nodrop
+    | parse regex "(?<signature>[A-Za-z0-9\.\-\_]+)" nodrop
+    | parse regex "(?<file_hash>[a-fA-F0-9]{32,64})" nodrop
+    | where !isNull(action) and !isNull(source_host)
+    | where !(action matches /(?i)(clean|delete|quarantine|clear)/)
+    | timeslice 1h
+    | join (
+        _sourceCategory=*antivirus* OR _sourceCategory=*av* OR _sourceCategory=*malware*
+        | parse regex "(?i)(?<action>clean|delete|quarantine|clear|detected|blocked|found|alert)" nodrop
+        | parse regex "(?<source_host>[^\s]+)" nodrop
+        | parse regex "(?<signature>[A-Za-z0-9\.\-\_]+)" nodrop
+        | parse regex "(?<file_hash>[a-fA-F0-9]{32,64})" nodrop
+        | where action matches /(?i)(clean|delete|quarantine|clear)/
+        | timeslice 1h
+    ) as remediation on source_host=remediation.source_host and signature=remediation.signature and file_hash=remediation.file_hash and _timeslice=remediation._timeslice
+    | where isNull(remediation.action)
+    | fields _messageTime, source_host, signature, file_hash, action
 false_positives:
 - Security software
 - Authorized admin tools
@@ -97,7 +160,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Malware Detection Event
 

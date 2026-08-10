@@ -23,71 +23,93 @@ queries:
     \ type=inner process_id \n    [search index=* sourcetype=\"WinEventLog:Microsoft-Windows-Sysmon/Operational\" EventCode=5 \n    | eval process_id=ProcessId,\
     \ end_time=_time]\n| eval duration=end_time - start_time\n| where duration <= 10\n| table _time, ComputerName, User, Image, CommandLine, ParentImage,\
     \ duration\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000769 {\n  meta:\n    author = \"TDL\"\n    description = \"GetUserGeoID / locale Probe in Short-Lived Process\"\n\
-    \    severity = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1614\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
+  kql: |
+    Event
+    | where TimeGenerated > ago(1h)
+    | where Source == "Microsoft-Windows-Sysmon" and EventID == 1
+    | extend CommandLine = tostring(EventData.CommandLine)
+    | extend ProcessName = tostring(EventData.Image)
+    | extend ProcessId = tostring(EventData.ProcessId)
+    | extend ParentProcessName = tostring(EventData.ParentImage)
+    | extend User = tostring(EventData.User)
+    | extend UtcTime = todatetime(EventData.UtcTime)
+    | where CommandLine has_any ("GetUserGeoID", "GetSystemDefaultLCID") or CommandLine has @"HKCU\Control Panel\International"
+    | extend ProcessGuid = tostring(EventData.ProcessGuid)
+    | join kind=inner (
+        Event
+        | where Source == "Microsoft-Windows-Sysmon" and EventID == 5
+        | extend ProcessGuid = tostring(EventData.ProcessGuid)
+        | extend ProcessTerminationTime = todatetime(EventData.UtcTime)
+    ) on ProcessGuid
+    | extend Duration = datetime_diff('second', ProcessTerminationTime, UtcTime)
+    | where Duration <= 10
+    | project TimeGenerated, Computer, ProcessName, CommandLine, User, ParentProcessName, Duration, ProcessId
+  aql: |
+    SELECT "Process Name", "Process CommandLine", username, sourceip, LOGSOURCENAME(logsourceid) AS host, eventtime
+    FROM events
+    WHERE (
+      ("Process CommandLine" ILIKE '%GetUserGeoID%' OR "Process CommandLine" ILIKE '%GetSystemDefaultLCID%' OR "Process CommandLine" ILIKE '%HKCU\\Control Panel\\International%')
+    )
+    LAST 10 SECONDS
+  yara_l: "rule system_location_discovery_t1614 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects process querying geolocation information\
+    \ and exiting within 10 seconds\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1614\"\n    severity = \"Medium\"\
+    \n\n  events:\n    // Process launch event\n    $launch.metadata.event_type = \"PROCESS_LAUNCH\"\n    $launch.principal.process.pid = $pid\n\
+    \    $launch.principal.hostname = $host\n    \n    // Registry read or API call patterns in command line or process activity\n    (\n    \
+    \  re.regex($launch.principal.process.command_line, `(?i)(GetUserGeoID|GetSystemDefaultLCID)`) or\n      re.regex($launch.target.process.command_line,\
+    \ `(?i)(GetUserGeoID|GetSystemDefaultLCID)`)\n    )\n    \n    // Process termination event within 10 seconds\n    $terminate.metadata.event_type\
+    \ = \"PROCESS_TERMINATION\"\n    $terminate.principal.process.pid = $pid\n    $terminate.principal.hostname = $host\n    \n    // Time constraint:\
+    \ termination within 10 seconds of launch\n    $terminate.metadata.event_timestamp.seconds <= $launch.metadata.event_timestamp.seconds + 10\n\
+    \n  match:\n    $host, $pid over 15s\n\n  condition:\n    $launch and $terminate\n}\n\nrule system_location_discovery_registry_t1614 {\n \
+    \ meta:\n    author = \"TDL\"\n    description = \"Detects registry query for Control Panel International settings and quick process exit\"\
+    \n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1614\"\n    severity = \"Medium\"\n\n  events:\n    // Registry\
+    \ access event\n    $reg.metadata.event_type = \"REGISTRY_MODIFICATION\"\n    re.regex($reg.target.registry.registry_key, `(?i)HKCU\\\\Control\
+    \ Panel\\\\International`)\n    $reg.principal.process.pid = $pid\n    $reg.principal.hostname = $host\n    \n    // Process termination event\
+    \ within 10 seconds\n    $terminate.metadata.event_type = \"PROCESS_TERMINATION\"\n    $terminate.principal.process.pid = $pid\n    $terminate.principal.hostname\
+    \ = $host\n    \n    // Time constraint: termination within 10 seconds of registry access\n    $terminate.metadata.event_timestamp.seconds\
+    \ <= $reg.metadata.event_timestamp.seconds + 10\n\n  match:\n    $host, $pid over 15s\n\n  condition:\n    $reg and $terminate\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      AND winlog.event_id IN (1, 10, 12, 13)
+      AND (
+        process.command_line RLIKE ".*GetUserGeoID.*"
+        OR process.command_line RLIKE ".*GetSystemDefaultLCID.*"
+        OR winlog.event_data.TargetObject LIKE "*HKCU\\Control Panel\\International*"
+        OR winlog.event_data.TargetObject LIKE "*\\Control Panel\\International*"
+      )
+    | EVAL proc_key = CONCAT(TO_STRING(process.entity_id), "-", TO_STRING(host.name))
+    | STATS first_time = MIN(@timestamp), last_time = MAX(@timestamp), event_count = COUNT(*) BY proc_key, host.name, process.name, process.command_line, user.name, process.parent.name
+    | EVAL duration_seconds = (last_time - first_time) / 1000
+    | WHERE duration_seconds <= 10
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, duration_seconds
+  leql: |
+    where(source_json.EventID=1 AND (process_cmd_line ICONTAINS "GetUserGeoID" OR process_cmd_line ICONTAINS "GetSystemDefaultLCID" OR process_cmd_line ICONTAINS "HKCU\\Control Panel\\International")) groupby(source_json.ProcessGuid, asset, process_name) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 (CommandLine=*GetUserGeoID* OR CommandLine=*GetSystemDefaultLCID* OR CommandLine=*"HKCU\\Control Panel\\International"*)
+    | TargetProcessId_decimal := format("%d", field=TargetProcessId)
+    | join({event_simpleName=EndOfProcess | ProcessEndTime_decimal := format("%d", field=ProcessEndTime)}, field=[TargetProcessId_decimal], key=TargetProcessId_decimal, include=[ProcessEndTime_decimal])
+    | ProcessStartTime_decimal := format("%d", field=ProcessStartTime)
+    | duration := ProcessEndTime_decimal - ProcessStartTime_decimal
+    | duration <= 10
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName, duration])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter action_process_image_command_line ~= "(?i)(GetUserGeoID|GetSystemDefaultLCID|HKCU\\\\Control Panel\\\\International)"
+    | alter process_start = _time
+    | join type=left (dataset = xdr_data | filter event_type = ENUM.EVENT_TYPE_PROCESS_TERMINATION | alter process_end = _time, term_pid = action_process_pid, term_hostname = agent_hostname | fields term_pid, term_hostname, process_end) as term_data term_data.term_pid = action_process_pid and term_data.term_hostname = agent_hostname
+    | filter process_end != null and to_epoch(process_end, "MILLIS") - to_epoch(process_start, "MILLIS") <= 10000
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, action_process_pid
+  lucene: |
+    (event.code:(1 OR 10) OR winlog.event_id:(1 OR 10)) AND (process.command_line:(*GetUserGeoID* OR *GetSystemDefaultLCID* OR *"HKCU\\Control Panel\\International"*) OR winlog.event_data.CallTrace:(*GetUserGeoID* OR *GetSystemDefaultLCID*) OR winlog.event_data.TargetObject:*"HKCU\\Control Panel\\International"*)
+  sumo: "_sourceCategory=*Sysmon* (\"GetUserGeoID\" OR \"GetSystemDefaultLCID\" OR \"HKCU\\\\Control Panel\\\\International\")\n| json field=_raw\
+    \ \"EventID\" as event_id\n| json field=_raw \"Image\" as process_name\n| json field=_raw \"CommandLine\" as command_line\n| json field=_raw\
+    \ \"ProcessGuid\" as process_guid\n| json field=_raw \"UtcTime\" as event_time\n| where (event_id = \"1\" OR event_id = \"10\" OR event_id\
+    \ = \"13\") \n  AND (command_line matches \"*GetUserGeoID*\" OR command_line matches \"*GetSystemDefaultLCID*\" OR command_line matches \"\
+    *HKCU\\\\Control Panel\\\\International*\")\n| parseDate(event_time, \"yyyy-MM-dd HH:mm:ss.SSS\") as start_time\n| join (\n    _sourceCategory=*Sysmon*\
+    \ \n    | json field=_raw \"EventID\" as event_id\n    | json field=_raw \"ProcessGuid\" as process_guid\n    | json field=_raw \"UtcTime\"\
+    \ as exit_time\n    | where event_id = \"5\"\n    | parseDate(exit_time, \"yyyy-MM-dd HH:mm:ss.SSS\") as end_time\n  ) as b on process_guid\n\
+    | where (end_time - start_time) <= 10000\n| fields _messageTime, _sourceHost, process_name, command_line, process_guid, start_time, end_time\n"
 pseudo_logic: Process queries GetUserGeoID, GetSystemDefaultLCID, or HKCU\Control Panel\International and exits within 10s. Geo-keyed payload.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -104,7 +126,7 @@ references:
 - https://attack.mitre.org/techniques/T1614/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

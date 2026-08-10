@@ -18,77 +18,76 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    (index=wineventlog (EventCode=4688 OR EventCode=592 OR EventCode=4104))
-    ((EventCode=4688 OR EventCode=592) (Image="*\\powershell.exe" OR process_name="*powershell.exe") (CommandLine="*New-Object*" AND CommandLine="*System.Net.NetworkInformation.Ping*" AND CommandLine="*.Send(*"))
+  spl: '(index=wineventlog (EventCode=4688 OR EventCode=592 OR EventCode=4104))
+
+    ((EventCode=4688 OR EventCode=592) (Image="*\\powershell.exe" OR process_name="*powershell.exe") (CommandLine="*New-Object*" AND CommandLine="*System.Net.NetworkInformation.Ping*"
+    AND CommandLine="*.Send(*"))
+
     OR
+
     (EventCode=4104 (ScriptBlockText="*New-Object*" AND ScriptBlockText="*System.Net.NetworkInformation.Ping*" AND ScriptBlockText="*.Send(*"))
+
     | table _time, ComputerName, EventCode, User, Image, CommandLine, ScriptBlockText
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("powershell.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('powershell.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000516 {\n  meta:\n    author = \"TDL\"\n    description = \"ICMP Exfiltration Commands\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(powershell.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("powershell.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [powershell.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    union
+    (SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (592, 4688)
+    | where Process has "powershell.exe"
+    | where CommandLine has_all ("New-Object", "System.Net.NetworkInformation.Ping", ".Send(")
+    | project TimeGenerated, Computer, Account, Process, CommandLine, EventID),
+    (Event
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4104
+    | where RenderedDescription has_all ("New-Object", "System.Net.NetworkInformation.Ping", ".Send(")
+    | project TimeGenerated, Computer, UserName, ScriptBlockText = RenderedDescription, EventID)
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, \"Process Name\", \"Process CommandLine\", \"ScriptBlockText\"\nFROM events\n\
+    WHERE (\n  (\"EventID\" IN ('592', '4688') \n   AND \"Process Name\" ILIKE '%powershell.exe%' \n   AND \"Process CommandLine\" ILIKE '%New-Object%'\
+    \ \n   AND \"Process CommandLine\" ILIKE '%System.Net.NetworkInformation.Ping%' \n   AND \"Process CommandLine\" ILIKE '%.Send(%')\n  OR\n\
+    \  (\"EventID\" = '4104' \n   AND \"ScriptBlockText\" ILIKE '%New-Object%' \n   AND \"ScriptBlockText\" ILIKE '%System.Net.NetworkInformation.Ping%'\
+    \ \n   AND \"ScriptBlockText\" ILIKE '%.Send(%')\n)\nLAST 1 HOURS\n"
+  yara_l: "rule powershell_network_ping_object_t1204 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects PowerShell creating System.Net.NetworkInformation.Ping\
+    \ objects and sending pings via T1204\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1204\"\n    severity = \"\
+    Medium\"\n\n  events:\n    // Process execution event\n    ($e1.metadata.event_type = \"PROCESS_LAUNCH\" and\n     $e1.metadata.product_event_type\
+    \ = \"4688\" and\n     re.regex($e1.principal.process.file.full_path, `(?i)powershell\\.exe$`) and\n     re.regex($e1.principal.process.command_line,\
+    \ `(?i)New-Object`) and\n     re.regex($e1.principal.process.command_line, `(?i)System\\.Net\\.NetworkInformation\\.Ping`) and\n     re.regex($e1.principal.process.command_line,\
+    \ `(?i)\\.Send\\(`)) or\n    \n    // PowerShell script block logging event\n    ($e1.metadata.event_type = \"SCRIPT_EXECUTE\" and\n     $e1.metadata.product_event_type\
+    \ = \"4104\" and\n     re.regex($e1.security_result.description, `(?i)New-Object`) and\n     re.regex($e1.security_result.description, `(?i)System\\\
+    .Net\\.NetworkInformation\\.Ping`) and\n     re.regex($e1.security_result.description, `(?i)\\.Send\\(`))\n    \n    $e1.principal.hostname\
+    \ = $host\n\n  match:\n    $host over 5m\n\n  condition:\n    $e1\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-system.security*, logs-endpoint.events.process*, winlogbeat-*, logs-windows.powershell_operational*
+    | WHERE @timestamp > NOW() - 24 hour
+    | WHERE (
+        (winlog.event_id IN (592, 4688) AND TO_LOWER(process.name) == "powershell.exe" AND process.command_line LIKE "*New-Object*" AND process.command_line LIKE "*System.Net.NetworkInformation.Ping*" AND process.command_line LIKE "*.Send(*")
+        OR
+        (winlog.event_id == 4104 AND winlog.event_data.ScriptBlockText LIKE "*New-Object*" AND winlog.event_data.ScriptBlockText LIKE "*System.Net.NetworkInformation.Ping*" AND winlog.event_data.ScriptBlockText LIKE "*.Send(*")
+      )
+    | KEEP @timestamp, host.name, user.name, winlog.event_id, process.name, process.command_line, process.parent.name, winlog.event_data.ScriptBlockText
+  leql: |
+    where((source_json.EventID=4688 AND process_name ICONTAINS "powershell.exe" AND process_cmd_line ICONTAINS "New-Object" AND process_cmd_line ICONTAINS "System.Net.NetworkInformation.Ping" AND process_cmd_line ICONTAINS ".Send(") OR (source_json.EventID=4104 AND source_json.ScriptBlockText ICONTAINS "New-Object" AND source_json.ScriptBlockText ICONTAINS "System.Net.NetworkInformation.Ping" AND source_json.ScriptBlockText ICONTAINS ".Send("))
+  crowdstrike: |
+    (EventCode=4688 OR EventCode=592 OR EventCode=4104)
+    (
+      (EventCode IN [4688, 592] FileName=*powershell.exe CommandLine=*New-Object* CommandLine=*System.Net.NetworkInformation.Ping* CommandLine=*.Send(*)
+      OR
+      (EventCode=4104 ScriptBlockText=*New-Object* ScriptBlockText=*System.Net.NetworkInformation.Ping* ScriptBlockText=*.Send(*)
+    )
+    | table([@timestamp, ComputerName, EventCode, FileName, CommandLine, ScriptBlockText, UserName])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) and lowercase(action_process_image_name) contains "powershell.exe" and action_process_image_command_line contains "New-Object" and action_process_image_command_line contains "System.Net.NetworkInformation.Ping" and action_process_image_command_line contains ".Send(") or (action_evtlog_event_id = 4104 and action_evtlog_message contains "New-Object" and action_evtlog_message contains "System.Net.NetworkInformation.Ping" and action_evtlog_message contains ".Send(")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_id, action_process_image_name, action_process_image_command_line, action_evtlog_message
+  lucene: |
+    (event.code:(592 OR 4688) AND process.name:powershell.exe AND process.command_line:(*New-Object* AND *System.Net.NetworkInformation.Ping* AND *.Send\(*)) OR (event.code:4104 AND winlog.event_data.ScriptBlockText:(*New-Object* AND *System.Net.NetworkInformation.Ping* AND *.Send\(*))
+  sumo: "_sourceCategory=*Windows* (EventID=4688 OR EventID=4104 OR EventID=592)\n| json field=_raw \"EventID\" as event_id\n| json field=_raw\
+    \ \"NewProcessName\" as process_name\n| json field=_raw \"CommandLine\" as command_line\n| json field=_raw \"ScriptBlockText\" as script_block\n\
+    | where (event_id in (\"4688\", \"592\") and process_name matches \"*powershell.exe\" and command_line matches \"*New-Object*\" and command_line\
+    \ matches \"*System.Net.NetworkInformation.Ping*\" and command_line matches \"*.Send(*\") \n   OR (event_id = \"4104\" and script_block matches\
+    \ \"*New-Object*\" and script_block matches \"*System.Net.NetworkInformation.Ping*\" and script_block matches \"*.Send(*\")\n| fields _messageTime,\
+    \ _sourceHost, event_id, process_name, command_line, script_block\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -98,7 +97,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe\nWhere Command\
   \ contains \"New-Object\"\nWhere Command contains \"System.Net.NetworkInformation.Ping\"\nWhere Command contains \".Send(\"\n\n---------------------------------------------------------------------------------------------------------------\n\

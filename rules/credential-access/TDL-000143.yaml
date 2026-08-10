@@ -18,77 +18,107 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=windows sourcetype=WinEventLog:Security (EventCode=566 OR EventCode=4662)
+  spl: 'index=windows sourcetype=WinEventLog:Security (EventCode=566 OR EventCode=4662)
+
     | search NOT Account_Name="*$" NOT Account_Name="msol_*"
+
     | search NOT ComputerName IN ("dc01","dc02","dc1","dc2","domaincontroller")
-    | search (Properties="*Replicating Directory Changes all*" OR Properties="*1131f6ad-9c07-11d1-f79f-00c04fc2dcd2*" OR Properties="*1131f6aa-9c07-11d1-f79f-00c04fc2dcd2*" OR Properties="*9923a32a-3607-11d2-b9be-0000f87a36b2*")
+
+    | search (Properties="*Replicating Directory Changes all*" OR Properties="*1131f6ad-9c07-11d1-f79f-00c04fc2dcd2*" OR Properties="*1131f6aa-9c07-11d1-f79f-00c04fc2dcd2*"
+    OR Properties="*9923a32a-3607-11d2-b9be-0000f87a36b2*")
+
     | table _time, ComputerName, Account_Name, Properties, Object_Name, Object_Type
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4662")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4662')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000143 {\n  meta:\n    author = \"TDL\"\n    description = \"DC Sync Attack\"\n    severity = \"MEDIUM\"\n    tactic\
-    \ = \"TA0006\"\n    technique = \"T1003\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4662)/\n    $host\
-    \ = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (566, 4662)
+    | where SubjectUserName !endswith "$"
+    | where SubjectUserName !startswith "msol_"
+    | where Computer !has "DC" and Computer !has "DomainController"
+    | where Properties has_any ("Replicating Directory Changes all", "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2", "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2", "9923a32a-3607-11d2-b9be-0000f87a36b2")
+    | project TimeGenerated, Computer, SubjectUserName, SubjectDomainName, ObjectName, Properties, AccessMask, EventID
+  aql: "SELECT username, sourceip, LOGSOURCENAME(logsourceid) AS host, \"Properties\", eventtime\nFROM events\nWHERE \"EventID\" IN ('566', '4662')\n\
+    \  AND username NOT LIKE '%$'\n  AND username NOT LIKE 'msol_%'\n  AND LOGSOURCENAME(logsourceid) NOT ILIKE '%domain controller%'\n  AND (\"\
+    Properties\" ILIKE '%Replicating Directory Changes all%' \n       OR \"Properties\" ILIKE '%1131f6ad-9c07-11d1-f79f-00c04fc2dcd2%'\n     \
+    \  OR \"Properties\" ILIKE '%1131f6aa-9c07-11d1-f79f-00c04fc2dcd2%'\n       OR \"Properties\" ILIKE '%9923a32a-3607-11d2-b9be-0000f87a36b2%')\n\
+    LAST 24 HOURS\n"
+  yara_l: |
+    rule dcsync_replication_access {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects potential DCSync attack via AD replication permissions abuse"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1003"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
+        ($e.metadata.product_event_type = "566" or $e.metadata.product_event_type = "4662")
+        $e.principal.user.userid = $user
+        not re.regex($e.principal.user.userid, `\$$`)
+        not re.regex($e.principal.user.userid, `(?i)^msol_`)
+        not re.regex($e.principal.hostname, `(?i)dc\d+|domaincontroller`)
+        (
+          re.regex($e.target.resource.attribute.labels, `(?i)Replicating Directory Changes all`) or
+          re.regex($e.target.resource.attribute.labels, `1131f6ad-9c07-11d1-f79f-00c04fc2dcd2`) or
+          re.regex($e.target.resource.attribute.labels, `1131f6aa-9c07-11d1-f79f-00c04fc2dcd2`) or
+          re.regex($e.target.resource.attribute.labels, `9923a32a-3607-11d2-b9be-0000f87a36b2`)
+        )
 
-    | WHERE event.category == "process" AND event_id IN ("4662")
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4662])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4662)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4662")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4662)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4662")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code IN ("566", "4662")
+      AND user.name IS NOT NULL
+      AND NOT user.name LIKE "*$"
+      AND NOT STARTS_WITH(user.name, "msol_")
+      AND NOT host.name LIKE "*DC*"
+      AND NOT host.name LIKE "*DomainController*"
+      AND (
+        winlog.event_data.Properties LIKE "*Replicating Directory Changes all*"
+        OR winlog.event_data.Properties LIKE "*1131f6ad-9c07-11d1-f79f-00c04fc2dcd2*"
+        OR winlog.event_data.Properties LIKE "*1131f6aa-9c07-11d1-f79f-00c04fc2dcd2*"
+        OR winlog.event_data.Properties LIKE "*9923a32a-3607-11d2-b9be-0000f87a36b2*"
+      )
+    | KEEP @timestamp, host.name, user.name, event.code, winlog.event_data.Properties, winlog.event_data.ObjectName
+  leql: |
+    where(source_json.EventID IN [566, 4662] AND NOT source_json.SubjectUserName ENDS-WITH "$" AND NOT source_json.SubjectUserName STARTS-WITH "msol_" AND NOT source_json.IsDomainController=true AND (source_json.Properties ICONTAINS "Replicating Directory Changes all" OR source_json.Properties ICONTAINS "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" OR source_json.Properties ICONTAINS "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2" OR source_json.Properties ICONTAINS "9923a32a-3607-11d2-b9be-0000f87a36b2"))
+  crowdstrike: |
+    EventCode=4662 OR EventCode=566
+    | regex("(?<SourceUsername>[^$]+[^$])$", field=SubjectUserName)
+    | SubjectUserName != /^msol_/
+    | ComputerName != /DC\d+/i AND ComputerName != /DomainController/i
+    | (Properties=*"Replicating Directory Changes all"* OR Properties=*1131f6ad-9c07-11d1-f79f-00c04fc2dcd2* OR Properties=*1131f6aa-9c07-11d1-f79f-00c04fc2dcd2* OR Properties=*9923a32a-3607-11d2-b9be-0000f87a36b2*)
+    | table([@timestamp, ComputerName, SubjectUserName, ObjectName, Properties, AccessMask])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (566, 4662)
+    | filter action_evtlog_event_data_SubjectUserName != null and not action_evtlog_event_data_SubjectUserName ~= "\$$"
+    | filter action_evtlog_event_data_SubjectUserName != null and not action_evtlog_event_data_SubjectUserName ~= "^msol_"
+    | filter not action_evtlog_event_data_SubjectLogonId ~= "^(DC|DOMAINCONTROLLER)" and not agent_hostname ~= "^(DC|DOMAINCONTROLLER)"
+    | filter action_evtlog_event_data_Properties contains "Replicating Directory Changes all" or action_evtlog_event_data_Properties contains "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" or action_evtlog_event_data_Properties contains "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2" or action_evtlog_event_data_Properties contains "9923a32a-3607-11d2-b9be-0000f87a36b2"
+    | fields _time, agent_hostname, action_evtlog_event_data_SubjectUserName, action_evtlog_event_data_ObjectName, action_evtlog_event_data_Properties, action_evtlog_event_id
+  lucene: |
+    event.code:(566 OR 4662) AND NOT winlog.event_data.SubjectUserName:*$ AND NOT winlog.event_data.SubjectUserName:msol_* AND NOT winlog.event_data.SourceName:*DC* AND winlog.event_data.Properties:("Replicating Directory Changes all" OR "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" OR "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2" OR "9923a32a-3607-11d2-b9be-0000f87a36b2")
+  sumo: |
+    _sourceCategory=*Windows* (566 OR 4662)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "SubjectUserName" as source_username
+    | json field=_raw "Computer" as computer
+    | json field=_raw "Properties" as properties
+    | where event_id in ("566", "4662")
+    | where !(source_username matches "*$")
+    | where !(source_username matches "msol_*")
+    | where !(computer matches "*DC*" or computer matches "*DomainController*")
+    | where properties matches "*Replicating Directory Changes all*" or properties matches "*1131f6ad-9c07-11d1-f79f-00c04fc2dcd2*" or properties matches "*1131f6aa-9c07-11d1-f79f-00c04fc2dcd2*" or properties matches "*9923a32a-3607-11d2-b9be-0000f87a36b2*"
+    | fields _messageTime, computer, source_username, event_id, properties
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -98,7 +128,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Operation Performed on an Object Event
 

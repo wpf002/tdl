@@ -14,76 +14,125 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 80
 queries:
-  spl: |
-    index=windows sourcetype="WinEventLog:Security" EventCode=4688 (New_Process_Name="*\\wscript.exe" OR New_Process_Name="*\\cscript.exe") (Process_Command_Line="*\\\\*" OR Process_Command_Line="*http://*" OR Process_Command_Line="*https://*") NOT (Process_Command_Line="*\\\\approvedshare\\logonscripts\\*" OR Process_Command_Line="*\\\\trusteddc\\netlogon\\*")
-    | stats count values(Process_Command_Line) as command_line values(New_Process_Name) as process values(LogonType) as logon_type by Account_Name, IpAddress, EventCode
+  spl: 'index=windows sourcetype="WinEventLog:Security" EventCode=4688 (New_Process_Name="*\\wscript.exe" OR New_Process_Name="*\\cscript.exe")
+    (Process_Command_Line="*\\\\*" OR Process_Command_Line="*http://*" OR Process_Command_Line="*https://*") NOT (Process_Command_Line="*\\\\approvedshare\\logonscripts\\*"
+    OR Process_Command_Line="*\\\\trusteddc\\netlogon\\*")
+
+    | stats count values(Process_Command_Line) as command_line values(New_Process_Name) as process values(LogonType) as logon_type by Account_Name,
+    IpAddress, EventCode
+
     | where count >= 1
+
     | sort - count
+
     | table Account_Name, IpAddress, EventCode, count, process, command_line, logon_type
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4688")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4688')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_002 {\n  meta:\n    author = \"TDL\"\n    description = \"Windows Script Host Executing Remote Payload\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1059.005\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id\
-    \ = /(4688)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where Process has_any ("wscript.exe", "cscript.exe") or NewProcessName has_any ("wscript.exe", "cscript.exe")
+    | where CommandLine has_any ("\\\\", "http://", "https://", "//")
+    | where not (CommandLine has_any ("\\\\approvedshare\\logonscripts\\", "\\\\domain.local\\sysvol\\"))
+    | extend User = coalesce(SubjectUserName, Account, TargetUserName)
+    | extend IpAddress = coalesce(IpAddress, "")
+    | summarize count() by User, IpAddress, LogonType, EventID, Computer, Process, CommandLine
+    | where count_ >= 1
+    | project User, IpAddress, LogonType, EventCode = EventID, Computer, Process, CommandLine, count_
+    | sort by count_ desc
+  aql: |
+    SELECT username AS user, sourceip AS IpAddress, "Logon Type" AS LogonType, "EventID" AS EventCode, "Process CommandLine", COUNT(*) AS event_count
+    FROM events
+    WHERE "EventID" = '4688'
+      AND ("Process Name" ILIKE '%wscript.exe%' OR "Process Name" ILIKE '%cscript.exe%')
+      AND ("Process CommandLine" MATCHES '.*\\\\[^\\]+\\.*' OR "Process CommandLine" ILIKE '%http://%' OR "Process CommandLine" ILIKE '%https://%' OR "Process CommandLine" MATCHES '.*\\\\\\\\.*')
+      AND NOT ("Process CommandLine" ILIKE '%\\\\approved-share\\scripts\\%' OR "Process CommandLine" ILIKE '%\\\\domain.local\\NETLOGON\\%' OR "Process CommandLine" ILIKE '%\\\\domain.local\\SYSVOL\\%')
+    GROUP BY username, sourceip, "Logon Type", "EventID", "Process CommandLine"
+    HAVING event_count >= 1
+    ORDER BY event_count DESC
+    LAST 24 HOURS
+  yara_l: |
+    rule remote_vbscript_execution_t1059_005 {
+      meta:
+        author = "TDL"
+        description = "Detects Windows Script Host executing remote payload via UNC path, HTTP/HTTPS URI, or network share"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1059.005"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 day
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.metadata.product_event_type = "4688"
+        (
+          re.regex($e.principal.process.file.full_path, `(?i)\\(wscript|cscript)\.exe$`) or
+          re.regex($e.target.process.file.full_path, `(?i)\\(wscript|cscript)\.exe$`)
+        )
+        (
+          re.regex($e.principal.process.command_line, `(?i)(\\\\[a-z0-9\-\.]+\\|https?://|\\\\\\\\)`) or
+          re.regex($e.target.process.command_line, `(?i)(\\\\[a-z0-9\-\.]+\\|https?://|\\\\\\\\)`)
+        )
+        not re.regex($e.principal.process.command_line, `(?i)\\\\(approved-share|logon-scripts|netlogon)\\`)
+        not re.regex($e.target.process.command_line, `(?i)\\\\(approved-share|logon-scripts|netlogon)\\`)
+        $e.principal.user.userid = $user
+        $e.principal.ip = $ip
 
-    | WHERE event.category == "authentication" AND event_id IN ("4688")
+      match:
+        $user, $ip over 1h
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+      outcome:
+        $risk_score = 75
+        $event_count = count_distinct($e.metadata.id)
+        $command_line = array_distinct($e.principal.process.command_line)
+        $hostname = array_distinct($e.principal.hostname)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4688])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4688)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4688")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4688)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4688")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: "FROM logs-system.security*, winlogbeat-*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.code == \"4688\"\n  AND (process.name IN\
+    \ (\"wscript.exe\", \"cscript.exe\") OR TO_LOWER(process.executable) LIKE \"*wscript.exe\" OR TO_LOWER(process.executable) LIKE \"*cscript.exe\"\
+    )\n  AND (process.command_line LIKE \"*\\\\\\\\*\" OR process.command_line LIKE \"*http://*\" OR process.command_line LIKE \"*https://*\"\
+    \ OR process.command_line LIKE \"*\\\\\\\\\\\\\\\\*\")\n  AND NOT (process.command_line LIKE \"*\\\\\\\\approvedshare\\\\logonscripts\\\\\
+    *\" OR process.command_line LIKE \"*\\\\\\\\corporate\\\\scripts\\\\approved\\\\*\")\n| STATS count = COUNT(*) BY user.name, source.ip, winlog.logon.type,\
+    \ event.code\n| WHERE count >= 1\n| SORT count DESC\n| KEEP user.name, source.ip, winlog.logon.type, event.code, count\n"
+  leql: |
+    where(source_json.EventID=4688 AND (process_name ICONTAINS "wscript.exe" OR process_name ICONTAINS "cscript.exe") AND (process_cmd_line=/\\\\[^\s]+/ OR process_cmd_line ICONTAINS "http://" OR process_cmd_line ICONTAINS "https://")) groupby(user, source_address) calculate(count)
+  crowdstrike: |
+    EventCode=4688 (NewProcessName=*wscript.exe OR NewProcessName=*cscript.exe OR CommandLine=*wscript.exe* OR CommandLine=*cscript.exe*) (CommandLine=*\\\\* OR CommandLine=*http://* OR CommandLine=*https://*)
+    NOT (CommandLine=*\\\\approvedshare\\* OR CommandLine=*\\\\logonscripts\\*)
+    | groupBy([SubjectUserName, IpAddress], function=count(as=cnt))
+    | cnt >= 1
+    | sort(cnt, order=desc)
+    | table([@timestamp, ComputerName, SubjectUserName, IpAddress, NewProcessName, CommandLine, LogonType, EventCode, cnt])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4688
+    | filter (lowercase(action_process_image_name) contains "wscript.exe" or lowercase(action_process_image_name) contains "cscript.exe")
+    | filter (action_process_image_command_line ~= "\\\\\\\\[^\\s]+" or action_process_image_command_line ~= "https?://" or action_process_image_command_line ~= "\\\\\\\\[a-zA-Z0-9\-\.]+\\\\")
+    | filter not (action_process_image_command_line contains "\\\\approved-share\\logon-scripts\\" or action_process_image_command_line contains "\\\\corporate-dc\\sysvol\\scripts\\")
+    | comp count() as event_count by actor_effective_username, action_remote_ip, action_evtlog_event_data_LogonType
+    | filter event_count >= 1
+    | sort desc event_count
+    | fields actor_effective_username, action_remote_ip, action_evtlog_event_data_LogonType, event_count
+  lucene: |
+    event.code:"4688" AND (NewProcessName:*wscript.exe OR NewProcessName:*cscript.exe OR CommandLine:*wscript.exe* OR CommandLine:*cscript.exe*) AND (CommandLine:*\\\\* OR CommandLine:*http:* OR CommandLine:*https:* OR CommandLine:*ftp:*) AND NOT (CommandLine:*\\\\approved-share\\logon-scripts\\* OR CommandLine:*\\\\domain-controller\\NETLOGON\\* OR CommandLine:*\\\\trusted-server\\scripts\\*)
+  sumo: |
+    _sourceCategory=*Windows*Security* "4688"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "SubjectUserName" as user
+    | json field=_raw "IpAddress" as IpAddress
+    | json field=_raw "LogonType" as LogonType
+    | json field=_raw "EventCode" as EventCode
+    | where event_id = "4688"
+    | where (process_name matches "*wscript.exe" or process_name matches "*cscript.exe")
+    | where (command_line matches "*\\\\*" or command_line matches "*http://*" or command_line matches "*https://*" or command_line matches "*\\\\*\\*")
+    | where !(command_line matches "*\\\\approved-share\\logon-scripts\\*" or command_line matches "*\\\\domain-controller\\NETLOGON\\*")
+    | count as cnt by user, IpAddress, LogonType, EventCode, process_name, command_line
+    | where cnt >= 1
+    | sort by cnt desc
+    | fields user, IpAddress, LogonType, EventCode, process_name, command_line, cnt
 false_positives:
 - Legitimate logon scripts from network shares
 tags:
@@ -93,7 +142,7 @@ tags:
 author: TDL
 created: '2024-01-15'
 test_method: synthetic
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'
 - Inspect the parent → child process tree, command line arguments, and code-signing status — pay attention to short-lived processes, encoded arguments,

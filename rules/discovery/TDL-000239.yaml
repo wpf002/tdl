@@ -17,78 +17,72 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=web OR index=webserver sourcetype=access_* OR sourcetype=iis OR sourcetype=apache:access OR sourcetype=nginx:plus:access
+  spl: 'index=web OR index=webserver sourcetype=access_* OR sourcetype=iis OR sourcetype=apache:access OR sourcetype=nginx:plus:access
+
     | rex field=status "(?<response_code>\d{3})"
+
     | where match(response_code, "(?i)(4[0-9]{2}|5[0-9]{2})")
+
     | bin _time span=2m
+
     | stats count by _time, src_ip
+
     | where count >= 1000
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000239 {\n  meta:\n    author = \"TDL\"\n    description = \"Excessive Webserver Errors from Host\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1083\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    W3CIISLog
+    | where TimeGenerated > ago(2m)
+    | where scStatus matches regex @"(?i)(4[0-9]{2}|5[0-9]{2})"
+    | summarize EventCount = count() by bin(TimeGenerated, 2m), cIP
+    | where EventCount >= 1000
+    | project TimeGenerated, SourceIP = cIP, EventCount
+  aql: "SELECT sourceip, COUNT(*) AS request_count, UNIQUECOUNT(qid) AS unique_events\nFROM events\nWHERE QIDNAME(qid) ILIKE '%web%request%' \n\
+    \  AND (CAST(qid AS VARCHAR) MATCHES '4[0-9]{2}' OR CAST(qid AS VARCHAR) MATCHES '5[0-9]{2}' OR categoryname(category) MATCHES '(?i)(4[0-9]{2}|5[0-9]{2})')\n\
+    GROUP BY sourceip\nHAVING request_count >= 1000\nLAST 2 MINUTES\n"
+  yara_l: |
+    rule webserver_discovery_high_error_rate {
+      meta:
+        author = "TDL"
+        description = "Detects potential discovery activity via high volume of HTTP error responses from single source"
+        mitre_attack_tactic = "Discovery"
+        mitre_attack_technique = "T1083"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        re.regex($e.security_result.summary, `(?i)(4[0-9]{2}|5[0-9]{2})`)
+        $e.principal.ip = $source_ip
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $source_ip over 2m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 1000
+    }
+  esql: "FROM logs-*\n| WHERE @timestamp > NOW() - 2 minutes \n  AND http.response.status_code RLIKE \"[45][0-9]{2}\"\n| STATS event_count = COUNT(*)\
+    \ BY source.ip, time_window = BUCKET(@timestamp, 2 minutes)\n| WHERE event_count >= 1000\n| KEEP time_window, source.ip, event_count\n"
+  leql: |
+    where(source_json.response_code=/^(4[0-9]{2}|5[0-9]{2})$/) groupby(source_address) calculate(count)
+  crowdstrike: "#type=webserver \n| regex(\"(?i)(4[0-9]{2}|5[0-9]{2})\", field=status_code)\n| groupBy([src_ip], function=count(as=request_count),\
+    \ span=2m)\n| request_count >= 1000\n| table([src_ip, request_count, _bucket])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter http_response_code ~= "(?i)(4[0-9]{2}|5[0-9]{2})"
+    | bin _time span=2m
+    | comp count() as request_count by _time, source_ip
+    | filter request_count >= 1000
+    | fields _time, source_ip, request_count
+  lucene: |
+    http.response.status_code:/[45][0-9]{2}/ AND _exists_:source.ip
+  sumo: |
+    _sourceCategory=*Webserver* OR _sourceCategory=*Web* OR _sourceCategory=*HTTP*
+    | parse regex "(?<status_code>\d{3})"
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | where status_code matches "(?i)(4[0-9]{2}|5[0-9]{2})"
+    | timeslice 2m
+    | count as request_count by _timeslice, src_ip
+    | where request_count >= 1000
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -98,7 +92,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1000 Webserver Request Events
 

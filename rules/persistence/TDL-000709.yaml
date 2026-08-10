@@ -20,77 +20,131 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=cloud_audit (source="*container*registry*" OR source="*artifact*registry*" OR sourcetype="gcp:cloudaudit:activity" OR sourcetype="aws:cloudtrail" OR sourcetype="azure:monitor:activity") (action="*push*" OR action="*upload*" OR action="*PutImage*" OR action="*UploadBlob*" OR eventName="PutImage" OR operationName="*uploadBlob*" OR operationName="*push*")
+  spl: 'index=cloud_audit (source="*container*registry*" OR source="*artifact*registry*" OR sourcetype="gcp:cloudaudit:activity" OR sourcetype="aws:cloudtrail"
+    OR sourcetype="azure:monitor:activity") (action="*push*" OR action="*upload*" OR action="*PutImage*" OR action="*UploadBlob*" OR eventName="PutImage"
+    OR operationName="*uploadBlob*" OR operationName="*push*")
+
     | eval registry_path=coalesce(requestParameters.repositoryName, resource.name, repository_name, repositoryName)
+
     | where (match(registry_path, "(?i)(prod|production|internal)") OR match(dest, "(?i)(prod|production|internal)"))
+
     | eval identity=coalesce(userIdentity.principalId, userIdentity.arn, user, caller, userPrincipalName, actor.user.email, principalEmail)
+
     | where NOT (match(identity, "(?i)(ci-cd-sa|gitlab-runner|jenkins-sa|github-actions|circleci|buildkite|tekton|argo-cd|flux-cd|deploy-bot|automation-sa)"))
-    | stats count earliest(_time) as first_time latest(_time) as last_time values(action) as actions values(registry_path) as repositories by identity, src_ip, user_agent
+
+    | stats count earliest(_time) as first_time latest(_time) as last_time values(action) as actions values(registry_path) as repositories by
+    identity, src_ip, user_agent
+
     | eval first_time=strftime(first_time, "%Y-%m-%d %H:%M:%S"), last_time=strftime(last_time, "%Y-%m-%d %H:%M:%S")
+
     | table identity, src_ip, user_agent, count, first_time, last_time, repositories, actions
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000709 {\n  meta:\n    author = \"TDL\"\n    description = \"Container Image Pushed to Production Registry by Unusual\
-    \ Identity\"\n    severity = \"HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1525\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AzureActivity
+    | where TimeGenerated > ago(24h)
+    | where OperationNameValue has_any ("Microsoft.ContainerRegistry/registries/push", "Microsoft.ContainerRegistry/registries/importImage")
+        or (OperationNameValue has "push" and ResourceProviderValue =~ "Microsoft.ContainerRegistry")
+    | extend Identity = tostring(Caller)
+    | extend RegistryName = tostring(split(ResourceId, "/")[-1])
+    | extend ImageName = tostring(Properties.repository)
+    | where RegistryName has_any ("internal", "prod", "production")
+    | where Identity !in (
+        "ci-service-account@project.iam.gserviceaccount.com",
+        "azure-pipelines@contoso.com",
+        "github-actions@contoso.com",
+        "jenkins@contoso.com",
+        "ado-build-agent@contoso.com"
+    )
+    | project TimeGenerated, Identity, OperationNameValue, RegistryName, ImageName, ResourceGroup, SubscriptionId, CallerIpAddress, ActivityStatusValue
+  aql: |
+    SELECT sourceip, username, "Registry", "Image Name", "Action", COUNT(*) AS push_events
+    FROM events
+    WHERE categoryname(category) ILIKE '%container%'
+      AND ("Action" = 'push' OR "Action" = 'PutImage' OR "EventName" = 'PutImage')
+      AND ("Registry" ILIKE '%prod%' OR "Registry" ILIKE '%internal%')
+      AND username NOT IN ('ci-service-account', 'gitlab-runner', 'jenkins-sa', 'github-actions', 'circleci-sa', 'argo-cd', 'tekton-sa')
+    GROUP BY sourceip, username, "Registry", "Image Name", "Action"
+    LAST 1 HOURS
+  yara_l: |
+    rule container_registry_push_outside_cicd {
+      meta:
+        author = "TDL"
+        description = "Detects container image push to internal/prod registry from identity outside CI/CD allowlist - T1525 Implant Internal Image"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1525"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "RESOURCE_WRITTEN"
+        (
+          re.regex($e.target.resource.name, `(?i)(container|registry|artifact|image|gcr\.io|azurecr\.io|ecr\.amazonaws\.com)`) or
+          re.regex($e.metadata.product_event_type, `(?i)(push|upload|putimage|createrepository)`)
+        )
+        (
+          re.regex($e.target.resource.name, `(?i)(prod|production|internal|private)`) or
+          re.regex($e.target.resource.attribute.labels.value, `(?i)(prod|production|internal|private)`)
+        )
+        not re.regex($e.principal.user.userid, `(?i)(cicd|jenkins|gitlab-runner|github-actions|circleci|tekton|argo|spinnaker|cloudbuild|codebuild|pipeline|service-account|sa-|automation)`)
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $registry
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user, $registry over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-cloud.audit*, logs-gcp.audit*, logs-azure.activitylogs*, logs-aws.cloudtrail*\n| WHERE @timestamp > NOW() - 24 hours\n  AND\
+    \ (\n    (event.action IN (\"containerregistry.googleapis.com/images/push\", \"containerregistry.googleapis.com/images/upload\") AND cloud.provider\
+    \ == \"gcp\")\n    OR (event.action LIKE \"*Microsoft.ContainerRegistry*push*\" AND cloud.provider == \"azure\")\n    OR (event.action IN\
+    \ (\"PutImage\", \"BatchImportUpstreamImage\", \"StartImageScan\") AND event.provider == \"ecr.amazonaws.com\" AND cloud.provider == \"aws\"\
+    )\n    OR (event.action IN (\"push\", \"upload\") AND event.dataset LIKE \"*container*registry*\" AND cloud.provider == \"kubernetes\")\n\
+    \  )\n  AND event.outcome IN (\"success\", \"Success\", \"succeeded\")\n  AND NOT (\n    user.name LIKE \"*cicd*\" \n    OR user.name LIKE\
+    \ \"*jenkins*\" \n    OR user.name LIKE \"*github-actions*\" \n    OR user.name LIKE \"*gitlab-runner*\" \n    OR user.name LIKE \"*circleci*\"\
+    \n    OR user.name LIKE \"*build-agent*\"\n    OR user.name LIKE \"*pipeline*\"\n  )\n| STATS push_count = COUNT(*) BY user.name, cloud.provider,\
+    \ event.action, source.ip\n| WHERE push_count >= 1\n| KEEP @timestamp, user.name, cloud.provider, event.action, source.ip, push_count\n"
+  leql: |
+    where(source_json.eventName IN ["PutImage", "UploadLayerPart", "CompleteLayerUpload", "PushImage", "docker.images.push", "containerregistry.googleapis.com/images.upload"] AND source_json.userIdentity.principalId NOT IN ["ci-service-account", "jenkins-sa", "github-actions-sa", "gitlab-runner-sa", "circleci-sa", "arn:aws:iam::*:role/ci-*", "*@ci-*.iam.gserviceaccount.com"] AND (source_json.requestParameters.repositoryName ICONTAINS "prod" OR source_json.requestParameters.repositoryName ICONTAINS "internal" OR source_json.resource.name ICONTAINS "prod" OR source_json.resource.name ICONTAINS "internal")) groupby(source_json.userIdentity.principalId, source_json.requestParameters.repositoryName, source_json.resource.name) calculate(count)
+  crowdstrike: |
+    #type=cloudaudit (eventName=*push* OR eventName=*upload* OR action=*push* OR action=*upload* OR operationName=*push* OR operationName=*upload*) (registry=*internal* OR registry=*prod* OR repository=*internal* OR repository=*prod* OR resourceName=*internal* OR resourceName=*prod*)
+    | regex("(?<serviceAccount>.*@.*\\.iam\\.gserviceaccount\\.com|.*@appspot\\.gserviceaccount\\.com|.*-sa@.*|.*-svc@.*|system:serviceaccount:.*|.*-pipeline.*|.*-ci.*|.*-cd.*|.*-deploy.*)", field=principalEmail, strict=false)
+    | serviceAccount!="*"
+    | not (principalEmail=*-ci* OR principalEmail=*-cd* OR principalEmail=*-pipeline* OR principalEmail=*-deploy* OR principalEmail=*cicd* OR principalEmail=*jenkins* OR principalEmail=*gitlab* OR principalEmail=*github-actions* OR principalEmail=*circleci* OR principalEmail=*tekton* OR principalEmail=*argo* OR principalEmail=*spinnaker* OR principalName=*-ci* OR principalName=*-cd* OR principalName=*-pipeline* OR principalName=*-deploy* OR user.name=*-ci* OR user.name=*-cd* OR user.name=*-pipeline* OR identityName=*-ci* OR identityName=*-pipeline*)
+    | table([@timestamp, principalEmail, principalName, user.name, identityName, eventName, action, operationName, registry, repository, resourceName, sourceIPAddress, userAgent])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider in (ENUM.CLOUD_PROVIDER_AWS, ENUM.CLOUD_PROVIDER_AZURE, ENUM.CLOUD_PROVIDER_GCP, ENUM.CLOUD_PROVIDER_K8S)
+      and (
+        (cloud_provider = ENUM.CLOUD_PROVIDER_AWS and operation_name in ("PutImage", "UploadLayerPart", "CompleteLayerUpload"))
+        or (cloud_provider = ENUM.CLOUD_PROVIDER_AZURE and operation_name contains "containerRegistries/push")
+        or (cloud_provider = ENUM.CLOUD_PROVIDER_GCP and operation_name in ("google.devtools.containeranalysis.v1.ContainerAnalysis.CreateOccurrence", "artifactregistry.googleapis.com/repositories.uploadArtifact"))
+        or (cloud_provider = ENUM.CLOUD_PROVIDER_K8S and operation_name = "push")
+      )
+      and operation_status = ENUM.AUDIT_OPERATION_STATUS_SUCCESS
+      and identity_name not in ("ci-service-account", "github-actions-sa", "jenkins-sa", "gitlab-runner-sa", "circleci-sa", "cicd-service-account")
+    | fields _time, cloud_provider, identity_name, operation_name, resource_name, source_ip_address, user_agent
+  lucene: |
+    (event.action:("PutImage" OR "UploadLayerPart" OR "CompleteLayerUpload" OR "push" OR "upload") OR azure.activitylog.operation_name:("Microsoft.ContainerRegistry/registries/push/write" OR "Microsoft.ContainerRegistry/registries/artifacts/write") OR gcp.audit.method_name:("artifactregistry.googleapis.com/UploadArtifact" OR "artifactregistry.googleapis.com/CreateDockerImage")) AND (cloud.provider:("aws" OR "azure" OR "gcp") OR event.dataset:("aws.cloudtrail" OR "azure.activitylogs" OR "gcp.audit" OR "kubernetes.audit")) AND NOT (user.name:(*cicd* OR *jenkins* OR *gitlab* OR *github-actions* OR *circleci* OR *buildkite* OR *teamcity* OR *bamboo* OR *argo* OR *tekton* OR *flux*) OR user.id:(*cicd* OR *pipeline* OR *builder*) OR cloud.account.id:(*cicd* OR *automation*) OR service_account.name:(*cicd* OR *pipeline* OR *builder* OR *automation*))
+  sumo: |
+    _sourceCategory=*Cloud*Audit* OR _sourceCategory=*Container*Registry* ("push" OR "upload" OR "PutImage" OR "UploadBlob")
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "userIdentity.principalId" as principal_id
+    | json field=_raw "userIdentity.type" as identity_type
+    | json field=_raw "actor.user" as actor_user
+    | json field=_raw "protoPayload.methodName" as method_name
+    | json field=_raw "protoPayload.authenticationInfo.principalEmail" as gcp_principal
+    | json field=_raw "repositoryName" as repository
+    | json field=_raw "imageName" as image_name
+    | where (event_name matches "*PutImage*" OR event_name matches "*UploadBlob*" OR method_name matches "*artifactregistry*.artifacts.upload*" OR method_name matches "*artifacts.docker.images.push*") AND (repository matches "*internal*" OR repository matches "*prod*" OR image_name matches "*internal*" OR image_name matches "*prod*")
+    | parse regex field=principal_id "(?<identity>[^:]+)$"
+    | parse regex field=actor_user "(?<user_identity>.+)"
+    | parse regex field=gcp_principal "(?<gcp_user>.+)"
+    | where !(identity matches "*ci-cd-service*" OR identity matches "*github-actions*" OR identity matches "*jenkins*" OR identity matches "*gitlab-runner*" OR identity matches "*circleci*" OR user_identity matches "*ci-cd-service*" OR user_identity matches "*github-actions*" OR user_identity matches "*jenkins*" OR user_identity matches "*gitlab-runner*" OR user_identity matches "*circleci*" OR gcp_user matches "*ci-cd-service*" OR gcp_user matches "*github-actions*" OR gcp_user matches "*jenkins*" OR gcp_user matches "*gitlab-runner*" OR gcp_user matches "*circleci*")
+    | fields _messageTime, _sourceHost, event_name, method_name, principal_id, actor_user, gcp_principal, repository, image_name
 pseudo_logic: Push to internal/prod container registry from an identity outside the CI/CD service-account allowlist. Adversaries plant backdoored
   images for later pulls.
 false_positives:
@@ -109,7 +163,7 @@ references:
 - https://attack.mitre.org/techniques/T1525/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'

@@ -19,68 +19,100 @@ queries:
   spl: "index=email_security Email_Label IN (\"Phishing\", \"Malware\") EventType=\"URL Click\"\n| eval url_lower=lower(URL)\n| bin _time span=5m\n\
     | join type=inner url_lower \n    [search index=proxy Action=\"Allowed\" earliest=-5m\n    | eval url_lower=lower(URL)\n    | eval proxy_time=_time]\n\
     | where proxy_time >= _time AND proxy_time <= (_time + 300)\n| table _time, User, Email_Label, URL, Action, proxy_time, src_ip, dest_ip\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    let PhishingEmailClicks = SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688 // Proxy for email security events - adjust based on actual log source
+    | where EventData has_any ("Phishing", "Malware")
+    | extend URL = extract(@"(https?://[^\s]+)", 1, EventData)
+    | extend EmailUser = Account
+    | where isnotempty(URL)
+    | project EmailClickTime = TimeGenerated, EmailUser, URL, Computer;
+    let ProxyEvents = SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688 // Proxy for forward proxy events - adjust based on actual log source
+    | where EventData has "Allowed"
+    | extend URL = extract(@"(https?://[^\s]+)", 1, EventData)
+    | extend ProxyUser = Account
+    | where isnotempty(URL)
+    | project ProxyTime = TimeGenerated, ProxyUser, URL, Computer;
+    PhishingEmailClicks
+    | join kind=inner (ProxyEvents) on URL
+    | where ProxyTime >= EmailClickTime and ProxyTime <= EmailClickTime + 5m
+    | project EmailClickTime, ProxyTime, EmailUser, ProxyUser, URL, Computer
+  aql: "SELECT e1.eventtime AS email_click_time, \n       e1.username, \n       e1.sourceip,\n       e1.\"URL\" AS clicked_url,\n       e1.\"\
+    Email Label\",\n       e2.eventtime AS proxy_time,\n       e2.\"Action\"\nFROM events e1, events e2\nWHERE e1.\"Event Type\" = 'Email Security\
+    \ URL Click'\n  AND (e1.\"Email Label\" = 'Phishing' OR e1.\"Email Label\" = 'Malware')\n  AND e2.\"Event Type\" = 'Forward Proxy'\n  AND\
+    \ e2.\"Action\" = 'Allowed'\n  AND e1.\"URL\" = e2.\"URL\"\n  AND e1.username = e2.username\n  AND e2.eventtime BETWEEN e1.eventtime AND (e1.eventtime\
+    \ + 300000)\nLAST 24 HOURS\n"
+  yara_l: "rule phishing_url_click_to_proxy_access {\n  meta:\n    author = \"TDL\"\n    description = \"Detects email security phishing/malware\
+    \ URL click followed by forward proxy allowed access to same URL\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1566\"\n    \n  events:\n    $email.metadata.event_type = \"EMAIL_TRANSACTION\"\n    $email.security_result.category_details = /(?i)(phishing|malware)/\n\
+    \    $email.target.url = $url\n    $email.target.user.userid = $user\n    $email.metadata.event_timestamp.seconds = $email_time\n    \n  \
+    \  $proxy.metadata.event_type = \"NETWORK_HTTP\"\n    $proxy.security_result.action = \"ALLOW\"\n    $proxy.target.url = $url\n    $proxy.principal.user.userid\
+    \ = $user\n    $proxy.metadata.event_timestamp.seconds = $proxy_time\n    \n  match:\n    $user, $url over 5m\n    \n  condition:\n    $email\
+    \ and $proxy and $proxy_time >= $email_time and $proxy_time - $email_time <= 300\n}\n"
+  esql: "FROM logs-windows.security*, logs-o365.audit*, logs-email*\n| WHERE @timestamp > NOW() - 1 hour\n| EVAL event_type = CASE(\n    event.action\
+    \ IN (\"MailItemsAccessed\", \"EmailUrlClicked\", \"email_click\") OR event.category == \"email\", \"email_click\",\n    event.action IN (\"\
+    ProxyRequest\", \"forward_proxy\", \"web_request\") OR event.category == \"web\", \"proxy_request\",\n    null\n  )\n| WHERE event_type IS\
+    \ NOT NULL\n| EVAL email_label = COALESCE(email.threat.classification, threat.indicator.type, labels.malware, labels.phishing)\n| EVAL is_malicious_email\
+    \ = CASE(\n    event_type == \"email_click\" AND (TO_LOWER(email_label) LIKE \"*phishing*\" OR TO_LOWER(email_label) LIKE \"*malware*\"),\
+    \ 1,\n    0\n  )\n| EVAL is_allowed_proxy = CASE(\n    event_type == \"proxy_request\" AND (event.action == \"allowed\" OR TO_LOWER(event.outcome)\
+    \ == \"success\"), 1,\n    0\n  )\n| EVAL url_normalized = COALESCE(url.full, url.original, http.request.url, destination.url)\n| EVAL user_key\
+    \ = COALESCE(user.email, user.name, source.user.name)\n| WHERE is_malicious_email == 1 OR is_allowed_proxy == 1\n| STATS \n    email_events\
+    \ = SUM(is_malicious_email),\n    proxy_events = SUM(is_allowed_proxy),\n    min_time = MIN(@timestamp),\n    max_time = MAX(@timestamp)\n\
+    \    BY user_key, url_normalized\n| WHERE email_events >= 1 AND proxy_events >= 1\n| EVAL time_diff_minutes = (max_time - min_time) / 60000\n\
+    | WHERE time_diff_minutes <= 5\n| KEEP user_key, url_normalized, email_events, proxy_events, min_time, max_time, time_diff_minutes\n"
+  leql: |
+    I need to reconsider this request. The detection logic describes a sequence correlation between email security events and forward proxy events, which requires temporal correlation across different log sources. However, LEQL (Log Entry Query Language) in Rapid7 InsightIDR does not support native sequence/temporal correlation operators like "Followed By" within a single query.
 
-    | where TimeGenerated > ago(1d)
+    LEQL queries can:
+    - Filter logs with `where(...)`
+    - Group and aggregate with `groupby(...) calculate(...)`
+    - But cannot express "Event A followed by Event B within time window X"
 
-    | where eventName matches regex ".+"
+    This type of detection would need to be implemented using InsightIDR's Detection Rules interface (which supports sequence/correlation logic) rather than a raw LEQL query.
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000261 {\n  meta:\n    author = \"TDL\"\n    description = \"Phishing URL Followed By Web Request\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1566\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    Since the requirement cannot be satisfied with a single LEQL query due to language limitations, I cannot provide a syntactically valid query that implements the full detection logic as specified.
+  crowdstrike: |
+    (#type=EmailSecurity event_simpleName=EmailSecurityUrlClick (EmailLabel=Phishing OR EmailLabel=Malware))
+    | ClickedURL := URL
+    | EmailTimestamp := @timestamp
+    | ClickComputerName := ComputerName
+    | ClickUserName := UserName
+    | join({
+        #type=ForwardProxy event_simpleName=ForwardProxyEvent Action=Allowed
+        | ProxyURL := URL
+        | ProxyTimestamp := @timestamp
+        | ProxyComputerName := ComputerName
+        | ProxyUserName := UserName
+      }, field=[ClickedURL=ProxyURL], key=[ClickedURL], include=[ProxyTimestamp, ProxyComputerName, ProxyUserName], mode=left)
+    | test(ProxyTimestamp >= EmailTimestamp AND ProxyTimestamp <= EmailTimestamp + 5m)
+    | table([@timestamp, ClickComputerName, ClickUserName, ClickedURL, EmailLabel, ProxyTimestamp, ProxyComputerName, ProxyUserName, Action])
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_EMAIL_SECURITY_URL_CLICK\n| filter action_email_security_classification in (\"\
+    Phishing\", \"Malware\")\n| alter email_url = action_email_security_url, email_time = _time\n| join type=inner (\n    dataset = xdr_data\n\
+    \    | filter event_type = ENUM.EVENT_TYPE_FORWARD_PROXY\n    | filter action_forward_proxy_action = \"Allowed\"\n    | alter proxy_url =\
+    \ action_forward_proxy_url, proxy_time = _time\n) as proxy_events \n  email_url = proxy_events.proxy_url\n| filter proxy_events.proxy_time\
+    \ >= email_time and proxy_events.proxy_time <= arrayexpand(email_time, 300000)\n| fields email_time, proxy_events.proxy_time, email_url, action_email_security_classification,\
+    \ action_email_security_recipient, agent_hostname\n"
+  lucene: |
+    (event_type:"email_security" AND email_label:(Phishing OR Malware)) OR (event_type:"forward_proxy" AND action:Allowed)
+  sumo: |
+    _sourceCategory=*Email* OR _sourceCategory=*Proxy*
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "email_label" as email_label
+    | json field=_raw "url" as url
+    | json field=_raw "action" as action
+    | json field=_raw "timestamp" as event_time
+    | where (event_type = "email_url_click" and (email_label = "Phishing" or email_label = "Malware")) or (event_type = "proxy" and action = "Allowed")
+    | sort by url, event_time
+    | timeslice 5m
+    | transaction on url with _timeslice
+    | where transactionCount >= 2
+    | parse regex field=_raw "(?<email_click>email_url_click.*?(?:Phishing|Malware))"
+    | parse regex field=_raw "(?<proxy_allowed>proxy.*?Allowed)"
+    | where !isEmpty(email_click) and !isEmpty(proxy_allowed)
+    | fields event_time, url, email_label, action
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -90,7 +122,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Email Security URL Click Event
 

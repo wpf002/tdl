@@ -15,91 +15,113 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp
+
     | stats count sum(bytes_out) as total_bytes_out dc(dest_ip) as unique_destinations values(dest_port) as dest_ports by src_ip, dest_ip
+
     | where count >= 1
+
     | sort - total_bytes_out
+
     | lookup domain_age_lookup dest_ip OUTPUT domain, domain_age
+
     | where domain_age < 30 OR isnull(domain_age)
+
     | lookup cdn_allowlist_lookup dest_ip OUTPUT is_allowed
+
     | where isnull(is_allowed) OR is_allowed != "true"
+
     | lookup cdn_allowlist_lookup domain OUTPUT is_allowed as domain_allowed
+
     | where isnull(domain_allowed) OR domain_allowed != "true"
+
     | mvexpand dest_ports
+
     | dedup src_ip, dest_ip, dest_ports
+
     | table src_ip, dest_ip, dest_ports, total_bytes_out, unique_destinations, count, domain, domain_age
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(1h)\n| where DeviceVendor has_any (\"Proxy\", \"Firewall\", \"IDS\") or DeviceProduct has_any\
+    \ (\"Proxy\", \"Firewall\", \"IDS\")\n| where NetworkProtocol =~ \"tcp\"\n| where SentBytes > 0\n| summarize \n    ConnectionCount = count(),\n\
+    \    TotalBytesOut = sum(SentBytes),\n    DestinationCount = dcount(DestinationIP),\n    DestinationPorts = make_set(DestinationPort)\n  \
+    \  by SourceIP, DestinationIP, DestinationPort\n| where ConnectionCount >= 1\n| join kind=inner (\n    DnsEvents\n    | where TimeGenerated\
+    \ > ago(24h)\n    | extend Domain = Name\n    | distinct Domain, IPAddresses\n    | mv-expand IPAddresses\n    | extend DestinationIP = tostring(IPAddresses)\n\
+    ) on DestinationIP\n| join kind=leftouter (\n    ThreatIntelligenceIndicator\n    | where TimeGenerated > ago(30d)\n    | where DomainName\
+    \ != \"\"\n    | extend Domain = DomainName\n    | where isnotempty(ValidFrom)\n    | extend DomainAge = datetime_diff('day', now(), ValidFrom)\n\
+    \    | where DomainAge <= 30\n    | project Domain, DomainAge\n) on Domain\n| where isnotempty(DomainAge) or isnotempty(Domain)\n| where DestinationIP\
+    \ !has_any (\"1.1.1.1\", \"8.8.8.8\") \n| where Domain !has_any (\".microsoft.com\", \".azure.com\", \".cloudflare.com\", \".akamai.net\"\
+    , \".fastly.net\", \".amazonaws.com\", \".cloudfront.net\", \".google.com\")\n| distinct SourceIP, DestinationIP, DestinationPort, TotalBytesOut,\
+    \ ConnectionCount, DestinationCount, Domain, DomainAge\n| sort by TotalBytesOut desc\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(bytesout) AS total_bytes_out, COUNT(*) AS connection_count, UNIQUECOUNT(destinationip) AS unique_destinations
     FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+    WHERE protocol = '6'
+      AND destinationip NOT IN ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')
+      AND destinationip NOT ILIKE '%cloudfront.net%'
+      AND destinationip NOT ILIKE '%akamai%'
+      AND destinationip NOT ILIKE '%fastly%'
+      AND destinationip NOT ILIKE '%cdn%'
     GROUP BY sourceip, destinationip, destinationport
-
+    HAVING connection_count >= 1
+    ORDER BY total_bytes_out DESC
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exf_002 {\n  meta:\n    author = \"TDL\"\n    description = \"Exfiltration to Newly Registered Domain\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0010\"\n    technique = \"T1048.002\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n   \
-    \ $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  yara_l: "rule exfil_to_new_domain {\n  meta:\n    author = \"TDL\"\n    description = \"T1048.002 - Exfiltration to newly registered domains\
+    \ with high volume\"\n    mitre_attack_tactic = \"Exfiltration\"\n    mitre_attack_technique = \"T1048.002\"\n    severity = \"HIGH\"\n\n\
+    \  events:\n    $net.metadata.event_type = \"NETWORK_CONNECTION\"\n    $net.network.ip_protocol = \"TCP\"\n    $net.network.direction = \"\
+    OUTBOUND\"\n    $net.principal.ip = $src_ip\n    $net.target.ip = $dest_ip\n    $net.target.port = $dest_port\n    $net.network.sent_bytes\
+    \ > 0\n    \n    not (\n      re.regex($net.target.hostname, `(?i)(amazonaws\\.com|cloudfront\\.net|akamai\\.net|fastly\\.net|cdn\\.cloudflare\\\
+    .net|googleusercontent\\.com|azureedge\\.net|msedge\\.net|microsoft\\.com|office\\.com|windows\\.net|apple\\.com|icloud\\.com|symantec\\.com|mcafee\\\
+    .com|adobe\\.com)$`)\n      or net.ip_in_range_cidr($net.target.ip, \"10.0.0.0/8\")\n      or net.ip_in_range_cidr($net.target.ip, \"172.16.0.0/12\"\
+    )\n      or net.ip_in_range_cidr($net.target.ip, \"192.168.0.0/16\")\n    )\n\n  match:\n    $src_ip, $dest_ip, $dest_port over 1h\n\n  outcome:\n\
+    \    $total_bytes_out = sum($net.network.sent_bytes)\n    $connection_count = count_distinct($net.metadata.id)\n    $unique_dest_count = count_distinct($dest_ip)\n\
+    \    $risk_score = max(75)\n\n  condition:\n    #net >= 1\n}\n"
+  esql: "FROM logs-network*, logs-proxy*, logs-dns*\n| WHERE @timestamp > NOW() - 24 hours \n  AND network.protocol == \"tcp\" \n  AND network.direction\
+    \ == \"outbound\"\n  AND destination.domain NOT IN (\"cdn.example.com\", \"s3.amazonaws.com\", \"cloudfront.net\", \"akamai.net\", \"fastly.net\"\
+    )\n  AND destination.ip NOT IN (\"203.0.113.0/24\", \"198.51.100.0/24\")\n| EVAL is_new_domain = CASE(\n    threat.indicator.first_seen >\
+    \ NOW() - 30 days, 1,\n    0\n  )\n| WHERE is_new_domain == 1\n| STATS \n    connections = COUNT(*), \n    bytes_out = SUM(network.bytes),\
+    \ \n    unique_destinations = COUNT_DISTINCT(destination.ip)\n  BY source.ip, destination.ip, destination.port\n| WHERE connections >= 1\n\
+    | SORT bytes_out DESC\n| KEEP source.ip, destination.ip, destination.port, connections, bytes_out, unique_destinations\n"
+  leql: |
+    where(protocol=TCP AND destination_address NOT IN ["cdn.cloudflare.com", "amazonaws.com", "azureedge.net", "akamaiedge.net", "fastly.net"])
+    groupby(source_address, destination_address, destination_port)
+    calculate(sum:bytes_out, unique:destination_address)
+  crowdstrike: |
+    #type=network (sourcetype=firewall OR sourcetype=ids) network.protocol=*tcp*
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=conn_count), sum(bytes_out, as=total_bytes_out)])
+    | conn_count >= 1
+    | groupBy([src_ip], function=[sum(total_bytes_out, as=src_total_bytes), count(dest_ip, distinct=true, as=unique_dests)])
+    | join({#type=threat_intel domain_age_days<*}, field=[dest_ip], include=[domain, domain_age_days], mode=left)
+    | join({#type=allowlist}, field=[dest_ip, dest_domain], include=[is_legitimate], mode=left)
+    | isNull(is_legitimate)
+    | sort(field=total_bytes_out, order=desc, limit=10000)
+    | table([src_ip, dest_ip, dest_port, conn_count, total_bytes_out, unique_dests, domain, domain_age_days])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_networking_protocol = "tcp" and bytes_sent > 0
+    | comp count() as conn_count, sum(bytes_sent) as total_bytes_out, count_distinct(action_destination_translated_ip) as unique_dests by action_source_translated_ip, action_destination_translated_ip, action_destination_translated_port
+    | filter conn_count >= 1
+    | sort desc total_bytes_out
+    | dedup action_source_translated_ip, action_destination_translated_ip, action_destination_translated_port
+    | fields action_source_translated_ip, action_destination_translated_ip, action_destination_translated_port, conn_count, total_bytes_out, unique_dests
+  lucene: |
+    network.protocol:tcp AND NOT (dest_ip:(known_cdn_ip_1 OR known_cdn_ip_2) OR dest_domain:(legitimate_vendor_domain OR cdn_edge_domain)) AND _exists_:bytes_out AND _exists_:dest_ip AND _exists_:src_ip AND _exists_:dest_port AND domain_age:[0 TO 90]
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*network* OR _sourceCategory=*dns*
+    | where protocol matches "*tcp*" OR proto matches "*tcp*" OR Protocol matches "*tcp*"
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dest[_\s]*ip[:\s=]+(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dest[_\s]*port[:\s=]+(?<dest_port>\d+)" nodrop
+    | parse regex "bytes[_\s]*out[:\s=]+(?<bytes_out>\d+)" nodrop
+    | parse regex "domain[:\s=]+(?<dest_domain>[^\s,]+)" nodrop
+    | where !isEmpty(src_ip) and !isEmpty(dest_ip) and !isEmpty(dest_port)
+    | where !(dest_ip matches "10.*" or dest_ip matches "172.16.*" or dest_ip matches "172.17.*" or dest_ip matches "172.18.*" or dest_ip matches "172.19.*" or dest_ip matches "172.20.*" or dest_ip matches "172.21.*" or dest_ip matches "172.22.*" or dest_ip matches "172.23.*" or dest_ip matches "172.24.*" or dest_ip matches "172.25.*" or dest_ip matches "172.26.*" or dest_ip matches "172.27.*" or dest_ip matches "172.28.*" or dest_ip matches "172.29.*" or dest_ip matches "172.30.*" or dest_ip matches "172.31.*" or dest_ip matches "192.168.*")
+    | where !(dest_domain matches "*amazonaws.com" or dest_domain matches "*cloudfront.net" or dest_domain matches "*akamai.net" or dest_domain matches "*microsoft.com" or dest_domain matches "*azure.com" or dest_domain matches "*google.com" or dest_domain matches "*gstatic.com" or dest_domain matches "*office.com" or dest_domain matches "*windows.net")
+    | num(bytes_out)
+    | count as conn_count, sum(bytes_out) as total_bytes_out, count_distinct(dest_ip) as unique_dest_ips by src_ip, dest_ip, dest_port
+    | where conn_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, conn_count, total_bytes_out, unique_dest_ips
 false_positives:
 - Legitimate vendors on new domains
 - CDN edge nodes
@@ -110,7 +132,7 @@ tags:
 author: TDL
 created: '2024-03-16'
 test_method: synthetic
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination, total bytes transferred, and the protocol used.'
 - Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — quantify the data volume vs the host's baseline outbound profile.

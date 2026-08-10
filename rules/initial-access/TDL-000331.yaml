@@ -20,68 +20,69 @@ queries:
     | table _time, detail.type, detail.resource.accessKeyDetails.userName, detail.resource.accessKeyDetails.principalId, detail.service.action.actionType,\
     \ detail.service.action.awsApiCallAction.remoteIpDetails.ipAddressV4, detail.service.action.awsApiCallAction.remoteIpDetails.organization.asn,\
     \ detail.severity, detail.region, detail.accountId\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where ActivityType in ("Recon:IAMUser/MaliciousIPCaller", "Recon:IAMUser/MaliciousIPCaller.Custom", "UnauthorizedAccess:IAMUser/MaliciousIPCaller", "UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom")
+    | project TimeGenerated, ActivityType, Title, Description, Severity, AccountId, AwsAccountId, Region, ResourceType, UserName, IpAddress, City, Country
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS log_source, qidname(qid) AS event_name, \"finding.type\" AS finding_type, \"resource.accessKeyDetails.userName\"\
+    \ AS username, sourceip, \"severity\" AS severity, \"service.action.awsApiCallAction.api\" AS api_call\nFROM events\nWHERE LOGSOURCENAME(logsourceid)\
+    \ ILIKE '%guardduty%'\n  AND (\"finding.type\" = 'Recon:IAMUser/MaliciousIPCaller' \n       OR \"finding.type\" = 'Recon:IAMUser/MaliciousIPCaller.Custom'\n\
+    \       OR \"finding.type\" = 'UnauthorizedAccess:IAMUser/MaliciousIPCaller'\n       OR \"finding.type\" = 'UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom')\n\
+    LAST 24 HOURS\n"
+  yara_l: |
+    rule aws_guardduty_iam_malicious_ip_caller {
+      meta:
+        author = "TDL"
+        description = "Detects AWS GuardDuty findings for IAM user activity from malicious IP addresses"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.vendor_name = "Amazon AWS"
+        $e.metadata.product_name = "GuardDuty"
+        (
+          $e.metadata.product_event_type = "Recon:IAMUser/MaliciousIPCaller" or
+          $e.metadata.product_event_type = "Recon:IAMUser/MaliciousIPCaller.Custom" or
+          $e.metadata.product_event_type = "UnauthorizedAccess:IAMUser/MaliciousIPCaller" or
+          $e.metadata.product_event_type = "UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom"
+        )
+        $e.target.user.userid = $user
+        $e.principal.ip = $ip
 
-    | where eventName matches regex "GuardDuty"
+      match:
+        $user, $ip over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000331 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS IAM User Activity from Threat Host - GuardDuty\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("Recon:IAMUser/MaliciousIPCaller", "Recon:IAMUser/MaliciousIPCaller.Custom", "UnauthorizedAccess:IAMUser/MaliciousIPCaller", "UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom")
+    | KEEP @timestamp, event.type, cloud.account.id, user.name, source.ip, aws.guardduty.severity, event.id
+  leql: |
+    where(source_json.type IN ["Recon:IAMUser/MaliciousIPCaller", "Recon:IAMUser/MaliciousIPCaller.Custom", "UnauthorizedAccess:IAMUser/MaliciousIPCaller", "UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom"])
+  crowdstrike: |
+    #repo=guardduty type IN ["Recon:IAMUser/MaliciousIPCaller", "Recon:IAMUser/MaliciousIPCaller.Custom", "UnauthorizedAccess:IAMUser/MaliciousIPCaller", "UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom"]
+    | table([@timestamp, type, service.action.awsApiCallAction.api, resource.accessKeyDetails.userName, resource.accessKeyDetails.userType, service.action.awsApiCallAction.remoteIpDetails.ipAddressV4, service.action.awsApiCallAction.remoteIpDetails.organization.asn, service.action.awsApiCallAction.remoteIpDetails.country.countryName, severity])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and vendor_name = "AWS" and log_name = "GuardDuty"
+    | filter action_finding_type in ("Recon:IAMUser/MaliciousIPCaller", "Recon:IAMUser/MaliciousIPCaller.Custom", "UnauthorizedAccess:IAMUser/MaliciousIPCaller", "UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom")
+    | fields _time, cloud_provider, action_finding_type, action_finding_severity, identity_name, src_ip_v4, action_finding_description
+  lucene: |
+    event.type:"guardduty" AND finding.type:("Recon:IAMUser/MaliciousIPCaller" OR "Recon:IAMUser/MaliciousIPCaller.Custom" OR "UnauthorizedAccess:IAMUser/MaliciousIPCaller" OR "UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom")
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty* OR _source=*guardduty*
+    | json field=_raw "detail.type" as event_type
+    | where event_type in ("Recon:IAMUser/MaliciousIPCaller", "Recon:IAMUser/MaliciousIPCaller.Custom", "UnauthorizedAccess:IAMUser/MaliciousIPCaller", "UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom")
+    | json field=_raw "detail.resource.accessKeyDetails.userName" as user_name
+    | json field=_raw "detail.resource.accessKeyDetails.principalId" as principal_id
+    | json field=_raw "detail.service.action.awsApiCallAction.remoteIpDetails.ipAddressV4" as source_ip
+    | json field=_raw "detail.severity" as severity
+    | json field=_raw "detail.accountId" as account_id
+    | fields _messageTime, account_id, event_type, user_name, principal_id, source_ip, severity
 false_positives:
 - Authorized pen testing
 - Security research
@@ -91,7 +92,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Recon:IAMUser/MaliciousIPCaller\", \"Recon:IAMUser/MaliciousIPCaller.Custom\"\
   , \"UnauthorizedAccess:IAMUser/MaliciousIPCaller\", \"UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom\"]"

@@ -16,71 +16,65 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=okta sourcetype=OktaIM2:log eventType IN ("user.session.impersonation.grant", "user.session.impersonation.initiate")
-    | table _time, actor.alternateId, actor.displayName, target.alternateId, target.displayName, eventType, client.ipAddress, client.userAgent.rawUserAgent, outcome.result
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: 'index=okta sourcetype=OktaIM2:log eventType IN ("user.session.impersonation.grant", "user.session.impersonation.initiate")
 
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+    | table _time, actor.alternateId, actor.displayName, target.alternateId, target.displayName, eventType, client.ipAddress, client.userAgent.rawUserAgent,
+    outcome.result
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000022 {\n  meta:\n    author = \"TDL\"\n    description = \"Okta User Impersonation\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    Okta_CL
+    | where TimeGenerated > ago(24h)
+    | where eventType_s in ("user.session.impersonation.grant", "user.session.impersonation.initiate")
+    | project TimeGenerated, eventType_s, actor_alternateId_s, actor_displayName_s, target_alternateId_s, target_displayName_s, client_ipAddress_s, client_userAgent_rawUserAgent_s, outcome_result_s, outcome_reason_s
+  aql: |
+    SELECT eventtime, username, sourceip, "Event Type", "Target Username", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "Event Type" IN ('user.session.impersonation.grant', 'user.session.impersonation.initiate')
+    LAST 24 HOURS
+  yara_l: |
+    rule okta_session_impersonation_access {
+      meta:
+        author = "TDL"
+        description = "Detects Okta admin session impersonation events - T1078 Initial Access"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Okta"
+        (
+          $e.metadata.product_event_type = "user.session.impersonation.grant" or
+          $e.metadata.product_event_type = "user.session.impersonation.initiate"
+        )
+        $e.principal.user.userid = $admin
+        $e.target.user.userid = $impersonated_user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $admin, $impersonated_user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-okta*
+    | WHERE event.action IN ("user.session.impersonation.grant", "user.session.impersonation.initiate")
+    | KEEP @timestamp, event.action, user.name, okta.actor.id, okta.actor.display_name, okta.target.id, okta.target.display_name, source.ip, user_agent.original
+  leql: |
+    where(source_json.eventType IN [user.session.impersonation.grant, user.session.impersonation.initiate])
+  crowdstrike: |
+    (#type=okta OR event_simpleName=OktaSystemLog) (eventType=user.session.impersonation.grant OR eventType=user.session.impersonation.initiate)
+    | table([@timestamp, actor.alternateId, actor.displayName, target.alternateId, target.displayName, eventType, client.ipAddress, client.userAgent.rawUserAgent])
+  xql: |
+    dataset = okta_raw_data
+    | filter event_type in ("user.session.impersonation.grant", "user.session.impersonation.initiate")
+    | fields _time, actor_id, actor_alternate_id, target_user_id, target_user_alternate_id, event_type, event_result, client_ip, client_location, client_user_agent
+  lucene: |
+    eventType:(user.session.impersonation.grant OR user.session.impersonation.initiate)
+  sumo: |
+    _sourceCategory=*Okta*
+    | json field=_raw "eventType" as event_type
+    | where event_type in ("user.session.impersonation.grant", "user.session.impersonation.initiate")
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +84,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: Where Event Type in [user.session.impersonation.grant, user.session.impersonation.initiate]
 suppression:

@@ -20,77 +20,75 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=* sourcetype IN (WinEventLog:Microsoft-Windows-Sysmon/Operational, XmlWinEventLog:Microsoft-Windows-Sysmon/Operational) EventCode=1
+  spl: 'index=* sourcetype IN (WinEventLog:Microsoft-Windows-Sysmon/Operational, XmlWinEventLog:Microsoft-Windows-Sysmon/Operational) EventCode=1
+
     | rex field=Image "^(?<DriveLetter>[A-Z]):\\.*"
+
     | eval DriveType=if(match(DriveLetter, "^[D-Z]$"), "Removable", "Fixed")
+
     | where DriveType="Removable" OR match(Image, "^(D|E|F|G|H|I|J|K|L|M|N|O|P|Q|R|S|T|U|V|W|X|Y|Z):\\.*")
+
     | table _time, ComputerName, User, Image, CommandLine, ParentImage, DriveLetter
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000700 {\n  meta:\n    author = \"TDL\"\n    description = \"Executable Launched from Removable USB Volume\"\n  \
-    \  severity = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1091\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n \
-    \   $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceProcessEvents
+    | where TimeGenerated > ago(24h)
+    | where FolderPath matches regex @"^[D-Z]:\\"
+    | join kind=inner (
+        DeviceInfo
+        | mv-expand todynamic(LogicalDrives)
+        | extend DriveLetter = tostring(LogicalDrives.DriveLetter), DriveType = tostring(LogicalDrives.DriveType)
+        | where DriveType == "Removable"
+        | project DeviceId, DriveLetter
+    ) on DeviceId
+    | where FolderPath startswith DriveLetter
+    | project TimeGenerated, DeviceName, AccountName, FileName, FolderPath, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine, DriveLetter
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Image" AS full_path, sourceip
+    FROM events
+    WHERE ("EventID" = '1' OR "EventID" = '4688')
+      AND ("Image" ILIKE 'D:\%' OR "Image" ILIKE 'E:\%' OR "Image" ILIKE 'F:\%' OR "Image" ILIKE 'G:\%' OR "Image" ILIKE 'H:\%' OR "Image" ILIKE 'I:\%' OR "Image" ILIKE 'J:\%' OR "Image" ILIKE 'K:\%' OR "Image" ILIKE 'L:\%' OR "Image" ILIKE 'M:\%' OR "Image" ILIKE 'N:\%' OR "Image" ILIKE 'O:\%' OR "Image" ILIKE 'P:\%' OR "Image" ILIKE 'Q:\%' OR "Image" ILIKE 'R:\%' OR "Image" ILIKE 'S:\%' OR "Image" ILIKE 'T:\%' OR "Image" ILIKE 'U:\%' OR "Image" ILIKE 'V:\%' OR "Image" ILIKE 'W:\%' OR "Image" ILIKE 'X:\%' OR "Image" ILIKE 'Y:\%' OR "Image" ILIKE 'Z:\%' OR "Process CommandLine" ILIKE 'D:\%' OR "Process CommandLine" ILIKE 'E:\%' OR "Process CommandLine" ILIKE 'F:\%' OR "Process CommandLine" ILIKE 'G:\%' OR "Process CommandLine" ILIKE 'H:\%' OR "Process CommandLine" ILIKE 'I:\%' OR "Process CommandLine" ILIKE 'J:\%' OR "Process CommandLine" ILIKE 'K:\%' OR "Process CommandLine" ILIKE 'L:\%' OR "Process CommandLine" ILIKE 'M:\%' OR "Process CommandLine" ILIKE 'N:\%' OR "Process CommandLine" ILIKE 'O:\%' OR "Process CommandLine" ILIKE 'P:\%' OR "Process CommandLine" ILIKE 'Q:\%' OR "Process CommandLine" ILIKE 'R:\%' OR "Process CommandLine" ILIKE 'S:\%' OR "Process CommandLine" ILIKE 'T:\%' OR "Process CommandLine" ILIKE 'U:\%' OR "Process CommandLine" ILIKE 'V:\%' OR "Process CommandLine" ILIKE 'W:\%' OR "Process CommandLine" ILIKE 'X:\%' OR "Process CommandLine" ILIKE 'Y:\%' OR "Process CommandLine" ILIKE 'Z:\%' OR "Image" ILIKE '/media/%' OR "Image" ILIKE '/mnt/%' OR "Image" ILIKE '/Volumes/%' OR "Process CommandLine" ILIKE '/media/%' OR "Process CommandLine" ILIKE '/mnt/%' OR "Process CommandLine" ILIKE '/Volumes/%')
+    LAST 24 HOURS
+  yara_l: "rule removable_drive_execution {\n  meta:\n    author = \"TDL\"\n    description = \"Detects process execution from removable media\
+    \ (USB drives)\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1091\"\n    severity = \"Medium\"\n  \n  events:\n\
+    \    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      re.regex($e.principal.process.file.full_path, `^[D-Z]:\\\\`) or\n      re.regex($e.principal.process.file.full_path,\
+    \ `^/media/`) or\n      re.regex($e.principal.process.file.full_path, `^/mnt/`) or\n      re.regex($e.principal.process.file.full_path, `^/run/media/`)\
+    \ or\n      re.regex($e.principal.process.file.full_path, `^/Volumes/`)\n    )\n    not re.regex($e.principal.process.file.full_path, `^C:\\\
+    \\`)\n    $e.principal.hostname = $host\n  \n  match:\n    $host over 5m\n  \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-endpoint.events.process*, logs-windows.sysmon_operational*
+    | WHERE event.category == "process" AND event.type == "start"
+      AND (process.executable RLIKE "[D-Z]:\\\\.*" OR process.executable RLIKE "/media/.*" OR process.executable RLIKE "/mnt/.*" OR process.executable RLIKE "/Volumes/.*")
+    | EVAL drive_letter = SUBSTRING(process.executable, 0, 2)
+    | WHERE drive_letter NOT IN ("C:", "A:", "B:")
+    | KEEP @timestamp, host.name, user.name, process.name, process.executable, process.command_line, process.parent.name, process.parent.executable
+  leql: |
+    where(source_json.EventID=1 AND (process_cmd_line ICONTAINS "E:\\" OR process_cmd_line ICONTAINS "F:\\" OR process_cmd_line ICONTAINS "G:\\" OR process_cmd_line ICONTAINS "H:\\" OR process_cmd_line ICONTAINS "I:\\" OR process_cmd_line ICONTAINS "J:\\" OR process_cmd_line ICONTAINS "K:\\" OR process_cmd_line ICONTAINS "L:\\" OR process_cmd_line ICONTAINS "M:\\" OR process_cmd_line ICONTAINS "N:\\" OR process_cmd_line ICONTAINS "O:\\" OR process_cmd_line ICONTAINS "P:\\" OR process_cmd_line ICONTAINS "Q:\\" OR process_cmd_line ICONTAINS "R:\\" OR process_cmd_line ICONTAINS "S:\\" OR process_cmd_line ICONTAINS "T:\\" OR process_cmd_line ICONTAINS "U:\\" OR process_cmd_line ICONTAINS "V:\\" OR process_cmd_line ICONTAINS "W:\\" OR process_cmd_line ICONTAINS "X:\\" OR process_cmd_line ICONTAINS "Y:\\" OR process_cmd_line ICONTAINS "Z:\\")) groupby(asset, process_name, process_cmd_line) calculate(count)
+  crowdstrike: "event_simpleName=ProcessRollup2 ImageFileName=/^[D-Z]:\\\\.*/ \n| regex(\"^(?<DriveLetter>[D-Z]):\", field=ImageFileName)\n| format(\"\
+    [%s]:\", field=[DriveLetter], as=DriveCheck)\n| selfJoin(field=DriveCheck, where=[{event_simpleName=VolumeDeviceInformation DriveType=2}],\
+    \ key=DriveLetter)\n| table([@timestamp, ComputerName, UserName, ImageFileName, CommandLine, ParentBaseFileName, SHA256HashData])\n"
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_PROCESS\n| filter action_process_image_path ~= \"^[A-Z]:\\\\\\\\\" \n| alter\
+    \ drive_letter = arrayindex(regextract(action_process_image_path, \"^([A-Z]):\"), 0)\n| filter drive_letter != null and drive_letter not in\
+    \ (\"C\", \"D\")\n| fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_path, action_process_image_command_line,\
+    \ drive_letter\n"
+  lucene: |
+    (process.executable:*\\E:\\* OR process.executable:*\\F:\\* OR process.executable:*\\G:\\* OR process.executable:*\\H:\\* OR process.executable:*/media/* OR process.executable:*/mnt/* OR process.executable:*/Volumes/*) AND (event.category:process AND event.type:start)
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Sysmon* OR _sourceCategory=*EDR*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Image" as image
+    | json field=_raw "NewProcessName" as new_process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "Computer" as computer
+    | json field=_raw "TargetUserName" as user
+    | json field=_raw "ProcessName" as process_name
+    | where event_id in ("1", "4688") or isNull(event_id)
+    | if(isNull(image), if(isNull(new_process_name), process_name, new_process_name), image) as process_path
+    | where process_path matches regex "^[D-Z]:\\.*" and !(process_path matches regex "^C:\\.*")
+    | parse regex field=process_path "^(?<drive_letter>[D-Z]):" nodrop
+    | where !isNull(drive_letter)
+    | fields _messageTime, computer, _sourceHost, user, process_path, command_line, drive_letter
 pseudo_logic: Process started from a path on a removable drive (DriveType=2). Adversaries copy implants to USB and rely on autorun or user click
   for first execution.
 false_positives:
@@ -109,7 +107,7 @@ references:
 - https://attack.mitre.org/techniques/T1091/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

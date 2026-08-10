@@ -16,71 +16,73 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=azure sourcetype=azure:aad:audit OR sourcetype=azure:monitor:activity operationName="MICROSOFT.STORAGE/STORAGEACCOUNTS/BLOBSERVICES/CONTAINERS/WRITE" status=Success OR resultType=Success
+  spl: 'index=azure sourcetype=azure:aad:audit OR sourcetype=azure:monitor:activity operationName="MICROSOFT.STORAGE/STORAGEACCOUNTS/BLOBSERVICES/CONTAINERS/WRITE"
+    status=Success OR resultType=Success
+
     | table _time, user, operationName, status, resultType, resourceId, subscriptionId, resourceGroup
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000654 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Blob Container Access Level Modified\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0005\"\n    technique = \"T1499\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AzureActivity
+    | where TimeGenerated > ago(1h)
+    | where OperationNameValue =~ "MICROSOFT.STORAGE/STORAGEACCOUNTS/BLOBSERVICES/CONTAINERS/WRITE"
+    | where ActivityStatusValue =~ "Success"
+    | project TimeGenerated, Caller, OperationNameValue, ActivityStatusValue, ResourceGroup, SubscriptionId, ResourceId, Properties
+  aql: |
+    SELECT username, sourceip, "Azure Operation", "Azure Resource", eventtime, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Azure%'
+      AND categoryname(category) ILIKE '%Azure%Activity%'
+      AND "Azure Operation" = 'MICROSOFT.STORAGE/STORAGEACCOUNTS/BLOBSERVICES/CONTAINERS/WRITE'
+      AND (eventname ILIKE '%success%' OR "Azure Result" ILIKE '%success%' OR "Azure Status" = 'Success')
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_storage_container_write_defense_evasion {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects Azure storage container write operations that may be used for defense evasion (T1499)"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1499"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_event_type = "Administrative"
+        $e.metadata.vendor_name = "Microsoft"
+        $e.metadata.product_name = "Azure"
+        re.regex($e.target.resource.name, `(?i)MICROSOFT\.STORAGE/STORAGEACCOUNTS/BLOBSERVICES/CONTAINERS/WRITE`)
+        $e.security_result.action = "ALLOW"
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $operation
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-azure.activitylogs*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND azure.activitylogs.operation_name == "MICROSOFT.STORAGE/STORAGEACCOUNTS/BLOBSERVICES/CONTAINERS/WRITE"
+      AND event.outcome == "success"
+    | KEEP @timestamp, azure.activitylogs.operation_name, event.outcome, azure.activitylogs.caller, azure.resource.id, azure.resource.group, cloud.account.id
+  leql: |
+    where(source_json.operationName IN ["MICROSOFT.STORAGE/STORAGEACCOUNTS/BLOBSERVICES/CONTAINERS/WRITE"] AND source_json.resultType="Success")
+  crowdstrike: |
+    event_platform=Azure event_simpleName=AzureActivityLog operationName="MICROSOFT.STORAGE/STORAGEACCOUNTS/BLOBSERVICES/CONTAINERS/WRITE" resultType=Success
+    | table([@timestamp, ComputerName, UserName, operationName, resourceId, resultType])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AZURE" and operation_name in ("MICROSOFT.STORAGE/STORAGEACCOUNTS/BLOBSERVICES/CONTAINERS/WRITE") and operation_status = "Success"
+    | fields _time, actor_user, resource_name, operation_name, operation_status, cloud_provider_project
+  lucene: |
+    operationName:"MICROSOFT.STORAGE/STORAGEACCOUNTS/BLOBSERVICES/CONTAINERS/WRITE" AND resultType:Success
+  sumo: |
+    _sourceCategory=*Azure* ("MICROSOFT.STORAGE/STORAGEACCOUNTS/BLOBSERVICES/CONTAINERS/WRITE")
+    | json field=_raw "operationName" as operation
+    | json field=_raw "resultType" as result
+    | where operation matches "*MICROSOFT.STORAGE/STORAGEACCOUNTS/BLOBSERVICES/CONTAINERS/WRITE*" and (result = "Success" or result = "Succeeded")
+    | fields _messageTime, _sourceHost, operation, result
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -90,7 +92,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Azure Administrative Activity Event
 

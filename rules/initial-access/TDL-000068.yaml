@@ -15,76 +15,97 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=* sourcetype=applocker* OR sourcetype="WinEventLog:Microsoft-Windows-AppLocker*" OR sourcetype="application_control"
+  spl: 'index=* sourcetype=applocker* OR sourcetype="WinEventLog:Microsoft-Windows-AppLocker*" OR sourcetype="application_control"
+
     | search (Category="Remote Control" OR Application_Category="Remote Control" OR CategoryName="Remote Control")
+
     | search NOT [| inputlookup authorized_remote_control_apps.csv | fields Application | format]
+
     | table _time, host, ComputerName, Application, Application_Name, User, UserName, Action, FilePath, FileHash
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000068 {\n  meta:\n    author = \"TDL\"\n    description = \"Traffic to Unauthorized Remote Control Application\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1219\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    AppLockerEvent
+    | where TimeGenerated > ago(24h)
+    | where ApplicationCategory == "Remote Control"
+    | where ApplicationName !in ("TeamViewer.exe", "AnyDesk.exe", "LogMeIn.exe", "GoToAssist.exe", "RemotePC.exe", "Splashtop.exe", "Chrome Remote Desktop.exe", "mstsc.exe", "msra.exe")
+    | project TimeGenerated, Computer, UserName, ApplicationName, ApplicationPath, ApplicationCategory, PolicyName, Action
+  aql: |
+    SELECT eventtime, sourceip, destinationip, username, LOGSOURCENAME(logsourceid) AS host, "Application Name", "Application Category", "Process Name", "Process CommandLine"
+    FROM events
+    WHERE "Application Category" = 'Remote Control'
+      AND "Application Name" NOT IN ('TeamViewer', 'LogMeIn', 'AnyDesk', 'Bomgar', 'ScreenConnect', 'RemotePC', 'Splashtop', 'GoToMyPC', 'Zoho Assist', 'Windows Remote Assistance')
+    LAST 24 HOURS
+  yara_l: |
+    rule remote_control_unauthorized_app {
+      meta:
+        author = "TDL"
+        description = "Detects unauthorized remote control application usage - MITRE T1219 Initial Access"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1219"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.metadata.product_name = "Application Control"
+        $e.target.application.category = "Remote Control"
+        not (
+          $e.target.process.file.full_path = /(?i)C:\\Program Files\\TeamViewer\\TeamViewer\.exe/ or
+          $e.target.process.file.full_path = /(?i)C:\\Program Files\\Microsoft\\Remote Desktop Connection\\mstsc\.exe/ or
+          $e.target.process.file.full_path = /(?i)C:\\Windows\\System32\\mstsc\.exe/ or
+          $e.target.process.file.full_path = /(?i)C:\\Program Files.*\\LogMeIn\\/ or
+          $e.target.process.file.full_path = /(?i)C:\\Program Files.*\\AnyDesk\\AnyDesk\.exe/ or
+          $e.target.process.file.full_path = /(?i)C:\\Program Files.*\\VNC\\/ or
+          re.regex($e.target.process.file.full_path, `(?i)\\approved_remote_tools\\`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 65
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.applocker*, logs-windows.sysmon_operational*, logs-endpoint.events.file*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (event.category == "process" AND event.type == "start")
+        OR (winlog.event_id IN (8001, 8002, 8003, 8004, 8005, 8006, 8007))
+      )
+      AND (
+        process.name IN ("teamviewer.exe", "anydesk.exe", "logmein.exe", "ammyy.exe", "remotepc.exe", "supremo.exe", "dwrcc.exe", "screenconnect.exe", "gotoassist.exe", "bomgar.exe", "dameware.exe", "radmin.exe", "ultravnc.exe", "tightvnc.exe", "realvnc.exe", "splash.exe", "remotedesktop.exe", "msra.exe", "mstsc.exe", "quicksupport.exe", "gosupportnow.exe", "logmeinrescue.exe", "ShowMyPC.exe")
+        OR file.name IN ("teamviewer.exe", "anydesk.exe", "logmein.exe", "ammyy.exe", "remotepc.exe", "supremo.exe", "dwrcc.exe", "screenconnect.exe", "gotoassist.exe", "bomgar.exe", "dameware.exe", "radmin.exe", "ultravnc.exe", "tightvnc.exe", "realvnc.exe", "splash.exe", "remotedesktop.exe", "msra.exe", "mstsc.exe", "quicksupport.exe", "gosupportnow.exe", "logmeinrescue.exe", "ShowMyPC.exe")
+      )
+      AND process.name NOT IN ("mstsc.exe", "msra.exe")
+      AND file.name NOT IN ("mstsc.exe", "msra.exe")
+    | KEEP @timestamp, host.name, user.name, process.name, process.executable, process.command_line, file.name, file.path
+  leql: |
+    where(source_json.ApplicationCategory="Remote Control" AND NOT(source_json.ApplicationName IN ["TeamViewer", "AnyDesk", "LogMeIn", "GoToMyPC", "RemotePC", "Splashtop", "Chrome Remote Desktop", "Windows Remote Assistance", "Remote Desktop Connection"]))
+  crowdstrike: |
+    #type=ApplicationControlEvent event_simpleName=*ApplicationControl* ApplicationCategory="Remote Control"
+    | NOT (ApplicationName IN [TeamViewer, AnyDesk, "Remote Desktop", LogMeIn, "Chrome Remote Desktop", "Microsoft Quick Assist"])
+    | table([@timestamp, ComputerName, UserName, ApplicationName, ApplicationCategory, FilePath, SHA256HashData])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter event_sub_type = ENUM.EVENT_SUB_TYPE_APP_CONTROL
+    | filter action_app_control_category = "Remote Control"
+    | filter action_app_control_app_name not in ("TeamViewer", "LogMeIn", "AnyDesk", "GoToMyPC", "RemotePC", "Splashtop", "Chrome Remote Desktop", "RealVNC", "TightVNC", "UltraVNC", "Bomgar", "BeyondTrust", "ConnectWise Control", "Dameware", "Remote Desktop Connection", "mstsc.exe")
+    | fields _time, agent_hostname, actor_effective_username, action_app_control_app_name, action_app_control_category, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:8003 AND application.category:"Remote Control" AND NOT application.name:("TeamViewer" OR "AnyDesk" OR "LogMeIn" OR "GoToMyPC" OR "Chrome Remote Desktop" OR "Microsoft Remote Desktop" OR "VNC" OR "Splashtop" OR "Zoom" OR "WebEx")
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*AppControl* OR _sourceCategory=*Application*
+    | json field=_raw "ApplicationCategory" as app_category
+    | json field=_raw "ApplicationName" as app_name
+    | json field=_raw "Application" as application
+    | where app_category = "Remote Control" or app_category matches "*Remote Control*"
+    | where !(app_name in ("TeamViewer", "LogMeIn", "AnyDesk", "GoToMyPC", "Splashtop", "ConnectWise Control", "Bomgar", "RemotePC") or application in ("TeamViewer", "LogMeIn", "AnyDesk", "GoToMyPC", "Splashtop", "ConnectWise Control", "Bomgar", "RemotePC"))
+    | fields _messageTime, _sourceHost, app_category, app_name, application
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -94,7 +115,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Application Control Event
 

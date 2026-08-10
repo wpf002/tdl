@@ -23,73 +23,98 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 85
 queries:
-  spl: |
-    index=linux sourcetype IN(linux_audit, auditd, syslog) (file_path="*/lib/security/pam_*.so" OR file_path="*/etc/pam.d/*" OR name="*/lib/security/pam_*.so" OR name="*/etc/pam.d/*") (action=write OR action=created OR action=modified OR syscall=open OR syscall=openat OR syscall=rename OR syscall=renameat)
-    | search NOT (exe="*/dpkg*" OR exe="*/apt*" OR exe="*/yum*" OR exe="*/rpm*" OR exe="*/dnf*" OR exe="*/zypper*" OR exe="*/pacman*" OR comm="*dpkg*" OR comm="*apt*" OR comm="*yum*" OR comm="*rpm*" OR comm="*dnf*" OR comm="*zypper*" OR comm="*pacman*")
-    | stats count values(file_path) as file_paths values(name) as file_names values(exe) as process values(comm) as command by _time, host, uid, user
+  spl: 'index=linux sourcetype IN(linux_audit, auditd, syslog) (file_path="*/lib/security/pam_*.so" OR file_path="*/etc/pam.d/*" OR name="*/lib/security/pam_*.so"
+    OR name="*/etc/pam.d/*") (action=write OR action=created OR action=modified OR syscall=open OR syscall=openat OR syscall=rename OR syscall=renameat)
+
+    | search NOT (exe="*/dpkg*" OR exe="*/apt*" OR exe="*/yum*" OR exe="*/rpm*" OR exe="*/dnf*" OR exe="*/zypper*" OR exe="*/pacman*" OR comm="*dpkg*"
+    OR comm="*apt*" OR comm="*yum*" OR comm="*rpm*" OR comm="*dnf*" OR comm="*zypper*" OR comm="*pacman*")
+
+    | stats count values(file_path) as file_paths values(name) as file_names values(exe) as process values(comm) as command by _time, host, uid,
+    user
+
     | table _time, host, user, uid, process, command, file_paths, file_names, count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000732 {\n  meta:\n    author = \"TDL\"\n    description = \"PAM Module File Modified Outside Patch Window\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0005\"\n    technique = \"T1556\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n \
-    \   $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    Event
+    | where TimeGenerated > ago(24h)
+    | where Source == "Linux" and RenderedDescription has_any ("/lib/security/", "/etc/pam.d/", "pam_")
+    | where RenderedDescription has_any ("write", "modify", "create", "open")
+    | where RenderedDescription !has_any ("apt", "yum", "dnf", "zypper", "dpkg", "rpm", "pacman")
+    | extend FileName = extract(@"(/lib/security/pam_[^\s]+\.so|/etc/pam\.d/[^\s]+)", 1, RenderedDescription)
+    | where isnotempty(FileName)
+    | extend Process = extract(@"comm=\"([^\"]+)\"", 1, RenderedDescription)
+    | extend User = extract(@"(uid|user)=([^\s]+)", 2, RenderedDescription)
+    | project TimeGenerated, Computer, User, Process, FileName, RenderedDescription
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "exe" AS process, "name" AS filename, "cwd" AS working_directory
+    FROM events
+    WHERE (categoryname(category) ILIKE '%file%' OR categoryname(category) ILIKE '%audit%')
+      AND ("name" ILIKE '%/lib/security/pam_%.so' OR "name" ILIKE '%/etc/pam.d/%')
+      AND ("syscall" = 'openat' OR "syscall" = 'open' OR "syscall" = 'rename' OR "syscall" = 'renameat' OR "type" = 'PATH' OR "EventID" = '11')
+      AND ("exe" NOT ILIKE '%/usr/bin/apt%' AND "exe" NOT ILIKE '%/usr/bin/dpkg%' AND "exe" NOT ILIKE '%/usr/bin/yum%' AND "exe" NOT ILIKE '%/usr/bin/dnf%' AND "exe" NOT ILIKE '%/usr/bin/rpm%' AND "exe" NOT ILIKE '%/usr/bin/zypper%' AND "exe" NOT ILIKE '%/usr/bin/pacman%')
+    LAST 24 HOURS
+  yara_l: |
+    rule pam_backdoor_modification {
+      meta:
+        author = "TDL"
+        description = "Detects writes to PAM configuration or modules outside approved package installs - T1556"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1556"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "FILE_MODIFICATION"
+        (
+          re.regex($e.target.file.full_path, `^/lib/security/pam_.*\.so$`) or
+          re.regex($e.target.file.full_path, `^/etc/pam\.d/.*`)
+        )
+        not re.regex($e.principal.process.file.full_path, `(?i)(dpkg|rpm|yum|apt|apt-get|dnf|zypper|pacman)`)
+        $e.principal.hostname = $host
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 85
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint.events.file*, logs-system.auditd*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.action IN ("creation", "modification", "rename", "write")
+      AND (
+        file.path LIKE "/lib/security/pam_*.so*"
+        OR file.path LIKE "/etc/pam.d/*"
+      )
+      AND NOT process.name IN ("apt", "apt-get", "dpkg", "yum", "dnf", "rpm", "zypper", "pacman", "aptitude")
+    | STATS event_count = COUNT(*) BY host.name, user.name, process.name, process.executable, file.path, process.command_line
+    | KEEP @timestamp, host.name, user.name, process.name, process.executable, file.path, process.command_line, event_count
+  leql: |
+    where(source_json.exe=/^((?!apt|dpkg|yum|rpm|dnf|zypper|pacman).)*$/ AND (source_json.name ICONTAINS "/lib/security/pam_" OR source_json.name ICONTAINS "/etc/pam.d/") AND (source_json.type="normal" OR source_json.type="create" OR source_json.type="open"))
+  crowdstrike: |
+    (event_simpleName=FileWritten OR event_simpleName=AsepValueUpdate) event_platform=Lin
+    (TargetFileName=/lib/security/pam_*.so OR TargetFileName=/etc/pam.d/*)
+    NOT (ImageFileName=*/dpkg* OR ImageFileName=*/rpm* OR ImageFileName=*/yum* OR ImageFileName=*/apt* OR ImageFileName=*/apt-get* OR ImageFileName=*/dnf* OR ImageFileName=*/zypper* OR ImageFileName=*/pacman*)
+    | table([@timestamp, ComputerName, UserName, ImageFileName, TargetFileName, SHA256HashData])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_FILE and action_file_path ~= "^(/lib/security/pam_.*\\.so|/etc/pam\\.d/.*)" and (event_sub_type = ENUM.EVENT_SUB_TYPE_FILE_WRITE or event_sub_type = ENUM.EVENT_SUB_TYPE_FILE_RENAME or event_sub_type = ENUM.EVENT_SUB_TYPE_FILE_CREATE)
+    | filter actor_process_image_name not in ("dpkg", "rpm", "yum", "apt", "apt-get", "dnf", "zypper", "pacman")
+    | fields _time, agent_hostname, actor_process_image_name, actor_process_image_command_line, action_file_path, actor_effective_username, event_sub_type
+  lucene: |
+    (file.path:\/lib\/security\/pam_*.so OR file.path:\/etc\/pam.d\/*) AND (event.action:(created OR modified OR renamed) OR event.type:(file_create OR file_change OR file_rename)) AND NOT (process.name:(apt OR apt-get OR dpkg OR yum OR rpm OR dnf OR zypper OR pacman) OR process.executable:(*\/apt OR *\/apt-get OR *\/dpkg OR *\/yum OR *\/rpm OR *\/dnf OR *\/zypper OR *\/pacman))
+  sumo: |
+    _sourceCategory=*Linux* OR _sourceCategory=*Auditd* (("/lib/security/pam_" AND ".so") OR "/etc/pam.d/")
+    | parse regex "(?<file_path>/(?:lib/security/pam_[^\s]+\.so|etc/pam\.d/[^\s]+))" nodrop
+    | parse regex "name=\"(?<file_name>[^\"]+)\"" nodrop
+    | parse regex "comm=\"(?<process>[^\"]+)\"" nodrop
+    | parse regex "exe=\"(?<executable>[^\"]+)\"" nodrop
+    | where (file_path matches "/lib/security/pam_*.so" OR file_path matches "/etc/pam.d/*")
+    | where !(process matches "*apt*" OR process matches "*yum*" OR process matches "*dnf*" OR process matches "*rpm*" OR process matches "*dpkg*" OR process matches "*zypper*" OR process matches "*pacman*")
+    | fields _messageTime, _sourceHost, file_path, file_name, process, executable
 pseudo_logic: Write to /lib/security/pam_*.so or /etc/pam.d/* outside an approved package install. Backdoors authentication on Linux.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -108,7 +133,7 @@ references:
 - https://attack.mitre.org/techniques/T1556/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

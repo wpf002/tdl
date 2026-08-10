@@ -27,71 +27,141 @@ queries:
     \\Windows\\\\System\\\\Scripts*\" OR Object_Name=\"*\\\\SOFTWARE\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Image File Execution Options*\"\
     )\n| lookup high_value_targets.csv hostname AS ComputerName OUTPUT is_hvt\n| where is_hvt=\"true\"\n| table _time, ComputerName, EventCode,\
     \ Object_Name, Process_Name, Account_Name, Operation_Type\n"
-  kql: 'DeviceRegistryEvents
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (567, 4657)
+    | where ObjectName has_any (
+        "\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        "\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        "\\Software\\Microsoft\\Windows\\CurrentVersion\\RunServices",
+        "\\Software\\Microsoft\\Windows\\CurrentVersion\\RunServicesOnce",
+        "\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+        "\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run",
+        "\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders",
+        "\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders",
+        "\\System\\CurrentControlSet\\Services",
+        "\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options",
+        "\\System\\CurrentControlSet\\Control\\Session Manager\\BootExecute",
+        "\\Software\\Classes\\exefile\\shell\\open\\command",
+        "\\Software\\Classes\\htmlfile\\shell\\open\\command",
+        "\\System\\CurrentControlSet\\Control\\Lsa",
+        "\\Software\\Policies\\Microsoft\\Windows\\System\\Scripts",
+        "\\Software\\Microsoft\\Command Processor\\Autorun"
+    )
+    | where Computer in (
+        "DC01",
+        "DC02",
+        "EXCH01",
+        "EXCH02",
+        "SQL01",
+        "SQL02",
+        "FILE01",
+        "FILE02",
+        "JUMP01",
+        "ADMIN01"
+    )
+    | project TimeGenerated, Computer, Account, ObjectName, ObjectValueName, OperationType, ProcessName, ProcessId, EventID
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, \"Object Name\", \"Process Name\"\nFROM events\nWHERE \"EventID\" IN ('567',\
+    \ '4657')\n  AND (\"Object Name\" ILIKE '%\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run%'\n    OR \"Object Name\" ILIKE '%\\SOFTWARE\\\
+    Microsoft\\Windows\\CurrentVersion\\RunOnce%'\n    OR \"Object Name\" ILIKE '%\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon%'\n\
+    \    OR \"Object Name\" ILIKE '%\\SYSTEM\\CurrentControlSet\\Services%'\n    OR \"Object Name\" ILIKE '%\\SOFTWARE\\Policies\\Microsoft\\\
+    Windows\\System\\Scripts%'\n    OR \"Object Name\" ILIKE '%\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options%'\n\
+    \    OR \"Object Name\" ILIKE '%\\SYSTEM\\CurrentControlSet\\Control\\Session Manager%'\n    OR \"Object Name\" ILIKE '%\\SOFTWARE\\Microsoft\\\
+    Windows NT\\CurrentVersion\\Windows%'\n    OR \"Object Name\" ILIKE '%\\SYSTEM\\CurrentControlSet\\Control\\SecurityProviders%'\n    OR \"\
+    Object Name\" ILIKE '%\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run%')\n  AND (destinationip IN ('10.0.0.10', '10.0.0.20',\
+    \ '10.0.0.30') \n    OR LOGSOURCENAME(logsourceid) IN ('DC01', 'DC02', 'EXCH01', 'FILE01', 'SQL01'))\nLAST 24 HOURS\n"
+  yara_l: |
+    rule defense_evasion_registry_modification_hvt {
+      meta:
+        author = "TDL"
+        description = "Detects registry modifications on sensitive keys on high value targets - MITRE T1112"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1112"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "REGISTRY_MODIFICATION"
+        (
+          $e.metadata.product_event_type = "567" or
+          $e.metadata.product_event_type = "4657"
+        )
+        (
+          re.regex($e.target.registry.registry_key, `(?i)\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\System\\CurrentControlSet\\Services`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\System\\CurrentControlSet\\Control\\Session Manager`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\System\\CurrentControlSet\\Control\\Lsa`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\Software\\Policies\\Microsoft\\Windows\\System\\Scripts`) or
+          re.regex($e.target.registry.registry_key, `(?i)\\Software\\Microsoft\\Windows\\CurrentVersion\\Group Policy\\Scripts`)
+        )
+        $e.principal.hostname = $host
 
-    | where registry_key matches regex ".+"
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
+      outcome:
+        $risk_score = 75
+        $hostname = $host
+        $registry_key = $e.target.registry.registry_key
+        $process_path = $e.principal.process.file.full_path
+        $user = $e.principal.user.userid
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Registry Key\", \"Registry Value Name\", \"Registry Value Data\", \"Process Name\"\nFROM events\nWHERE\
-    \ LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n  AND \"EventID\" IN ('12','13','14')\n  AND \"registry_key\" LIKE '%.+%'\n\
-    LAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000201 {\n  meta:\n    author = \"TDL\"\n    description = \"Sensitive Registry Key Modification - HVT\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1112\"\n  events:\n    $e.metadata.event_type = \"REGISTRY_MODIFICATION\"\n    $e.registry_key\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "registry" AND registry_key LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/.+/)
-
-    groupby(asset, registry_key, registry_value)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*.+*
-
-    | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
-
-    | sort -changes
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.REGISTRY AND registry_key ~= ".+"
-
-    | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
-
-    | sort desc changes
-
-    '
-  lucene: 'event.category:"registry" AND registry_key:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id IN ("12","13","14") AND registry_key matches "*.+*"
-
-    | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.security*, logs-system.security*
+    | WHERE winlog.event_id IN (567, 4657)
+      AND (
+        winlog.event_data.ObjectName LIKE "*\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run*"
+        OR winlog.event_data.ObjectName LIKE "*\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce*"
+        OR winlog.event_data.ObjectName LIKE "*\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon*"
+        OR winlog.event_data.ObjectName LIKE "*\\SYSTEM\\CurrentControlSet\\Services*"
+        OR winlog.event_data.ObjectName LIKE "*\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System*"
+        OR winlog.event_data.ObjectName LIKE "*\\SOFTWARE\\Policies\\Microsoft\\Windows\\System\\Scripts*"
+        OR winlog.event_data.ObjectName LIKE "*\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options*"
+        OR winlog.event_data.ObjectName LIKE "*\\SYSTEM\\CurrentControlSet\\Control\\Session Manager*"
+        OR winlog.event_data.ObjectName LIKE "*\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders*"
+        OR winlog.event_data.ObjectName LIKE "*\\SOFTWARE\\Classes\\*\\shell\\open\\command*"
+      )
+      AND host.name IN ("DC01", "DC02", "EXCHANGE01", "SQL-PROD", "FILE-SERVER01", "JUMP-BOX")
+    | KEEP @timestamp, host.name, user.name, winlog.event_id, winlog.event_data.ObjectName, winlog.event_data.OperationType
+  leql: |
+    where(source_json.EventID IN [567, 4657] AND source_json.ObjectName IN ["HKLM\SYSTEM\CurrentControlSet\Services\", "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest", "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "HKLM\SYSTEM\CurrentControlSet\Control\Lsa"] AND asset IN ["DC01", "DC02", "EXCH01", "FILE01", "SQL01"])
+  crowdstrike: |
+    EventCode IN [567, 4657]
+    | ObjectName IN ["\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\*", "\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run*", "\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\EnableLUA", "\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows Defender\\*", "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\WDigest\\UseLogonCredential", "\\REGISTRY\\MACHINE\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection\\DisableRealtimeMonitoring", "\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\*"]
+    | ComputerName IN ["DC01", "DC02", "FILE-SERVER-01", "WEB-SERVER-01", "SQL-SERVER-01"]
+    | table([@timestamp, ComputerName, ObjectName, ProcessName, UserName, OperationType])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (567, 4657)
+    | filter action_registry_key_name in ("HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce", "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce", "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run", "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run", "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "HKLM\\SYSTEM\\CurrentControlSet\\Services", "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServices", "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServicesOnce", "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServices", "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServicesOnce", "HKLM\\SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce")
+    | alter is_hvt = if(agent_hostname in ("DC01", "DC02", "EXCH01", "SQLPROD01", "FILESERVER01", "ADFS01", "CA01"), "true", "false")
+    | filter is_hvt = "true"
+    | fields _time, agent_hostname, action_evtlog_event_id, action_registry_key_name, action_registry_value_name, actor_effective_username, actor_process_image_name
+  lucene: |
+    event.code:(567 OR 4657) AND winlog.event_data.ObjectName:(*\SOFTWARE\Microsoft\Windows\CurrentVersion\Run* OR *\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce* OR *\SOFTWARE\Microsoft\Windows\CurrentVersion\RunServices* OR *\SOFTWARE\Microsoft\Windows\CurrentVersion\RunServicesOnce* OR *\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon* OR *\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run* OR *\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run* OR *\SYSTEM\CurrentControlSet\Services* OR *\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options* OR *\SYSTEM\CurrentControlSet\Control\Session Manager* OR *\SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad* OR *\SOFTWARE\Classes\*\Shell\Open\Command* OR *\SOFTWARE\Classes\htmlfile\shell\open\command* OR *\SOFTWARE\Classes\exefile\shell\open\command*) AND host.name:(HVT-DC01 OR HVT-DC02 OR HVT-EXCH01 OR HVT-SQL01 OR HVT-WEB01 OR HVT-FS01 OR HVT-APP01 OR HVT-ADMIN01)
+  sumo: "_sourceCategory=*Windows* (\"567\" OR \"4657\")\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"ObjectName\" as object_name\n\
+    | json field=_raw \"Computer\" as computer\n| where event_id in (\"567\", \"4657\")\n| where object_name matches \"*\\\\Software\\\\Microsoft\\\
+    \\Windows\\\\CurrentVersion\\\\Run*\" \n    OR object_name matches \"*\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\RunOnce*\"\
+    \n    OR object_name matches \"*\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Policies\\\\Explorer\\\\Run*\"\n    OR object_name\
+    \ matches \"*\\\\Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Winlogon*\"\n    OR object_name matches \"*\\\\Software\\\\Microsoft\\\
+    \\Windows\\\\CurrentVersion\\\\Explorer\\\\Shell Folders*\"\n    OR object_name matches \"*\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\
+    \\Explorer\\\\User Shell Folders*\"\n    OR object_name matches \"*\\\\System\\\\CurrentControlSet\\\\Services*\"\n    OR object_name matches\
+    \ \"*\\\\Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Image File Execution Options*\"\n    OR object_name matches \"*\\\\Software\\\
+    \\Classes\\\\*\\\\shell\\\\*\\\\command*\"\n    OR object_name matches \"*\\\\Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Windows*\"\
+    \n    OR object_name matches \"*\\\\System\\\\CurrentControlSet\\\\Control\\\\Session Manager*\"\n    OR object_name matches \"*\\\\Software\\\
+    \\Policies\\\\Microsoft\\\\Windows\\\\System\\\\Scripts*\"\n    OR object_name matches \"*\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\
+    \\Group Policy\\\\Scripts*\"\n| where computer in (\"DC01\", \"DC02\", \"EXCHANGE01\", \"SQLSERVER01\", \"FILESERVER01\", \"WEBAPP01\", \"\
+    VIP-WORKSTATION01\")\n| fields _messageTime, event_id, computer, object_name\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -101,7 +171,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Registry Modification Event
 

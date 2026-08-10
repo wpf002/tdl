@@ -25,71 +25,96 @@ queries:
     | eval start_address=coalesce(StartAddress, start_address, ThreadStartAddress)\n| eval process=coalesce(process_name, Image, ProcessName,\
     \ TargetImage)\n| eval host=coalesce(host, ComputerName, hostname)\n| table _time, host, process, start_address, MemoryProtection, memory_protection,\
     \ AllocationProtect, TargetProcessId, SourceProcessId, user\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    DeviceEvents
+    | where TimeGenerated > ago(1h)
+    | where ActionType == "CreateRemoteThreadApiCall"
+    | where AdditionalFields has "RWX"
+    | where AdditionalFields !has "ImageFileName"
+    | extend AdditionalFieldsParsed = parse_json(AdditionalFields)
+    | where AdditionalFieldsParsed.MemoryProtection =~ "RWX" or AdditionalFieldsParsed.MemoryProtection =~ "PAGE_EXECUTE_READWRITE"
+    | where isempty(AdditionalFieldsParsed.MappedImagePath) or AdditionalFieldsParsed.MappedImagePath == ""
+    | project TimeGenerated, DeviceName, ActionType, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName, FileName, ProcessCommandLine, AdditionalFields
+  aql: |
+    SELECT eventtime, sourceip, username, "Process Name", "Process CommandLine", "Target Address", "Start Address", "Memory Protection", LOGSOURCENAME(logsourceid) AS host
+    FROM events
+    WHERE ("EventID" = '8' OR "Event Type" ILIKE '%thread%' OR "Event Type" ILIKE '%remote thread%')
+      AND ("Memory Protection" ILIKE '%RWX%' OR "Memory Protection" ILIKE '%PAGE_EXECUTE_READWRITE%')
+      AND ("Start Address" NOT ILIKE '%:\\%' AND "Target Image" IS NULL)
+    LAST 1 HOURS
+  yara_l: |
+    rule reflective_code_injection_rwx_memory {
+      meta:
+        author = "TDL"
+        description = "Detects thread execution from RWX private memory without backing image - T1620 Reflective Code Loading"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1620"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_INJECTION"
+        $e.target.process.command_line != ""
+        $e.principal.hostname = $host
+        (
+          re.regex($e.metadata.description, `(?i)rwx`) or
+          re.regex($e.security_result.summary, `(?i)rwx`) or
+          re.regex($e.metadata.product_event_type, `(?i)(8|10)$`)
+        )
+        (
+          re.regex($e.metadata.description, `(?i)private`) or
+          re.regex($e.security_result.summary, `(?i)private`) or
+          re.regex($e.security_result.summary, `(?i)unbacked`)
+        )
+        not re.regex($e.target.process.file.full_path, `(?i)\\(system32|syswow64|program files)\\`)
 
-    | where process_name matches regex ".+"
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      outcome:
+        $risk_score = max(85)
+        $target_process = array_distinct($e.target.process.file.full_path)
+        $principal_process = array_distinct($e.principal.process.file.full_path)
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000736 {\n  meta:\n    author = \"TDL\"\n    description = \"Code Execution from Unbacked RWX Memory\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1620\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-endpoint.events.memory*\n| WHERE event.category == \"intrusion_detection\" \n  AND event.type == \"start\"\n  AND memory.protection\
+    \ LIKE \"*RWX*\"\n  AND memory.type == \"private\"\n  AND NOT memory.backed_by_file == true\n| STATS thread_starts = COUNT(*) BY host.name,\
+    \ process.name, process.executable, process.pid, user.name\n| WHERE thread_starts > 0\n| KEEP @timestamp, host.name, process.name, process.executable,\
+    \ process.pid, user.name, thread_starts\n"
+  leql: |
+    where(source_json.EventType="CreateRemoteThread" AND source_json.StartAddressModule="Unknown" AND source_json.MemoryProtection ICONTAINS "RWX") OR where(source_json.EventID=8 AND source_json.StartModule="Unknown" AND source_json.MemoryProtection ICONTAINS "PAGE_EXECUTE_READWRITE")
+  crowdstrike: |
+    event_simpleName=SuspiciousRawDiskRead OR event_simpleName=RemoteThreadInjection OR event_simpleName=SuspiciousMemoryWrite OR event_simpleName=ImageLoaded
+    (MemoryProtection=*RWX* OR Protection=*RWX* OR AllocationType=*PRIVATE* OR ImageBase=0x0)
+    (ImageFileName="" OR ImageFileName=null OR MappedImageFileName="" OR MappedImageFileName=null)
+    | table([@timestamp, ComputerName, UserName, event_simpleName, TargetProcessId, TargetFileName, ThreadStartAddress, MemoryProtection, Protection, AllocationType, SHA256HashData, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_LOAD_IMAGE
+      and action_module_file_info_file_path = null
+      and action_module_memory_region_allocation_attributes contains "RWX"
+    | fields _time, agent_hostname, agent_os_type, actor_process_image_name, actor_process_image_path, actor_effective_username, action_module_base_address, action_module_memory_region_allocation_attributes, action_thread_thread_id
+  lucene: |
+    event.type:thread AND thread.start_address_memory_protection:(*RWX* OR *PAGE_EXECUTE_READWRITE*) AND thread.start_address_module:("-" OR "Unbacked" OR "Unknown" OR "Private") AND NOT thread.start_address_module:*.dll
+  sumo: |
+    _sourceCategory=*EDR* OR _sourceCategory=*Sysmon*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "SourceImage" as source_image
+    | json field=_raw "TargetImage" as target_image
+    | json field=_raw "StartAddress" as start_address
+    | json field=_raw "MemoryProtection" as memory_protection
+    | json field=_raw "MemoryType" as memory_type
+    | json field=_raw "ImageLoaded" as image_loaded
+    | json field=_raw "ProcessName" as process_name
+    | json field=_raw "ThreadStartAddress" as thread_start_address
+    | json field=_raw "AllocationType" as allocation_type
+    | json field=_raw "Protection" as protection
+    | where (event_id = "8" OR event_id = "10" OR event_id matches "*thread*" OR event_id matches "*memory*")
+    | where (memory_protection matches "*RWX*" OR memory_protection matches "*PAGE_EXECUTE_READWRITE*" OR protection matches "*RWX*" OR protection matches "*0x40*")
+    | where (memory_type = "MEM_PRIVATE" OR allocation_type = "MEM_PRIVATE" OR image_loaded = "" OR image_loaded = "null" OR isNull(image_loaded))
+    | where (start_address != "" OR thread_start_address != "")
+    | fields _messageTime, _sourceHost, event_id, source_image, process_name, target_image, start_address, thread_start_address, memory_protection, protection, memory_type, allocation_type
 pseudo_logic: EDR event showing thread start address inside RWX private memory (no backing image). Reflective DLL / shellcode loader signal.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -107,7 +132,7 @@ references:
 - https://attack.mitre.org/techniques/T1620/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

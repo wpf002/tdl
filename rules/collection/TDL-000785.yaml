@@ -27,71 +27,94 @@ queries:
     \ values(Image) as process values(ParentImage) as parent_process values(dest_port) as destination_port values(DestinationPort) as dest_port_alt\
     \ by _time, ComputerName, Computer, host, User, user\n| table _time, ComputerName, Computer, host, User, user, process, parent_process, command_line,\
     \ destination_port, dest_port_alt, count\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    DeviceNetworkEvents
+    | where TimeGenerated > ago(1h)
+    | where RemotePort in (9222, 9223)
+    | where InitiatingProcessCommandLine has_any ("chrome", "msedge")
+    | where InitiatingProcessCommandLine has_any ("--remote-debugging-port", "--remote-debugging-pipe")
+    | join kind=inner (
+        DeviceProcessEvents
+        | where TimeGenerated > ago(1h)
+        | where ProcessCommandLine has_any ("--remote-debugging-port", "--remote-debugging-pipe")
+        | where FileName in~ ("chrome.exe", "msedge.exe", "Google Chrome", "Microsoft Edge")
+        ) on DeviceId
+    | where InitiatingProcessFileName !in~ ("devenv.exe", "code.exe", "python.exe", "python3", "node.exe", "idea64.exe", "pycharm64.exe", "studio64.exe", "eclipse.exe")
+    | project TimeGenerated, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteIP, RemotePort, ProcessCommandLine
+  aql: |
+    SELECT sourceip, destinationip, destinationport, "Process Name", "Process CommandLine", COUNT(*) AS connection_count
+    FROM events
+    WHERE (destinationport = 9222 OR "Process CommandLine" ILIKE '%--remote-debugging%')
+      AND "Process Name" NOT ILIKE '%code.exe%'
+      AND "Process Name" NOT ILIKE '%visual studio%'
+      AND "Process Name" NOT ILIKE '%devtools%'
+      AND "Process Name" NOT ILIKE '%chrome.exe%'
+      AND "Process Name" NOT ILIKE '%msedge.exe%'
+    GROUP BY sourceip, destinationip, destinationport, "Process Name", "Process CommandLine"
+    LAST 1 HOURS
+  yara_l: |
+    rule browser_remote_debugging_abuse {
+      meta:
+        author = "TDL"
+        description = "Detects connections to Chrome or Edge remote debugging ports by non-developer processes - MITRE T1185"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1185"
+        severity = "High"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        (
+          $e.target.port = 9222 or
+          re.regex($e.principal.process.command_line, `(?i)--remote-debugging-pipe`)
+        )
+        (
+          re.regex($e.principal.process.file.full_path, `(?i)(chrome|msedge)\.exe$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)(Google Chrome|Microsoft Edge)\.app`)
+        )
+        not re.regex($e.principal.process.file.full_path, `(?i)(visual studio|vscode|code\.exe|idea|pycharm|webstorm|developer|devtools)`)
+        not re.regex($e.principal.process.command_line, `(?i)(visual studio|vscode|developer|devtools|selenium|puppeteer|playwright)`)
+        $e.principal.hostname = $host
 
-    | where process_name matches regex ".+"
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      outcome:
+        $risk_score = 75
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000785 {\n  meta:\n    author = \"TDL\"\n    description = \"Process Attaching to Browser via Debug/Inspector Port\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0009\"\n    technique = \"T1185\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint.events.network*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND (destination.port == 9222 OR process.command_line LIKE "*--remote-debugging-port*" OR process.command_line LIKE "*--remote-debugging-pipe*")
+      AND NOT (process.name IN ("chrome.exe", "msedge.exe", "node.exe", "python.exe", "python3.exe", "visual studio code.exe", "code.exe", "devtools.exe"))
+    | STATS count = COUNT(*) BY host.name, process.name, process.executable, user.name, destination.port, process.command_line
+    | WHERE count > 0
+    | KEEP @timestamp, host.name, process.name, process.executable, user.name, destination.port, process.command_line, count
+  leql: |
+    where(process_cmd_line ICONTAINS "--remote-debugging-port" OR process_cmd_line ICONTAINS "--remote-debugging-pipe") AND NOT (process_name ICONTAINS "devtools" OR process_name ICONTAINS "vscode" OR process_name ICONTAINS "visual studio" OR parent_process_name ICONTAINS "devtools" OR parent_process_name ICONTAINS "vscode" OR parent_process_name ICONTAINS "visual studio")
+  crowdstrike: |
+    event_simpleName=NetworkConnectIP4 (LocalPort=9222 OR RemotePort=9222)
+    | groupBy([ComputerName, FileName, LocalAddressIP4, RemoteAddressIP4, LocalPort, RemotePort], function=count(as=connections))
+    | !in(field=FileName, values=["chrome.exe", "msedge.exe", "chromium.exe", "devtools.exe", "node.exe", "python.exe", "code.exe", "Code.exe", "Code - Insiders.exe"])
+    | table([@timestamp, ComputerName, FileName, LocalAddressIP4, RemoteAddressIP4, LocalPort, RemotePort, connections])
+  xql: |
+    preset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_NETWORK
+    | filter action_remote_port in (9222, 9223)
+    | filter actor_process_image_name not in ("chrome.exe", "msedge.exe", "node.exe", "python.exe", "python3.exe", "pwsh.exe", "powershell.exe", "code.exe", "devenv.exe", "idea.exe", "idea64.exe", "pycharm.exe", "pycharm64.exe", "webstorm.exe", "webstorm64.exe", "goland.exe", "goland64.exe", "rider.exe", "rider64.exe", "clion.exe", "clion64.exe", "phpstorm.exe", "phpstorm64.exe", "rubymine.exe", "rubymine64.exe", "datagrip.exe", "datagrip64.exe", "studio.exe", "studio64.exe", "eclipse.exe", "java.exe", "javaw.exe", "ruby.exe", "perl.exe", "go.exe", "cargo.exe", "rust.exe", "dotnet.exe", "msbuild.exe", "gradle.exe", "maven.exe", "npm.exe", "yarn.exe", "pnpm.exe", "bun.exe", "deno.exe")
+    | filter action_local_ip = "127.0.0.1" or action_remote_ip = "127.0.0.1" or action_local_ip = "::1" or action_remote_ip = "::1"
+    | fields _time, agent_hostname, actor_process_image_name, actor_process_image_command_line, action_remote_ip, action_remote_port, actor_effective_username
+  lucene: |
+    (process.command_line:*--remote-debugging-port* OR process.command_line:*--remote-debugging-pipe*) AND (process.name:chrome.exe OR process.name:msedge.exe OR process.name:"Google Chrome" OR process.name:"Microsoft Edge") AND NOT (process.parent.name:*code.exe OR process.parent.name:*devtools* OR process.parent.name:*vscode* OR process.parent.name:*studio* OR process.parent.name:*idea* OR process.parent.name:*eclipse* OR process.parent.name:*selenium* OR process.parent.name:*puppeteer* OR process.parent.name:*playwright*)
+  sumo: |
+    _sourceCategory=*EDR* OR _sourceCategory=*Sysmon* OR _sourceCategory=*Windows*
+    | parse regex "(?<command_line>.*(?:chrome|msedge).*(?:--remote-debugging-port=9222|--remote-debugging-pipe).*)" nodrop
+    | parse regex "(?<parent_process>(?:vscode|devtools|visual studio|pycharm|intellij|eclipse|rider|webstorm))" nodrop
+    | where command_line matches "*chrome*--remote-debugging-port=9222*" OR command_line matches "*chrome*--remote-debugging-pipe*" OR command_line matches "*msedge*--remote-debugging-port=9222*" OR command_line matches "*msedge*--remote-debugging-pipe*"
+    | where !(parent_process matches "*vscode*" OR parent_process matches "*devtools*" OR parent_process matches "*visual studio*" OR parent_process matches "*pycharm*" OR parent_process matches "*intellij*" OR parent_process matches "*eclipse*" OR parent_process matches "*rider*" OR parent_process matches "*webstorm*")
+    | fields _messageTime, _sourceHost, command_line, parent_process
 pseudo_logic: Connection to chrome --remote-debugging-port (9222) or msedge --remote-debugging-pipe by a non-developer process.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -109,7 +132,7 @@ references:
 - https://attack.mitre.org/techniques/T1185/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'

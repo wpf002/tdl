@@ -19,79 +19,111 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 50
 queries:
-  spl: |
-    index=edr OR index=wineventlog sourcetype IN ("edr:*", "WinEventLog:Microsoft-Windows-Sysmon/Operational", "syslog", "linux_secure")
+  spl: 'index=edr OR index=wineventlog sourcetype IN ("edr:*", "WinEventLog:Microsoft-Windows-Sysmon/Operational", "syslog", "linux_secure")
+
     (syscall_name="Nt*" OR function_name="Nt*" OR api_call="Nt*")
+
     (memory_region_type="private" OR memory_type="private" OR region_type="unbacked")
+
     (memory_protection="RX" OR protection="PAGE_EXECUTE_READ" OR perms="r-x")
-    | stats count values(syscall_name) as syscalls values(process_name) as process values(memory_region_address) as memory_address by host, process_id, image_path
+
+    | stats count values(syscall_name) as syscalls values(process_name) as process values(memory_region_address) as memory_address by host, process_id,
+    image_path
+
     | where count > 0
+
     | table _time, host, process, image_path, process_id, syscalls, memory_address, count
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000703 {\n  meta:\n    author = \"TDL\"\n    description = \"Direct Syscall via Unbacked Memory Region\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1106\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    DeviceEvents
+    | where TimeGenerated > ago(1h)
+    | where ActionType == "SuspiciousSystemCall"
+    | where AdditionalFields has "UnbackedMemory" or AdditionalFields has "PrivateMemory"
+    | extend ParsedFields = parse_json(AdditionalFields)
+    | extend MemoryProtection = tostring(ParsedFields.MemoryProtection)
+    | extend MemoryType = tostring(ParsedFields.MemoryType)
+    | extend SystemCall = tostring(ParsedFields.SystemCall)
+    | where MemoryProtection in~ ("RX", "Execute_Read")
+    | where MemoryType =~ "Private" or MemoryType =~ "Unbacked"
+    | where SystemCall startswith "Nt" or SystemCall startswith "Zw"
+    | where InitiatingProcessFileName !in~ ("MsMpEng.exe", "SenseIR.exe", "SenseCncProxy.exe", "MsSense.exe")
+    | project TimeGenerated, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine, SystemCall, MemoryType, MemoryProtection, FolderPath, SHA256
+  aql: |
+    SELECT "Process Name", "Process ID", sourceip, LOGSOURCENAME(logsourceid) AS host, "Image", "CallTrace", COUNT(*) AS syscall_count
+    FROM events
+    WHERE (categoryname(category) ILIKE '%process%' OR categoryname(category) ILIKE '%endpoint%')
+      AND ("EventID" = '10' OR "EventID" = '8' OR "Event Type" ILIKE '%syscall%' OR "Event Type" ILIKE '%memory%')
+      AND ("CallTrace" ILIKE '%UNKNOWN%' OR "CallTrace" ILIKE '%Unbacked%' OR "CallTrace" ILIKE '%Private%')
+      AND ("TargetObject" ILIKE '%Nt%' OR "System Call" ILIKE '%Nt%' OR "Function Name" ILIKE '%Nt%' OR "CallTrace" ILIKE '%Nt%')
+    GROUP BY "Process Name", "Process ID", sourceip, LOGSOURCENAME(logsourceid), "Image", "CallTrace"
+    LAST 1 HOURS
+  yara_l: |
+    rule direct_syscall_from_unbacked_memory {
+      meta:
+        author = "TDL"
+        description = "Detects NT syscalls executed from unbacked or private memory regions indicating syscall stub injection or direct system call evasion"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1106"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_UNCATEGORIZED"
+        (
+          re.regex($e.metadata.product_event_type, `(?i)syscall`) or
+          re.regex($e.security_result.summary, `(?i)syscall`) or
+          re.regex($e.target.process.command_line, `(?i)nt.*syscall`)
+        )
+        (
+          re.regex($e.security_result.description, `(?i)(unbacked|private|rx).*memory`) or
+          re.regex($e.target.resource.attribute.labels.value, `(?i)(unbacked|private|rx)`) or
+          re.regex($e.additional.fields.value, `(?i)(unbacked.*memory|private.*memory|memory.*rx)`)
+        )
+        (
+          re.regex($e.security_result.summary, `(?i)nt(allocatevirtualmemory|protectvirtualmemory|writevirtualmemory|createthread|querysysteminformation|openprocess)`) or
+          re.regex($e.target.process.command_line, `(?i)nt(allocatevirtualmemory|protectvirtualmemory|writevirtualmemory|createthread|querysysteminformation|openprocess)`)
+        )
+        $e.principal.hostname = $host
+        $e.principal.process.pid = $pid
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host, $pid over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 85
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-endpoint.events.api*\n| WHERE @timestamp > NOW() - 1 hour \n  AND event.category == \"api\" \n  AND process.Ext.api.name LIKE\
+    \ \"Nt*\"\n  AND process.Ext.api.metadata.target_address_protection == \"RX\"\n  AND process.Ext.api.metadata.target_address_allocation_type\
+    \ == \"PRIVATE\"\n  AND (process.Ext.api.metadata.target_address_path IS NULL OR process.Ext.api.metadata.target_address_path == \"Unbacked\"\
+    )\n| STATS syscall_count = COUNT(*) BY process.entity_id, process.name, process.executable, host.name, user.name, process.Ext.api.name\n|\
+    \ WHERE syscall_count >= 1\n| KEEP @timestamp, host.name, user.name, process.name, process.executable, process.entity_id, process.Ext.api.name,\
+    \ syscall_count\n"
+  leql: |
+    where(source_json.EventID=10 AND source_json.CallTrace=/Unknown\(([0-9A-Fa-f]+)\)/ AND (process_name NOT ICONTAINS "csrss.exe" AND process_name NOT ICONTAINS "wininit.exe" AND process_name NOT ICONTAINS "services.exe"))
+  crowdstrike: |
+    event_simpleName=SuspectProcessApiCall* (TargetApiName=Nt* OR TargetApiName=Zw*) (CallingModuleName="" OR CallingModuleName="-" OR CallingModuleName="Unknown")
+    | regex("(RX|R-X|RWX)", field=MemoryProtection, strict=false)
+    | table([@timestamp, ComputerName, UserName, ImageFileName, TargetProcessId, TargetApiName, CallingModuleName, MemoryProtection, CallStackHash, SHA256HashData])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_API_CALL
+      and action_api_name ~= "^Nt"
+      and (action_memory_allocation_type = "PRIVATE" or action_memory_protection contains "RX")
+      and (action_memory_mapped_file_path = null or action_memory_mapped_file_path = "")
+    | fields _time, agent_hostname, actor_process_image_name, actor_process_image_path, action_api_name, action_memory_allocation_type, action_memory_protection, action_memory_address, actor_effective_username
+  lucene: |
+    event.action:"syscall" AND event.module:(edr OR sysmon) AND (process.memory.region.type:"unbacked" OR process.memory.region.type:"private") AND process.memory.region.protection:"RX" AND syscall.name:/^nt.*/i
+  sumo: "_sourceCategory=*EDR* OR _sourceCategory=*Sysmon*\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"Image\" as process_image\n\
+    | json field=_raw \"ImageLoaded\" as image_loaded\n| json field=_raw \"MemoryRegion\" as memory_region\n| json field=_raw \"MemoryProtection\"\
+    \ as memory_protection\n| json field=_raw \"CallTrace\" as call_trace\n| json field=_raw \"TargetProcessName\" as target_process\n| json field=_raw\
+    \ \"GrantedAccess\" as granted_access\n| json field=_raw \"CallStack\" as call_stack\n| json field=_raw \"CommandLine\" as command_line\n\
+    | where (memory_region matches \"*unbacked*\" or memory_region matches \"*private*\") \n  and (memory_protection matches \"*RX*\" or memory_protection\
+    \ matches \"*EXECUTE_READ*\")\n  and (call_trace matches \"*Nt*\" or call_trace matches \"*Zw*\" or call_stack matches \"*Nt*\" or call_stack\
+    \ matches \"*Zw*\")\n| fields _messageTime, _sourceHost, process_image, target_process, command_line, memory_region, memory_protection, call_trace,\
+    \ call_stack\n"
 pseudo_logic: Process makes NT* syscalls from an unbacked / RX private memory region. Indicates syscall stub injection or direct system call evasion.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -108,7 +140,7 @@ references:
 - https://attack.mitre.org/techniques/T1106/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'

@@ -16,71 +16,63 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=google_workspace events.name="CREATE_ROLE"
+  spl: 'index=google_workspace events.name="CREATE_ROLE"
+
     | table _time, user, events.name, events.parameters.ROLE_NAME, events.parameters.ROLE_ID, events.parameters.ORG_UNIT_NAME
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_pe_000296 {\n  meta:\n    author = \"TDL\"\n    description = \"Google Workspace Admin Role Created\"\n    severity =\
-    \ \"LOW\"\n    tactic = \"TA0004\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    GWorkspaceActivityReports
+    | where TimeGenerated > ago(90d)
+    | where RecordType == "admin"
+    | mv-expand Events = parse_json(Events)
+    | where Events.name == "CREATE_ROLE"
+    | project TimeGenerated, ActorIpAddress, ActorCallerType, Events, RecordType
+  aql: "SELECT username, sourceip, eventtime, QIDNAME(qid), UTF8(payload) AS event_details\nFROM events\nWHERE QIDNAME(qid) ILIKE '%google%workspace%'\
+    \ \n  AND (UTF8(payload) ILIKE '%CREATE_ROLE%' OR UTF8(payload) ILIKE '%create_role%')\nLAST 24 HOURS\n"
+  yara_l: |
+    rule gworkspace_create_role_privilege_escalation {
+      meta:
+        author = "TDL"
+        description = "Detects creation of custom roles in Google Workspace which may indicate privilege escalation attempts"
+        mitre_attack_tactic = "Privilege Escalation"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Google"
+        $e.metadata.product_name = "Google Workspace"
+        $e.metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT"
+        $e.metadata.product_event_type = "CREATE_ROLE"
+        $e.principal.user.userid = $user
+        $e.principal.ip = $ip
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-google_workspace*
+    | WHERE event.action == "CREATE_ROLE" OR event.dataset == "google_workspace.admin" AND event.action == "CREATE_ROLE"
+    | KEEP @timestamp, user.email, user.name, event.action, google_workspace.admin.new_value, google_workspace.admin.role.name, source.ip, user_agent.original
+  leql: |
+    where(source_json.events.name="CREATE_ROLE")
+  crowdstrike: |
+    #type=gws events.name="CREATE_ROLE"
+    | table([@timestamp, actor.email, events.name, events.parameters.ROLE_NAME, ipAddress])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = GCP and event_type = "CREATE_ROLE"
+    | fields _time, actor_user, cloud_project, event_type, resource_name, resource_type
+  lucene: |
+    events.name:"CREATE_ROLE"
+  sumo: |
+    _sourceCategory=*Google*Workspace* "CREATE_ROLE"
+    | json field=_raw "events[*].name" as event_name
+    | where event_name = "CREATE_ROLE"
+    | fields _messageTime, _sourceHost, event_name
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +82,7 @@ tags:
 - privilege-escalation
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Google Workspace Event
 

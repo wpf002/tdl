@@ -17,76 +17,84 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=644 OR EventCode=4740)
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=644 OR EventCode=4740)
+
     | bin _time span=10m
+
     | stats dc(TargetUserName) as unique_users values(TargetUserName) as users by _time, EventCode
+
     | where unique_users >= 10
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4740")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4740')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000113 {\n  meta:\n    author = \"TDL\"\n    description = \"Excessive Account Lockouts\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1531\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id = /(4740)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(10m)
+    | where EventID in (644, 4740)
+    | summarize UniqueUsers = dcount(TargetUserName), UserList = make_set(TargetUserName), EventCount = count() by EventID, bin(TimeGenerated, 10m)
+    | where UniqueUsers >= 10
+    | project TimeGenerated, EventID, UniqueUsers, EventCount, UserList
+  aql: |
+    SELECT username AS destination_username, "EventID", COUNT(*) AS lock_events, UNIQUECOUNT(username) AS unique_users
+    FROM events
+    WHERE "EventID" IN ('644', '4740')
+    GROUP BY "EventID"
+    HAVING unique_users >= 10
+    LAST 10 MINUTES
+  yara_l: |
+    rule multiple_account_lockouts_t1531 {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects 10+ unique user account lockouts within 10 minutes - potential T1531 Account Access Removal"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1531"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "USER_RESOURCE_ACCESS"
+        ($e.metadata.product_event_type = "644" or $e.metadata.product_event_type = "4740")
+        $e.target.user.userid = $user
+        $e.metadata.product_event_type = $event_id
 
-    | WHERE event.category == "process" AND event_id IN ("4740")
+      match:
+        $event_id over 10m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
+        $unique_users = count_distinct($user)
+        $total_lockouts = count($e)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4740])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4740)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4740")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4740)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4740")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $unique_users >= 10
+    }
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE @timestamp > NOW() - 10 minutes AND event.code IN ("644", "4740")
+    | STATS unique_users = COUNT_DISTINCT(user.target.name), event_count = COUNT(*) BY event.code, bucket = BUCKET(@timestamp, 10 minutes)
+    | WHERE unique_users >= 10
+  leql: |
+    where(source_json.EventID IN [644, 4740]) groupby(source_json.TargetUserName, source_json.EventID) calculate(count)
+  crowdstrike: |
+    EventCode IN [644, 4740]
+    | groupBy([EventCode], function=count(TargetUserName, distinct=true, as=uniqueUsers), span=10m)
+    | uniqueUsers >= 10
+    | table([@timestamp, EventCode, uniqueUsers])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (644, 4740)
+    | bin _time span=10m
+    | comp count_distinct(action_evtlog_event_data_TargetUserName) as unique_users by _time, action_evtlog_event_id, agent_hostname
+    | filter unique_users >= 10
+    | fields _time, agent_hostname, action_evtlog_event_id, unique_users
+  lucene: |
+    event.code:(644 OR 4740)
+  sumo: |
+    _sourceCategory=*Windows* ("644" OR "4740")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetUserName" as target_user
+    | where event_id in ("644", "4740")
+    | timeslice 10m
+    | count_distinct(target_user) as unique_users by _timeslice, event_id
+    | where unique_users >= 10
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -96,7 +104,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '10 Windows Account Locked Out Events
 

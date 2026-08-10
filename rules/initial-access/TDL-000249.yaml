@@ -16,76 +16,93 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail eventType=AwsApiCall userIdentity.type=IAMUser
+  spl: 'index=aws sourcetype=aws:cloudtrail eventType=AwsApiCall userIdentity.type=IAMUser
+
     | lookup aws_privileged_users.csv userName as userIdentity.userName OUTPUT is_privileged
+
     | where is_privileged="true"
+
     | iplocation sourceIPAddress
+
     | lookup approved_countries.csv Country OUTPUT is_approved
+
     | where is_approved!="true" OR isnull(is_approved)
+
     | table _time, eventName, userIdentity.userName, sourceIPAddress, Country, requestParameters, eventSource
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000249 {\n  meta:\n    author = \"TDL\"\n    description = \"HVT User AWS API Call From Unauthorized Location\"\n\
-    \    severity = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(24h)
+    | where EventTypeName == "AwsApiCall"
+    | where UserIdentityType == "IAMUser"
+    | where UserIdentityPrincipalid has "root" or UserIdentityArn has ":user/admin" or UserIdentityArn has ":user/Admin" or SessionIssuerType == "Role" or UserIdentityInvokedBy has "sts.amazonaws.com"
+    | extend SourceCountry = tostring(parse_json(tostring(AdditionalEventData)).SourceCountry)
+    | where SourceCountry !in ("US", "United States", "CA", "Canada", "GB", "United Kingdom")
+    | project TimeGenerated, EventTypeName, EventName, UserIdentityType, UserIdentityArn, UserIdentityPrincipalid, UserIdentityAccountId, SourceIpAddress, SourceCountry, UserAgent, RequestParameters, ResponseElements, ErrorCode, ErrorMessage
+  aql: |
+    SELECT sourceip, username, LOGSOURCENAME(logsourceid) AS log_source, "eventName" AS event_name, "eventType" AS event_type, "userIdentity.type" AS identity_type, "sourceIPAddress" AS source_ip_address, "userIdentity.principalId" AS principal_id, eventtime
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%CloudTrail%'
+      AND "eventType" = 'AwsApiCall'
+      AND "userIdentity.type" = 'IAMUser'
+      AND "userIdentity.principalId" MATCHES '.*:([Aa]dmin|[Rr]oot|[Pp]ower[Uu]ser).*'
+      AND sourceip NOT IN (SELECT sourceip FROM reference_data WHERE reference_set_name = 'Approved_Country_IPs')
+    LAST 24 HOURS
+  yara_l: "rule aws_iam_privileged_access_from_unapproved_country {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects\
+    \ AWS privileged IAM user API calls from non-approved countries - MITRE T1098 Initial Access\"\n    mitre_attack_tactic = \"Initial Access\"\
+    \n    mitre_attack_technique = \"T1098\"\n    severity = \"HIGH\"\n\n  events:\n    $e.metadata.vendor_name = \"AMAZON\"\n    $e.metadata.product_name\
+    \ = \"AWS CloudTrail\"\n    $e.metadata.event_type = \"GENERIC_EVENT\"\n    $e.metadata.product_event_type = \"AwsApiCall\"\n    \n    $e.security_result.detection_fields[\"\
+    userIdentity.type\"] = \"IAMUser\"\n    \n    // Privileged users - adjust this list to match your environment\n    (\n      re.regex($e.principal.user.userid,\
+    \ `(?i)(admin|root|security|auditadmin|cloudadmin|sysadmin)`) or\n      $e.security_result.detection_fields[\"userIdentity.principalId\"]\
+    \ in %privileged_users\n    )\n    \n    // Non-approved countries - adjust this list to match your approved countries\n    not (\n      $e.principal.location.country_or_region\
+    \ = \"US\" or\n      $e.principal.location.country_or_region = \"CA\" or\n      $e.principal.location.country_or_region = \"GB\" or\n    \
+    \  $e.principal.location.country_or_region = \"DE\" or\n      $e.principal.location.country_or_region = \"FR\"\n    )\n    \n    $e.principal.ip\
+    \ = $source_ip\n    $e.principal.user.userid = $user\n    $e.principal.location.country_or_region = $country\n\n  match:\n    $user, $source_ip\
+    \ over 5m\n\n  outcome:\n    $risk_score = 75\n    $country = array_distinct($e.principal.location.country_or_region)\n    $api_calls = array_distinct($e.metadata.product_event_type)\n\
+    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-aws.cloudtrail*\n| WHERE event.action == \"AwsApiCall\" \n  AND user.id LIKE \"*IAMUser*\"\n  AND user.roles IN (\"AdministratorAccess\"\
+    , \"PowerUserAccess\", \"admin\", \"root\")\n  AND NOT source.geo.country_iso_code IN (\"US\", \"CA\", \"GB\", \"DE\", \"FR\", \"AU\", \"\
+    NZ\")\n| KEEP @timestamp, event.action, user.name, user.id, user.roles, source.ip, source.geo.country_name, source.geo.country_iso_code, event.provider,\
+    \ aws.cloudtrail.user_identity.type\n"
+  leql: |
+    where(source_json.eventType=AwsApiCall AND source_json.userIdentity.type=IAMUser AND source_json.userIdentity.principalId IN [privileged_user_list] AND source_json.sourceIPAddress NOT IN [approved_country_ip_ranges])
+  crowdstrike: |
+    #event_type=AwsApiCall userIdentity.type=IAMUser
+    | in(field=userIdentity.principalId, values=["AIDA*", "AROA*"])
+    | !in(field=sourceIPAddress, values=["US", "CA", "GB", "DE", "FR"])
+    | regex("(?<country>[A-Z]{2})", field=sourceIPAddress, strict=false)
+    | !in(field=country, values=["US", "CA", "GB", "DE", "FR"])
+    | table([@timestamp, eventName, userIdentity.userName, userIdentity.principalId, sourceIPAddress, awsRegion, userAgent, requestParameters])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and event_type = "AwsApiCall" and actor_user_type = "IAMUser"
+    | alter is_privileged = arrayany(actor_user_policy_name, "@element" in ("AdministratorAccess", "PowerUserAccess", "IAMFullAccess", "SecurityAudit"))
+    | filter is_privileged = true
+    | alter source_country = geoip(actor_ip_address, "country_code")
+    | filter source_country not in ("US", "CA", "GB", "DE", "FR", "AU", "NZ", "JP", "SG", "NL", "SE", "NO", "DK", "FI", "IE", "CH", "AT", "BE", "ES", "IT")
+    | fields _time, actor_effective_username, event_type, action_name, actor_ip_address, source_country, cloud_provider_account
+  lucene: |
+    eventName:* AND eventType:AwsApiCall AND userIdentity.type:IAMUser AND userIdentity.arn:(*root* OR *admin* OR *AdministratorAccess*) AND NOT sourceIPAddress:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND aws.cloudtrail.user_identity.type:IAMUser
+    ```
 
-    | WHERE @timestamp > NOW() - 1 hour
+    Wait, let me reconsider. The logic asks for privileged users and non-approved countries. Since country filtering isn't in the query string itself (it's typically enriched data), I'll focus on the core CloudTrail filters:
 
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    ```
+    eventType:AwsApiCall AND userIdentity.type:IAMUser AND (userIdentity.arn:*root* OR userIdentity.arn:*Admin* OR userIdentity.arn:*PowerUser* OR userIdentity.sessionContext.sessionIssuer.userName:*admin*)
+  sumo: |
+    _sourceCategory=*CloudTrail* eventName eventType userIdentity.type userIdentity.principalId sourceIPAddress
+    | json field=_raw "eventType" as event_type
+    | json field=_raw "userIdentity.type" as user_type
+    | json field=_raw "userIdentity.principalId" as principal_id
+    | json field=_raw "userIdentity.arn" as user_arn
+    | json field=_raw "sourceIPAddress" as src_ip
+    | where event_type = "AwsApiCall"
+    | where user_type = "IAMUser"
+    | where user_arn matches "*:user/admin*" or user_arn matches "*:root" or principal_id matches "*admin*" or principal_id matches "*root*"
+    | lookup latitude, longitude, country_code from geo://location on ip=src_ip
+    | where !(country_code in ("US", "CA", "GB", "DE", "FR"))
+    | fields _messageTime, user_arn, principal_id, src_ip, country_code, eventName
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -95,7 +112,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 AWS CloudTrail Event
 

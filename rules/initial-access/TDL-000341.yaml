@@ -18,68 +18,47 @@ queries:
   spl: "index=aws sourcetype=aws:cloudwatch:guardduty \n(finding.type=\"Impact:EC2/SuspiciousDomainRequest.Reputation\" OR finding.type=\"Impact:Runtime/SuspiciousDomainRequest.Reputation\"\
     )\n| table _time, finding.type, finding.severity, resource.instanceDetails.instanceId, resource.instanceDetails.networkInterfaces{}.privateIpAddress,\
     \ service.action.dnsRequestAction.domain, finding.description\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000341 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS DNS Request to Suspicious Domain - GuardDuty\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1189\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where Title in ("Impact:EC2/SuspiciousDomainRequest.Reputation", "Impact:Runtime/SuspiciousDomainRequest.Reputation")
+    | project TimeGenerated, Title, Description, AccountId, Region, ResourceType, Severity, AwsResourceId = tostring(parse_json(Resource).ResourceType), RemoteIpDetails = tostring(parse_json(Service).Action.NetworkConnectionAction.RemoteIpDetails)
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS log_source, sourceip, destinationip, "eventType", "severity", "title", "description"
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%guardduty%'
+      AND ("eventType" IN ('Impact:EC2/SuspiciousDomainRequest.Reputation', 'Impact:Runtime/SuspiciousDomainRequest.Reputation')
+           OR "finding.type" IN ('Impact:EC2/SuspiciousDomainRequest.Reputation', 'Impact:Runtime/SuspiciousDomainRequest.Reputation')
+           OR qidname(qid) ILIKE '%SuspiciousDomainRequest.Reputation%')
+    LAST 24 HOURS
+  yara_l: "rule guardduty_suspicious_domain_request {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects AWS GuardDuty\
+    \ alerts for suspicious domain requests indicating potential drive-by compromise\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1189\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.vendor_name = \"Amazon AWS\"\n    $e.metadata.product_name = \"\
+    GuardDuty\"\n    (\n      $e.metadata.product_event_type = \"Impact:EC2/SuspiciousDomainRequest.Reputation\" or\n      $e.metadata.product_event_type\
+    \ = \"Impact:Runtime/SuspiciousDomainRequest.Reputation\"\n    )\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n \
+    \   \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("Impact:EC2/SuspiciousDomainRequest.Reputation", "Impact:Runtime/SuspiciousDomainRequest.Reputation")
+    | KEEP @timestamp, cloud.account.id, cloud.region, aws.guardduty.finding.type, aws.guardduty.finding.severity, cloud.instance.id, source.ip, destination.ip, destination.domain
+  leql: |
+    where(source_json.type IN ["Impact:EC2/SuspiciousDomainRequest.Reputation", "Impact:Runtime/SuspiciousDomainRequest.Reputation"])
+  crowdstrike: |
+    #repo=guardduty
+    | detail.type in ["Impact:EC2/SuspiciousDomainRequest.Reputation", "Impact:Runtime/SuspiciousDomainRequest.Reputation"]
+    | table([@timestamp, detail.type, detail.resource.instanceDetails.instanceId, detail.service.action.dnsRequestAction.domain, detail.region, account])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter logtype_vendor = "Amazon" and logtype_product = "GuardDuty"
+    | filter cloud_provider_event_type in ("Impact:EC2/SuspiciousDomainRequest.Reputation", "Impact:Runtime/SuspiciousDomainRequest.Reputation")
+    | fields _time, cloud_provider, cloud_provider_event_type, event_id, resource_name, resource_sub_type, severity
+  lucene: |
+    service.type:"guardduty" AND finding.type:("Impact:EC2/SuspiciousDomainRequest.Reputation" OR "Impact:Runtime/SuspiciousDomainRequest.Reputation")
+  sumo: |
+    _sourceCategory=*GuardDuty* OR _sourceCategory=*guardduty* OR _source=*GuardDuty* OR _source=*guardduty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("Impact:EC2/SuspiciousDomainRequest.Reputation", "Impact:Runtime/SuspiciousDomainRequest.Reputation")
+    | fields _messageTime, event_type, _sourceHost
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -89,7 +68,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Impact:EC2/SuspiciousDomainRequest.Reputation\", \"Impact:Runtime/SuspiciousDomainRequest.Reputation\"\
   ]"

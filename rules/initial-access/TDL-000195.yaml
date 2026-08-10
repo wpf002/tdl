@@ -16,74 +16,68 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=okta eventType="system.push.send_factor_verify_push"
+  spl: 'index=okta eventType="system.push.send_factor_verify_push"
+
     | bin _time span=5m
+
     | stats count by _time, src_ip, user
+
     | where count >= 6
+
     | table _time, src_ip, user, count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000195 {\n  meta:\n    author = \"TDL\"\n    description = \"Multiple MFA Push Sent Detected\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    Okta_CL
+    | where TimeGenerated > ago(5m)
+    | where eventType_s == "system.push.send_factor_verify_push"
+    | summarize PushCount = count() by bin(TimeGenerated, 5m), client_ipAddress_s, actor_alternateId_s
+    | where PushCount >= 6
+    | project TimeGenerated, SourceIP = client_ipAddress_s, UserPrincipalName = actor_alternateId_s, PushCount
+  aql: |
+    SELECT sourceip, username, COUNT(*) AS push_count
+    FROM events
+    WHERE "eventType" = 'system.push.send_factor_verify_push'
+    GROUP BY sourceip, username
+    HAVING push_count >= 6
+    LAST 5 MINUTES
+  yara_l: "rule okta_push_notification_spam {\n  meta:\n    author = \"TDL\"\n    description = \"Detects MFA push notification spam attacks -\
+    \ T1078 Initial Access\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"HIGH\"\n\
+    \  \n  events:\n    $e.metadata.product_event_type = \"system.push.send_factor_verify_push\"\n    $e.principal.ip = $ip\n    $e.target.user.userid\
+    \ = $user\n  \n  match:\n    $ip, $user over 5m\n  \n  outcome:\n    $risk_score = 75\n    $total_pushes = count_distinct($e.metadata.id)\n\
+    \  \n  condition:\n    #e >= 6\n}\n"
+  esql: |
+    FROM logs-okta*
+    | WHERE @timestamp > NOW() - 5 minutes AND event.action == "system.push.send_factor_verify_push"
+    | STATS push_count = COUNT(*) BY source.ip, user.name, time_window = BUCKET(@timestamp, 5 minutes)
+    | WHERE push_count >= 6
+    | KEEP time_window, source.ip, user.name, push_count
+  leql: |
+    where(source_json.eventType="system.push.send_factor_verify_push") groupby(source_address, user) calculate(count)
+  crowdstrike: |
+    eventType=system.push.send_factor_verify_push
+    | groupBy([client.ipAddress, actor.alternateId], function=count(as=pushCount), span=5m)
+    | pushCount >= 6
+    | table([@timestamp, client.ipAddress, actor.alternateId, pushCount])
+  xql: |
+    dataset = okta_raw
+    | filter event_type = "system.push.send_factor_verify_push"
+    | bin _time span=5m
+    | comp count() as notification_count by _time, src_ip, actor_username
+    | filter notification_count >= 6
+    | fields _time, src_ip, actor_username, notification_count
+  lucene: |
+    eventType:system.push.send_factor_verify_push
+  sumo: |
+    _sourceCategory=*Okta* "system.push.send_factor_verify_push"
+    | json field=_raw "eventType" as event_type
+    | json field=_raw "actor.alternateId" as user
+    | json field=_raw "client.ipAddress" as src_ip
+    | where event_type = "system.push.send_factor_verify_push"
+    | timeslice 5m
+    | count as push_count by _timeslice, src_ip, user
+    | where push_count >= 6
+    | fields _timeslice, src_ip, user, push_count
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -93,7 +87,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Okta Event
 

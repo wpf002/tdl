@@ -19,76 +19,73 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=630 OR EventCode=4726)
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=630 OR EventCode=4726)
+
     | bin _time span=3m
+
     | stats count by _time, SubjectUserName, ComputerName
+
     | where count >= 10 AND NOT match(SubjectUserName, "^(Administrator|admin|authorized_user1|authorized_user2)$")
+
     | table _time, SubjectUserName, ComputerName, count
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4726")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4726')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_000003 {\n  meta:\n    author = \"TDL\"\n    description = \"Mass User Deletions\"\n    severity = \"HIGH\"\n    tactic\
-    \ = \"TA0040\"\n    technique = \"T1531\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(4726)/\n    $user =\
-    \ $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("4726")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4726])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4726)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4726")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4726)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4726")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+  kql: |
+    let AuthorizedUsers = dynamic([]);
+    let TimeWindow = 3m;
+    let Threshold = 10;
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (630, 4726)
+    | where SubjectUserName !in (AuthorizedUsers)
+    | summarize DeletedAccounts = make_set(TargetAccount), DeletionCount = count() by bin(TimeGenerated, TimeWindow), SubjectUserName, Computer
+    | where DeletionCount >= Threshold
+    | project TimeGenerated, SubjectUserName, Computer, DeletionCount, DeletedAccounts
+  aql: |
+    SELECT username AS source_username, sourceip, COUNT(*) AS delete_count, LOGSOURCENAME(logsourceid) AS host
+    FROM events
+    WHERE "EventID" IN ('630', '4726')
+      AND username NOT IN ('authorized_admin1', 'authorized_admin2', 'authorized_admin3')
+    GROUP BY username, sourceip, LOGSOURCENAME(logsourceid)
+    HAVING delete_count >= 10
+    LAST 3 MINUTES
+  yara_l: "rule account_deletion_abuse {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects 10+ user account deletions\
+    \ from single source within 3 minutes - MITRE T1531\"\n    mitre_attack_tactic = \"Impact\"\n    mitre_attack_technique = \"T1531\"\n    severity\
+    \ = \"HIGH\"\n    \n  events:\n    $e.metadata.event_type = \"USER_DELETION\"\n    (\n      $e.metadata.product_event_type = \"630\" or\n\
+    \      $e.metadata.product_event_type = \"4726\"\n    )\n    $e.principal.user.userid = $source_user\n    not re.regex($e.principal.user.userid,\
+    \ `(?i)(administrator|admin_service|domain_admin_svc)`)\n    \n  match:\n    $source_user over 3m\n    \n  outcome:\n    $risk_score = 85\n\
+    \    $deleted_user_count = count_distinct($e.target.user.userid)\n    \n  condition:\n    #e >= 10\n}\n"
+  esql: "FROM logs-system.security*, logs-windows.security*, winlogbeat-*\n| WHERE @timestamp > NOW() - 3 minutes \n  AND event.code IN (\"630\"\
+    , \"4726\")\n  AND user.name IS NOT NULL\n  AND user.name NOT IN (\"authorized_admin1\", \"authorized_admin2\", \"authorized_admin3\")\n|\
+    \ STATS delete_count = COUNT(*) BY user.name, bucket = BUCKET(@timestamp, 3 minutes)\n| WHERE delete_count >= 10\n| KEEP user.name, delete_count,\
+    \ bucket\n"
+  leql: |
+    where(source_json.EventID IN [630, 4726]) groupby(source_user) calculate(count)
+  crowdstrike: |
+    (EventCode=630 OR EventCode=4726)
+    | groupBy([SubjectUserName], function=count(as=deletions), limit=max)
+    | deletions >= 10
+    | !in(SubjectUserName, values=["Administrator", "SYSTEM", "DomainAdmin"])
+    | timeChart(span=3m, function=max(deletions), limit=max)
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (630, 4726)
+    | bin _time span=3m
+    | comp count() as deletion_count by _time, actor_effective_username, agent_hostname
+    | filter deletion_count >= 10
+    | filter actor_effective_username not in ("authorized_admin1", "authorized_admin2")
+    | fields _time, agent_hostname, actor_effective_username, deletion_count
+  lucene: |
+    event.code:(630 OR 4726) AND NOT user.name:(authorized_admin1 OR authorized_admin2 OR authorized_admin3)
+  sumo: |
+    _sourceCategory=*Windows*Security* (EventID=630 OR EventID=4726)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "SubjectUserName" as source_user
+    | where event_id in ("630", "4726")
+    | where !(source_user in ("administrator", "domain_admin", "hr_admin"))
+    | timeslice 3m
+    | count as deletions by _timeslice, source_user
+    | where deletions >= 10
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -98,7 +95,7 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '10 Windows User Deleted Events
 

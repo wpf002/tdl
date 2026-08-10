@@ -19,83 +19,141 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=* sourcetype IN ("WinEventLog:Microsoft-Windows-Sysmon/Operational", "edr:*", "linux:*", "macos:*") (EventCode=7 OR event_type="image_load" OR event_type="module_load")
+  spl: 'index=* sourcetype IN ("WinEventLog:Microsoft-Windows-Sysmon/Operational", "edr:*", "linux:*", "macos:*") (EventCode=7 OR event_type="image_load"
+    OR event_type="module_load")
+
     | rex field=ImageLoaded "(?<loaded_dll_path>.*\\(?<dll_name>[^\\]+\.dll))"
+
     | rex field=ImageLoaded "(?i)(?<writable_path>C:\\Users\\[^\\]+\\AppData\\|C:\\ProgramData\\|C:\\Windows\\Temp\\|/tmp/|/var/tmp/|/home/[^/]+/)"
+
     | where isnotnull(writable_path)
+
     | eval system_dll_exists=if(match(ImageLoaded, "(?i)C:\\Windows\\System32\\") OR match(ImageLoaded, "(?i)C:\\Windows\\SysWOW64\\"), 0, 1)
+
     | where system_dll_exists=1
+
     | lookup system_dlls.csv dll_name OUTPUT is_system_dll
+
     | where is_system_dll="true"
+
     | stats count values(ImageLoaded) as loaded_paths values(Image) as loading_process by ComputerName, dll_name, User
+
     | where count > 0
+
     | table ComputerName, User, dll_name, loading_process, loaded_paths
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000731 {\n  meta:\n    author = \"TDL\"\n    description = \"DLL Search Order Hijack via Phantom DLL in PATH Directory\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1574\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    DeviceImageLoadEvents
+    | where TimeGenerated > ago(1h)
+    | where FolderPath has_any ("\\AppData\\", "\\ProgramData\\", "\\Temp\\", "\\Users\\Public\\")
+    | where FolderPath !has "\\system32\\" and FolderPath !has "\\SysWOW64\\"
+    | join kind=inner (
+        DeviceImageLoadEvents
+        | where TimeGenerated > ago(1h)
+        | where FolderPath has_any ("\\system32\\", "\\SysWOW64\\")
+        | extend SystemDLL = FileName
+        | project DeviceId, InitiatingProcessId, SystemDLL, SystemLoadTime = TimeGenerated
+    ) on DeviceId, InitiatingProcessId, $left.FileName == $right.SystemDLL
+    | where TimeGenerated < SystemLoadTime
+    | project TimeGenerated, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, FolderPath, InitiatingProcessAccountName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, "Process Name", "ImageLoaded", "Image", username, COUNT(*) AS load_count
+    FROM events
+    WHERE "EventID" IN ('7', '3033')
+      AND ("ImageLoaded" ILIKE '%\temp\%' OR "ImageLoaded" ILIKE '%\users\%' OR "ImageLoaded" ILIKE '%\programdata\%' OR "ImageLoaded" ILIKE '%\appdata\%' OR "ImageLoaded" ILIKE '%/tmp/%' OR "ImageLoaded" ILIKE '%/var/tmp/%')
+      AND ("ImageLoaded" ILIKE '%.dll' OR "ImageLoaded" ILIKE '%.so' OR "ImageLoaded" ILIKE '%.dylib')
+      AND "ImageLoaded" NOT ILIKE '%\system32\%'
+      AND "ImageLoaded" NOT ILIKE '%\syswow64\%'
+      AND "ImageLoaded" NOT ILIKE '%\winsxs\%'
+      AND "Process Name" NOT ILIKE '%\temp\%'
+    GROUP BY eventtime, LOGSOURCENAME(logsourceid), "Process Name", "ImageLoaded", "Image", username
+    LAST 1 HOURS
+  yara_l: |
+    rule phantom_dll_hijack {
+      meta:
+        author = "TDL"
+        description = "Detects DLL loading from writable PATH directories before system32 - phantom DLL hijack"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1574"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $load.metadata.event_type = "FILE_OPEN"
+        $load.target.file.full_path = $dll_path
+        (
+          re.regex($load.target.file.full_path, `(?i)C:\\Users\\[^\\]+\\AppData\\Local\\`) or
+          re.regex($load.target.file.full_path, `(?i)C:\\Users\\[^\\]+\\AppData\\Roaming\\`) or
+          re.regex($load.target.file.full_path, `(?i)C:\\ProgramData\\`) or
+          re.regex($load.target.file.full_path, `(?i)C:\\Temp\\`) or
+          re.regex($load.target.file.full_path, `(?i)C:\\Windows\\Temp\\`) or
+          re.regex($load.target.file.full_path, `(?i)/tmp/`) or
+          re.regex($load.target.file.full_path, `(?i)/var/tmp/`) or
+          re.regex($load.target.file.full_path, `(?i)/usr/local/`)
+        )
+        re.regex($load.target.file.full_path, `(?i)\.(dll|so|dylib)$`)
+        not re.regex($load.target.file.full_path, `(?i)C:\\Windows\\System32\\`)
+        not re.regex($load.target.file.full_path, `(?i)C:\\Windows\\SysWOW64\\`)
+        $load.principal.process.file.full_path = $process
+        $load.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host, $process over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $load
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.library*
+    | WHERE event.code == "7" OR event.category == "library"
+    | WHERE dll.path RLIKE "(?i).*(\\\\appdata\\\\|\\\\programdata\\\\|\\\\temp\\\\|\\\\users\\\\public\\\\).*\\.dll"
+      AND NOT dll.path RLIKE "(?i).*\\\\system32\\\\.*"
+      AND NOT dll.path RLIKE "(?i).*\\\\syswow64\\\\.*"
+    | EVAL dll_name = TO_LOWER(CASE(
+        dll.name IS NOT NULL, dll.name,
+        ENDS_WITH(dll.path, ".dll"), SUBSTRING(dll.path, LAST_INDEX_OF(dll.path, "\\") + 1, LENGTH(dll.path))
+      ))
+    | WHERE dll_name IN ("version.dll", "cryptsp.dll", "cryptbase.dll", "wtsapi32.dll", "samlib.dll", "wlanapi.dll", "dwmapi.dll", "dnsapi.dll", "iphlpapi.dll", "uxtheme.dll", "profapi.dll", "propsys.dll", "setupapi.dll", "winnsi.dll", "winhttp.dll", "wininet.dll", "msasn1.dll", "mpr.dll", "bcrypt.dll", "ncrypt.dll", "netapi32.dll", "userenv.dll", "wldap32.dll")
+    | STATS load_count = COUNT(*) BY host.name, process.name, process.executable, dll_name, dll.path, user.name
+    | WHERE load_count >= 1
+    | KEEP @timestamp, host.name, user.name, process.name, process.executable, dll_name, dll.path, load_count
+  leql: |
+    where(source_json.EventID=7 AND source_json.ImageLoaded ICONTAINS "\appdata\" OR source_json.ImageLoaded ICONTAINS "\programdata\" OR source_json.ImageLoaded ICONTAINS "\temp\" OR source_json.ImageLoaded ICONTAINS "\users\public\") groupby(source_json.Image, source_json.ImageLoaded, asset) calculate(count)
+  crowdstrike: |
+    event_simpleName=ImageLoad
+    | case {
+        event_platform=Win | ImageLoaded=/\\(temp|users|appdata|programdata)\\.*\.dll/i ;
+        event_platform=Lin | ImageLoaded=~regex("/(tmp|home|var/tmp)/.*\\.so", ignoreCase=true) ;
+        event_platform=Mac | ImageLoaded=~regex("/(tmp|Users|private/tmp)/.*\\.dylib", ignoreCase=true) ;
+        * | ImageLoaded=* ;
+      }
+    | ImageLoaded!=/\\(windows\\system32|windows\\syswow64|program files)/i
+    | groupBy([ComputerName, FileName, ImageLoaded], function=count(as=load_count))
+    | load_count >= 1
+    | table([@timestamp, ComputerName, event_platform, FileName, ImageLoaded, load_count])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_LOAD_IMAGE
+    | filter action_module_path != null
+    | filter lowercase(action_module_path) ~= "^[a-z]:\\\\(?:windows\\\\temp|users\\\\[^\\\\]+\\\\appdata\\\\local\\\\temp|programdata|temp|perflogs|windows\\\\tasks|windows\\\\tracing|windows\\\\registration\\\\crmlog|windows\\\\system32\\\\com\\\\dmp|windows\\\\system32\\\\fxstmp|windows\\\\system32\\\\microsoft\\\\crypto\\\\rsa\\\\machinekeys|windows\\\\system32\\\\spool\\\\drivers\\\\color|windows\\\\system32\\\\spool\\\\printers|windows\\\\system32\\\\spool\\\\servers|windows\\\\system32\\\\tasks|windows\\\\syswow64\\\\com\\\\dmp|windows\\\\syswow64\\\\fxstmp|windows\\\\syswow64\\\\tasks)"
+    | filter action_module_path !~= "(?i)\\\\windows\\\\system32\\\\" and action_module_path !~= "(?i)\\\\windows\\\\syswow64\\\\"
+    | alter dll_name = arrayindex(regextract(action_module_path, "([^\\\\]+)$"), 0)
+    | filter dll_name != null
+    | comp count() as load_count by agent_hostname, actor_process_image_name, dll_name, action_module_path
+    | filter load_count >= 1
+    | fields agent_hostname, actor_process_image_name, dll_name, action_module_path, load_count
+  lucene: |
+    (event.code:7 OR winlog.event_id:7) AND (winlog.event_data.ImageLoaded:*\\AppData\\* OR winlog.event_data.ImageLoaded:*\\ProgramData\\* OR winlog.event_data.ImageLoaded:*\\Users\\Public\\* OR winlog.event_data.ImageLoaded:*\\Temp\\* OR winlog.event_data.ImageLoaded:*\\Windows\\Temp\\*) AND NOT winlog.event_data.ImageLoaded:*\\system32\\* AND NOT winlog.event_data.ImageLoaded:*\\SysWOW64\\*
+  sumo: |
+    _sourceCategory=*Sysmon* "7"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ImageLoaded" as image_loaded
+    | json field=_raw "Image" as process_name
+    | where event_id = "7"
+    | where image_loaded matches "*\\Users\\*" or image_loaded matches "*\\ProgramData\\*" or image_loaded matches "*\\Temp\\*" or image_loaded matches "*\\AppData\\*"
+    | parse regex field=image_loaded ".*\\(?<dll_name>[^\\]+\.dll)$"
+    | where !(image_loaded matches "*\\System32\\*" or image_loaded matches "*\\SysWOW64\\*" or image_loaded matches "*\\Program Files\\*" or image_loaded matches "*\\Program Files (x86)\\*")
+    | count by _sourceHost, process_name, dll_name, image_loaded
 pseudo_logic: Process loads a DLL from a writable PATH directory before the system32 copy. Phantom-DLL hijack.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -113,7 +171,7 @@ references:
 - https://attack.mitre.org/techniques/T1574/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

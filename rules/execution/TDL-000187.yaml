@@ -17,74 +17,50 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=windows sourcetype=WinEventLog:Security (EventCode=592 OR EventCode=4688) New_Process_Name="*\\powershell.exe"
+  spl: 'index=windows sourcetype=WinEventLog:Security (EventCode=592 OR EventCode=4688) New_Process_Name="*\\powershell.exe"
+
     | table _time, ComputerName, Account_Name, New_Process_Name, Process_Command_Line, Creator_Process_Name
-  kql: 'DeviceProcessEvents
 
+    '
+  kql: |
+    SecurityEvent
     | where TimeGenerated > ago(1d)
-
-    | where process_name in ("powershell.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('powershell.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000187 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized Powershell\"\n    severity = \"MEDIUM\"\n\
-    \    tactic = \"TA0002\"\n    technique = \"T1059\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(powershell.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("powershell.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [powershell.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+    | where EventID in (592, 4688)
+    | where Process has "powershell.exe"
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName, EventID
+  aql: |
+    SELECT eventtime, sourceip, username, LOGSOURCENAME(logsourceid) AS host, "Process Name", "Process CommandLine", "Parent Process Name"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Process Name" ILIKE '%powershell.exe%'
+    LAST 24 HOURS
+  yara_l: "rule powershell_execution_t1059 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects PowerShell execution via Windows process\
+    \ creation events\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1059\"\n    \n  events:\n    $e.metadata.event_type\
+    \ = \"PROCESS_LAUNCH\"\n    (\n      $e.metadata.product_event_type = \"592\" or\n      $e.metadata.product_event_type = \"4688\"\n    )\n\
+    \    re.regex($e.target.process.file.full_path, `(?i)\\\\powershell\\.exe$`)\n    $e.principal.hostname = $host\n    \n  match:\n    $host\
+    \ over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code IN ("592", "4688") AND TO_LOWER(process.name) LIKE "*powershell.exe*"
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.executable
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND process_name ICONTAINS "powershell.exe")
+  crowdstrike: |
+    EventCode=4688 NewProcessName=*powershell.exe
+    | table([@timestamp, ComputerName, SubjectUserName, NewProcessName, CommandLine, ParentProcessName])
+  xql: "dataset = xdr_data\n| filter action_evtlog_event_id in (592, 4688)\n  and (lowercase(action_process_image_name) contains \"powershell.exe\"\
+    \ \n       or lowercase(actor_process_image_name) contains \"powershell.exe\")\n| fields _time, agent_hostname, actor_effective_username,\
+    \ action_process_image_name, actor_process_image_name, action_process_image_command_line, action_evtlog_event_id\n"
+  lucene: |
+    event.code:(592 OR 4688) AND process.name:*powershell.exe
+  sumo: |
+    _sourceCategory=*Windows* (powershell.exe OR "powershell.exe")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "ProcessName" as process_name_alt
+    | where event_id in ("592", "4688")
+    | where process_name matches "*powershell.exe" OR process_name_alt matches "*powershell.exe"
+    | fields _messageTime, _sourceHost, event_id, process_name, process_name_alt
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +70,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe"
 tuning_period: 7 days

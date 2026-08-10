@@ -15,71 +15,77 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=slack action IN ("organization_created", "organization_deleted", "organization_domain_changed", "organization_public_url_updated") NOT [| inputlookup slack_admins.csv | fields user | rename user as src_user]
+  spl: 'index=slack action IN ("organization_created", "organization_deleted", "organization_domain_changed", "organization_public_url_updated")
+    NOT [| inputlookup slack_admins.csv | fields user | rename user as src_user]
+
     | table _time, action, src_user, organization_id, organization_name, src_ip
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000689 {\n  meta:\n    author = \"TDL\"\n    description = \"Slack Organization Modified by Unauthorized User\"\n \
-    \   severity = \"HIGH\"\n    tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    Slack_Audit_CL
+    | where TimeGenerated > ago(1h)
+    | where action_s in ("organization_created", "organization_deleted", "organization_domain_changed", "organization_public_url_updated")
+    | where actor_user_email_s !in ("admin1@example.com", "admin2@example.com")
+    | project TimeGenerated, action_s, actor_user_email_s, actor_user_name_s, actor_user_id_s, entity_s, context_ip_address_s, context_user_agent_s
+  aql: |
+    SELECT eventtime, username, "Action", "Organization", sourceip, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%slack%'
+      AND "Action" IN ('organization_created', 'organization_deleted', 'organization_domain_changed', 'organization_public_url_updated')
+      AND username NOT IN ('admin1@company.com', 'admin2@company.com', 'slack_admin@company.com')
+    LAST 24 HOURS
+  yara_l: |
+    rule slack_unauthorized_org_changes {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects unauthorized organization configuration changes in Slack"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1078"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Slack"
+        (
+          $e.metadata.product_event_type = "organization_created" or
+          $e.metadata.product_event_type = "organization_deleted" or
+          $e.metadata.product_event_type = "organization_domain_changed" or
+          $e.metadata.product_event_type = "organization_public_url_updated"
+        )
+        $e.principal.user.userid = $user
+        not $e.principal.user.userid in %slack_admins_list
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-slack*
+    | WHERE action IN ("organization_created", "organization_deleted", "organization_domain_changed", "organization_public_url_updated")
+    | WHERE NOT user.name IN ("slack_admin1", "slack_admin2", "slack_admin3")
+    | KEEP @timestamp, user.name, action, host.name, source.ip
+  leql: |
+    where(source_json.action IN ["organization_created", "organization_deleted", "organization_domain_changed", "organization_public_url_updated"] AND source_user NOT IN [slack_admin_1, slack_admin_2, slack_admin_3])
+  crowdstrike: |
+    #type=slack action IN ("organization_created", "organization_deleted", "organization_domain_changed", "organization_public_url_updated")
+    | NOT (user IN ("admin1@company.com", "admin2@company.com", "slackadmin@company.com"))
+    | table([@timestamp, user, action, organization, ip_address])
+  xql: |
+    dataset = slack_audit_logs
+    | filter action in ("organization_created", "organization_deleted", "organization_domain_changed", "organization_public_url_updated")
+    | alter is_admin = coalesce(actor_is_admin, false)
+    | filter is_admin = false
+    | fields _time, action, actor_user_id, actor_user_name, actor_user_email, organization_id, organization_name
+  lucene: |
+    action:("organization_created" OR "organization_deleted" OR "organization_domain_changed" OR "organization_public_url_updated") AND NOT user.name:(admin1 OR admin2 OR admin3)
+  sumo: |
+    _sourceCategory=*Slack* (organization_created OR organization_deleted OR organization_domain_changed OR organization_public_url_updated)
+    | json field=_raw "action" as action
+    | json field=_raw "actor.user.email" as source_user
+    | where action in ("organization_created", "organization_deleted", "organization_domain_changed", "organization_public_url_updated")
+    | where !(source_user in ("admin1@company.com", "admin2@company.com"))
+    | fields _messageTime, action, source_user, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +95,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Slack Event
 

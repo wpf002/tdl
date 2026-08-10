@@ -19,80 +19,132 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=* (sourcetype=azure:audit OR sourcetype=o365:management:activity OR sourcetype=vpn) (action=failure OR ResultStatus=failure OR Result=failure) (ActivityType=UserLoginFailed OR Operation=UserLoginFailed OR event_type=login_failed OR Category=SignInLogs)
+  spl: 'index=* (sourcetype=azure:audit OR sourcetype=o365:management:activity OR sourcetype=vpn) (action=failure OR ResultStatus=failure OR Result=failure)
+    (ActivityType=UserLoginFailed OR Operation=UserLoginFailed OR event_type=login_failed OR Category=SignInLogs)
+
     | eval src=coalesce(src, ClientIP, IPAddress, source_ip)
+
     | eval dest_user=coalesce(dest_user, UserId, UserPrincipalName, user, TargetUserName)
+
     | where isnotnull(src) AND isnotnull(dest_user)
+
     | sort 0 _time
+
     | streamstats time_window=3m dc(dest_user) as unique_users by src
+
     | where unique_users >= 2
+
     | bin _time span=1h
-    | stats count dc(dest_user) as unique_dest_users values(dest_user) as dest_users earliest(_time) as first_seen latest(_time) as last_seen by _time, src
+
+    | stats count dc(dest_user) as unique_dest_users values(dest_user) as dest_users earliest(_time) as first_seen latest(_time) as last_seen
+    by _time, src
+
     | where count >= 4 AND unique_dest_users >= 2
+
     | table first_seen, last_seen, src, count, unique_dest_users, dest_users
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000284 {\n  meta:\n    author = \"TDL\"\n    description = \"Stealth Remote Password Spraying\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: "SigninLogs\n| where TimeGenerated > ago(1h)\n| where ResultType != 0\n| where AppDisplayName has_any (\"VPN\", \"Remote\") or NetworkLocationDetails\
+    \ has \"vpn\" or AuthenticationProtocol has \"Remote\"\n| extend SourceIP = IPAddress\n| summarize \n    FailedLogins = count(),\n    UniqueUsers\
+    \ = dcount(UserPrincipalName),\n    Users = make_set(UserPrincipalName),\n    TimeWindow = max(TimeGenerated) - min(TimeGenerated),\n    FirstSeen\
+    \ = min(TimeGenerated),\n    LastSeen = max(TimeGenerated)\n    by SourceIP, bin(TimeGenerated, 3m)\n| where FailedLogins >= 2 and UniqueUsers\
+    \ >= 2\n| summarize \n    TotalInstances = count(),\n    TotalFailedLogins = sum(FailedLogins),\n    AllUsers = make_set(Users),\n    EarliestTime\
+    \ = min(FirstSeen),\n    LatestTime = max(LastSeen)\n    by SourceIP\n| where TotalInstances >= 4\n| project SourceIP, TotalInstances, TotalFailedLogins,\
+    \ AllUsers, EarliestTime, LatestTime\n"
+  aql: |
+    SELECT sourceip, UNIQUECOUNT(username) AS unique_users, COUNT(*) AS total_failures
+    FROM events
+    WHERE categoryname(category) ILIKE '%authentication%' AND categoryname(category) ILIKE '%fail%'
+      AND (qidname(qid) ILIKE '%logon%' OR qidname(qid) ILIKE '%login%' OR qidname(qid) ILIKE '%sign%in%')
+    GROUP BY sourceip
+    HAVING unique_users >= 2 AND total_failures >= 4
+    LAST 1 HOURS
+  yara_l: |
+    rule azure_remote_login_failures_multiple_users {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects 4 instances over 1 hour of 2 remote login failures from the same source with unique destination usernames within 3 minutes - T1078"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $login.metadata.event_type = "USER_LOGIN"
+        $login.security_result.action = "BLOCK"
+        $login.principal.ip = $source_ip
+        $login.target.user.userid = $target_user
+        $login.metadata.product_name = /Azure|Office 365|Microsoft 365/
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $source_ip over 1h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 65
+        $failed_users = array_distinct($login.target.user.userid)
+        $failed_count = count_distinct($login.target.user.userid)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #login >= 4 and
+        $failed_count >= 2
+    }
+  esql: "FROM logs-azure.signinlogs*, logs-o365.audit*\n| WHERE @timestamp > NOW() - 1 hour \n  AND event.outcome == \"failure\"\n  AND (event.category\
+    \ == \"authentication\" OR event.action LIKE \"*login*\" OR event.action LIKE \"*signin*\")\n| EVAL time_bucket = BUCKET(@timestamp, 3 minutes)\n\
+    | STATS \n    failures = COUNT(*),\n    unique_users = COUNT_DISTINCT(user.name),\n    min_time = MIN(@timestamp),\n    max_time = MAX(@timestamp)\n\
+    \  BY source.ip, time_bucket\n| WHERE failures >= 2 AND unique_users >= 2\n| STATS \n    total_instances = COUNT(*),\n    total_failures =\
+    \ SUM(failures),\n    users_targeted = SUM(unique_users)\n  BY source.ip\n| WHERE total_instances >= 4\n| KEEP source.ip, total_instances,\
+    \ total_failures, users_targeted\n"
+  leql: |
+    where(result=FAILED_BAD_PASSWORD) groupby(source_address) calculate(unique:user)
+  crowdstrike: |
+    #type=azure_ad OR #type=office365 OR #type=vpn (event_simpleName=UserLogon OR event_simpleName=UserLogonFailed OR EventCode=4625 OR action=failure OR result=failure OR status=failed)
+    | case {
+        event_simpleName=UserLogonFailed | TargetUserName := coalesce(TargetUserName, UserName, user);
+        EventCode=4625 | TargetUserName := coalesce(TargetUserName, TargetUser, user);
+        * | TargetUserName := coalesce(user, UserName, TargetUserName, username);
+      }
+    | case {
+        RemoteAddressIP4=* | SourceIP := RemoteAddressIP4;
+        src_ip=* | SourceIP := src_ip;
+        source_ip=* | SourceIP := source_ip;
+        ClientIP=* | SourceIP := ClientIP;
+        * | SourceIP := coalesce(SourceIP, src, source);
+      }
+    | SourceIP=* AND TargetUserName=*
+    | bucket(span=3m, field=@timestamp, as=window_3m)
+    | groupBy([SourceIP, window_3m], function=[count(TargetUserName, distinct=true, as=unique_users), count(as=failures)])
+    | unique_users >= 2 AND failures >= 2
+    | bucket := formatTime("%F %T", field=window_3m, as=window_start)
+    | groupBy([SourceIP], function=[collect([window_start, unique_users, failures]), count(as=instances)])
+    | instances >= 4
+    | table([SourceIP, instances, window_start, unique_users, failures])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter action_result = "FAIL" and event_type in ("LOGIN", "AUTHENTICATION") and (vendor = "Microsoft" or vendor = "Azure")
+    | bin _time span=3m
+    | comp count_distinct(target_username) as unique_users, count() as login_failures by _time, source_ip
+    | filter login_failures >= 2 and unique_users >= 2
+    | alter hour_window = timestamp_diff(_time, current_time(), "HOUR")
+    | filter hour_window <= 1
+    | comp count() as instances by source_ip
+    | filter instances >= 4
+    | fields source_ip, instances
+  lucene: |
+    event.category:authentication AND event.outcome:failure AND (event.action:"user login" OR event.action:logon OR azure.signinlogs.properties.status.errorCode:* OR office365.audit.ResultStatus:Failed) AND NOT user.name:(*$ OR health* OR system)
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*Office* OR _sourceCategory=*VPN*
+    | json field=_raw "ResultType" as result_type
+    | json field=_raw "ResultDescription" as result_desc
+    | json field=_raw "IPAddress" as source_ip
+    | json field=_raw "UserPrincipalName" as username
+    | json field=_raw "Status" as status
+    | where (result_type = "50126" OR result_type = "50055" OR result_desc matches "*fail*" OR status matches "*fail*")
+    | timeslice 3m
+    | count_distinct(username) as unique_users by _timeslice, source_ip
+    | where unique_users >= 2
+    | fields _timeslice, source_ip, unique_users
+    | timeslice 1h
+    | count as instances by source_ip
+    | where instances >= 4
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -102,7 +154,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '4 Instances over 1 hour of 2 Remote Login Failures
 

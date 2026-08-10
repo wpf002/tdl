@@ -24,68 +24,74 @@ queries:
     \ src_ip=172.27.* OR src_ip=172.28.* OR src_ip=172.29.* OR src_ip=172.30.* OR src_ip=172.31.* OR src_ip=192.168.*)\n| eval day=strftime(_time,\
     \ \"%Y-%m-%d\")\n| stats count by day, user\n| eventstats avg(count) as avg_count, stdev(count) as stdev_count by user\n| where count > (avg_count\
     \ + (2 * stdev_count)) AND count >= 10\n| where _time >= relative_time(now(), \"-90d\")\n| table day, user, count, avg_count, stdev_count\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000402 {\n  meta:\n    author = \"TDL\"\n    description = \"Spike in Failed Remote Login Attempts for a User\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "let baseline_period = 90d;\nlet learning_period = 30d;\nlet sensitivity = 2.0;\nlet minimum_threshold = 10;\nlet internal_ip_ranges =\
+    \ dynamic([\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"]);\nlet baseline_data = \n    SigninLogs\n    | where TimeGenerated between\
+    \ (ago(baseline_period) .. ago(1d))\n    | where ResultType != 0\n    | where isnotempty(IPAddress)\n    | where not(ipv4_is_in_any_range(IPAddress,\
+    \ internal_ip_ranges))\n    | summarize daily_failed_count = count() by bin(TimeGenerated, 1d), UserPrincipalName\n    | summarize avg_daily_failed\
+    \ = avg(daily_failed_count), stdev_daily_failed = stdev(daily_failed_count) by UserPrincipalName;\nlet recent_data = \n    SigninLogs\n  \
+    \  | where TimeGenerated > ago(1d)\n    | where ResultType != 0\n    | where isnotempty(IPAddress)\n    | where not(ipv4_is_in_any_range(IPAddress,\
+    \ internal_ip_ranges))\n    | summarize current_failed_count = count(), ips = make_set(IPAddress), locations = make_set(Location) by UserPrincipalName;\n\
+    recent_data\n| join kind=inner (baseline_data) on UserPrincipalName\n| extend threshold = avg_daily_failed + (sensitivity * stdev_daily_failed)\n\
+    | where current_failed_count >= minimum_threshold\n| where current_failed_count > threshold\n| project TimeGenerated = now(), UserPrincipalName,\
+    \ current_failed_count, avg_daily_failed, threshold, ips, locations\n"
+  aql: |
+    SELECT username, sourceip, COUNT(*) AS failed_login_count
+    FROM events
+    WHERE INOFFENSE('*') = FALSE
+      AND (categoryname(category) ILIKE '%authentication%' OR categoryname(category) ILIKE '%logon%' OR qidname(qid) ILIKE '%failed%login%' OR qidname(qid) ILIKE '%logon%failure%')
+      AND (LOGSOURCETYPENAME(devicetype) ILIKE '%Azure%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%Office%365%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%VPN%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%O365%')
+      AND sourceip NOT IN (SELECT sourceip FROM flows WHERE destinationip IN CIDR('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16'))
+      AND sourceip NOT IN CIDR('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16')
+    GROUP BY username, sourceip
+    HAVING failed_login_count >= 10
+    LAST 24 HOURS
+  yara_l: "rule failed_remote_login_from_external_ip_outlier {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects anomalous\
+    \ count of failed remote login attempts from external IPs for a user - T1078 Initial Access\"\n    mitre_attack_tactic = \"Initial Access\"\
+    \n    mitre_attack_technique = \"T1078\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.security_result.action\
+    \ = \"BLOCK\"\n    (\n      $e.metadata.product_name = \"Azure Active Directory\" or\n      $e.metadata.product_name = \"Office 365\" or\n\
+    \      $e.metadata.product_name = \"Microsoft 365\"\n    )\n    not net.ip_in_range_cidr($e.principal.ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($e.principal.ip,\
+    \ \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($e.principal.ip, \"192.168.0.0/16\")\n    $e.target.user.userid = $user\n    $e.principal.ip\
+    \ = $source_ip\n    \n  match:\n    $user over 1d\n    \n  outcome:\n    $risk_score = max(35 + (count($e) - 10) * 2)\n    $failed_login_count\
+    \ = count_distinct($e.metadata.id)\n    $unique_source_ips = count_distinct($source_ip)\n    \n  condition:\n    #e >= 10\n}\n"
+  esql: |
+    FROM logs-azure.signinlogs*, logs-o365.audit*
+    | WHERE @timestamp > NOW() - 90 days
+      AND event.outcome == "failure"
+      AND NOT CIDR_MATCH(source.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    | EVAL day = DATE_TRUNC(1 day, @timestamp)
+    | STATS daily_count = COUNT(*) BY user.name, day
+    | STATS avg_daily = AVG(daily_count), stddev_daily = STDDEV(daily_count), recent_count = MAX(CASE(day >= DATE_TRUNC(1 day, NOW()), daily_count, 0)) BY user.name
+    | EVAL threshold = avg_daily + (2 * stddev_daily)
+    | WHERE recent_count >= 10 AND recent_count > threshold
+    | KEEP user.name, recent_count, avg_daily, threshold
+  leql: |
+    where(result=FAILED_BAD_PASSWORD AND source_address!=10.0.0.0/8 AND source_address!=172.16.0.0/12 AND source_address!=192.168.0.0/16) groupby(user) calculate(count)
+  crowdstrike: |
+    #type=AzureAD OR #type=Office365 OR #type=VPN
+    (event.outcome=failure OR ResultType=50126 OR ResultType=50053 OR ResultType=50055 OR ResultType=50057 OR action=failed OR status=failed)
+    (event.category=authentication OR event.action=*login* OR Operation=UserLogin* OR event_type=*login*)
+    NOT (SourceIP=10.* OR SourceIP=172.16.* OR SourceIP=172.17.* OR SourceIP=172.18.* OR SourceIP=172.19.* OR SourceIP=172.20.* OR SourceIP=172.21.* OR SourceIP=172.22.* OR SourceIP=172.23.* OR SourceIP=172.24.* OR SourceIP=172.25.* OR SourceIP=172.26.* OR SourceIP=172.27.* OR SourceIP=172.28.* OR SourceIP=172.29.* OR SourceIP=172.30.* OR SourceIP=172.31.* OR SourceIP=192.168.*)
+    | groupBy([UserName], function=count(as=failed_logins))
+    | failed_logins >= 10
+    | table([UserName, failed_logins])
+  xql: "dataset = cloud_audit_logs\n| filter cloud_provider = \"AZURE\" and operation_type ~= \"(?i)(sign.*in|log.*in|auth)\" and outcome = \"\
+    FAILURE\" \n| filter not incidr(source_ip, \"10.0.0.0/8\") and not incidr(source_ip, \"172.16.0.0/12\") and not incidr(source_ip, \"192.168.0.0/16\"\
+    )\n| bin _time span = 1d\n| comp count() as failed_logins by _time, identity_name, source_ip\n| filter failed_logins >= 10\n| fields _time,\
+    \ identity_name, source_ip, failed_logins\n"
+  lucene: |
+    (event.category:"authentication" OR event.type:"authentication" OR event.action:("UserLoginFailed" OR "user-login-failed" OR "logon-failed")) AND event.outcome:"failure" AND NOT source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*Office365* OR _sourceCategory=*O365* OR _sourceCategory=*AAD*
+    | json field=_raw "ResultType" as result_type
+    | json field=_raw "UserPrincipalName" as username
+    | json field=_raw "IPAddress" as src_ip
+    | json field=_raw "Operation" as operation
+    | where (operation matches "*login*" OR operation matches "*signin*" OR operation matches "*UserLoginFailed*") AND (result_type != "0" AND result_type != "Success")
+    | where !(src_ip matches "10.*" OR src_ip matches "172.16.*" OR src_ip matches "172.17.*" OR src_ip matches "172.18.*" OR src_ip matches "172.19.*" OR src_ip matches "172.20.*" OR src_ip matches "172.21.*" OR src_ip matches "172.22.*" OR src_ip matches "172.23.*" OR src_ip matches "172.24.*" OR src_ip matches "172.25.*" OR src_ip matches "172.26.*" OR src_ip matches "172.27.*" OR src_ip matches "172.28.*" OR src_ip matches "172.29.*" OR src_ip matches "172.30.*" OR src_ip matches "172.31.*" OR src_ip matches "192.168.*")
+    | timeslice 1d
+    | count as daily_count by _timeslice, username
+    | where daily_count >= 10
+    | sort by username, _timeslice
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -95,7 +101,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: 'Failed Remote Login Events
 

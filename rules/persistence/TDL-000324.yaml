@@ -19,68 +19,53 @@ queries:
   spl: "index=gcp sourcetype=\"google:gcp:pubsub:message\" protoPayload.methodName=\"*CreateServiceAccount*\" \n| search NOT (protoPayload.authenticationInfo.principalEmail=\"\
     *@gserviceaccount.com\" OR protoPayload.authenticationInfo.principalEmail=\"*admin*\") \n| table _time, protoPayload.authenticationInfo.principalEmail,\
     \ protoPayload.serviceName, protoPayload.resourceName, protoPayload.request.accountId, protoPayload.response.email\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000324 {\n  meta:\n    author = \"TDL\"\n    description = \"Service Account Created by Unauthorized User - GCP\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1136\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    GCPAuditLogs
+    | where TimeGenerated > ago(1h)
+    | where MethodName has "CreateServiceAccount"
+    | where AuthenticationInfo_PrincipalEmail !has "gserviceaccount" and AuthenticationInfo_PrincipalEmail !has "admin"
+    | project TimeGenerated, MethodName, AuthenticationInfo_PrincipalEmail, CallerIp, ResourceName, RequestMetadata_CallerSuppliedUserAgent, ServiceName
+  aql: |
+    SELECT eventtime, username, sourceip, "methodName", "resource.labels.project_id" AS project_id, "protoPayload.authenticationInfo.principalEmail" AS principal_email, "protoPayload.request.accountId" AS new_service_account
+    FROM events
+    WHERE "methodName" ILIKE '%CreateServiceAccount%'
+      AND username NOT ILIKE '%admin%'
+      AND username NOT ILIKE '%gserviceaccount%'
+      AND "protoPayload.authenticationInfo.principalEmail" NOT ILIKE '%admin%'
+      AND "protoPayload.authenticationInfo.principalEmail" NOT ILIKE '%gserviceaccount%'
+    LAST 24 HOURS
+  yara_l: "rule gcp_service_account_creation_non_admin {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects GCP service\
+    \ account creation by non-admin users - MITRE T1136 Persistence\"\n    severity = \"MEDIUM\"\n    mitre_attack_tactic = \"Persistence\"\n\
+    \    mitre_attack_technique = \"T1136\"\n    \n  events:\n    $e.metadata.event_type = \"SYSTEM_AUDIT_LOG_UNCATEGORIZED\"\n    $e.metadata.vendor_name\
+    \ = \"Google Cloud Platform\"\n    $e.metadata.product_name = \"Google Cloud Platform\"\n    re.regex($e.target.resource.attribute.labels[\"\
+    methodName\"], `CreateServiceAccount`) or\n    re.regex($e.metadata.description, `CreateServiceAccount`)\n    $e.principal.user.userid = $user\n\
+    \    not re.regex($e.principal.user.userid, `(?i)admin`)\n    not re.regex($e.principal.user.userid, `gserviceaccount\\.com$`)\n    \n  match:\n\
+    \    $user over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-gcp.audit*\n| WHERE @timestamp > NOW() - 24 hour \n  AND event.action == \"google.iam.admin.v1.CreateServiceAccount\"\n  AND\
+    \ NOT (user.name LIKE \"*gserviceaccount.com\" OR user.roles LIKE \"*admin*\" OR user.roles LIKE \"*Admin*\")\n| STATS account_creations =\
+    \ COUNT(*) BY user.name, host.name, gcp.audit.resource.labels.project_id, event.action\n| KEEP @timestamp, user.name, host.name, gcp.audit.resource.labels.project_id,\
+    \ event.action, account_creations\n"
+  leql: |
+    where(source_json.protoPayload.methodName ICONTAINS "CreateServiceAccount" AND source_json.protoPayload.authenticationInfo.principalEmail NOT ICONTAINS "gserviceaccount.com" AND source_json.protoPayload.authenticationInfo.principalEmail NOT ICONTAINS "admin")
+  crowdstrike: |
+    #type=gcp_audit message.data.protoPayload.methodName=*CreateServiceAccount*
+    | regex("protoPayload\\.authenticationInfo\\.principalEmail\"\\s*:\\s*\"(?<SourceUser>[^\"]+)", field=message)
+    | SourceUser != "*admin*" AND SourceUser != "*gserviceaccount*"
+    | table([@timestamp, SourceUser, message.data.protoPayload.methodName, message.data.protoPayload.resourceName])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = GCP and cloud_audit_operation_name contains "CreateServiceAccount"
+    | filter cloud_audit_actor not contains "gserviceaccount" and cloud_audit_actor not contains "admin"
+    | fields _time, cloud_audit_actor, cloud_audit_operation_name, cloud_audit_resource_name, cloud_audit_project_id
+  lucene: |
+    message.data.protoPayload.methodName:*CreateServiceAccount* AND NOT (message.data.protoPayload.authenticationInfo.principalEmail:*admin* OR message.data.protoPayload.authenticationInfo.principalEmail:*gserviceaccount*)
+  sumo: |
+    _sourceCategory=*GCP* *CreateServiceAccount*
+    | json field=_raw "protoPayload.methodName" as method_name
+    | json field=_raw "protoPayload.authenticationInfo.principalEmail" as principal_email
+    | where method_name matches "*CreateServiceAccount*"
+    | where !(principal_email matches "*admin*" OR principal_email matches "*gserviceaccount*")
+    | fields _messageTime, _sourceHost, method_name, principal_email
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +75,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Cloud Audit event
 

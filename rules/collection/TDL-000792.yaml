@@ -18,77 +18,78 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=edr (event_type=keyboard_hook OR action=keyboard_hook OR event_name=keyboard_hook OR event_category=keyboard_hook OR modload_name=*SetWindowsHook* OR api_call=SetWindowsHookEx OR hook_type=WH_KEYBOARD* OR hook_type=WH_KEYBOARD_LL)
+  spl: 'index=edr (event_type=keyboard_hook OR action=keyboard_hook OR event_name=keyboard_hook OR event_category=keyboard_hook OR modload_name=*SetWindowsHook*
+    OR api_call=SetWindowsHookEx OR hook_type=WH_KEYBOARD* OR hook_type=WH_KEYBOARD_LL)
+
     NOT (process_name IN ("explorer.exe","winlogon.exe","csrss.exe","dwm.exe","svchost.exe","taskmgr.exe","osk.exe","tabtip.exe","narrator.exe","magnify.exe","msedge.exe","chrome.exe","firefox.exe","iexplore.exe","slack.exe","teams.exe","discord.exe","skype.exe","zoom.exe","notepad.exe","notepad++.exe","code.exe","devenv.exe","idea64.exe","pycharm64.exe","studio64.exe","sublime_text.exe","atom.exe"))
-    | stats count values(process_path) as process_path values(process_cmdline) as process_cmdline values(parent_process) as parent_process by host, process_name, user
+
+    | stats count values(process_path) as process_path values(process_cmdline) as process_cmdline values(parent_process) as parent_process by
+    host, process_name, user
+
     | where count > 0
+
     | table host, user, process_name, process_path, process_cmdline, parent_process, count
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000792 {\n  meta:\n    author = \"TDL\"\n    description = \"SetWindowsHookEx WH_KEYBOARD_LL Installed\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0009\"\n    technique = \"T1056\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceEvents
+    | where TimeGenerated > ago(24h)
+    | where ActionType == "SetWindowsHookEx"
+    | where AdditionalFields has "WH_KEYBOARD" or AdditionalFields has "WH_KEYBOARD_LL"
+    | where InitiatingProcessFileName !in~ ("explorer.exe","taskmgr.exe","osk.exe","tabtip.exe","narrator.exe","magnify.exe","TeamViewer.exe","ScreenConnect.exe","LogMeIn.exe","VNC.exe","RemotePC.exe")
+    | where InitiatingProcessFileName !endswith ".ime"
+    | where InitiatingProcessFileName !has_any ("InputMethod","IME","Keyboard","Language")
+    | project TimeGenerated, DeviceName, ActionType, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessFolderPath, ProcessId, AccountName, AdditionalFields
+  aql: |
+    SELECT username, sourceip, LOGSOURCENAME(logsourceid) AS hostname, "Process Name", "Process CommandLine", "Image Path", "Technique ID", COUNT(*) AS hook_events
+    FROM events
+    WHERE ("Technique ID" = 'T1056' OR "Technique ID" ILIKE '%T1056%' OR QIDNAME(qid) ILIKE '%keyboard%hook%' OR QIDNAME(qid) ILIKE '%input%capture%' OR categoryname(category) ILIKE '%keylog%' OR "Process Name" NOT IN ('explorer.exe', 'ctfmon.exe', 'winlogon.exe', 'dwm.exe', 'TextInputHost.exe', 'ShellExperienceHost.exe', 'SearchUI.exe', 'StartMenuExperienceHost.exe', 'Taskmgr.exe', 'osk.exe', 'TabTip.exe', 'SnippingTool.exe', 'systemd', 'gnome-shell', 'kwin', 'Dock', 'loginwindow'))
+    AND (QIDNAME(qid) ILIKE '%SetWindowsHookEx%' OR QIDNAME(qid) ILIKE '%WH_KEYBOARD%' OR QIDNAME(qid) ILIKE '%GetAsyncKeyState%' OR QIDNAME(qid) ILIKE '%input%capture%' OR QIDNAME(qid) ILIKE '%keylog%' OR "API Call" ILIKE '%SetWindowsHookEx%' OR "API Call" ILIKE '%GetAsyncKeyState%' OR "Behavior" ILIKE '%keyboard%hook%' OR "Behavior" ILIKE '%input%capture%')
+    GROUP BY username, sourceip, LOGSOURCENAME(logsourceid), "Process Name", "Process CommandLine", "Image Path", "Technique ID"
+    LAST 1 HOURS
+  yara_l: "rule keylogger_keyboard_hook_detection {\n  meta:\n    author = \"TDL\"\n    description = \"Detects low-level keyboard hook registration\
+    \ from non-input-tooling processes - T1056 Collection\"\n    mitre_attack_tactic = \"Collection\"\n    mitre_attack_technique = \"T1056\"\n\
+    \    severity = \"HIGH\"\n\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\" or\n    $e.metadata.event_type = \"PROCESS_MODIFICATION\"\
+    \ or\n    $e.metadata.product_event_type = \"SetWindowsHookEx\"\n    \n    (\n      re.regex($e.principal.process.command_line, `(?i)SetWindowsHookEx`)\
+    \ or\n      re.regex($e.target.process.command_line, `(?i)WH_KEYBOARD_LL`) or\n      re.regex($e.metadata.description, `(?i)(keyboard.*hook|hook.*keyboard|WH_KEYBOARD_LL)`)\n\
+    \    )\n    \n    not re.regex($e.principal.process.file.full_path, `(?i)(\\\\Windows\\\\System32\\\\|\\\\Windows\\\\SysWOW64\\\\|\\\\Program\
+    \ Files\\\\Microsoft Office\\\\|\\\\Program Files (x86)\\\\Microsoft Office\\\\|osk\\.exe|magnify\\.exe|narrator\\.exe|utilman\\.exe|tabtip\\\
+    .exe|onscreenkeyboard|inputmethod|ime|ctfmon\\.exe)`)\n    \n    $e.principal.hostname = $host\n    $e.principal.process.file.full_path =\
+    \ $process_path\n\n  match:\n    $host, $process_path over 5m\n\n  condition:\n    $e\n}\n"
+  esql: "FROM logs-endpoint.events.api*\n| WHERE @timestamp > NOW() - 1 hour \n  AND event.category == \"api\" \n  AND (event.action LIKE \"*SetWindowsHookEx*\"\
+    \ OR event.action LIKE \"*keyboard*hook*\")\n  AND process.name NOT IN (\"explorer.exe\", \"notepad.exe\", \"osk.exe\", \"tabtip.exe\", \"\
+    inputpersonalization.exe\", \"ctfmon.exe\", \"textinputhost.exe\", \"screenreader.exe\", \"nvda.exe\", \"jaws.exe\", \"magnify.exe\")\n| STATS\
+    \ hook_count = COUNT(*) BY host.name, process.name, process.executable, user.name\n| WHERE hook_count > 0\n| KEEP @timestamp, host.name, user.name,\
+    \ process.name, process.executable, hook_count\n"
+  leql: |
+    where(source_json.EventID=13 AND source_json.TargetObject ICONTAINS "\Windows\CurrentVersion\Run" AND source_json.Details ICONTAINS "hook") OR (source_json.EventID=12 AND source_json.TargetObject ICONTAINS "keyboard" AND source_json.TargetObject ICONTAINS "hook") OR (process_name NOT IN ["osk.exe", "tabtip.exe", "TabTip32.exe", "TextInputHost.exe", "ScreenClippingHost.exe", "SnippingTool.exe"] AND (process_cmd_line ICONTAINS "SetWindowsHookEx" OR process_cmd_line ICONTAINS "WH_KEYBOARD" OR process_cmd_line ICONTAINS "GetAsyncKeyState" OR process_cmd_line ICONTAINS "GetKeyboardState"))
+  crowdstrike: "event_simpleName=SetWindowsHookExInfoEvent HookType=WH_KEYBOARD* \n| FileName!=*osk.exe AND FileName!=*explorer.exe AND FileName!=*devenv.exe\
+    \ AND FileName!=*Teams.exe AND FileName!=*Zoom.exe AND FileName!=*Slack.exe AND FileName!=*Discord.exe AND FileName!=*notepad.exe AND FileName!=*Code.exe\
+    \ AND FileName!=*chrome.exe AND FileName!=*firefox.exe AND FileName!=*msedge.exe AND FileName!=*vmware-vmx.exe AND FileName!=*VBoxClient.exe\n\
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, SHA256HashData, aid])\n"
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_LOAD_IMAGE \n  and (action_module_name contains \"user32.dll\" or action_module_name\
+    \ contains \"USER32.DLL\")\n  and (action_process_image_command_line ~= \".*SetWindowsHookEx.*\" \n       or action_process_image_command_line\
+    \ ~= \".*WH_KEYBOARD.*\"\n       or action_process_image_command_line ~= \".*GetAsyncKeyState.*\"\n       or action_process_image_command_line\
+    \ ~= \".*GetRawInputData.*\")\n  and action_process_image_name not in (\"explorer.exe\", \"chrome.exe\", \"firefox.exe\", \"msedge.exe\",\
+    \ \"Teams.exe\", \"Slack.exe\", \"Discord.exe\", \"Code.exe\", \"devenv.exe\", \"sublime_text.exe\", \"notepad++.exe\", \"idea64.exe\", \"\
+    vmware.exe\", \"VBoxHeadless.exe\", \"citrix\", \"rdpclip.exe\", \"mstsc.exe\")\n  and lowercase(action_process_image_path) not contains \"\
+    \\\\microsoft office\\\\\"\n  and lowercase(action_process_image_path) not contains \"\\\\windows\\\\system32\\\\\"\n  and lowercase(action_process_image_path)\
+    \ not contains \"\\\\windows\\\\syswow64\\\\\"\n| fields _time, agent_hostname, agent_os_type, actor_effective_username, action_process_image_name,\
+    \ action_process_image_path, action_process_image_command_line, action_module_name\n"
+  lucene: |
+    (event.action:"keyboard_hook_registered" OR event.type:"driver_load" OR event.category:"process") AND (process.name:* AND NOT (process.name:(*input* OR *ime* OR *osk.exe OR *tabtip.exe OR *narrator.exe OR *magnify.exe OR *accessibility* OR *teamviewer* OR *zoom* OR *skype* OR *discord* OR *slack* OR *remote*))) AND (event.message:(*SetWindowsHookEx* OR *WH_KEYBOARD* OR *WH_KEYBOARD_LL* OR *GetAsyncKeyState* OR *GetKeyState* OR *keyboard hook* OR *keylogger*) OR process.command_line:(*SetWindowsHookEx* OR *WH_KEYBOARD* OR *GetAsyncKeyState*) OR file.path:(*keylog* OR *keycap*))
+  sumo: |
+    _sourceCategory=*EDR* (hook OR keyboard OR keylogger OR SetWindowsHookEx OR kbdhook)
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "process_name" as process_name
+    | json field=_raw "process_path" as process_path
+    | json field=_raw "hook_type" as hook_type
+    | json field=_raw "api_call" as api_call
+    | json field=_raw "Computer" as computer
+    | json field=_raw "user" as user
+    | where (hook_type matches "*keyboard*" or hook_type matches "*WH_KEYBOARD*" or api_call matches "*SetWindowsHookEx*" or event_type matches "*keyboard_hook*")
+    | where !(process_name matches "*explorer.exe" or process_name matches "*InputService*" or process_name matches "*TextInputHost.exe" or process_name matches "*ctfmon.exe" or process_name matches "*osk.exe" or process_name matches "*TabTip.exe" or process_name matches "*ShellExperienceHost.exe" or process_name matches "*SearchUI.exe" or process_name matches "*SystemSettings.exe" or process_name matches "*ibus*" or process_name matches "*fcitx*" or process_name matches "*scim*" or process_name matches "*XIM*")
+    | fields _messageTime, computer, user, process_name, process_path, hook_type, api_call
 pseudo_logic: EDR signal of low-level keyboard hook from a non-input-tooling process. Classic user-mode keylogger primitive.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -105,7 +106,7 @@ references:
 - https://attack.mitre.org/techniques/T1056/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'

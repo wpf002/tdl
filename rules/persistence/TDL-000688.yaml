@@ -15,71 +15,62 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=slack action IN ("auth_policy_created", "auth_policy_entity_assigned", "auth_policy_entity_removed") NOT [| inputlookup slack_admins.csv | fields user | rename user as source_user]
+  spl: 'index=slack action IN ("auth_policy_created", "auth_policy_entity_assigned", "auth_policy_entity_removed") NOT [| inputlookup slack_admins.csv
+    | fields user | rename user as source_user]
+
     | table _time, source_user, action, user, entity_type, entity_id, auth_policy_id
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000688 {\n  meta:\n    author = \"TDL\"\n    description = \"Slack Authentication Policy Settings Modified by Unauthorized\
-    \ User\"\n    severity = \"HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    Slack
+    | where TimeGenerated > ago(1h)
+    | where Action in ("auth_policy_created", "auth_policy_entity_assigned", "auth_policy_entity_removed")
+    | where UserId !in (
+        Slack
+        | where TimeGenerated > ago(7d)
+        | where Action == "user_role_assigned" and RoleName == "admin"
+        | distinct UserId
+    )
+    | project TimeGenerated, UserId, UserName, Action, TargetUserId, TargetUserName, PolicyId, PolicyName, SourceIP
+  aql: |
+    SELECT eventtime, "Source User", "Action", "Target User", "Policy Name", sourceip
+    FROM events
+    WHERE "Action" IN ('auth_policy_created', 'auth_policy_entity_assigned', 'auth_policy_entity_removed')
+      AND "Source User" NOT IN ('slack_admin1', 'slack_admin2', 'slack_admin3')
+      AND logsourceid IN (SELECT logsourceid FROM logsourcetypes WHERE logsourcetypename ILIKE '%slack%')
+    LAST 24 HOURS
+  yara_l: "rule slack_unauthorized_auth_policy_changes {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects non-admin\
+    \ users modifying Slack authentication policies - T1098 Persistence\"\n    mitre_attack_tactic = \"Persistence\"\n    mitre_attack_technique\
+    \ = \"T1098\"\n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.product_name = \"Slack\"\n    (\n      $e.metadata.product_event_type\
+    \ = \"auth_policy_created\" or\n      $e.metadata.product_event_type = \"auth_policy_entity_assigned\" or\n      $e.metadata.product_event_type\
+    \ = \"auth_policy_entity_removed\"\n    )\n    $e.principal.user.userid = $user\n    not $e.principal.user.attribute.labels.key = \"slack_admin\"\
+    \n    \n  match:\n    $user over 5m\n    \n  outcome:\n    $risk_score = 75\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-slack*
+    | WHERE event.action IN ("auth_policy_created", "auth_policy_entity_assigned", "auth_policy_entity_removed")
+      AND user.name NOT IN ("slack_admin_user1", "slack_admin_user2", "slack_admin_user3")
+    | KEEP @timestamp, user.name, event.action, source.ip, user.id, event.dataset
+  leql: |
+    where(source_json.action IN ["auth_policy_created", "auth_policy_entity_assigned", "auth_policy_entity_removed"] AND source_user NOT IN ["slack_admin_1", "slack_admin_2", "slack_admin_3"])
+  crowdstrike: |
+    #type=slack action IN ["auth_policy_created", "auth_policy_entity_assigned", "auth_policy_entity_removed"]
+    | NOT (source_user IN ["admin1@company.com", "admin2@company.com"])
+    | table([@timestamp, action, source_user, target_entity, policy_id, ComputerName])
+  xql: |
+    dataset = slack_audit_logs
+    | filter action_type in ("auth_policy_created", "auth_policy_entity_assigned", "auth_policy_entity_removed")
+    | alter is_admin = actor_user_email in ("admin1@company.com", "admin2@company.com", "admin3@company.com")
+    | filter is_admin = false
+    | fields _time, actor_user_email, action_type, actor_user_name, action_context
+  lucene: |
+    action:("auth_policy_created" OR "auth_policy_entity_assigned" OR "auth_policy_entity_removed") AND NOT source_user:(admin1 OR admin2 OR admin3)
+  sumo: |
+    _sourceCategory=*Slack* (auth_policy_created OR auth_policy_entity_assigned OR auth_policy_entity_removed)
+    | json field=_raw "action" as action
+    | json field=_raw "actor.user.email" as source_user
+    | where action in ("auth_policy_created", "auth_policy_entity_assigned", "auth_policy_entity_removed")
+    | where !(source_user in ("admin1@company.com", "admin2@company.com", "admin3@company.com"))
+    | fields _messageTime, source_user, action, _raw
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +80,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Slack Event
 

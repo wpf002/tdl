@@ -19,68 +19,76 @@ queries:
     \ type=\"Execution:ECS/MaliciousFile\" OR type=\"Execution:Kubernetes/MaliciousFile\" OR type=\"Execution:Runtime/MaliciousFileExecuted\"\
     \ OR type=\"Object:S3/MaliciousFile\")\n(severity=3 OR severity=4 OR severity=5 OR severity=6)\n| table _time, type, severity, title, description,\
     \ region, accountId, resource.instanceDetails.instanceId, resource.instanceDetails.imageId, service.action.awsApiCallAction.api, service.action.awsApiCallAction.serviceName\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(24h)
+    | where Type in ("Execution:Container/MaliciousFile", "Execution:EC2/MaliciousFile", "Execution:ECS/MaliciousFile", "Execution:Kubernetes/MaliciousFile", "Execution:Runtime/MaliciousFileExecuted", "Object:S3/MaliciousFile")
+    | where Severity in (3, 4, 5, 6)
+    | project TimeGenerated, Type, Severity, Title, Description, AccountId, Region, ResourceType, ResourceId, ServiceAction
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS source, "finding.type" AS event_type, "finding.severity" AS severity, "resource.instanceDetails.instanceId" AS instance_id, "resource.resourceType" AS resource_type, "service.action.actionType" AS action_type, sourceip, destinationip
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%GuardDuty%'
+      AND "finding.type" IN ('Execution:Container/MaliciousFile', 'Execution:EC2/MaliciousFile', 'Execution:ECS/MaliciousFile', 'Execution:Kubernetes/MaliciousFile', 'Execution:Runtime/MaliciousFileExecuted', 'Object:S3/MaliciousFile')
+      AND "finding.severity" IN ('3', '4', '5', '6')
+    LAST 24 HOURS
+  yara_l: |
+    rule guardduty_malicious_file_execution {
+      meta:
+        author = "TDL"
+        description = "Detects GuardDuty findings for malicious file execution across AWS services"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "MEDIUM"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.product_name = "Amazon GuardDuty"
+        (
+          $e.metadata.product_event_type = "Execution:Container/MaliciousFile" or
+          $e.metadata.product_event_type = "Execution:EC2/MaliciousFile" or
+          $e.metadata.product_event_type = "Execution:ECS/MaliciousFile" or
+          $e.metadata.product_event_type = "Execution:Kubernetes/MaliciousFile" or
+          $e.metadata.product_event_type = "Execution:Runtime/MaliciousFileExecuted" or
+          $e.metadata.product_event_type = "Object:S3/MaliciousFile"
+        )
+        (
+          $e.security_result.severity = "LOW" or
+          $e.security_result.severity = "MEDIUM" or
+          $e.security_result.severity = "HIGH"
+        )
+        $e.principal.resource.id = $resource_id
 
-    | where eventName matches regex "GuardDuty"
+      match:
+        $resource_id over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000357 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Medium Severity Malicious File Detected  - GuardDuty\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-aws.guardduty*\n| WHERE event.type == \"guardduty\" \n  AND event.action IN (\"Execution:Container/MaliciousFile\", \"Execution:EC2/MaliciousFile\"\
+    , \"Execution:ECS/MaliciousFile\", \"Execution:Kubernetes/MaliciousFile\", \"Execution:Runtime/MaliciousFileExecuted\", \"Object:S3/MaliciousFile\"\
+    )\n  AND event.severity IN (3, 4, 5, 6)\n| KEEP @timestamp, host.name, cloud.account.id, cloud.region, event.action, event.severity, aws.guardduty.finding_id,\
+    \ aws.guardduty.resource.resource_type, user.name, source.ip\n"
+  leql: |
+    where(source_json.type IN ["Execution:Container/MaliciousFile", "Execution:EC2/MaliciousFile", "Execution:ECS/MaliciousFile", "Execution:Kubernetes/MaliciousFile", "Execution:Runtime/MaliciousFileExecuted", "Object:S3/MaliciousFile"] AND source_json.severity IN [3, 4, 5, 6])
+  crowdstrike: |
+    #repo=* #type=guardduty
+    | eventType IN ["Execution:Container/MaliciousFile", "Execution:EC2/MaliciousFile", "Execution:ECS/MaliciousFile", "Execution:Kubernetes/MaliciousFile", "Execution:Runtime/MaliciousFileExecuted", "Object:S3/MaliciousFile"]
+    | severity IN [3,4,5,6]
+    | table([@timestamp, eventType, severity, accountId, region, resource.instanceDetails.instanceId, resource.resourceType, service.additionalInfo, title, description])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and raw_log_source = "AWS.GuardDuty"
+    | filter action_event_type in ("Execution:Container/MaliciousFile", "Execution:EC2/MaliciousFile", "Execution:ECS/MaliciousFile", "Execution:Kubernetes/MaliciousFile", "Execution:Runtime/MaliciousFileExecuted", "Object:S3/MaliciousFile")
+    | filter severity in (3, 4, 5, 6)
+    | fields _time, cloud_provider, action_event_type, severity, action_resource_id, action_region, actor_user
+  lucene: |
+    event_type:("Execution:Container/MaliciousFile" OR "Execution:EC2/MaliciousFile" OR "Execution:ECS/MaliciousFile" OR "Execution:Kubernetes/MaliciousFile" OR "Execution:Runtime/MaliciousFileExecuted" OR "Object:S3/MaliciousFile") AND severity:(3 OR 4 OR 5 OR 6)
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty* OR _source=*guardduty*
+    | json field=_raw "type" as event_type
+    | json field=_raw "severity" as severity
+    | where event_type in ("Execution:Container/MaliciousFile", "Execution:EC2/MaliciousFile", "Execution:ECS/MaliciousFile", "Execution:Kubernetes/MaliciousFile", "Execution:Runtime/MaliciousFileExecuted", "Object:S3/MaliciousFile")
+    | where severity in (3, 4, 5, 6)
 false_positives:
 - Security software
 - Authorized admin tools
@@ -90,7 +98,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Execution:Container/MaliciousFile\", \"Execution:EC2/MaliciousFile\", \"Execution:ECS/MaliciousFile\"\
   , \"Execution:Kubernetes/MaliciousFile\", \"Execution:Runtime/MaliciousFileExecuted\", \"Object:S3/MaliciousFile\"]\nWhere the severity is in\

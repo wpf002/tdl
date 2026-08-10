@@ -25,77 +25,76 @@ queries:
     \ as src_ips values(dest_ip) as dest_ips values(declared_length) as content_length values(actual_bytes) as actual_size values(response_hash)\
     \ as hashes by dest_ip, http.hostname\n| where count > 0\n| table _time, dest_ip, hostnames, src_ips, content_length, actual_size, hashes,\
     \ count\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tls"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tls%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000796 {\n  meta:\n    author = \"TDL\"\n    description = \"HTTP Response Body Modified Mid-Path\"\n    severity =\
-    \ \"HIGH\"\n    tactic = \"TA0011\"\n    technique = \"T1659\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tls/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tls%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tls/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tls*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tls"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tls*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tls*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(1h)
+    | where DeviceVendor has_any ("Palo Alto", "Fortinet", "Cisco", "Snort", "Suricata", "Zeek")
+    | where DeviceEventClassID has_any ("HTTP", "web", "proxy") or Activity has_any ("HTTP", "web-browsing")
+    | where ApplicationProtocol in~ ("http", "HTTP") or DestinationPort in (80, 8080)
+    | extend ContentLength = extract(@"Content-Length:\s*(\d+)", 1, AdditionalExtensions, typeof(long))
+    | extend ActualSize = coalesce(SentBytes, BytesSent, DeviceCustomNumber1, tolong(0))
+    | extend HashValue = coalesce(FileHash, DeviceCustomString1, "")
+    | extend SizeMismatch = abs(ActualSize - ContentLength)
+    | where (isnotnull(ContentLength) and ContentLength > 0 and SizeMismatch > 1024)
+        or (isnotempty(HashValue) and DeviceAction !in~ ("allow", "permitted", "success"))
+    | project TimeGenerated, SourceIP, DestinationIP, DestinationPort, RequestURL, ContentLength, ActualSize, SizeMismatch, HashValue, DeviceVendor, DeviceAction, Message
+  aql: "SELECT sourceip, destinationip, destinationport, username, QIDNAME(qid) AS alert_name, CATEGORYNAME(category) AS alert_category, \"Payload\"\
+    , \"HTTP Response Code\", \"Content-Length\", \"Actual Response Size\", COUNT(*) AS occurrences\nFROM events\nWHERE (CATEGORYNAME(category)\
+    \ ILIKE '%IDS%' OR CATEGORYNAME(category) ILIKE '%IPS%' OR category IN (6000, 6001))\n  AND (QIDNAME(qid) ILIKE '%content%length%mismatch%'\
+    \ \n       OR QIDNAME(qid) ILIKE '%http%size%mismatch%'\n       OR QIDNAME(qid) ILIKE '%stripped%'\n       OR QIDNAME(qid) ILIKE '%hash%mismatch%'\n\
+    \       OR QIDNAME(qid) ILIKE '%integrity%violation%'\n       OR (\"HTTP Response Code\" IS NOT NULL AND \"Content-Length\" IS NOT NULL AND\
+    \ \"Actual Response Size\" IS NOT NULL))\n  AND destinationport IN (80, 8080, 443, 8443)\nGROUP BY sourceip, destinationip, destinationport,\
+    \ username, QIDNAME(qid), CATEGORYNAME(category), \"Payload\", \"HTTP Response Code\", \"Content-Length\", \"Actual Response Size\"\nLAST\
+    \ 24 HOURS\n"
+  yara_l: "rule t1659_content_hijack_size_mismatch {\n  meta:\n    author = \"TDL\"\n    description = \"Detects TLS-stripped or plaintext HTTP\
+    \ responses with size mismatch vs Content-Length header indicating potential content hijack\"\n    mitre_attack_tactic = \"Command and Control\"\
+    \n    mitre_attack_technique = \"T1659\"\n    mitre_attack_technique_name = \"Content Injection\"\n    severity = \"HIGH\"\n    \n  events:\n\
+    \    $e.metadata.event_type = \"NETWORK_HTTP\"\n    (\n      $e.network.application_protocol = \"HTTP\" or\n      $e.security_result.summary\
+    \ = \"TLS_STRIPPED\"\n    )\n    $e.network.direction = \"INBOUND\"\n    $e.network.http.response_code >= 200\n    $e.network.http.response_code\
+    \ < 300\n    (\n      (\n        $e.network.http.content_length > 0 and\n        $e.principal.resource.size > 0 and\n        (\n         \
+    \ $e.principal.resource.size < $e.network.http.content_length * 0.9 or\n          $e.principal.resource.size > $e.network.http.content_length\
+    \ * 1.1\n        )\n      ) or\n      $e.security_result.detection_fields.value = \"HASH_MISMATCH\"\n    )\n    $e.principal.ip = $client_ip\n\
+    \    $e.target.ip = $server_ip\n    \n  match:\n    $client_ip, $server_ip over 5m\n    \n  outcome:\n    $risk_score = max(75)\n    \n  condition:\n\
+    \    $e\n}\n"
+  esql: "FROM logs-network.http*, logs-zeek.http*, logs-suricata.http*, packetbeat-*\n| WHERE @timestamp > NOW() - 1 hour\n  AND network.protocol\
+    \ == \"http\"\n  AND http.response.status_code >= 200 AND http.response.status_code < 300\n  AND (\n    (http.response.body.bytes IS NOT NULL\
+    \ AND http.response.headers.content-length IS NOT NULL \n     AND TO_LONG(http.response.headers.content-length) != http.response.body.bytes)\n\
+    \    OR (http.response.body.hash.sha256 IS NOT NULL AND http.response.body.hash.sha256 != event.baseline_hash)\n  )\n| EVAL size_mismatch\
+    \ = CASE(\n    TO_LONG(http.response.headers.content-length) != http.response.body.bytes, \"true\",\n    \"false\"\n  )\n| EVAL hash_mismatch\
+    \ = CASE(\n    http.response.body.hash.sha256 IS NOT NULL AND http.response.body.hash.sha256 != event.baseline_hash, \"true\",\n    \"false\"\
+    \n  )\n| STATS events = COUNT(*) BY source.ip, destination.ip, url.domain, url.path, size_mismatch, hash_mismatch\n| WHERE events > 0\n| KEEP\
+    \ @timestamp, source.ip, destination.ip, url.domain, url.path, events, size_mismatch, hash_mismatch\n"
+  leql: |
+    where(source_json.protocol IN ["http", "HTTP"] AND (source_json.content_length != source_json.actual_response_size OR source_json.response_hash_mismatch=true)) groupby(destination_address, source_address, source_json.url) calculate(count)
+  crowdstrike: |
+    #type=network* (protocol=http OR protocol=https tls_stripped=true OR ssl_version=* encryption=none)
+    | in(field=status_code, values=[200, 201, 202, 203, 204, 206, 301, 302, 304])
+    | response_body_len != content_length OR (known_good_hash=* AND response_hash != known_good_hash)
+    | table([@timestamp, src_ip, dest_ip, dest_port, http_host, http_uri, status_code, content_length, response_body_len, response_hash, known_good_hash])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter app ~= "(?i)(http|web-browsing)" and action = "allow"
+    | filter to_string(bytes_received) != "" and to_string(http_content_length) != ""
+    | alter size_mismatch = to_number(bytes_received) != to_number(http_content_length)
+    | filter size_mismatch = true
+    | fields _time, src_ip, dst_ip, dst_port, app, bytes_received, http_content_length, http_url, action
+  lucene: |
+    (network.protocol:http OR network.transport:tcp) AND (http.response.status_code:[200 TO 299]) AND (_exists_:http.response.body.bytes AND _exists_:http.response.headers.content_length AND NOT http.response.body.bytes:http.response.headers.content_length) OR (event.dataset:"suricata.http" AND http.response.status_code:[200 TO 299] AND alert.signature:*mismatch*) OR (event.dataset:"zeek.http" AND resp_mime_types:* AND NOT tls.established:true AND (_exists_:http.response_body_len AND _exists_:http.content_length AND NOT http.response_body_len:http.content_length))
+  sumo: |
+    _sourceCategory=*Network* OR _sourceCategory=*IDS* OR _sourceCategory=*HTTP* (http OR tls OR ssl)
+    | json field=_raw "protocol" as protocol
+    | json field=_raw "http.response.status" as status_code
+    | json field=_raw "http.response.content_length" as declared_length
+    | json field=_raw "http.response.body_length" as actual_length
+    | json field=_raw "http.response.body_hash" as body_hash
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "http.hostname" as hostname
+    | json field=_raw "http.uri" as uri
+    | where (protocol = "http" OR protocol = "plaintext") AND status_code = "200"
+    | where (declared_length != actual_length AND declared_length != "" AND actual_length != "") OR (body_hash != "" AND body_hash matches "*mismatch*")
+    | fields _messageTime, src_ip, dest_ip, dest_port, hostname, uri, protocol, declared_length, actual_length, body_hash
 pseudo_logic: TLS-stripped or plaintext HTTP response with size mismatch vs. server-declared Content-Length, or known-good page hash mismatch
   from gateway.
 false_positives:
@@ -113,7 +112,7 @@ references:
 - https://attack.mitre.org/techniques/T1659/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

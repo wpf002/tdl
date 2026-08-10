@@ -18,76 +18,103 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 95
 queries:
-  spl: |
-    (index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (ParentImage="*\\w3wp.exe" OR ParentImage="*\\httpd.exe" OR ParentImage="*\\nginx.exe") (Image="*\\cmd.exe" OR Image="*\\powershell.exe" OR Image="*\\bash.exe" OR Image="*\\sh.exe")) OR (index=linux sourcetype IN (syslog, linux_secure) (parent_process="*httpd*" OR parent_process="*nginx*") (process_name IN ("bash", "sh", "cmd")))
-    | stats count values(Image) as spawned_process values(CommandLine) as command_line values(ParentImage) as web_server by _time, ComputerName, host, User
+  spl: '(index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (ParentImage="*\\w3wp.exe" OR ParentImage="*\\httpd.exe"
+    OR ParentImage="*\\nginx.exe") (Image="*\\cmd.exe" OR Image="*\\powershell.exe" OR Image="*\\bash.exe" OR Image="*\\sh.exe")) OR (index=linux
+    sourcetype IN (syslog, linux_secure) (parent_process="*httpd*" OR parent_process="*nginx*") (process_name IN ("bash", "sh", "cmd")))
+
+    | stats count values(Image) as spawned_process values(CommandLine) as command_line values(ParentImage) as web_server by _time, ComputerName,
+    host, User
+
     | table _time, ComputerName, host, User, web_server, spawned_process, command_line, count
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("w3wp.exe", "cmd.exe", "powershell.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('w3wp.exe', 'cmd.exe', 'powershell.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000714 {\n  meta:\n    author = \"TDL\"\n    description = \"Web Shell Indicator: Webserver Spawning Shell\"\n   \
-    \ severity = \"CRITICAL\"\n    tactic = \"TA0003\"\n    technique = \"T1505\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /(w3wp.exe|cmd.exe|powershell.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n\
-    \    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    union
+    (SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 1
+    | where ParentImage has_any ("w3wp.exe", "httpd", "nginx")
+    | where Image has_any ("cmd.exe", "powershell.exe", "bash")
+    | project TimeGenerated, Computer, ParentImage, Image, CommandLine, User),
+    (Event
+    | where TimeGenerated > ago(1h)
+    | where EventID == 1
+    | where EventLog == "Microsoft-Windows-Sysmon/Operational"
+    | extend ParentImage = tostring(EventData.ParentImage)
+    | extend Image = tostring(EventData.Image)
+    | extend CommandLine = tostring(EventData.CommandLine)
+    | extend User = tostring(EventData.User)
+    | where ParentImage has_any ("w3wp.exe", "httpd", "nginx")
+    | where Image has_any ("cmd.exe", "powershell.exe", "bash")
+    | project TimeGenerated, Computer, ParentImage, Image, CommandLine, User)
+    | project TimeGenerated, Computer, ParentImage, Image, CommandLine, User
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, "Parent Process Name", "Process Name", "Process CommandLine", username, sourceip
+    FROM events
+    WHERE ("Parent Process Name" ILIKE '%w3wp.exe%' OR "Parent Process Name" ILIKE '%httpd%' OR "Parent Process Name" ILIKE '%nginx%')
+      AND ("Process Name" ILIKE '%cmd.exe%' OR "Process Name" ILIKE '%powershell.exe%' OR "Process Name" ILIKE '%bash%')
+    LAST 24 HOURS
+  yara_l: |
+    rule webshell_command_execution {
+      meta:
+        author = "TDL"
+        description = "Detects web server processes spawning command interpreters indicating webshell execution"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1505"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          re.regex($e.principal.process.file.full_path, `(?i)\\w3wp\.exe$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)/httpd$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)/nginx$`)
+        )
+        (
+          re.regex($e.target.process.file.full_path, `(?i)\\cmd\.exe$`) or
+          re.regex($e.target.process.file.full_path, `(?i)\\powershell\.exe$`) or
+          re.regex($e.target.process.file.full_path, `(?i)/bash$`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name IN ("w3wp.exe", "cmd.exe", "powershell.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 85
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [w3wp.exe, cmd.exe, powershell.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (w3wp.exe, cmd.exe, powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("w3wp.exe", "cmd.exe", "powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(w3wp.exe OR cmd.exe OR powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("w3wp.exe", "cmd.exe", "powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint.events.process*, logs-windows.sysmon_operational*
+    | WHERE event.category == "process" AND event.type == "start"
+      AND (
+        (TO_LOWER(process.parent.name) IN ("w3wp.exe", "httpd", "nginx") AND TO_LOWER(process.name) IN ("cmd.exe", "powershell.exe", "bash", "sh"))
+      )
+    | KEEP @timestamp, host.name, user.name, process.parent.name, process.parent.executable, process.name, process.executable, process.command_line, process.pid, process.parent.pid
+  leql: |
+    where((parent_process_name ICONTAINS "w3wp.exe" OR parent_process_name ICONTAINS "httpd" OR parent_process_name ICONTAINS "nginx") AND (process_name ICONTAINS "cmd.exe" OR process_name ICONTAINS "powershell.exe" OR process_name ICONTAINS "bash"))
+  crowdstrike: "(event_simpleName=ProcessRollup2 OR EventCode=1) \n(ParentBaseFileName IN [w3wp.exe, httpd, nginx, apache2] OR ParentProcessFileName\
+    \ IN [*w3wp.exe, *httpd, *nginx, *apache2])\n(FileName IN [cmd.exe, powershell.exe, bash, sh] OR ImagePath IN [*cmd.exe, *powershell.exe,\
+    \ *bash, */sh])\n| table([@timestamp, ComputerName, UserName, ParentBaseFileName, ParentProcessFileName, FileName, ImagePath, CommandLine])\n"
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_PROCESS\n| filter (lowercase(actor_process_image_name) contains \"w3wp.exe\"\
+    \ \n         or lowercase(actor_process_image_name) contains \"httpd\" \n         or lowercase(actor_process_image_name) contains \"nginx\"\
+    )\n| filter (lowercase(action_process_image_name) contains \"cmd.exe\" \n         or lowercase(action_process_image_name) contains \"powershell.exe\"\
+    \ \n         or lowercase(action_process_image_name) contains \"bash\")\n| fields _time, agent_hostname, actor_process_image_name, action_process_image_name,\
+    \ action_process_image_command_line, actor_effective_username\n"
+  lucene: |
+    (process.parent.name:(w3wp.exe OR httpd OR nginx OR apache2) OR process.parent.executable:(*w3wp.exe OR *httpd OR *nginx OR *apache2)) AND (process.name:(cmd.exe OR powershell.exe OR bash OR sh) OR process.executable:(*cmd.exe OR *powershell.exe OR *bash OR */sh))
+  sumo: |
+    _sourceCategory=*Sysmon* "1"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ParentImage" as parent_image
+    | json field=_raw "Image" as image
+    | json field=_raw "CommandLine" as command_line
+    | where event_id = "1"
+    | where (parent_image matches "*w3wp.exe" or parent_image matches "*httpd" or parent_image matches "*nginx")
+    | where (image matches "*cmd.exe" or image matches "*powershell.exe" or image matches "*bash")
+    | fields _messageTime, _sourceHost, parent_image, image, command_line
 pseudo_logic: w3wp.exe / httpd / nginx spawning cmd.exe / powershell.exe / bash. Web-shell command execution.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -105,7 +132,7 @@ references:
 - https://attack.mitre.org/techniques/T1505/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'

@@ -19,71 +19,78 @@ queries:
   spl: "index=wineventlog sourcetype=\"WinEventLog:Microsoft-Windows-Sysmon/Operational\" EventCode=1 \n(Image=\"*\\\\gpresult.exe\" CommandLine\
     \ IN (\"*/h*\",\"*/H*\")) OR (Image=\"*\\\\powershell.exe\" (CommandLine=\"*Get-GPO*\" OR CommandLine=\"*Get-GPOReport*\"))\n| search NOT\
     \ ComputerName IN (\"*ADMIN*\", \"*ADM*\")\n| table _time, ComputerName, User, Image, CommandLine, ParentImage\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 1
+    | where (Process has "gpresult.exe" and CommandLine has_any ("/h", "/H"))
+        or (Process has "powershell.exe" and CommandLine has_any ("Get-GPO", "Get-GPOReport"))
+        or (Process has "pwsh.exe" and CommandLine has_any ("Get-GPO", "Get-GPOReport"))
+    | where Computer !contains "admin"
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName
+  aql: |
+    SELECT eventtime, sourceip, username, "Process Name", "Process CommandLine", "Parent Process Name", LOGSOURCENAME(logsourceid) AS host
+    FROM events
+    WHERE ("Process Name" ILIKE '%gpresult.exe%' AND "Process CommandLine" ILIKE '%/h%')
+       OR ("Process Name" ILIKE '%powershell.exe%' AND ("Process CommandLine" ILIKE '%Get-GPO%' OR "Process CommandLine" ILIKE '%Get-GPOReport%'))
+       AND NOT (sourceip IN ('10.0.1.10', '10.0.1.11') OR LOGSOURCENAME(logsourceid) ILIKE '%admin-desktop%')
+    LAST 1 HOURS
+  yara_l: |
+    rule group_policy_discovery_t1615 {
+      meta:
+        author = "TDL"
+        description = "Detects T1615 Group Policy Discovery via gpresult.exe or PowerShell cmdlets outside admin desktops"
+        mitre_attack_tactic = "Discovery"
+        mitre_attack_technique = "T1615"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          (
+            re.regex($e.principal.process.file.full_path, `(?i)\\gpresult\.exe$`) and
+            re.regex($e.principal.process.command_line, `(?i)/h`)
+          ) or
+          (
+            re.regex($e.principal.process.file.full_path, `(?i)\\powershell\.exe$`) and
+            (
+              re.regex($e.principal.process.command_line, `(?i)Get-GPO`) or
+              re.regex($e.principal.process.command_line, `(?i)Get-GPOReport`)
+            )
+          )
+        )
+        not re.regex($e.principal.hostname, `(?i)admin|adm-`)
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $user
 
-    | where process_name in ("gpresult.exe")
+      match:
+        $host, $user over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('gpresult.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000761 {\n  meta:\n    author = \"TDL\"\n    description = \"gpresult / Get-GPO Discovery from Workstation\"\n   \
-    \ severity = \"MEDIUM\"\n    tactic = \"TA0007\"\n    technique = \"T1615\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /(gpresult.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("gpresult.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [gpresult.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (gpresult.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("gpresult.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(gpresult.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("gpresult.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-windows.sysmon_operational*\n| WHERE @timestamp > NOW() - 1 hour \n  AND winlog.event_id == 1\n  AND (\n    (process.name ==\
+    \ \"gpresult.exe\" AND process.command_line LIKE \"*-h*\")\n    OR (process.name == \"powershell.exe\" AND (process.command_line LIKE \"*Get-GPO*\"\
+    \ OR process.command_line LIKE \"*Get-GPOReport*\"))\n  )\n  AND NOT host.name LIKE \"*admin*\"\n| KEEP @timestamp, host.name, user.name,\
+    \ process.name, process.command_line, process.parent.name\n"
+  leql: |
+    where((process_name ICONTAINS "gpresult.exe" AND process_cmd_line ICONTAINS "/h") OR (process_name ICONTAINS "powershell.exe" AND (process_cmd_line ICONTAINS "Get-GPO" OR process_cmd_line ICONTAINS "Get-GPOReport"))) AND NOT (hostname ICONTAINS "admin" OR hostname ICONTAINS "mgmt") groupby(asset, user, process_name, process_cmd_line) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 event_platform=Win (FileName=gpresult.exe (CommandLine=*/h* OR CommandLine=*/H*) OR (FileName=powershell.exe (CommandLine=*Get-GPO* OR CommandLine=*Get-GPOReport*))) ComputerName!=*admin* ComputerName!=*adm* ComputerName!=*management*
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter (lowercase(action_process_image_name) contains "gpresult.exe" and action_process_image_command_line ~= ".*\/h.*")
+       or (lowercase(action_process_image_name) contains "powershell.exe" and (action_process_image_command_line ~= ".*Get-GPO.*" or action_process_image_command_line ~= ".*Get-GPOReport.*"))
+    | filter not (lowercase(agent_hostname) ~= ".*admin.*" or lowercase(agent_hostname) ~= ".*adm.*")
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, actor_process_image_name
+  lucene: |
+    (process.name:gpresult.exe AND process.command_line:*/h*) OR (process.name:powershell.exe AND (process.command_line:*Get-GPO* OR process.command_line:*Get-GPOReport*)) AND NOT host.name:(*admin* OR *desktop*)
+  sumo: "_sourceCategory=*Sysmon* (\"1\" OR \"EventID=1\")\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"Image\" as image\n\
+    | json field=_raw \"CommandLine\" as command_line\n| json field=_raw \"Computer\" as computer\n| where event_id = \"1\"\n| where (image matches\
+    \ \"*\\\\gpresult.exe\" and command_line matches \"*/h*\") \n   or command_line matches \"*Get-GPO*\" \n   or command_line matches \"*Get-GPOReport*\"\
+    \n| where !(computer matches \"*admin*\" or computer matches \"*ADM*\")\n| fields _messageTime, computer, image, command_line\n"
 pseudo_logic: gpresult.exe /h or Get-GPO / Get-GPOReport invoked outside admin desktops. Pre-attack GPO reconnaissance.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -100,7 +107,7 @@ references:
 - https://attack.mitre.org/techniques/T1615/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

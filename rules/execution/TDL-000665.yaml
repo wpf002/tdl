@@ -17,74 +17,85 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security EventCode=4701 (Task_Name="*\\Windows\\SystemRestore\\SR*" OR Task_Name="*\\Windows\\Defender*" OR Task_Name="*\\Windows\\BitLocker*" OR Task_Name="*\\Windows\\WindowsBackup*" OR Task_Name="*\\Windows\\WindowsUpdate*" OR Task_Name="*\\Windows\\UpdateOrchestrator\\Schedule*" OR Task_Name="*\\Windows\\ExploitGuard*")
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security EventCode=4701 (Task_Name="*\\Windows\\SystemRestore\\SR*" OR Task_Name="*\\Windows\\Defender*"
+    OR Task_Name="*\\Windows\\BitLocker*" OR Task_Name="*\\Windows\\WindowsBackup*" OR Task_Name="*\\Windows\\WindowsUpdate*" OR Task_Name="*\\Windows\\UpdateOrchestrator\\Schedule*"
+    OR Task_Name="*\\Windows\\ExploitGuard*")
+
     | table _time, ComputerName, Account_Name, Task_Name
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4701")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4701')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000665 {\n  meta:\n    author = \"TDL\"\n    description = \"High Risk Scheduled Task Disabled\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1053\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id =\
-    \ /(4701)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4701
+    | where TaskName has_any ("\\Windows\\SystemRestore\\SR", "\\Windows\\Windows\\Defender", "\\Windows\\BitLocker", "\\Windows\\WindowsBackup", "\\Windows\\WindowsUpdate", "\\Windows\\UpdateOrchestrator\\Schedule", "\\Windows\\ExploitGuard")
+    | project TimeGenerated, Computer, Account, TaskName, EventData
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Task Name"
+    FROM events
+    WHERE "EventID" = '4701'
+      AND ("Task Name" ILIKE '%\\Windows\\SystemRestore\\SR%'
+           OR "Task Name" ILIKE '%\\Windows\\Defender%'
+           OR "Task Name" ILIKE '%\\Windows\\BitLocker%'
+           OR "Task Name" ILIKE '%\\Windows\\WindowsBackup%'
+           OR "Task Name" ILIKE '%\\Windows\\WindowsUpdate%'
+           OR "Task Name" ILIKE '%\\Windows\\UpdateOrchestrator\\Schedule%'
+           OR "Task Name" ILIKE '%\\Windows\\ExploitGuard%')
+    LAST 24 HOURS
+  yara_l: |
+    rule scheduled_task_disabled_security_features {
+      meta:
+        author = "TDL"
+        description = "Detects disabling of scheduled tasks related to Windows security features - T1053"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1053"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "GENERIC_EVENT"
+        $e.metadata.product_event_type = "4701"
+        $e.metadata.vendor_name = "Microsoft"
+        $e.metadata.product_name = "Windows"
+        (
+          re.regex($e.target.resource.name, `(?i)\\Windows\\SystemRestore\\SR`) or
+          re.regex($e.target.resource.name, `(?i)\\Windows\\Windows\\Defender`) or
+          re.regex($e.target.resource.name, `(?i)\\Windows\\BitLocker`) or
+          re.regex($e.target.resource.name, `(?i)\\Windows\\WindowsBackup`) or
+          re.regex($e.target.resource.name, `(?i)\\Windows\\WindowsUpdate`) or
+          re.regex($e.target.resource.name, `(?i)\\Windows\\UpdateOrchestrator\\Schedule`) or
+          re.regex($e.target.resource.name, `(?i)\\Windows\\ExploitGuard`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND event_id IN ("4701")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4701])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4701)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4701")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4701)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4701")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-system.security*, logs-windows.security*, winlogbeat-*\n| WHERE @timestamp > NOW() - 24 hour \n  AND event.code == \"4701\"\
+    \n  AND (\n    winlog.event_data.TaskName LIKE \"*\\\\Windows\\\\SystemRestore\\\\SR*\"\n    OR winlog.event_data.TaskName LIKE \"*\\\\Windows\\\
+    \\Windows\\\\Defender*\"\n    OR winlog.event_data.TaskName LIKE \"*\\\\Windows\\\\BitLocker*\"\n    OR winlog.event_data.TaskName LIKE \"\
+    *\\\\Windows\\\\WindowsBackup*\"\n    OR winlog.event_data.TaskName LIKE \"*\\\\Windows\\\\WindowsUpdate*\"\n    OR winlog.event_data.TaskName\
+    \ LIKE \"*\\\\Windows\\\\UpdateOrchestrator\\\\Schedule*\"\n    OR winlog.event_data.TaskName LIKE \"*\\\\Windows\\\\ExploitGuard*\"\n  )\n\
+    | KEEP @timestamp, host.name, user.name, winlog.event_data.TaskName, winlog.event_data.TaskContent\n"
+  leql: |
+    where(source_json.EventID=4701 AND (source_json.TaskName ICONTAINS "\\Windows\\SystemRestore\\SR" OR source_json.TaskName ICONTAINS "\\Windows\\Windows\\Defender" OR source_json.TaskName ICONTAINS "\\Windows\\BitLocker" OR source_json.TaskName ICONTAINS "\\Windows\\WindowsBackup" OR source_json.TaskName ICONTAINS "\\Windows\\WindowsUpdate" OR source_json.TaskName ICONTAINS "\\Windows\\UpdateOrchestrator\\Schedule" OR source_json.TaskName ICONTAINS "\\Windows\\ExploitGuard"))
+  crowdstrike: |
+    EventCode=4701 (TaskName=*\\Windows\\SystemRestore\\SR* OR TaskName=*\\Windows\\Defender* OR TaskName=*\\Windows\\BitLocker* OR TaskName=*\\Windows\\WindowsBackup* OR TaskName=*\\Windows\\WindowsUpdate* OR TaskName=*\\Windows\\UpdateOrchestrator\\Schedule* OR TaskName=*\\Windows\\ExploitGuard*) | table([@timestamp, ComputerName, TaskName, UserName])
+  xql: "dataset = xdr_data\n| filter action_evtlog_event_id = 4701\n| filter action_evtlog_message contains \"TaskName\" \n| filter action_evtlog_message\
+    \ ~= \".*\\\\\\\\Windows\\\\\\\\SystemRestore\\\\\\\\SR.*|.*\\\\\\\\Windows\\\\\\\\Defender.*|.*\\\\\\\\Windows\\\\\\\\BitLocker.*|.*\\\\\\\
+    \\Windows\\\\\\\\WindowsBackup.*|.*\\\\\\\\Windows\\\\\\\\WindowsUpdate.*|.*\\\\\\\\Windows\\\\\\\\UpdateOrchestrator\\\\\\\\Schedule.*|.*\\\
+    \\\\\\Windows\\\\\\\\ExploitGuard.*\"\n| fields _time, agent_hostname, actor_effective_username, action_evtlog_message\n"
+  lucene: |
+    event.code:4701 AND TaskName:(*\\Windows\\SystemRestore\\SR* OR *\\Windows\\Windows\\Defender* OR *\\Windows\\BitLocker* OR *\\Windows\\WindowsBackup* OR *\\Windows\\WindowsUpdate* OR *\\Windows\\UpdateOrchestrator\\Schedule* OR *\\Windows\\ExploitGuard*)
+  sumo: |
+    _sourceCategory=*Windows*Security* "4701"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TaskName" as taskname
+    | where event_id = "4701"
+    | where taskname matches "*\\Windows\\SystemRestore\\SR*" or taskname matches "*\\Windows\\Windows\\Defender*" or taskname matches "*\\Windows\\BitLocker*" or taskname matches "*\\Windows\\WindowsBackup*" or taskname matches "*\\Windows\\WindowsUpdate*" or taskname matches "*\\Windows\\UpdateOrchestrator\\Schedule*" or taskname matches "*\\Windows\\ExploitGuard*"
+    | fields _messageTime, _sourceHost, taskname, event_id
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -94,7 +105,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Security Event\nWhere Event ID 4701\nWhere Taskname contains either \n\"\"*\\\\Windows\\\\SystemRestore\\\\SR*\"\" \n\
   \"\"*\\\\Windows\\\\Windows\\\\Defender*\"\" \n\"\"*\\\\Windows\\\\BitLocker*\"\" \n\"\"*\\\\Windows\\\\WindowsBackup*\"\" \n\"\"*\\\\Windows\\\

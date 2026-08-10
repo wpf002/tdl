@@ -22,77 +22,93 @@ queries:
     10.0.0.0/8\",src_ip) OR cidrmatch(\"172.16.0.0/12\",src_ip) OR cidrmatch(\"192.168.0.0/16\",src_ip),1,0)\n| eval is_external_dest=if(NOT (cidrmatch(\"\
     10.0.0.0/8\",dest_ip) OR cidrmatch(\"172.16.0.0/12\",dest_ip) OR cidrmatch(\"192.168.0.0/16\",dest_ip)),1,1)\n| where (dest_port=53 AND is_internal_src=1\
     \ AND is_external_dest=1) OR sourcetype=\"dns\"\n| table _time, src_ip, dest_ip, dest_port, query, action, direction\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where destination_port in ("53")
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "destination_port" IN (''53'')
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: "let SinkholeIPs = dynamic([\"192.0.2.1\", \"198.51.100.1\", \"203.0.113.1\"]); \nlet SinkholeDomains = dynamic([\"sinkhole.example.com\"\
+    , \"blackhole.example.net\"]);\nlet FirewallEvents = \n    CommonSecurityLog\n    | where TimeGenerated > ago(24h)\n    | where DeviceAction\
+    \ !in~ (\"deny\", \"drop\", \"reject\", \"blocked\")\n    | where CommunicationDirection =~ \"Outbound\"\n    | where DestinationPort == 53\n\
+    \    | where DestinationIP in (SinkholeIPs)\n    | extend EventType = \"Firewall\"\n    | project TimeGenerated, SourceIP, DestinationIP,\
+    \ DestinationPort, DeviceVendor, DeviceProduct, DeviceAction, EventType;\nlet DNSEvents = \n    DnsEvents\n    | where TimeGenerated > ago(24h)\n\
+    \    | where IPAddresses has_any (SinkholeIPs) or Name has_any (SinkholeDomains)\n    | extend EventType = \"DNS\"\n    | project TimeGenerated,\
+    \ ClientIP, Name, IPAddresses, EventType;\nunion FirewallEvents, DNSEvents\n| project TimeGenerated, EventType, SourceIP = coalesce(SourceIP,\
+    \ ClientIP), DestinationIP = coalesce(DestinationIP, tostring(IPAddresses)), Domain = Name, DestinationPort\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE (categoryname(category) ILIKE '%firewall%' OR category IN (SELECT category FROM categories WHERE low_level_category_id IN (1001, 1002, 1003)))
+      AND destinationip NOT IN (SELECT * FROM REFERENCE SET 'Internal_IP_Ranges')
+      AND destinationip IN (SELECT * FROM REFERENCE SET 'Known_Sinkhole_IPs')
+      AND destinationport = 53
+    GROUP BY sourceip, destinationip, destinationport, logsourceid
     LAST 1 HOURS
+  yara_l: |
+    rule dns_exfil_via_sinkhole {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects outbound DNS traffic to known sinkhole IPs or domains (T1568)"
+        mitre_attack_tactic = "Exfiltration"
+        mitre_attack_technique = "T1568"
+        severity = "HIGH"
 
-    '
-  yara_l: "rule tdl_tdl_exf_000069 {\n  meta:\n    author = \"TDL\"\n    description = \"DNS Connection to Known Sinkhole\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0010\"\n    technique = \"T1568\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.destination_port\
-    \ = /(53)/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        // Firewall event: outbound DNS to sinkhole IP
+        $firewall.metadata.event_type = "NETWORK_CONNECTION"
+        $firewall.metadata.product_log_id = "FIREWALL"
+        $firewall.network.direction = "OUTBOUND"
+        $firewall.target.port = 53
+        $firewall.target.ip = $dst_ip
+        $firewall.principal.ip = $src_ip
+        net.ip_in_range_cidr($src_ip, "10.0.0.0/8") or
+        net.ip_in_range_cidr($src_ip, "172.16.0.0/12") or
+        net.ip_in_range_cidr($src_ip, "192.168.0.0/16")
+        (
+          $firewall.target.ip in %sinkhole_ips
+        )
 
-    | WHERE @timestamp > NOW() - 1 hour
+        // DNS request event: resolved IP or domain is on sinkhole list
+        $dns.metadata.event_type = "NETWORK_DNS"
+        $dns.principal.ip = $src_ip_dns
+        (
+          $dns.target.ip in %sinkhole_ips or
+          $dns.target.hostname in %sinkhole_domains
+        )
 
-    | WHERE event.category == "network" AND destination_port IN ("53")
+      match:
+        $src_ip, $src_ip_dns over 5m
 
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND destination_port IN [53])
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND destination_port IN (53)
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND destination_port in ("53")
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND destination_port:(53)
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where destination_port IN ("53")
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $firewall or $dns
+    }
+  esql: |
+    FROM logs-network.firewall*, logs-network.dns*
+    | WHERE @timestamp > NOW() - 24 hours
+    | WHERE (
+        (event.category == "network" AND network.direction == "outbound" AND destination.port == 53 AND destination.ip IN ("sinkhole_ip_1", "sinkhole_ip_2", "sinkhole_ip_3"))
+        OR
+        (event.category == "dns" AND (destination.ip IN ("sinkhole_ip_1", "sinkhole_ip_2", "sinkhole_ip_3") OR dns.question.name IN ("sinkhole.domain1.com", "sinkhole.domain2.com", "sinkhole.domain3.com")))
+      )
+    | KEEP @timestamp, source.ip, destination.ip, destination.port, dns.question.name, event.category, network.direction, host.name
+  leql: |
+    where(log_source_type=firewall AND direction=OUTBOUND AND destination_port=53 AND destination_address IN [sinkhole_ip_list]) OR where(log_source_type=dns AND (destination_address IN [sinkhole_ip_list] OR query IN [sinkhole_domain_list]))
+  crowdstrike: |
+    (#type=firewall OR event_simpleName=DnsRequest* OR #type=dns)
+    | case {
+        #type=firewall AND DestinationPort=53 AND (Direction=outbound OR Direction=Outbound) AND DestinationIP=/^(?!10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.).*/ AND DestinationIP IN [SinkholeIPList] ;
+        event_simpleName=DnsRequest* AND (IP4Records IN [SinkholeIPList] OR ContextBaseFileName IN [SinkholeDomainList] OR DomainName IN [SinkholeDomainList]) ;
+        #type=dns AND (answer IN [SinkholeIPList] OR query IN [SinkholeDomainList]) ;
+        * | drop()
+      }
+    | table([@timestamp, ComputerName, SourceIP, DestinationIP, DestinationPort, DomainName, query, Direction, event_simpleName])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter action_source_translated_ip ~= \"^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)\" \n \
+    \ and action_source_translated_ip != null\n  and not action_destination_translated_ip ~= \"^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\\
+    .)\"\n  and action_destination_translated_port = 53\n  and action_destination_translated_ip in (\"192.0.2.1\", \"198.51.100.1\", \"203.0.113.1\"\
+    )\n| fields _time, action_source_translated_ip, action_destination_translated_ip, action_destination_translated_port, agent_hostname\n"
+  lucene: |
+    (event.category:network AND network.direction:outbound AND destination.port:53 AND destination.ip:(sinkhole_ip_1 OR sinkhole_ip_2 OR sinkhole_ip_3)) OR (event.category:dns AND (destination.ip:(sinkhole_ip_1 OR sinkhole_ip_2 OR sinkhole_ip_3) OR dns.question.name:(sinkhole_domain_1 OR sinkhole_domain_2 OR sinkhole_domain_3)))
+  sumo: "_sourceCategory=*Firewall* OR _sourceCategory=*DNS*\n| json field=_raw \"src_ip\" as src_ip\n| json field=_raw \"dest_ip\" as dest_ip\n\
+    | json field=_raw \"dest_port\" as dest_port\n| json field=_raw \"direction\" as direction\n| json field=_raw \"domain\" as domain\n| json\
+    \ field=_raw \"event_type\" as event_type\n| where (event_type matches \"*firewall*\" and direction matches \"*outbound*\" and dest_port =\
+    \ \"53\" and dest_ip in (\"198.18.0.1\", \"198.18.0.2\", \"192.0.2.1\", \"198.51.100.1\", \"203.0.113.1\")) \n   OR (event_type matches \"\
+    *dns*\" and (dest_ip in (\"198.18.0.1\", \"198.18.0.2\", \"192.0.2.1\", \"198.51.100.1\", \"203.0.113.1\") OR domain in (\"sinkhole.example.com\"\
+    , \"malware-sink.net\", \"blackhole.domain\")))\n| fields _messageTime, src_ip, dest_ip, dest_port, domain, event_type, _sourceHost\n"
 false_positives:
 - Authorized pen testing
 - Security research
@@ -102,7 +118,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Firewall Event\nFrom one internal source to one external destination (Outbound)\nWhere the Destination Port is 53\nWhere the\
   \ Destination IP is on a Known Sinkhole IP list\n\n---------------------------------------------------------------------------------------------------------------\n\

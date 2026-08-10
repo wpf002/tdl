@@ -16,73 +16,84 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail eventType=AwsApiCall userIdentity.type=IAMUser
+  spl: 'index=aws sourcetype=aws:cloudtrail eventType=AwsApiCall userIdentity.type=IAMUser
+
     | lookup threatintel_ip_list ip as sourceIPAddress OUTPUT threat_match
+
     | where isnotnull(threat_match)
+
     | table _time, userIdentity.userName, eventName, sourceIPAddress, userAgent, requestParameters, responseElements, threat_match
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000099 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS API Call from Threat Host\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    let ThreatIntelIPs = materialize(
+        ThreatIntelligenceIndicator
+        | where TimeGenerated > ago(14d)
+        | where isnotempty(NetworkIP)
+        | summarize by NetworkIP
+    );
+    AWSCloudTrail
+    | where TimeGenerated > ago(24h)
+    | where EventTypeName == "AwsApiCall"
+    | where UserIdentityType == "IAMUser"
+    | where isnotempty(SourceIpAddress)
+    | join kind=inner (ThreatIntelIPs) on $left.SourceIpAddress == $right.NetworkIP
+    | project TimeGenerated, EventName, UserIdentityArn, UserIdentityPrincipalid, SourceIpAddress, UserAgent, RequestParameters, ResponseElements, AWSRegion, RecipientAccountId
+  aql: |
+    SELECT sourceip, username, qidname(qid) AS event_name, LOGSOURCENAME(logsourceid) AS log_source, "eventName" AS api_call, "userIdentity.type" AS identity_type, COUNT(*) AS event_count
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%cloudtrail%'
+      AND "eventType" = 'AwsApiCall'
+      AND "userIdentity.type" = 'IAMUser'
+      AND sourceip IN (SELECT sourceip FROM events WHERE category IN (SELECT category FROM categories WHERE high_level_category_id = 18000))
+    GROUP BY sourceip, username, qid, logsourceid, "eventName", "userIdentity.type"
+    LAST 24 HOURS
+  yara_l: "rule aws_iam_user_api_call_from_threat_intel_ip {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects AWS\
+    \ API calls from IAM users originating from IPs on threat intelligence lists\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1098\"\n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.metadata.product_name\
+    \ = \"AWS CloudTrail\"\n    $e.metadata.product_event_type = \"AwsApiCall\"\n    $e.principal.user.user_display_name = \"IAMUser\"\n    $e.principal.ip\
+    \ = $source_ip\n    $e.principal.hostname = $host\n    \n    $e.graph.metadata.threat.ip_threat_verdict = \"malicious\"\n    \n  match:\n\
+    \    $source_ip over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-aws.cloudtrail*\n| WHERE event.action == \"AwsApiCall\" \n  AND user.id RLIKE \".*IAMUser.*\"\n  AND threat.indicator.ip ==\
+    \ source.ip\n| KEEP @timestamp, cloud.account.id, user.name, user.id, source.ip, event.action, aws.cloudtrail.user_identity.type, threat.indicator.ip\n"
+  leql: |
+    where(source_json.eventType=AwsApiCall AND source_json.userIdentity.type=IAMUser AND threat_command.indicator_value=source_json.sourceIPAddress)
+  crowdstrike: |
+    #event_type=AwsApiCall userIdentity.type=IAMUser
+    | match(file="threatlists/default.csv", field=sourceIPAddress, include=[sourceIPAddress], strict=false)
+    | table([@timestamp, userIdentity.userName, eventName, sourceIPAddress, userAgent, requestParameters, responseElements, errorCode, errorMessage, awsRegion])
+  xql: "dataset = cloud_audit_logs\n| filter vendor = \"AWS\" and operation_type = \"AwsApiCall\" and identity_type = \"IAMUser\"\n| filter cloud_provider_event_action_name\
+    \ != null\n| alter threat_match = arrayindex(regextract(action_external_hostname, \".*\"), 0)\n| filter action_country in (\"A1\", \"A2\"\
+    ) or action_external_hostname ~= \".*\" and incidr(action_external_ip, \"0.0.0.0/0\")\n| comp threat_intel_match = array_distinct(arrayfilter(threat_feed,\
+    \ \"$.action_external_ip\")) \n| filter threat_intel_match != null and array_length(threat_intel_match) > 0\n| fields _time, identity_name,\
+    \ action_external_ip, cloud_provider_event_action_name, actor_caller_account_id\n```\n\nWait, let me reconsider this with the proper XQL syntax\
+    \ for threat intelligence matching:\n\n```\ndataset = cloud_audit_logs\n| filter vendor = \"AWS\" and operation_type = \"AwsApiCall\" and\
+    \ identity_type = \"IAMUser\"\n| filter action_external_ip != null\n| comp threat_match = if(action_external_ip in threat_feed, \"true\",\
+    \ \"false\")\n| filter threat_match = \"true\"\n| fields _time, identity_name, action_external_ip, cloud_provider_event_action_name, actor_caller_account_id,\
+    \ cloud_provider_event_raw_data\n```\n\nActually, the correct approach for threat intelligence in XQL:\n\ndataset = cloud_audit_logs\n| filter\
+    \ vendor = \"AWS\" and operation_type = \"AwsApiCall\" and identity_type = \"IAMUser\"\n| filter action_external_ip != null\n| filter action_external_ip\
+    \ in threat_feed\n| fields _time, identity_name, action_external_ip, cloud_provider_event_action_name, actor_caller_account_id\n"
+  lucene: |
+    eventName:* AND eventType:AwsApiCall AND userIdentity.type:IAMUser AND _exists_:sourceIPAddress AND threat.indicator.ip:* AND sourceIPAddress:threat.indicator.ip
+    ```
 
-    | WHERE @timestamp > NOW() - 1 hour
+    Wait, let me reconsider. Generic Lucene for CloudTrail with threat intelligence typically requires the source IP field to match against a threat intel list. The exact implementation depends on how threat intel is enriched in your environment. Here's the correct query:
 
-    | WHERE eventName LIKE "%.+%"
+    ```
+    eventType:AwsApiCall AND userIdentity.type:IAMUser AND sourceIPAddress:* AND (tags:"threat_intel" OR threat_feed:true OR threat.matched:true)
+    ```
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+    Actually, the most standard approach in OpenSearch/Graylog with threat intel enrichment:
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    eventType:AwsApiCall AND userIdentity.type:IAMUser AND threat_intel_matched:true
+  sumo: |
+    _sourceCategory=*cloudtrail* eventType=AwsApiCall
+    | json field=_raw "userIdentity.type" as user_type
+    | json field=_raw "sourceIPAddress" as source_ip
+    | where user_type = "IAMUser"
+    | lookup type, actor, raw, threatlevel as malicious_confidence from sumo://threat/cs on threat=source_ip
+    | where type = "ip_address" and !isNull(malicious_confidence)
+    | fields eventTime, eventName, userIdentity.principalId, source_ip, type, actor, threatlevel
 false_positives:
 - Authorized pen testing
 - Security research
@@ -92,7 +103,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 AWS CloudTrail Event
 

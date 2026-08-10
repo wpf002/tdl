@@ -22,68 +22,83 @@ queries:
     \ Name=\"Suspicious inbox forwarding\" \n| table _time, UserId, ClientIP, Name, AlertEntityId, Data\n```\n\nOR\n\n```\nindex=mcas sourcetype=mcas:activity\
     \ activity_type=\"ADMIN_EVENT\" activity_name=\"Create inbox rule\" \n| search NOT target_domain IN (\"your-org-domain.com\") \n| table _time,\
     \ user, ip_address, activity_name, target_domain\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "New-InboxRule"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%New-InboxRule%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000028 {\n  meta:\n    author = \"TDL\"\n    description = \"Suspicious Inbox Forwarding\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0005\"\n    technique = \"T1020\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /New-InboxRule/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%New-InboxRule%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/New-InboxRule/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*New-InboxRule*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "New-InboxRule"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*New-InboxRule*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*New-InboxRule*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    OfficeActivity
+    | where TimeGenerated > ago(24h)
+    | where OfficeWorkload == "Exchange"
+    | where Operation == "New-InboxRule"
+    | extend ForwardingParameters = parse_json(Parameters)
+    | mv-expand ForwardingParameters
+    | extend ParameterName = tostring(ForwardingParameters.Name)
+    | extend ParameterValue = tostring(ForwardingParameters.Value)
+    | where ParameterName in ("ForwardTo", "ForwardAsAttachmentTo", "RedirectTo")
+    | extend ForwardingAddress = ParameterValue
+    | where isnotempty(ForwardingAddress)
+    | extend ForwardingDomain = extract(@"@(.+?)(?:;|$)", 1, ForwardingAddress)
+    | where ForwardingDomain !endswith ".onmicrosoft.com"
+    | where ForwardingDomain !in ("yourdomain.com")
+    | project TimeGenerated, UserId, ClientIP, Operation, ForwardingAddress, ForwardingDomain, OfficeObjectId
+    | union (
+        SecurityAlert
+        | where TimeGenerated > ago(24h)
+        | where AlertName == "Suspicious inbox forwarding"
+        | where ProviderName == "OATP"
+        | project TimeGenerated, CompromisedEntity, AlertName, AlertSeverity, Description
+    )
+    | union (
+        McasShadowItReporting
+        | where TimeGenerated > ago(24h)
+        | where ActivityType == "EVENT_CATEGORY_CREATE_INBOX_RULE"
+        | project TimeGenerated, User = UserName, ActivityType, RawEventData
+    )
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS log_source, "Operation", "ForwardTo", "RedirectTo", "AlertName"
+    FROM events
+    WHERE (("Operation" = 'New-InboxRule' AND ("ForwardTo" IS NOT NULL OR "RedirectTo" IS NOT NULL))
+       OR ("Operation" = 'AlertTriggered' AND "AlertName" ILIKE '%Suspicious inbox forwarding%'))
+      AND LOGSOURCENAME(logsourceid) ILIKE '%Office 365%'
+    LAST 24 HOURS
+  yara_l: "rule o365_suspicious_inbox_forwarding {\n  meta:\n    author = \"TDL\"\n    description = \"Detects suspicious inbox forwarding rules\
+    \ in O365 Exchange\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1020\"\n    severity = \"Medium\"\n \
+    \   \n  events:\n    // O365 Exchange New-InboxRule with external forwarding\n    $exchange.metadata.product_name = \"Microsoft 365\"\n  \
+    \  $exchange.metadata.product_event_type = \"New-InboxRule\"\n    $exchange.target.user.userid = $user\n    (\n      re.regex($exchange.security_result.summary,\
+    \ `(?i)(forward|redirect)`) or\n      re.regex($exchange.additional.fields.value.string_value, `(?i)(forward|redirect)`)\n    )\n    // Exclude\
+    \ internal domains - adjust these to match your organization\n    not re.regex($exchange.security_result.summary, `(?i)@(yourcompany\\.com|yourdomain\\\
+    .net)`)\n    not re.regex($exchange.additional.fields.value.string_value, `(?i)@(yourcompany\\.com|yourdomain\\.net)`)\n    \n    // O365\
+    \ ATP Alert for suspicious inbox forwarding\n    $atp.metadata.product_name = \"Microsoft 365\"\n    $atp.metadata.product_event_type = \"\
+    AlertTriggered\"\n    (\n      re.regex($atp.security_result.summary, `(?i)suspicious inbox forwarding`) or\n      re.regex($atp.metadata.description,\
+    \ `(?i)suspicious inbox forwarding`)\n    )\n    $atp.target.user.userid = $user_atp\n    \n    // MCAS Event\n    $mcas.metadata.product_name\
+    \ = \"Microsoft Cloud App Security\"\n    $mcas.target.user.userid = $user_mcas\n\n  match:\n    $user over 1h\n    \n  condition:\n    $exchange\
+    \ or $atp or $mcas\n}\n"
+  esql: "FROM logs-o365.audit*\n| WHERE @timestamp > NOW() - 24 hours\n  AND (\n    (event.action == \"New-InboxRule\" \n     AND o365.audit.Parameters.ForwardTo\
+    \ IS NOT NULL \n     AND NOT o365.audit.Parameters.ForwardTo LIKE \"*@yourorganization.com\")\n    OR\n    (event.action == \"New-InboxRule\"\
+    \ \n     AND o365.audit.Parameters.RedirectTo IS NOT NULL \n     AND NOT o365.audit.Parameters.RedirectTo LIKE \"*@yourorganization.com\"\
+    )\n    OR\n    (event.action == \"AlertTriggered\" \n     AND o365.audit.Name == \"Suspicious inbox forwarding\")\n    OR\n    (event.dataset\
+    \ == \"o365.audit\" \n     AND o365.audit.Source == \"Microsoft Cloud App Security\")\n  )\n| KEEP @timestamp, event.action, user.name, o365.audit.Parameters.ForwardTo,\
+    \ o365.audit.Parameters.RedirectTo, o365.audit.Name, o365.audit.Source, host.name\n"
+  leql: |
+    where(source_json.Operation="New-InboxRule" AND source_json.ForwardTo NOT IN ["yourdomain.com", "yourorgdomain.com"])
+  crowdstrike: |
+    (#type=O365Exchange Operation="New-InboxRule" ForwardTo=* NOT ForwardTo=*@yourorganization.com)
+    OR (#type=O365ATP Operation="AlertTriggered" Name="Suspicious inbox forwarding")
+    OR (#type=MCAS Operation=*forward*)
+    | table([@timestamp, Operation, Name, ForwardTo, ForwardAsAttachmentTo, RedirectTo, UserPrincipalName, UserId, ComputerName])
+  xql: |
+    dataset = o365_audit_logs
+    | filter Operation in ("New-InboxRule", "AlertTriggered")
+    | filter (Operation = "New-InboxRule" and (ForwardTo != null or RedirectTo != null) and not (ForwardTo ~= "@(yourorgdomain\.com|yourdomain\.onmicrosoft\.com)" or RedirectTo ~= "@(yourorgdomain\.com|yourdomain\.onmicrosoft\.com)")) or (Operation = "AlertTriggered" and AlertName = "Suspicious inbox forwarding")
+    | fields _time, UserId, Operation, Parameters, ForwardTo, RedirectTo, AlertName, ClientIP
+  lucene: |
+    (Operation:"New-InboxRule" AND NOT ForwardingSmtpAddress:*@yourdomain.com AND NOT RedirectTo:*@yourdomain.com AND NOT ForwardAsAttachmentTo:*@yourdomain.com) OR (Operation:"AlertTriggered" AND Name:"Suspicious inbox forwarding") OR (Workload:"Microsoft Cloud App Security" AND Operation:"New-InboxRule")
+  sumo: |
+    _sourceCategory=*Exchange* OR _sourceCategory=*O365* OR _sourceCategory=*Office365*
+    | json field=_raw "Operation" as operation
+    | json field=_raw "Parameters" as parameters
+    | json field=_raw "Name" as alert_name
+    | where (operation = "New-InboxRule" and parameters matches "*ForwardTo*" and NOT (parameters matches "*@yourdomain.com*" OR parameters matches "*@yourorg.com*"))
+       OR (operation = "AlertTriggered" and alert_name = "Suspicious inbox forwarding")
+       OR (operation matches "*InboxRule*" and parameters matches "*Redirect*" and NOT (parameters matches "*@yourdomain.com*" OR parameters matches "*@yourorg.com*"))
+    | fields _messageTime, _sourceHost, operation, parameters, alert_name
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -93,7 +108,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 O365 Exchange event \nWhere the operation is \"New-InboxRule\"\nWhere the Forward/Redirect Target Domain is not owned by the\
   \ organization\n\n---------------------------------------------------------------------------------------------------------------\n\n1 O365\

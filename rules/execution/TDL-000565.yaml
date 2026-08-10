@@ -15,72 +15,95 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=* sourcetype=kube:* OR sourcetype=kubernetes:* (verb=delete OR objectRef.resource=cronjob) objectRef.subresource=null OR objectRef.resource=cronjob
+  spl: 'index=* sourcetype=kube:* OR sourcetype=kubernetes:* (verb=delete OR objectRef.resource=cronjob) objectRef.subresource=null OR objectRef.resource=cronjob
+
     | where (verb="delete") OR (objectRef.resource="cronjob" AND (objectRef.subresource="" OR isnull(objectRef.subresource)) OR objectRef.resource="cronjob")
+
     | table _time, user.username, verb, objectRef.resource, objectRef.subresource, objectRef.name, objectRef.namespace, sourceIPs{}
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000565 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubernetes Cronjob Deleted\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1053\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    KubernetesAuditLogs
+    | where TimeGenerated > ago(1h)
+    | where Verb == "delete"
+    | where ObjectRef.resource == "cronjobs"
+    | where ObjectRef.subresource == ""
+    | project TimeGenerated, User.username, ObjectRef.namespace, ObjectRef.name, ObjectRef.resource, Verb, ResponseStatus.code, SourceIPs
+  aql: |
+    SELECT username, sourceip, "ObjectRef.Resource" AS resource, "ObjectRef.Name" AS object_name, "Verb", "ObjectRef.Namespace" AS namespace, COUNT(*) AS event_count
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%kubernetes%' OR categoryname(category) ILIKE '%kubernetes%')
+      AND (
+        ("Verb" = 'delete' AND "ObjectRef.Resource" = 'cronjob' AND ("ObjectRef.Subresource" IS NULL OR "ObjectRef.Subresource" = ''))
+        OR
+        ("ObjectRef.Resource" = 'cronjob' AND "ObjectRef.Subresource" = 'status')
+      )
+    GROUP BY username, sourceip, "ObjectRef.Resource", "ObjectRef.Name", "Verb", "ObjectRef.Namespace"
+    LAST 1 HOURS
+  yara_l: |
+    rule kubernetes_cronjob_deletion_or_modification {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects Kubernetes cronjob deletion or modification - T1053 Execution"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1053"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Kubernetes"
+        (
+          $e.metadata.event_type = "RESOURCE_DELETION"
+          or
+          (
+            $e.target.resource.type = "cronjob"
+            $e.target.resource.attribute.labels.subresource = ""
+          )
+          or
+          (
+            $e.target.resource.attribute.labels.subresource = "cronjob"
+          )
+        )
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $resource
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user, $resource over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-kubernetes.audit*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND (
+        kubernetes.audit.verb == "delete"
+        OR (
+          kubernetes.audit.objectRef.resource == "cronjob"
+          AND kubernetes.audit.objectRef.subresource IS NULL
+        )
+        OR kubernetes.audit.objectRef.subresource == "cronjob"
+      )
+    | KEEP @timestamp, kubernetes.audit.user.username, kubernetes.audit.verb, kubernetes.audit.objectRef.resource, kubernetes.audit.objectRef.subresource, kubernetes.audit.objectRef.name, kubernetes.audit.objectRef.namespace, kubernetes.audit.sourceIPs
+  leql: |
+    where((source_json.verb="delete" AND source_json.objectRef.resource="cronjob" AND source_json.objectRef.subresource=NULL) OR (source_json.objectRef.resource="cronjob" AND source_json.objectRef.subresource="cronjob"))
+  crowdstrike: |
+    #type=k8s:audit
+    | verb=delete resource=*cronjob* Subresource!=*
+    | table([@timestamp, user.username, objectRef.namespace, objectRef.name, verb, resource, Subresource, responseStatus.code])
+  xql: |
+    dataset = k8s_audit_log_raw
+    | filter verb = "delete" and objectRef_resource = "cronjobs" and objectRef_subresource = null
+    | fields _time, user_username, objectRef_namespace, objectRef_name, verb, objectRef_resource, sourceIPs
+  lucene: |
+    (verb:delete AND resource:cronjob AND NOT _exists_:subresource) OR (resource:cronjob AND subresource:cronjob)
+  sumo: |
+    _sourceCategory=*kubernetes* OR _sourceCategory=*k8s*
+    | json field=_raw "verb" as verb
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "objectRef.subresource" as subresource
+    | where (verb = "delete" AND resource = "cronjobs" AND (isNull(subresource) OR subresource = ""))
+       OR (resource = "cronjobs" AND (isNull(subresource) OR subresource = ""))
+    | fields _messageTime, verb, resource, subresource, _sourceHost
 false_positives:
 - Security software
 - Authorized admin tools
@@ -90,7 +113,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere Verb is \"delete\"\nOR\n             Where Resource is \"cronjob\"\n             Where Subresource is\
   \ NULL\n\n             Where Subresource is \"cronjob\""

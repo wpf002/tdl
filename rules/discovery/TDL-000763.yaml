@@ -29,71 +29,76 @@ queries:
     , \"*/wireshark\"))\n| eval process=coalesce(process_name, Image, ProcessName)\n| eval command=coalesce(CommandLine, command_line, ProcessCommandLine)\n\
     | eval username=coalesce(user, User, SourceUser, Account_Name)\n| eval hostname=coalesce(host, ComputerName, hostname)\n| table _time, hostname,\
     \ username, process, command, ParentImage\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    DeviceProcessEvents
+    | where TimeGenerated > ago(24h)
+    | where FileName in~ ("tcpdump","tshark","windump","pktmon.exe","dumpcap","dumpcap.exe")
+    | where InitiatingProcessFileName !in~ ("wireshark.exe","wireshark","nmap","nmap.exe","ansible-playbook","ansible","puppet","chef-client","saltstack")
+    | where InitiatingProcessFolderPath !has_any ("/opt/neteng","/usr/local/netmon","C:\\NetTools","C:\\Program Files\\Network")
+    | where AccountName !in~ ("netadmin","neteng","wireshark","monitoring")
+    | project TimeGenerated, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessFolderPath
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process Name", "Process CommandLine", "Parent Process Name"
+    FROM events
+    WHERE ("Process Name" ILIKE '%tcpdump%' OR "Process Name" ILIKE '%tshark%' OR "Process Name" ILIKE '%windump%' OR "Process Name" ILIKE '%pktmon%' OR "Process Name" ILIKE '%dumpcap%' OR "Process CommandLine" ILIKE '%tcpdump%' OR "Process CommandLine" ILIKE '%tshark%' OR "Process CommandLine" ILIKE '%windump%' OR "Process CommandLine" ILIKE '%pktmon%' OR "Process CommandLine" ILIKE '%dumpcap%')
+      AND username NOT IN ('root', 'SYSTEM', 'netadmin', 'network_engineer')
+      AND "Parent Process Name" NOT ILIKE '%wireshark%'
+    LAST 1 HOURS
+  yara_l: |
+    rule network_sniffing_tools_t1040 {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects execution of network packet capture tools (tcpdump, tshark, windump, pktmon, dumpcap) used for Network Sniffing (T1040)"
+        mitre_attack_technique = "T1040"
+        mitre_attack_tactic = "Discovery"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          re.regex($e.target.process.file.full_path, `(?i)(tcpdump|tshark|windump|pktmon|dumpcap)(\.exe)?$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)(tcpdump|tshark|windump|pktmon|dumpcap)(\.exe)?$`)
+        )
+        $e.principal.hostname = $host
+        $e.target.process.file.full_path = $path
 
-    | where process_name matches regex ".+"
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000763 {\n  meta:\n    author = \"TDL\"\n    description = \"Packet Capture Tool Execution\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0007\"\n    technique = \"T1040\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-endpoint.events.process*, logs-windows.sysmon_operational*, logs-system.security*\n| WHERE @timestamp > NOW() - 1 hour \n \
+    \ AND (\n    TO_LOWER(process.name) IN (\"tcpdump\", \"tshark\", \"windump\", \"pktmon.exe\", \"dumpcap\", \"tshark.exe\", \"tcpdump.exe\"\
+    , \"windump.exe\", \"dumpcap.exe\")\n    OR TO_LOWER(process.executable) LIKE \"*tcpdump*\"\n    OR TO_LOWER(process.executable) LIKE \"*tshark*\"\
+    \n    OR TO_LOWER(process.executable) LIKE \"*windump*\"\n    OR TO_LOWER(process.executable) LIKE \"*pktmon*\"\n    OR TO_LOWER(process.executable)\
+    \ LIKE \"*dumpcap*\"\n  )\n  AND NOT (\n    TO_LOWER(user.name) IN (\"neteng\", \"netadmin\", \"wireshark\", \"network\", \"sysadmin\")\n\
+    \    OR TO_LOWER(process.working_directory) LIKE \"*wireshark*\"\n    OR TO_LOWER(process.working_directory) LIKE \"*network tools*\"\n  \
+    \  OR TO_LOWER(process.parent.name) IN (\"ansible\", \"puppet\", \"chef-client\", \"saltstack\")\n  )\n| STATS event_count = COUNT(*) BY host.name,\
+    \ user.name, process.name, process.command_line, process.parent.name\n| KEEP @timestamp, host.name, user.name, process.name, process.command_line,\
+    \ process.parent.name, event_count\n"
+  leql: |
+    where((process_name ICONTAINS "tcpdump" OR process_name ICONTAINS "tshark" OR process_name ICONTAINS "windump" OR process_name ICONTAINS "pktmon" OR process_name ICONTAINS "dumpcap") AND NOT (parent_process_name ICONTAINS "wireshark" OR parent_process_name ICONTAINS "network" OR parent_process_name ICONTAINS "monitoring" OR user ICONTAINS "netadmin" OR user ICONTAINS "wireshark"))
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 (FileName=*tcpdump* OR FileName=*tshark* OR FileName=*windump* OR FileName=*pktmon* OR FileName=*dumpcap*)
+    NOT (ParentBaseFileName=*monitor* OR ParentBaseFileName=*ansible* OR ParentBaseFileName=*puppet* OR ParentBaseFileName=*chef* OR ParentBaseFileName=*salt* OR ParentBaseFileName=*wireshark* OR FilePath=*/opt/splunk/* OR FilePath=*/usr/lib/nagios/* OR FilePath=*/usr/lib/zabbix/*)
+    | table([@timestamp, ComputerName, UserName, FileName, FilePath, CommandLine, ParentBaseFileName, SHA256HashData])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter action_process_image_name in ("tcpdump", "tshark", "windump", "pktmon.exe", "dumpcap", "tcpdump.exe", "tshark.exe", "windump.exe", "dumpcap.exe")
+       or lowercase(action_process_image_name) in ("tcpdump", "tshark", "windump", "pktmon", "dumpcap")
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, action_process_image_path
+  lucene: |
+    (process.name:(tcpdump OR tshark OR windump OR pktmon OR dumpcap OR tcpdump.exe OR tshark.exe OR windump.exe OR pktmon.exe OR dumpcap.exe) OR process.executable:(*tcpdump* OR *tshark* OR *windump* OR *pktmon* OR *dumpcap*)) AND NOT (process.parent.name:(wireshark OR wireshark.exe OR nmap OR nmap.exe OR nessus OR qualys) OR user.name:(netadmin OR networkadmin OR sysadmin) OR process.working_directory:(*Wireshark* OR *NetworkMonitor* OR *Program\ Files*))
+  sumo: |
+    _sourceCategory=* (tcpdump OR tshark OR windump OR pktmon OR dumpcap)
+    | parse regex "(?i)\"?(CommandLine|command|COMMAND_LINE|cmd)\"?\s*[:=]\s*\"?(?<command_line>[^\"]+)" nodrop
+    | parse regex "(?i)\"?(NewProcessName|process_name|ProcessName|process|exe)\"?\s*[:=]\s*\"?(?<process_path>[^\"]+)" nodrop
+    | parse regex "(?i)\"?(Image)\"?\s*[:=]\s*\"?(?<image_path>[^\"]+)" nodrop
+    | where command_line matches "*tcpdump*" OR command_line matches "*tshark*" OR command_line matches "*windump*" OR command_line matches "*pktmon*" OR command_line matches "*dumpcap*" OR process_path matches "*tcpdump*" OR process_path matches "*tshark*" OR process_path matches "*windump*" OR process_path matches "*pktmon*" OR process_path matches "*dumpcap*" OR image_path matches "*tcpdump*" OR image_path matches "*tshark*" OR image_path matches "*windump*" OR image_path matches "*pktmon*" OR image_path matches "*dumpcap*"
+    | where !(command_line matches "*wireshark*" OR command_line matches "*/opt/neteng/*" OR command_line matches "*C:\\Program Files\\NetworkTools\\*" OR process_path matches "*/opt/neteng/*" OR process_path matches "*C:\\Program Files\\NetworkTools\\*")
+    | fields _messageTime, _sourceHost, process_path, image_path, command_line
 pseudo_logic: tcpdump / tshark / windump / pktmon / dumpcap launched outside known network-engineering context.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -111,7 +116,7 @@ references:
 - https://attack.mitre.org/techniques/T1040/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

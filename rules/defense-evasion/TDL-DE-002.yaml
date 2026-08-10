@@ -13,78 +13,99 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 85
 queries:
-  spl: |
-    index=endpoint sourcetype=Sysmon EventCode=8 process_name="*.*"
-    | search NOT (process_name IN ("*\\devenv.exe", "*\\WinDbg.exe", "*\\WinDbgX.exe", "*\\msvsmon.exe") OR SourceImage IN ("*\\devenv.exe", "*\\WinDbg.exe", "*\\WinDbgX.exe", "*\\msvsmon.exe", "*\\MsMpEng.exe", "*\\SenseCE.exe", "*\\SenseIR.exe", "*\\CSFalconService.exe", "*\\CylanceSvc.exe", "*\\CarbonBlack.exe"))
-    | stats dc(ComputerName) as distinct_hosts, dc(User) as distinct_users, values(ComputerName) as hosts, values(User) as users, count by SourceImage, ParentImage, ParentCommandLine
+  spl: 'index=endpoint sourcetype=Sysmon EventCode=8 process_name="*.*"
+
+    | search NOT (process_name IN ("*\\devenv.exe", "*\\WinDbg.exe", "*\\WinDbgX.exe", "*\\msvsmon.exe") OR SourceImage IN ("*\\devenv.exe", "*\\WinDbg.exe",
+    "*\\WinDbgX.exe", "*\\msvsmon.exe", "*\\MsMpEng.exe", "*\\SenseCE.exe", "*\\SenseIR.exe", "*\\CSFalconService.exe", "*\\CylanceSvc.exe", "*\\CarbonBlack.exe"))
+
+    | stats dc(ComputerName) as distinct_hosts, dc(User) as distinct_users, values(ComputerName) as hosts, values(User) as users, count by SourceImage,
+    ParentImage, ParentCommandLine
+
     | where count >= 1
+
     | rename SourceImage as process_name, ParentImage as parent_process_name, ParentCommandLine as command_line
+
     | table _time, process_name, parent_process_name, command_line, distinct_hosts, distinct_users, hosts, users, count
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_002 {\n  meta:\n    author = \"TDL\"\n    description = \"Process Injection via CreateRemoteThread\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1055.001\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    Event
+    | where TimeGenerated > ago(90d)
+    | where Source == "Microsoft-Windows-Sysmon" and EventID == 8
+    | extend EventData = parse_xml(EventData)
+    | extend SourceProcessName = tostring(EventData.DataItem.EventData.Data[6]["#text"])
+    | extend SourceImage = tostring(EventData.DataItem.EventData.Data[4]["#text"])
+    | extend TargetImage = tostring(EventData.DataItem.EventData.Data[5]["#text"])
+    | extend SourceCommandLine = tostring(EventData.DataItem.EventData.Data[10]["#text"])
+    | extend ParentImage = tostring(EventData.DataItem.EventData.Data[20]["#text"])
+    | extend SourceUser = tostring(EventData.DataItem.EventData.Data[3]["#text"])
+    | extend process_name = tostring(split(SourceImage, '\\')[-1])
+    | extend parent_process_name = tostring(split(ParentImage, '\\')[-1])
+    | extend command_line = SourceCommandLine
+    | where isnotempty(process_name)
+    | where process_name !in~ ("devenv.exe", "windbg.exe", "msvsmon.exe", "cdb.exe", "msbuild.exe")
+    | where process_name !in~ ("MsMpEng.exe", "MsSense.exe", "SenseIR.exe", "SenseCncProxy.exe", "SenseNdr.exe", "SenseSampleUploader.exe")
+    | summarize distinct_hosts = dcount(Computer), distinct_users = dcount(SourceUser), event_count = count(), first_seen = min(TimeGenerated), last_seen = max(TimeGenerated), computers = make_set(Computer), users = make_set(SourceUser) by process_name, parent_process_name, command_line, SourceImage, TargetImage
+    | where event_count >= 1
+    | project first_seen, last_seen, process_name, parent_process_name, command_line, SourceImage, TargetImage, distinct_hosts, distinct_users, event_count, computers, users
+  aql: "SELECT \n    \"Process Name\" AS process_name,\n    \"Parent Process Name\" AS parent_process_name,\n    \"Process CommandLine\" AS command_line,\n\
+    \    UNIQUECOUNT(LOGSOURCENAME(logsourceid)) AS distinct_hosts,\n    UNIQUECOUNT(username) AS distinct_users,\n    COUNT(*) AS event_count,\n\
+    \    FIRST(eventtime) AS first_seen,\n    LAST(eventtime) AS last_seen\nFROM events\nWHERE \"EventID\" = '8'\n    AND \"Process Name\" IS\
+    \ NOT NULL\n    AND \"Process Name\" != ''\n    AND \"Process Name\" NOT ILIKE '%devenv.exe%'\n    AND \"Process Name\" NOT ILIKE '%windbg.exe%'\n\
+    \    AND \"Process Name\" NOT ILIKE '%x64dbg.exe%'\n    AND \"Process Name\" NOT ILIKE '%x32dbg.exe%'\n    AND \"Process Name\" NOT ILIKE\
+    \ '%ollydbg.exe%'\n    AND \"Process Name\" NOT ILIKE '%msvsmon.exe%'\n    AND \"Process Name\" NOT ILIKE '%defender%'\n    AND \"Process\
+    \ Name\" NOT ILIKE '%mcafee%'\n    AND \"Process Name\" NOT ILIKE '%symantec%'\n    AND \"Process Name\" NOT ILIKE '%carbon%black%'\n    AND\
+    \ \"Process Name\" NOT ILIKE '%crowdstrike%'\n    AND \"Process Name\" NOT ILIKE '%cylance%'\n    AND \"Process Name\" NOT ILIKE '%sentinel%'\n\
+    GROUP BY \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nHAVING event_count >= 1\nLAST 24 HOURS\n"
+  yara_l: "rule sysmon_createremotethread_t1055_001 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects Sysmon CreateRemoteThread events\
+    \ (Event ID 8) indicating potential process injection (T1055.001)\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique\
+    \ = \"T1055.001\"\n    severity = \"HIGH\"\n\n  events:\n    $e.metadata.product_event_type = \"8\"\n    $e.metadata.event_type = \"PROCESS_INJECTION\"\
+    \n    $e.principal.process.file.full_path = $process_name\n    $e.principal.process.parent_process.file.full_path = $parent_process_name\n\
+    \    $e.principal.process.command_line = $command_line\n    $e.principal.hostname = $host\n    $e.principal.user.userid = $user\n    \n  \
+    \  not re.regex($process_name, `(?i)(devenv\\.exe|windbg\\.exe|msvsmon\\.exe|vsjitdebugger\\.exe)$`)\n    not re.regex($process_name, `(?i)(mbam\\\
+    .exe|mpcmdrun\\.exe|msmpeng\\.exe|nissrv\\.exe|carbonblack|crowdstrike|tanium|defender|cylance|sentinelone|mcafee|symantec|trellix|cortex)`)\n\
+    \n  match:\n    $process_name, $parent_process_name, $command_line over 24h\n\n  outcome:\n    $risk_score = 75\n    $distinct_hosts = count_distinct($host)\n\
+    \    $distinct_users = count_distinct($user)\n\n  condition:\n    #e >= 1\n}\n"
+  esql: "FROM logs-windows.sysmon_operational*\n| WHERE winlog.event_id == 8\n  AND process.name RLIKE \".+\"\n  AND NOT (\n    TO_LOWER(process.name)\
+    \ LIKE \"*devenv.exe\" OR\n    TO_LOWER(process.name) LIKE \"*windbg.exe\" OR\n    TO_LOWER(process.name) LIKE \"*cdb.exe\" OR\n    TO_LOWER(process.name)\
+    \ LIKE \"*ntsd.exe\" OR\n    TO_LOWER(process.parent.name) LIKE \"*devenv.exe\" OR\n    TO_LOWER(process.parent.name) LIKE \"*windbg.exe\"\
+    \n  )\n| STATS \n    event_count = COUNT(*),\n    distinct_hosts = COUNT_DISTINCT(host.name),\n    distinct_users = COUNT_DISTINCT(user.name)\n\
+    \  BY process.name, process.parent.name, process.command_line\n| WHERE event_count >= 1\n| KEEP process.name, process.parent.name, process.command_line,\
+    \ event_count, distinct_hosts, distinct_users\n"
+  leql: |
+    where(source_json.EventID=8 AND process_name=/^.+$/ AND process_name NOT ICONTAINS "devenv.exe" AND process_name NOT ICONTAINS "windbg.exe" AND process_name NOT ICONTAINS "msvsmon.exe" AND process_name NOT ICONTAINS "msbuild.exe" AND process_name NOT ICONTAINS "vsjitdebugger.exe" AND parent_process_name NOT ICONTAINS "devenv.exe" AND parent_process_name NOT ICONTAINS "windbg.exe") groupby(process_name, parent_process_name, process_cmd_line) calculate(unique:asset)
+  crowdstrike: |
+    EventCode=8 SourceImage=/.+/
+    | regex("^(?!.*(?:devenv\.exe|WinDbg\.exe|msvsmon\.exe|MsMpEng\.exe|SenseIR\.exe|SenseCncProxy\.exe|CSFalconContainer\.exe|CSFalconService\.exe)).*$", field=SourceImage, as=SourceImage)
+    | groupBy([SourceImage, ParentImage, CommandLine], function=[count(ComputerName, distinct=true, as=distinct_hosts), count(User, distinct=true, as=distinct_users), count(as=event_count)])
+    | event_count >= 1
+    | table([@timestamp, SourceImage, ParentImage, CommandLine, distinct_hosts, distinct_users, event_count])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 8
+    | filter action_process_image_name ~= ".+"
+    | filter actor_process_image_name not in ("devenv.exe", "windbg.exe", "x64dbg.exe", "x32dbg.exe", "msbuild.exe")
+    | filter action_process_image_name not in ("MsMpEng.exe", "SenseIR.exe", "SenseCncProxy.exe", "MsSense.exe", "cyserver.exe", "CylanceSvc.exe")
+    | comp count() as event_count, count_distinct(agent_hostname) as distinct_hosts, count_distinct(actor_effective_username) as distinct_users by action_process_image_name, actor_process_image_name, action_process_image_command_line
+    | filter event_count >= 1
+    | fields action_process_image_name, actor_process_image_name, action_process_image_command_line, event_count, distinct_hosts, distinct_users
+  lucene: |
+    winlog.event_id:8 AND process.name:*.* AND NOT (process.name:(*devenv.exe* OR *windbg.exe* OR *msvsmon.exe* OR *vsjitdebugger.exe* OR *MsMpEng.exe* OR *SenseIR.exe* OR *SenseCncProxy.exe* OR *SenseNdr.exe* OR *TaniumClient.exe* OR *cb.exe* OR *RepMgr.exe* OR *CylanceSvc.exe* OR *CSFalconService.exe*))
+  sumo: |
+    _sourceCategory=*Sysmon* "8"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "SourceImage" as process_name
+    | json field=_raw "SourceParentImage" as parent_process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "SourceUser" as user
+    | json field=_raw "Computer" as host
+    | where event_id = "8"
+    | where !isEmpty(process_name) and process_name matches "*"
+    | where !(process_name matches "*devenv.exe" or process_name matches "*windbg.exe" or process_name matches "*vshost.exe" or process_name matches "*msbuild.exe")
+    | where !(process_name matches "*MsMpEng.exe" or process_name matches "*SenseIR.exe" or process_name matches "*CylanceSvc.exe" or process_name matches "*cb.exe" or process_name matches "*TaniumClient.exe")
+    | count_distinct(host) as distinct_hosts, count_distinct(user) as distinct_users, count as event_count by process_name, parent_process_name, command_line
+    | where event_count >= 1
+    | fields process_name, parent_process_name, command_line, distinct_hosts, distinct_users, event_count
 false_positives:
 - Debugging tools
 - AV/EDR products
@@ -94,7 +115,7 @@ tags:
 author: TDL
 created: '2024-01-26'
 test_method: purple_team
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
 - Inspect the parent → child process tree, command line arguments, and code-signing status — distinguish administrative tooling from adversary

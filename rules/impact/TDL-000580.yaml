@@ -19,71 +19,61 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=kubernetes sourcetype=kube:events object.kind="Deployment" verb="delete"
+  spl: 'index=kubernetes sourcetype=kube:events object.kind="Deployment" verb="delete"
+
     | table _time, user.username, object.metadata.name, object.metadata.namespace, verb, sourceIPs{}
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_000580 {\n  meta:\n    author = \"TDL\"\n    description = \"Deployment Deleted From Kubernetes Cluster\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0040\"\n    technique = \"T1498\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    KubernetesEvents
+    | where TimeGenerated > ago(1h)
+    | where ObjectKind =~ "Deployment"
+    | where Verb =~ "delete"
+    | project TimeGenerated, Namespace, ObjectName, Verb, ObjectKind, User, SourceIPs, UserAgent, ResponseCode, RequestURI
+  aql: "SELECT eventtime, username, sourceip, \"Resource\", \"Verb\", LOGSOURCENAME(logsourceid) AS source\nFROM events\nWHERE \"Resource\" =\
+    \ 'deployments' \n  AND \"Verb\" = 'delete'\nLAST 24 HOURS\n"
+  yara_l: |
+    rule kubernetes_deployment_deletion {
+      meta:
+        author = "TDL"
+        description = "Detects deletion of Kubernetes deployments - potential DoS activity (T1498)"
+        mitre_attack_tactic = "Impact"
+        mitre_attack_technique = "T1498"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "RESOURCE_DELETION"
+        $e.target.resource.type = "deployments"
+        $e.target.resource.attribute.labels["verb"] = "delete"
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $deployment
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-kubernetes.audit*\n| WHERE @timestamp > NOW() - 1 hour \n  AND kubernetes.audit.objectRef.resource == \"deployments\" \n  AND\
+    \ kubernetes.audit.verb == \"delete\"\n| KEEP @timestamp, kubernetes.audit.user.username, kubernetes.audit.objectRef.namespace, kubernetes.audit.objectRef.name,\
+    \ kubernetes.audit.sourceIPs, kubernetes.audit.requestURI\n"
+  leql: |
+    where(source_json.objectRef.resource="deployments" AND source_json.verb="delete")
+  crowdstrike: |
+    #type=kubernetesAudit objectRef.resource=deployments verb=delete
+    | table([@timestamp, user.username, objectRef.namespace, objectRef.name, sourceIPs, userAgent])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "KUBERNETES" and json_extract_scalar(raw_log, "$.objectRef.resource") = "deployments" and json_extract_scalar(raw_log, "$.verb") = "delete"
+    | fields _time, json_extract_scalar(raw_log, "$.objectRef.namespace") as namespace, json_extract_scalar(raw_log, "$.objectRef.name") as deployment_name, json_extract_scalar(raw_log, "$.user.username") as username, json_extract_scalar(raw_log, "$.sourceIPs") as source_ips
+  lucene: |
+    kubernetes.audit.objectRef.resource:deployments AND kubernetes.audit.verb:delete
+  sumo: |
+    _sourceCategory=*Kubernetes* "delete" "deployments"
+    | json field=_raw "verb" as verb
+    | json field=_raw "objectRef.resource" as resource
+    | where verb = "delete" and resource = "deployments"
+    | fields _messageTime, _sourceHost, verb, resource
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +83,7 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere Resource is \"deployments\"\nWhere Verb is \"delete\""
 triage_steps:

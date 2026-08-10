@@ -20,93 +20,120 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 85
 queries:
-  spl: |
-    index=* (
-        (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (ParentUser=*\\* NOT ParentUser="*SYSTEM*" NOT ParentUser="*AUTHORITY*") (User="NT AUTHORITY\\SYSTEM" OR User="*\\SYSTEM"))
-        OR (sourcetype=linux_secure (comm="sudo" OR comm="su") (uid!=0 AND euid=0))
-        OR (sourcetype=auditd syscall=execve (uid!=0 AND euid=0))
-        OR (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=6 NOT (Signed="true" OR SignatureStatus="Valid"))
+  spl: "index=* (\n    (sourcetype=\"WinEventLog:Microsoft-Windows-Sysmon/Operational\" EventCode=1 (ParentUser=*\\\\* NOT ParentUser=\"*SYSTEM*\"\
+    \ NOT ParentUser=\"*AUTHORITY*\") (User=\"NT AUTHORITY\\\\SYSTEM\" OR User=\"*\\\\SYSTEM\"))\n    OR (sourcetype=linux_secure (comm=\"sudo\"\
+    \ OR comm=\"su\") (uid!=0 AND euid=0))\n    OR (sourcetype=auditd syscall=execve (uid!=0 AND euid=0))\n    OR (sourcetype=\"WinEventLog:Microsoft-Windows-Sysmon/Operational\"\
+    \ EventCode=6 NOT (Signed=\"true\" OR SignatureStatus=\"Valid\"))\n)\nNOT (\n    (ParentImage=\"*\\\\consent.exe\" OR ParentImage=\"*\\\\\
+    conhost.exe\")\n    OR (ParentCommandLine=\"*UAC*\" OR ParentCommandLine=\"*elevation*\")\n)\n| eval privilege_escalation=case(\n    EventCode=1\
+    \ AND User=\"NT AUTHORITY\\\\SYSTEM\" AND ParentUser!=\"*SYSTEM*\", \"Windows SYSTEM spawn\",\n    EventCode=6, \"Unsigned driver load\",\n\
+    \    euid=0 AND uid!=0, \"Unix privilege escalation\",\n    1=1, \"Unknown\"\n)\n| bin _time span=5m\n| stats count values(Image) as process\
+    \ values(ParentImage) as parent values(CommandLine) as command values(ParentCommandLine) as parent_command by _time, ComputerName, host, User,\
+    \ ParentUser, privilege_escalation\n| where count >= 1\n| table _time, ComputerName, host, User, ParentUser, privilege_escalation, process,\
+    \ parent, command, parent_command, count\n"
+  kql: "union \n(DeviceProcessEvents\n| where TimeGenerated > ago(1h)\n| where AccountName !has \"SYSTEM\" and AccountName !has \"root\" and AccountName\
+    \ !has \"Administrator\"\n| where InitiatingProcessAccountName !has \"SYSTEM\" and InitiatingProcessAccountName !has \"root\"\n| where AccountName\
+    \ has_any (\"SYSTEM\", \"root\", \"NT AUTHORITY\\\\SYSTEM\")\n| where InitiatingProcessFileName !in~ (\"services.exe\", \"svchost.exe\", \"\
+    wininit.exe\", \"winlogon.exe\", \"lsass.exe\", \"csrss.exe\", \"smss.exe\")\n| join kind=leftanti (\n    DeviceEvents\n    | where TimeGenerated\
+    \ > ago(1h)\n    | where ActionType in (\"UserAccountControl\", \"ConsentUI\")\n) on DeviceId, $left.TimeGenerated == $right.TimeGenerated\n\
+    | extend ElevationType = \"ProcessElevation\"\n| project TimeGenerated, DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName,\
+    \ InitiatingProcessCommandLine, AccountName, FileName, ProcessCommandLine, ElevationType\n),\n(DeviceEvents\n| where TimeGenerated > ago(1h)\n\
+    | where ActionType in (\"DriverLoad\", \"KernelModuleLoad\")\n| extend DriverPath = tostring(AdditionalFields.DriverPath)\n| extend ModuleName\
+    \ = tostring(AdditionalFields.ModuleName)\n| join kind=leftanti (\n    DeviceEvents\n    | where TimeGenerated > ago(1h)\n    | where ActionType\
+    \ == \"DriverLoadSignatureVerified\"\n    | extend VerifiedDriver = tostring(AdditionalFields.DriverPath)\n) on DeviceId, $left.DriverPath\
+    \ == $right.VerifiedDriver\n| extend ElevationType = \"UnsignedKernelModule\"\n| project TimeGenerated, DeviceName, AccountName, DriverPath,\
+    \ ModuleName, ActionType, ElevationType\n)\n| sort by TimeGenerated desc\n"
+  aql: |
+    SELECT sourceip, LOGSOURCENAME(logsourceid) AS host, "Process Name" AS parent_process, "Target Username" AS child_user, "Process CommandLine" AS child_command, COUNT(*) AS privilege_escalations
+    FROM events
+    WHERE (
+      (LOGSOURCENAME(logsourceid) ILIKE '%windows%' AND "EventID" IN ('4688', '1') AND "Target Username" IN ('SYSTEM', 'NT AUTHORITY\SYSTEM') AND "Parent Process Name" NOT IN ('services.exe', 'svchost.exe', 'taskeng.exe', 'taskhostw.exe', 'winlogon.exe', 'wininit.exe', 'lsass.exe', 'smss.exe', 'csrss.exe') AND "Process CommandLine" NOT ILIKE '%consent.exe%')
+      OR
+      (LOGSOURCENAME(logsourceid) ILIKE '%linux%' AND ("EventID" = '4689' OR qidname(qid) ILIKE '%execve%' OR qidname(qid) ILIKE '%process%') AND "Target Username" = 'root' AND "Parent Process Name" NOT IN ('/usr/sbin/sshd', '/usr/sbin/cron', '/usr/lib/systemd/systemd', '/sbin/init', 'sudo', 'su'))
+      OR
+      (LOGSOURCENAME(logsourceid) ILIKE '%mac%' AND qidname(qid) ILIKE '%process%' AND "Target Username" = 'root' AND "Parent Process Name" NOT IN ('launchd', 'sudo', 'su'))
+      OR
+      ("EventID" IN ('6', '3033') AND ("Image" ILIKE '%.sys' OR "Image" ILIKE '%.ko' OR qidname(qid) ILIKE '%kernel%module%'))
     )
-    NOT (
-        (ParentImage="*\\consent.exe" OR ParentImage="*\\conhost.exe")
-        OR (ParentCommandLine="*UAC*" OR ParentCommandLine="*elevation*")
+    GROUP BY sourceip, LOGSOURCENAME(logsourceid), "Process Name", "Target Username", "Process CommandLine"
+    LAST 1 HOURS
+  yara_l: "rule privilege_escalation_exploit_t1068 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects potential exploitation of elevation\
+    \ of privilege vulnerabilities (T1068)\"\n    mitre_attack_tactic = \"Privilege Escalation\"\n    mitre_attack_technique = \"T1068\"\n   \
+    \ severity = \"HIGH\"\n    \n  events:\n    // Parent process running as non-admin/non-root\n    $parent.metadata.event_type = \"PROCESS_LAUNCH\"\
+    \n    (\n      // Windows: non-SYSTEM parent\n      ($parent.principal.process.integrity_level_rid != \"16384\" and \n       $parent.principal.user.userid\
+    \ != \"S-1-5-18\" and\n       $parent.principal.user.userid != \"NT AUTHORITY\\\\SYSTEM\") or\n      // Linux/macOS: non-root parent\n   \
+    \   ($parent.principal.user.userid != \"0\" and \n       $parent.principal.user.userid != \"root\")\n    )\n    $parent.principal.process.pid\
+    \ = $parent_pid\n    $parent.principal.hostname = $host\n    \n    // Child process running as SYSTEM/root\n    $child.metadata.event_type\
+    \ = \"PROCESS_LAUNCH\"\n    (\n      // Windows: SYSTEM child\n      ($child.principal.process.integrity_level_rid = \"16384\" or\n      \
+    \ $child.principal.user.userid = \"S-1-5-18\" or\n       $child.principal.user.userid = \"NT AUTHORITY\\\\SYSTEM\") or\n      // Linux/macOS:\
+    \ root child\n      ($child.principal.user.userid = \"0\" or \n       $child.principal.user.userid = \"root\")\n    )\n    $child.principal.process.parent_process.pid\
+    \ = $parent_pid\n    $child.principal.hostname = $host\n    \n    // Exclude UAC consent prompts\n    not re.regex($child.target.process.file.full_path,\
+    \ `(?i)\\\\consent\\.exe$`)\n    not re.regex($parent.principal.process.file.full_path, `(?i)\\\\consent\\.exe$`)\n    \n    // Exclude legitimate\
+    \ elevation paths\n    not re.regex($parent.principal.process.file.full_path, `(?i)\\\\(svchost|services|winlogon|lsass|wininit|smss|csrss)\\\
+    .exe$`)\n    not re.regex($child.target.process.file.full_path, `(?i)\\\\(taskhostw|taskhost|dllhost|rundll32|mmc)\\.exe$`)\n    \n  match:\n\
+    \    $host over 5m\n    \n  outcome:\n    $risk_score = 85\n    $parent_process = $parent.principal.process.file.full_path\n    $parent_cmdline\
+    \ = $parent.principal.process.command_line\n    $child_process = $child.target.process.file.full_path\n    $child_cmdline = $child.target.process.command_line\n\
+    \    \n  condition:\n    $parent and $child\n}\n"
+  esql: |
+    FROM logs-endpoint.events.process*, logs-windows.sysmon_operational*, logs-system.security*
+    | WHERE @timestamp > NOW() - 15 minute
+      AND (
+        (process.Ext.token.integrity_level_name == "system" OR user.name == "root" OR user.id == "0")
+        AND process.parent.Ext.token.integrity_level_name IN ("medium", "low", "high")
+        AND process.parent.name NOT IN ("services.exe", "svchost.exe", "wininit.exe", "lsass.exe", "winlogon.exe", "taskeng.exe", "msiexec.exe", "consent.exe", "systemd", "init", "launchd")
+      )
+    | STATS privilege_escalations = COUNT(*) BY host.name, process.parent.name, process.parent.executable, process.name, process.executable, user.name, process.parent.Ext.token.integrity_level_name
+    | WHERE privilege_escalations > 0
+    | KEEP @timestamp, host.name, process.parent.name, process.parent.executable, process.name, process.executable, user.name, process.parent.Ext.token.integrity_level_name, privilege_escalations
+  leql: |
+    where((source_json.EventID=1 AND ((source_json.IntegrityLevel IN ["Low", "Medium"] AND source_json.User ICONTAINS "SYSTEM") OR (source_json.ParentUser NOT ICONTAINS "SYSTEM" AND source_json.User ICONTAINS "SYSTEM"))) OR (source_json.EventID=6 AND source_json.Signed="false") OR (source_json.type="SYSCALL" AND source_json.syscall IN ["init_module", "finit_module"] AND source_json.uid=0 AND source_json.auid!=0)) groupby(asset, process_name, parent_process_name, user) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2
+    | case {
+        event_platform=Win AND ParentUserName!=*SYSTEM* AND ParentUserName!=*Administrator* AND UserName=*SYSTEM* AND ParentBaseFileName!=consent.exe AND ParentBaseFileName!=consentui.exe;
+        event_platform=Lin AND ParentUserName!=root AND UserName=root;
+        event_platform=Mac AND ParentUserName!=root AND UserName=root;
+        * | drop=true
+      }
+    | groupBy([ComputerName, ParentBaseFileName, FileName, UserName, ParentUserName], function=count(as=escalations))
+    | table([@timestamp, ComputerName, ParentBaseFileName, ParentUserName, FileName, UserName, CommandLine, escalations])
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_PROCESS\n| filter (\n    (action_registry_data contains \"S-1-5-18\" or action_registry_data\
+    \ contains \"root\" or actor_effective_username in (\"SYSTEM\", \"root\"))\n    and (causality_actor_effective_username not in (\"SYSTEM\"\
+    , \"root\", \"NT AUTHORITY\\\\SYSTEM\") and causality_actor_effective_username != null)\n    and action_process_image_name not in (\"consent.exe\"\
+    , \"consentui.exe\")\n  )\n  or (\n    event_sub_type = ENUM.EVENT_SUB_TYPE_MODULE_LOAD\n    and action_module_path ~= \".*\\\\.sys$|.*\\\\\
+    .ko$|.*\\\\.kext.*\"\n  )\n| alter is_privileged_spawn = if(\n    actor_effective_username in (\"SYSTEM\", \"root\", \"NT AUTHORITY\\\\SYSTEM\"\
+    ),\n    \"true\",\n    \"false\"\n  )\n| alter parent_is_unprivileged = if(\n    causality_actor_effective_username not in (\"SYSTEM\", \"\
+    root\", \"NT AUTHORITY\\\\SYSTEM\") and causality_actor_effective_username != null,\n    \"true\", \n    \"false\"\n  )\n| filter (is_privileged_spawn\
+    \ = \"true\" and parent_is_unprivileged = \"true\") or event_sub_type = ENUM.EVENT_SUB_TYPE_MODULE_LOAD\n| fields _time, agent_hostname, os_type,\
+    \ causality_actor_process_image_name, causality_actor_effective_username, action_process_image_name, actor_effective_username, action_process_image_command_line,\
+    \ action_module_path, event_sub_type\n"
+  lucene: |
+    (process.parent.user.name:(* AND NOT (SYSTEM OR root OR Administrator)) AND process.user.name:(SYSTEM OR root)) OR (event.code:(7045 OR 4697 OR 601) AND NOT process.code_signature.status:valid) OR (linux.audit.key:"module_load" AND NOT process.code_signature.trusted:true)
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Sysmon* OR _sourceCategory=*Linux* OR _sourceCategory=*Auditd*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ParentUser" as parent_user
+    | json field=_raw "User" as user
+    | json field=_raw "IntegrityLevel" as integrity_level
+    | json field=_raw "ParentIntegrityLevel" as parent_integrity_level
+    | json field=_raw "ParentProcessName" as parent_process
+    | json field=_raw "ProcessName" as process_name
+    | json field=_raw "Image" as image
+    | json field=_raw "ParentImage" as parent_image
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "type" as audit_type
+    | json field=_raw "uid" as uid
+    | json field=_raw "euid" as euid
+    | json field=_raw "comm" as comm
+    | parse regex "(?<consent_ui>consent\.exe|useraccountcontrolsettings\.exe)" nodrop
+    | where (
+        (event_id = "4688" AND parent_integrity_level matches "*Medium*" AND integrity_level matches "*System*" AND consent_ui is null)
+        OR (event_id = "1" AND parent_user matches "*Users*" AND user matches "*SYSTEM*")
+        OR (audit_type = "SYSCALL" AND uid != "0" AND euid = "0")
+        OR (event_id = "6" AND consent_ui is null)
     )
-    | eval privilege_escalation=case(
-        EventCode=1 AND User="NT AUTHORITY\\SYSTEM" AND ParentUser!="*SYSTEM*", "Windows SYSTEM spawn",
-        EventCode=6, "Unsigned driver load",
-        euid=0 AND uid!=0, "Unix privilege escalation",
-        1=1, "Unknown"
-    )
-    | bin _time span=5m
-    | stats count values(Image) as process values(ParentImage) as parent values(CommandLine) as command values(ParentCommandLine) as parent_command by _time, ComputerName, host, User, ParentUser, privilege_escalation
-    | where count >= 1
-    | table _time, ComputerName, host, User, ParentUser, privilege_escalation, process, parent, command, parent_command, count
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_pe_000721 {\n  meta:\n    author = \"TDL\"\n    description = \"Unprivileged Process Spawning Elevated Child via Known\
-    \ LPE Pattern\"\n    severity = \"CRITICAL\"\n    tactic = \"TA0004\"\n    technique = \"T1068\"\n  events:\n    $e.metadata.event_type =\
-    \ \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n\
-    }\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+    | timeslice 5m
+    | count by _timeslice, _sourceHost, parent_process, parent_image, process_name, image, command_line, parent_user, user, comm
+    | fields _timeslice, _sourceHost, parent_process, parent_image, process_name, image, command_line, parent_user, user, comm
 pseudo_logic: Non-admin process spawns a SYSTEM/root child without UAC consent prompt; or kernel module load with no preceding signed-driver event.
   Indicates LPE exploit.
 false_positives:
@@ -126,7 +153,7 @@ references:
 - https://attack.mitre.org/techniques/T1068/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, source user, and (if visible) the resulting privileged context.'

@@ -18,74 +18,118 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 35
 queries:
-  spl: |
-    index=cloud_audit (eventName="ListObjects" OR eventName="ListBucket" OR eventName="ListBlobs" OR eventName="ListContainers" OR action="storage.buckets.list" OR action="storage.objects.list")
+  spl: 'index=cloud_audit (eventName="ListObjects" OR eventName="ListBucket" OR eventName="ListBlobs" OR eventName="ListContainers" OR action="storage.buckets.list"
+    OR action="storage.objects.list")
+
     | bin _time span=10m
+
     | stats dc(bucket) as distinct_buckets values(bucket) as buckets by _time, user, userIdentity.principalId, src_ip
+
     | where distinct_buckets >= 10
+
     | table _time, user, userIdentity.principalId, src_ip, distinct_buckets, buckets
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "ListObjects"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%ListObjects%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000757 {\n  meta:\n    author = \"TDL\"\n    description = \"Mass ListObjects Across Many Buckets\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1619\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /ListObjects/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AzureDiagnostics
+    | where TimeGenerated > ago(10m)
+    | where Category == "StorageRead" or OperationName has_any ("List", "ListBlobs", "ListObjects", "ListBuckets", "ListContainers")
+    | extend Identity = coalesce(Identity_s, CallerIdentity_s, caller_s, UserId_s, UserPrincipalName)
+    | extend BucketContainer = coalesce(bucket_s, container_s, ResourceId)
+    | where isnotempty(Identity) and isnotempty(BucketContainer)
+    | summarize DistinctBuckets = dcount(BucketContainer), BucketList = make_set(BucketContainer, 100) by bin(TimeGenerated, 10m), Identity, SourceSystem
+    | where DistinctBuckets >= 10
+    | project TimeGenerated, Identity, DistinctBuckets, BucketList, SourceSystem
+  aql: |
+    SELECT username, sourceip, UNIQUECOUNT("Bucket Name") AS distinct_buckets, COUNT(*) AS total_calls
+    FROM events
+    WHERE (qidname(qid) ILIKE '%ListObjects%' OR qidname(qid) ILIKE '%ListBlobs%' OR qidname(qid) ILIKE '%ListBucket%' OR qidname(qid) ILIKE '%list_objects%' OR qidname(qid) ILIKE '%list_blobs%')
+    GROUP BY username, sourceip
+    HAVING distinct_buckets >= 10
+    LAST 10 MINUTES
+  yara_l: |
+    rule cloud_bucket_enumeration_t1619 {
+      meta:
+        author = "TDL"
+        description = "Detects bucket-walking behavior via ListObjects/ListBlobs against multiple distinct buckets/containers"
+        mitre_attack_tactic = "Discovery"
+        mitre_attack_technique = "T1619"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "RESOURCE_READ"
+        (
+          re.regex($e.metadata.product_event_type, `(?i)(ListObjects|ListBlobs|ListBucket|GetBucket|storage\.buckets\.list|storage\.objects\.list)`) or
+          re.regex($e.target.resource.name, `(?i)(bucket|container|blob)`) or
+          $e.metadata.product_event_type = "storage.buckets.list" or
+          $e.metadata.product_event_type = "storage.objects.list" or
+          $e.metadata.product_event_type = "ListBucket" or
+          $e.metadata.product_event_type = "GetBucket"
+        )
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $bucket
 
-    | WHERE eventName LIKE "%ListObjects%"
+      match:
+        $user over 10m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 65
+        $distinct_buckets = count_distinct($bucket)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/ListObjects/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*ListObjects*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "ListObjects"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*ListObjects*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*ListObjects*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #bucket >= 10
+    }
+  esql: |
+    FROM logs-cloud.audit*
+    | WHERE @timestamp > NOW() - 10 minute
+      AND event.action IN ("storage.objects.list", "ListObjects", "ListBucket", "BlobContainers.List", "Blobs.List", "storage.buckets.list", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/list/action")
+    | STATS bucket_count = COUNT_DISTINCT(cloud.resource.name) BY cloud.account.id, user.name, source.ip
+    | WHERE bucket_count >= 10
+    | KEEP cloud.account.id, user.name, source.ip, bucket_count
+  leql: |
+    where(source_json.eventName IN ["ListObjects", "ListObjectsV2", "s3:ListBucket", "ListBlobs", "storage.buckets.list", "storage.objects.list"] OR source_json.operationName IN ["ListBlobs", "Storage.Blobs.List", "Storage.Containers.List"]) groupby(source_json.userIdentity.principalId, source_json.userPrincipalName, source_json.user) calculate(unique:source_json.bucketName, unique:source_json.containerName, unique:source_json.requestParameters.bucketName, unique:source_json.resource)
+  crowdstrike: |
+    #type=cloud-audit (eventName=ListObjects OR eventName=ListBuckets OR eventName=ListBlobs OR eventName=ListContainers OR eventName="storage.buckets.list" OR eventName="storage.objects.list" OR eventName="Microsoft.Storage/storageAccounts/blobServices/containers/blobs/list/action")
+    | bucket := coalesce(requestParameters.bucketName, requestParameters.containerName, resourceName)
+    | identity := coalesce(userIdentity.principalId, userIdentity.arn, actor.email, user.name)
+    | groupBy([identity], function=([count(bucket, distinct=true, as=bucket_count), collect([bucket])]), limit=max)
+    | bucket_count >= 10
+    | table([identity, bucket_count, _count])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider in ("AWS", "Azure", "GCP")
+      and (
+        (cloud_provider = "AWS" and action_operation in ("ListBucket", "ListObjects", "ListObjectsV2"))
+        or (cloud_provider = "Azure" and action_operation in ("BlobContainers.List", "Blobs.List"))
+        or (cloud_provider = "GCP" and action_operation in ("storage.buckets.list", "storage.objects.list"))
+      )
+    | bin _time span=10m
+    | alter bucket_name = coalesce(action_resource_name, action_resource)
+    | comp count_distinct(bucket_name) as distinct_buckets by _time, actor_caller_identity_name, cloud_provider
+    | filter distinct_buckets >= 10
+    | fields _time, actor_caller_identity_name, cloud_provider, distinct_buckets
+  lucene: |
+    (event.action:(s3:ListBucket OR storage.buckets.list OR Storage.Containers.List OR ListBucket OR ListBlobs) OR action:(s3:ListBucket OR storage.buckets.list OR Storage.Containers.List OR ListBucket OR ListBlobs)) AND (event.outcome:success OR outcome:success OR result:success OR status:success OR eventOutcome:Success)
+  sumo: |
+    _sourceCategory=*CloudTrail* OR _sourceCategory=*Azure* OR _sourceCategory=*GCP*
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "userIdentity.principalId" as aws_principal
+    | json field=_raw "userIdentity.arn" as aws_arn
+    | json field=_raw "requestParameters.bucketName" as aws_bucket
+    | json field=_raw "operationName" as azure_operation
+    | json field=_raw "identity.claims.http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name" as azure_user
+    | json field=_raw "callerIpAddress" as azure_ip
+    | json field=_raw "resourceUri" as azure_resource
+    | json field=_raw "protoPayload.methodName" as gcp_method
+    | json field=_raw "protoPayload.authenticationInfo.principalEmail" as gcp_principal
+    | json field=_raw "protoPayload.resourceName" as gcp_resource
+    | where (event_name = "ListObjects" or event_name = "ListObjectsV2" or event_name = "GetBucket" or azure_operation matches "*Microsoft.Storage/storageAccounts/blobServices/containers/blobs/list*" or azure_operation matches "*list*" or gcp_method = "storage.buckets.list" or gcp_method = "storage.objects.list")
+    | if (!isEmpty(aws_principal), aws_principal, if(!isEmpty(azure_user), azure_user, gcp_principal)) as identity
+    | if (!isEmpty(aws_bucket), aws_bucket, if(!isEmpty(azure_resource), azure_resource, gcp_resource)) as bucket
+    | timeslice 10m
+    | count_distinct(bucket) as distinct_buckets by _timeslice, identity
+    | where distinct_buckets >= 10
+    | fields _timeslice, identity, distinct_buckets
 pseudo_logic: ListObjects/ListBlobs against ≥10 distinct buckets/containers from the same identity in 10m. Bucket-walking pre-exfil.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -103,7 +147,7 @@ references:
 - https://attack.mitre.org/techniques/T1619/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

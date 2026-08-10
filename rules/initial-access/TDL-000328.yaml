@@ -20,68 +20,71 @@ queries:
     \ OR type=\"InitialAccess:IAMUser/AnomalousBehavior\" OR type=\"Persistence:IAMUser/AnomalousBehavior\" OR type=\"PrivilegeEscalation:IAMUser/AnomalousBehavior\"\
     )\n| table _time, type, severity, accountId, region, resource.accessKeyDetails.userName, resource.accessKeyDetails.principalId, service.action.actionType,\
     \ title, description\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where Type in ("CredentialAccess:IAMUser/AnomalousBehavior", "DefenseEvasion:IAMUser/AnomalousBehavior", "Discovery:IAMUser/AnomalousBehavior", "Exfiltration:IAMUser/AnomalousBehavior", "Impact:IAMUser/AnomalousBehavior", "InitialAccess:IAMUser/AnomalousBehavior", "Persistence:IAMUser/AnomalousBehavior", "PrivilegeEscalation:IAMUser/AnomalousBehavior")
+    | project TimeGenerated, Type, Title, Description, Severity, AccountId, Region, ResourceType, Resource
+  aql: |
+    SELECT "Event Type", username, sourceip, "AWS Account ID", COUNT(*) AS event_count
+    FROM events
+    WHERE "Event Type" IN ('CredentialAccess:IAMUser/AnomalousBehavior', 'DefenseEvasion:IAMUser/AnomalousBehavior', 'Discovery:IAMUser/AnomalousBehavior', 'Exfiltration:IAMUser/AnomalousBehavior', 'Impact:IAMUser/AnomalousBehavior', 'InitialAccess:IAMUser/AnomalousBehavior', 'Persistence:IAMUser/AnomalousBehavior', 'PrivilegeEscalation:IAMUser/AnomalousBehavior')
+    GROUP BY "Event Type", username, sourceip, "AWS Account ID"
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_iam_anomalous_behavior {
+      meta:
+        author = "TDL"
+        description = "Detects AWS GuardDuty IAM user anomalous behavior findings across multiple MITRE tactics"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.product_name = "Amazon GuardDuty"
+        (
+          $e.metadata.product_event_type = "CredentialAccess:IAMUser/AnomalousBehavior" or
+          $e.metadata.product_event_type = "DefenseEvasion:IAMUser/AnomalousBehavior" or
+          $e.metadata.product_event_type = "Discovery:IAMUser/AnomalousBehavior" or
+          $e.metadata.product_event_type = "Exfiltration:IAMUser/AnomalousBehavior" or
+          $e.metadata.product_event_type = "Impact:IAMUser/AnomalousBehavior" or
+          $e.metadata.product_event_type = "InitialAccess:IAMUser/AnomalousBehavior" or
+          $e.metadata.product_event_type = "Persistence:IAMUser/AnomalousBehavior" or
+          $e.metadata.product_event_type = "PrivilegeEscalation:IAMUser/AnomalousBehavior"
+        )
+        $e.principal.user.userid = $user
 
-    | where eventName matches regex "GuardDuty"
+      match:
+        $user over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000328 {\n  meta:\n    author = \"TDL\"\n    description = \"Anomalous IAM User Activity Detected - GuardDuty\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.action IN ("CredentialAccess:IAMUser/AnomalousBehavior", "DefenseEvasion:IAMUser/AnomalousBehavior", "Discovery:IAMUser/AnomalousBehavior", "Exfiltration:IAMUser/AnomalousBehavior", "Impact:IAMUser/AnomalousBehavior", "InitialAccess:IAMUser/AnomalousBehavior", "Persistence:IAMUser/AnomalousBehavior", "PrivilegeEscalation:IAMUser/AnomalousBehavior")
+    | KEEP @timestamp, event.action, user.name, cloud.account.id, aws.guardduty.severity, source.ip, cloud.region
+  leql: |
+    where(source_json.type IN ["CredentialAccess:IAMUser/AnomalousBehavior", "DefenseEvasion:IAMUser/AnomalousBehavior", "Discovery:IAMUser/AnomalousBehavior", "Exfiltration:IAMUser/AnomalousBehavior", "Impact:IAMUser/AnomalousBehavior", "InitialAccess:IAMUser/AnomalousBehavior", "Persistence:IAMUser/AnomalousBehavior", "PrivilegeEscalation:IAMUser/AnomalousBehavior"])
+  crowdstrike: |
+    #type=guardduty (detail.type="CredentialAccess:IAMUser/AnomalousBehavior" OR detail.type="DefenseEvasion:IAMUser/AnomalousBehavior" OR detail.type="Discovery:IAMUser/AnomalousBehavior" OR detail.type="Exfiltration:IAMUser/AnomalousBehavior" OR detail.type="Impact:IAMUser/AnomalousBehavior" OR detail.type="InitialAccess:IAMUser/AnomalousBehavior" OR detail.type="Persistence:IAMUser/AnomalousBehavior" OR detail.type="PrivilegeEscalation:IAMUser/AnomalousBehavior")
+    | table([@timestamp, detail.type, detail.resource.accessKeyDetails.userName, detail.resource.accessKeyDetails.principalId, detail.accountId, detail.region, detail.severity, detail.description])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and vendor_name = "AWS" and event_source = "guardduty.amazonaws.com"
+    | filter resource_type in ("CredentialAccess:IAMUser/AnomalousBehavior", "DefenseEvasion:IAMUser/AnomalousBehavior", "Discovery:IAMUser/AnomalousBehavior", "Exfiltration:IAMUser/AnomalousBehavior", "Impact:IAMUser/AnomalousBehavior", "InitialAccess:IAMUser/AnomalousBehavior", "Persistence:IAMUser/AnomalousBehavior", "PrivilegeEscalation:IAMUser/AnomalousBehavior")
+    | fields _time, cloud_provider, event_source, resource_type, actor_user, resource_sub_type, raw_log
+  lucene: |
+    eventName:"GuardDuty" AND eventType:("CredentialAccess:IAMUser/AnomalousBehavior" OR "DefenseEvasion:IAMUser/AnomalousBehavior" OR "Discovery:IAMUser/AnomalousBehavior" OR "Exfiltration:IAMUser/AnomalousBehavior" OR "Impact:IAMUser/AnomalousBehavior" OR "InitialAccess:IAMUser/AnomalousBehavior" OR "Persistence:IAMUser/AnomalousBehavior" OR "PrivilegeEscalation:IAMUser/AnomalousBehavior")
+  sumo: |
+    _sourceCategory=*GuardDuty* OR _sourceCategory=*guardduty* OR _source=*guardduty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("CredentialAccess:IAMUser/AnomalousBehavior", "DefenseEvasion:IAMUser/AnomalousBehavior", "Discovery:IAMUser/AnomalousBehavior", "Exfiltration:IAMUser/AnomalousBehavior", "Impact:IAMUser/AnomalousBehavior", "InitialAccess:IAMUser/AnomalousBehavior", "Persistence:IAMUser/AnomalousBehavior", "PrivilegeEscalation:IAMUser/AnomalousBehavior")
+    | json field=_raw "resource.accessKeyDetails.userName" as user_name
+    | json field=_raw "accountId" as account_id
+    | json field=_raw "region" as region
+    | json field=_raw "severity" as severity
+    | fields _messageTime, account_id, region, user_name, event_type, severity
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -91,7 +94,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"CredentialAccess:IAMUser/AnomalousBehavior\", \"DefenseEvasion:IAMUser/AnomalousBehavior\"\
   , \"Discovery:IAMUser/AnomalousBehavior\", \"Exfiltration:IAMUser/AnomalousBehavior\", \"Impact:IAMUser/AnomalousBehavior\", \"InitialAccess:IAMUser/AnomalousBehavior\"\

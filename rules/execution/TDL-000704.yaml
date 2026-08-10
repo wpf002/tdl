@@ -29,68 +29,118 @@ queries:
     (?i)(admin|owner|editor)\"), 1, 0)\n| where is_cicd=0 AND is_privileged=1\n| stats count earliest(_time) as first_seen latest(_time) as last_seen\
     \ values(role_arn) as roles values(function_name) as functions by caller_identity, eventName, src_ip\n| table first_seen last_seen caller_identity\
     \ eventName src_ip roles functions count\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000704 {\n  meta:\n    author = \"TDL\"\n    description = \"Suspicious Lambda/Function Created with Admin Role\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1648\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "AzureActivity\n| where TimeGenerated > ago(24h)\n| where OperationNameValue has_any (\"MICROSOFT.WEB/SITES/FUNCTIONS/WRITE\", \"Microsoft.Web/sites/write\"\
+    )\n    or (OperationNameValue has \"lambda\" and OperationNameValue has \"CreateFunction\")\n    or (OperationNameValue has \"cloudfunctions\"\
+    \ and OperationNameValue has \"create\")\n| extend CallerIdentity = coalesce(Caller, CallerIpAddress)\n| where CallerIdentity !has \"azure-pipelines\"\
+    \ \n    and CallerIdentity !has \"github\" \n    and CallerIdentity !has \"jenkins\"\n    and CallerIdentity !has \"gitlab\"\n    and CallerIdentity\
+    \ !has \"circleci\"\n    and CallerIdentity !has \"codebuild\"\n    and CallerIdentity !has \"cloudbuild\"\n| join kind=inner (\n    AzureActivity\n\
+    \    | where TimeGenerated > ago(24h)\n    | where ActivityStatusValue == \"Success\"\n    | where Properties has_any (\"Owner\", \"Contributor\"\
+    , \"Administrator\", \"AdministratorAccess\", \"iam:*\", \"roles/owner\", \"roles/editor\")\n    | extend CallerIdentity = coalesce(Caller,\
+    \ CallerIpAddress)\n    | distinct CallerIdentity\n) on CallerIdentity\n| project TimeGenerated, OperationNameValue, CallerIdentity, ResourceGroup,\
+    \ Resource, SubscriptionId, ActivityStatusValue, Properties\n"
+  aql: |
+    SELECT username, sourceip, "Cloud Provider", "Function Name", "Role Name", "Service Name", eventtime
+    FROM events
+    WHERE (categoryname(category) ILIKE '%cloud%audit%' OR categoryname(category) ILIKE '%aws%' OR categoryname(category) ILIKE '%azure%' OR categoryname(category) ILIKE '%gcp%')
+      AND (("Event Name" ILIKE '%CreateFunction%' OR "Event Name" ILIKE '%create_function%' OR "Event Name" ILIKE '%functions.create%' OR "Event Name" ILIKE '%PutFunction%')
+           OR ("Service Name" IN ('lambda.amazonaws.com', 'functions.azure.com', 'cloudfunctions.googleapis.com') AND "Event Name" ILIKE '%create%'))
+      AND ("Role Name" ILIKE '%admin%' OR "Role Name" ILIKE '%contributor%' OR "Role Name" ILIKE '%AdministratorAccess%' OR "Role Name" ILIKE '%FullAccess%' OR "Role Name" ILIKE '%owner%' OR "Role Name" ILIKE '%PowerUser%')
+      AND username NOT ILIKE '%jenkins%'
+      AND username NOT ILIKE '%gitlab%'
+      AND username NOT ILIKE '%circleci%'
+      AND username NOT ILIKE '%github%'
+      AND username NOT ILIKE '%terraform%'
+      AND username NOT ILIKE '%pipeline%'
+      AND username NOT ILIKE '%service-account%'
+      AND username NOT ILIKE '%automation%'
+    LAST 24 HOURS
+  yara_l: "rule serverless_function_created_with_privileged_role {\n  meta:\n    author = \"TDL\"\n    description = \"Detects creation of serverless\
+    \ function with privileged IAM role by non-CI/CD identity\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1648\"\
+    \n    severity = \"HIGH\"\n\n  events:\n    // AWS Lambda creation\n    ($aws.metadata.product_event_type = \"CreateFunction\" or\n     $aws.metadata.product_event_type\
+    \ = \"CreateFunction20150331\" or\n     // Azure Functions creation\n     $azure.metadata.product_event_type = \"MICROSOFT.WEB/SITES/WRITE\"\
+    \ or\n     // GCP Cloud Functions creation\n     $gcp.metadata.product_event_type = \"google.cloud.functions.v1.CloudFunctionsService.CreateFunction\"\
+    \ or\n     $gcp.metadata.product_event_type = \"v1.compute.instances.insert\")\n    \n    $aws.metadata.vendor_name = \"AMAZON\" or\n    $azure.metadata.vendor_name\
+    \ = \"MICROSOFT\" or\n    $gcp.metadata.vendor_name = \"GOOGLE\"\n    \n    $aws.metadata.product_name = \"AWS CloudTrail\" or\n    $azure.metadata.product_name\
+    \ = \"Azure\" or\n    $gcp.metadata.product_name = \"GCP\"\n    \n    $aws.security_result.action = \"ALLOW\" or\n    $azure.security_result.action\
+    \ = \"ALLOW\" or\n    $gcp.security_result.action = \"ALLOW\"\n    \n    // Check for privileged roles in request parameters or target resource\n\
+    \    (re.regex($aws.target.resource.attribute.labels.value, `(?i)(admin|administrator|poweruser|AdministratorAccess|iam:.*full|.*:*\\*)`)\
+    \ or\n     re.regex($azure.target.resource.attribute.labels.value, `(?i)(contributor|owner|administrator|\\/providers\\/Microsoft\\.Authorization\\\
+    /roleAssignments)`) or\n     re.regex($gcp.target.resource.attribute.labels.value, `(?i)(owner|editor|admin|roles\\/iam\\.|roles\\/editor|roles\\\
+    /owner)`))\n    \n    // Exclude CI/CD service accounts and automation identities\n    not re.regex($aws.principal.user.userid, `(?i)(codebuild|codepipeline|jenkins|github|gitlab|circleci|terraform|cloudformation)`)\
+    \ and\n    not re.regex($azure.principal.user.userid, `(?i)(devops|pipeline|serviceprincipal|automation|terraform|github|azuredevops)`) and\n\
+    \    not re.regex($gcp.principal.user.userid, `(?i)(cloudbuild|serviceaccount|terraform|github|gitlab|jenkins)`)\n    \n    ($aws.principal.user.userid\
+    \ = $user or\n     $azure.principal.user.userid = $user or\n     $gcp.principal.user.userid = $user)\n    \n    ($aws.principal.cloud.project.id\
+    \ = $project or\n     $azure.target.resource.attribute.labels.key = \"subscription_id\" or\n     $gcp.principal.cloud.project.id = $project)\n\
+    \n  match:\n    $user over 5m\n\n  outcome:\n    $risk_score = 75\n\n  condition:\n    $aws or $azure or $gcp\n}\n"
+  esql: |
+    FROM logs-aws.cloudtrail*, logs-azure.activitylogs*, logs-gcp.audit*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (event.dataset == "aws.cloudtrail" AND event.action IN ("CreateFunction", "CreateFunction20150331") AND cloud.provider == "aws")
+        OR (event.dataset == "azure.activitylogs" AND event.action LIKE "*Microsoft.Web/sites/functions/write*" AND cloud.provider == "azure")
+        OR (event.dataset == "gcp.audit" AND event.action IN ("google.cloudfunctions.v1.CloudFunctionsService.CreateFunction", "google.cloudfunctions.v2.FunctionService.CreateFunction") AND cloud.provider == "gcp")
+      )
+      AND (
+        cloud.account.name RLIKE ".*(admin|root|contributor|owner).*"
+        OR user.roles RLIKE ".*(admin|root|contributor|owner).*"
+        OR event.outcome == "success"
+      )
+      AND NOT user.name RLIKE ".*(jenkins|circleci|github|gitlab|azure-devops|codebuild|cloudbuild|pipeline|deploy|automation|service).*"
+    | EVAL function_name = COALESCE(aws.cloudtrail.request_parameters.functionName, azure.activitylogs.properties.resource, gcp.audit.resource.labels.function_name)
+    | KEEP @timestamp, cloud.provider, cloud.account.id, user.name, user.email, event.action, function_name, source.ip, user.roles
+  leql: |
+    where(source_json.eventName IN ["CreateFunction", "CreateFunction20150331", "PutFunction"] OR source_json.operationName IN ["MICROSOFT.WEB/SITES/WRITE", "MICROSOFT.WEB/SITES/FUNCTIONS/WRITE", "cloudfunctions.functions.create", "cloudfunctions.functions.update"]) AND (source_json.requestParameters.role ICONTAINS "admin" OR source_json.requestParameters.role ICONTAINS "contributor" OR source_json.requestParameters.role ICONTAINS "arn:aws:iam::*:role/*Admin*" OR source_json.requestParameters.functionConfiguration.role ICONTAINS "admin" OR source_json.authorization.permissions ICONTAINS "admin" OR source_json.authorization.permissions ICONTAINS "contributor") AND NOT (source_json.userIdentity.principalId ICONTAINS "jenkins" OR source_json.userIdentity.principalId ICONTAINS "circleci" OR source_json.userIdentity.principalId ICONTAINS "github" OR source_json.userIdentity.principalId ICONTAINS "gitlab" OR source_json.userIdentity.principalId ICONTAINS "codebuild" OR source_json.userIdentity.principalId ICONTAINS "codepipeline" OR source_json.caller ICONTAINS "jenkins" OR source_json.caller ICONTAINS "circleci" OR source_json.caller ICONTAINS "github" OR source_json.caller ICONTAINS "gitlab" OR source_json.caller ICONTAINS "azuredevops" OR source_json.caller ICONTAINS "cloudbuild") groupby(source_json.userIdentity.principalId, source_json.caller, source_json.eventName, source_json.operationName) calculate(count)
+  crowdstrike: |
+    #type=cloud_audit event.action IN ["CreateFunction", "createFunction", "cloudfunctions.functions.create", "Microsoft.Web/sites/functions/write"] event.outcome=success
+    | regex("(?i)(admin|contributor|owner|poweruser)", field=role_name, as=is_privileged)
+    | is_privileged=*
+    | !regex("(?i)(jenkins|github|gitlab|circleci|azure-pipelines|codebuild|cloudbuild|terraform|service-account)", field=user_identity)
+    | table([@timestamp, cloud_provider, user_identity, function_name, role_name, event.action, ComputerName, account_id])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider in (ENUM.AZURE, ENUM.AWS, ENUM.GCP)
+      and (
+        (cloud_provider = ENUM.AWS and action_operation in ("CreateFunction", "CreateFunction20150331") and outcome = ENUM.SUCCESS)
+        or (cloud_provider = ENUM.AZURE and action_operation in ("Microsoft.Web/sites/functions/write", "MICROSOFT.WEB/SITES/FUNCTIONS/WRITE") and outcome = ENUM.SUCCESS)
+        or (cloud_provider = ENUM.GCP and action_operation in ("cloudfunctions.functions.create", "google.cloud.functions.v1.CloudFunctionsService.CreateFunction") and outcome = ENUM.SUCCESS)
+      )
+    | alter is_privileged = (
+        (cloud_provider = ENUM.AWS and (action_resource contains "AdministratorAccess" or action_resource contains "IAMFullAccess" or action_resource contains "*:*"))
+        or (cloud_provider = ENUM.AZURE and (action_resource contains "/Owner" or action_resource contains "/Contributor" or action_resource contains "Administrator"))
+        or (cloud_provider = ENUM.GCP and (action_resource contains "roles/owner" or action_resource contains "roles/editor" or action_resource contains "roles/iam.serviceAccountAdmin"))
+      )
+    | alter is_cicd = (
+        actor_effective_username contains "jenkins"
+        or actor_effective_username contains "gitlab"
+        or actor_effective_username contains "github"
+        or actor_effective_username contains "circleci"
+        or actor_effective_username contains "terraform"
+        or actor_effective_username contains "cloudformation"
+        or actor_effective_username contains "deployer"
+        or actor_effective_username contains "pipeline"
+        or actor_effective_username contains "codebuild"
+        or actor_effective_username contains "codepipeline"
+      )
+    | filter is_privileged = true and is_cicd = false
+    | fields _time, cloud_provider, actor_effective_username, action_operation, action_resource, action_resource_name, action_country
+  lucene: |
+    (event.action:("lambda:CreateFunction" OR "functions.create" OR "cloudfunctions.functions.create") OR event.dataset:("aws.cloudtrail" OR "azure.activitylogs" OR "gcp.audit")) AND (aws.cloudtrail.event_name:"CreateFunction" OR azure.activitylogs.operation_name:"MICROSOFT.WEB/SITES/FUNCTIONS/WRITE" OR gcp.audit.method_name:"google.cloud.functions.*.CreateFunction") AND (cloud.account.policy.name:(*Admin* OR *admin* OR *Contributor* OR *contributor* OR *FullAccess* OR AdministratorAccess OR "roles/owner" OR "roles/editor") OR aws.cloudtrail.request_parameters:(*AdministratorAccess* OR *FullAccess* OR *:policy/AdministratorAccess*) OR azure.activitylogs.properties.role:(*Contributor* OR *Owner* OR *Administrator*) OR gcp.audit.response.serviceAccountEmail:(*admin* OR *owner* OR *editor*)) AND NOT (user.name:(*jenkins* OR *circleci* OR *gitlab* OR *github* OR *codebuild* OR *codepipeline* OR *azuredevops* OR *cloudbuild* OR *terraform* OR *service-account* OR *automation*) OR source.ip:(10.* OR 172.16.* OR 192.168.*))
+  sumo: "_sourceCategory=*Cloud*Audit* OR _sourceCategory=*CloudTrail* OR _sourceCategory=*Azure* OR _sourceCategory=*GCP*\n| json field=_raw\
+    \ \"eventName\" as event_name\n| json field=_raw \"eventSource\" as event_source\n| json field=_raw \"userIdentity.principalId\" as principal_id\n\
+    | json field=_raw \"userIdentity.type\" as user_type\n| json field=_raw \"userIdentity.arn\" as user_arn\n| json field=_raw \"requestParameters.functionName\"\
+    \ as function_name\n| json field=_raw \"requestParameters.role\" as role_arn\n| json field=_raw \"operationName\" as operation_name\n| json\
+    \ field=_raw \"authorization.evidence.role\" as azure_role\n| json field=_raw \"protoPayload.authenticationInfo.principalEmail\" as gcp_principal\n\
+    | json field=_raw \"protoPayload.serviceName\" as gcp_service\n| json field=_raw \"protoPayload.methodName\" as gcp_method\n| json field=_raw\
+    \ \"protoPayload.request.function.serviceAccountEmail\" as gcp_sa\n| where (event_name = \"CreateFunction\" and event_source = \"lambda.amazonaws.com\"\
+    ) \n  OR (operation_name matches \"*Microsoft.Web/sites/functions/write*\" or operation_name matches \"*Microsoft.Web/sites/write*\") \n \
+    \ OR (gcp_service = \"cloudfunctions.googleapis.com\" and gcp_method matches \"*functions.create*\")\n| where (role_arn matches \"*Administrator*\"\
+    \ or role_arn matches \"*Admin*\" or role_arn matches \"*:iam::*:role/*Admin*\") \n  OR (azure_role matches \"*Contributor*\" or azure_role\
+    \ matches \"*Owner*\") \n  OR (gcp_sa matches \"*compute@developer.gserviceaccount.com*\" or gcp_sa matches \"*editor*\" or gcp_sa matches\
+    \ \"*owner*\")\n| where !(principal_id matches \"*jenkins*\" or principal_id matches \"*circleci*\" or principal_id matches \"*gitlab*\" or\
+    \ principal_id matches \"*github*\" or principal_id matches \"*terraform*\" or principal_id matches \"*cloudformation*\" or principal_id matches\
+    \ \"*codebuild*\" or principal_id matches \"*codepipeline*\" or principal_id matches \"*devops*\" or user_arn matches \"*service-role*\" or\
+    \ gcp_principal matches \"*@cloudbuild.gserviceaccount.com*\")\n| fields _messageTime, _sourceHost, event_name, operation_name, gcp_method,\
+    \ principal_id, user_arn, gcp_principal, function_name, role_arn, azure_role, gcp_sa\n"
 pseudo_logic: New serverless function created with privileged role (IAM admin / contributor) by a non-CI/CD identity. Adversaries weaponize serverless
   to persist with cloud creds.
 false_positives:
@@ -109,7 +159,7 @@ references:
 - https://attack.mitre.org/techniques/T1648/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'

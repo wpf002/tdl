@@ -18,74 +18,102 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    (index=okta sourcetype=OktaIM2:log eventType=user.authentication.sso outcome.result=SUCCESS) OR (index=azure sourcetype=azure:monitor:aad category=SignInLogs status.signInStatus=success) OR (index=duo sourcetype=duo:authentication result=SUCCESS)
+  spl: '(index=okta sourcetype=OktaIM2:log eventType=user.authentication.sso outcome.result=SUCCESS) OR (index=azure sourcetype=azure:monitor:aad
+    category=SignInLogs status.signInStatus=success) OR (index=duo sourcetype=duo:authentication result=SUCCESS)
+
     | eval src_ip=coalesce(client.ipAddress, clientIpAddress, access_device.ip.ip)
+
     | lookup tor_exit_nodes.csv ip as src_ip OUTPUT is_tor
+
     | where is_tor="true" OR is_tor=1
+
     | table _time, user, src_ip, eventType, sourcetype, index
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000602 {\n  meta:\n    author = \"TDL\"\n    description = \"MFA Login from TOR Exit Node\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    let TorExitNodes = externaldata(IPAddress: string)
+    [@"https://check.torproject.org/torbulkexitlist"]
+    with (format="txt", ignoreFirstRecord=false);
+    let TorIPs = TorExitNodes | where IPAddress matches regex @"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$" | distinct IPAddress;
+    union
+    (SigninLogs
+    | where TimeGenerated > ago(1h)
+    | where ResultType == 0
+    | where AuthenticationRequirement == "multiFactorAuthentication"
+    | where NetworkLocationDetails has "external" or RiskDetail has "none"
+    | where IPAddress in (TorIPs)
+    | project TimeGenerated, UserPrincipalName, IPAddress, Location, AppDisplayName, DeviceDetail, AuthenticationRequirement, ResultType, SourceSystem = "AzureAD"),
+    (OfficeActivity
+    | where TimeGenerated > ago(1h)
+    | where Operation == "UserLoggedIn"
+    | where ClientIP in (TorIPs)
+    | project TimeGenerated, UserPrincipalName = UserId, IPAddress = ClientIP, Location = ClientIP, AppDisplayName = OfficeWorkload, DeviceDetail = "", AuthenticationRequirement = "MFA", ResultType = "Success", SourceSystem = "Office365"),
+    (Syslog
+    | where TimeGenerated > ago(1h)
+    | where SyslogMessage has "duo" or SyslogMessage has "okta" or ProcessName in ("duo","okta")
+    | where SyslogMessage has_any ("success","authentication_success","login_success","mfa_success")
+    | extend IPAddress = extract(@"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", 1, SyslogMessage)
+    | where isnotempty(IPAddress)
+    | where IPAddress in (TorIPs)
+    | project TimeGenerated, UserPrincipalName = extract(@"user[=:](\S+)", 1, SyslogMessage), IPAddress, Location = "", AppDisplayName = ProcessName, DeviceDetail = "", AuthenticationRequirement = "MFA", ResultType = "Success", SourceSystem = ProcessName)
+    | project TimeGenerated, UserPrincipalName, IPAddress, Location, AppDisplayName, SourceSystem, AuthenticationRequirement, ResultType
+  aql: |
+    SELECT username, sourceip, LOGSOURCENAME(logsourceid) AS log_source, eventtime, qidname(qid) AS event_name, COUNT(*) AS login_count
+    FROM events
+    WHERE (categoryname(category) ILIKE '%authentication%' OR categoryname(category) ILIKE '%logon%' OR qidname(qid) ILIKE '%success%' OR qidname(qid) ILIKE '%logon%')
+      AND (LOGSOURCENAME(logsourceid) ILIKE '%okta%' OR LOGSOURCENAME(logsourceid) ILIKE '%azure%' OR LOGSOURCENAME(logsourceid) ILIKE '%duo%')
+      AND sourceip IN (REFERENCESET('TorExitNodes'))
+    GROUP BY username, sourceip, logsourceid, eventtime, qid
+    LAST 24 HOURS
+  yara_l: "rule successful_mfa_login_from_tor_exit_node {\n  meta:\n    author = \"Chronicle Detection\"\n    description = \"Detects successful\
+    \ MFA authentication from Tor exit node IP addresses\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1078\"\
+    \n    severity = \"HIGH\"\n\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.security_result.action = \"ALLOW\"\n    (\n  \
+    \    $e.metadata.vendor_name = \"OKTA\" or\n      $e.metadata.vendor_name = \"MICROSOFT\" or\n      $e.metadata.vendor_name = \"DUO\"\n  \
+    \  )\n    $e.security_result.detection_fields[\"mfa_result\"] = \"SUCCESS\" or\n    $e.security_result.summary =~ \"MFA\" or\n    $e.metadata.description\
+    \ =~ \"(?i)multi.factor|mfa|two.factor|2fa\"\n    \n    $e.principal.ip = $source_ip\n    \n    $e.principal.location.country_or_region !=\
+    \ \"\" or\n    net.ip_in_range_cidr($source_ip, \"0.0.0.0/0\")\n    \n    $e.network.session_id != \"\"\n\n  match:\n    $source_ip over 5m\n\
+    \n  outcome:\n    $risk_score = max(75)\n    $user = array_distinct($e.target.user.userid)\n    $source_country = array_distinct($e.principal.location.country_or_region)\n\
+    \n  condition:\n    $e and $source_ip in %tor_exit_nodes\n}\n"
+  esql: |
+    FROM logs-okta*, logs-azure*, logs-duo*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND event.outcome == "success"
+      AND (event.category == "authentication" OR event.action IN ("user.authentication.sso", "user.session.start", "UserLoggedIn", "Sign-in activity"))
+      AND (source.ip IS NOT NULL AND network.direction == "external" OR NOT CIDR_MATCH(source.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+    | ENRICH tor_exit_nodes ON source.ip
+    | WHERE tor_exit_node == true
+    | KEEP @timestamp, event.action, user.name, source.ip, source.geo.country_name, user_agent.original, host.name, event.provider
+  leql: |
+    where(result=SUCCESS AND source_address IN tor_exit_nodes)
+  crowdstrike: |
+    (#datasource=okta OR #datasource=azure OR #datasource=duo)
+    (eventType=user.authentication.sso OR eventType=user.authentication.auth_via_mfa OR eventType=authentication OR category=SignInLogs OR event_simpleName=UserLogon)
+    (outcome.result=SUCCESS OR result=success OR resultType=0 OR Status=Success OR AuthResult=Success)
+    (client.ipAddress=* OR ipAddress=* OR IPAddress=* OR src.ip=* OR SourceIP=*)
+    | case {
+        #datasource=okta | ipField := client.ipAddress;
+        #datasource=azure | ipField := ipAddress;
+        #datasource=duo | ipField := coalesce(field=["access_device.ip", "ip"], as=ipField);
+        * | ipField := coalesce(field=["client.ipAddress", "ipAddress", "IPAddress", "src.ip", "SourceIP"], as=ipField);
+      }
+    | match(file="tor-exit-nodes.csv", field=ipField, include=[ipField], strict=false)
+    | table([@timestamp, #datasource, ipField, UserName, user.name, userPrincipalName, eventType, outcome.result])
+  xql: "dataset = okta_raw\n| alter external_source = coalesce(arrayindex(regextract(json_extract_scalar(raw_log, \"$.client.ipAddress\"), \"\
+    (\\d+\\.\\d+\\.\\d+\\.\\d+)\"), 0), json_extract_scalar(raw_log, \"$.client.ipAddress\"))\n| filter json_extract_scalar(raw_log, \"$.outcome.result\"\
+    ) = \"SUCCESS\" \n  and json_extract_scalar(raw_log, \"$.eventType\") in (\"user.authentication.sso\", \"user.authentication.auth_via_mfa\"\
+    )\n  and external_source != null\n| comp values(json_extract_scalar(raw_log, \"$.actor.alternateId\")) as user, values(external_source) as\
+    \ source_ip by _time, json_extract_scalar(raw_log, \"$.uuid\")\n| alter is_tor = external_reference(source_ip, type=\"tor_exit_nodes\")\n\
+    | filter is_tor = \"true\"\n| fields _time, user, source_ip\n"
+  lucene: |
+    (event.dataset:(duo.authentication OR okta.system OR azure.signinlogs) OR source.service:(Duo OR Okta OR Azure)) AND (event.outcome:success OR result:success OR status:success OR event.action:user.authentication.sso) AND (mfa:true OR event.category:authentication) AND NOT source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND threat.indicator.ip:* AND (threat.indicator.type:"tor-exit-node" OR tags:"tor-exit-node" OR threat.feed.name:*tor*)
+  sumo: "_sourceCategory=*Okta* OR _sourceCategory=*Azure* OR _sourceCategory=*Duo*\n| json field=_raw \"eventType\" as okta_event_type\n| json\
+    \ field=_raw \"outcome.result\" as okta_result\n| json field=_raw \"client.ipAddress\" as okta_ip\n| json field=_raw \"category\" as azure_category\n\
+    | json field=_raw \"resultType\" as azure_result\n| json field=_raw \"properties.ipAddress\" as azure_ip\n| json field=_raw \"result\" as\
+    \ duo_result\n| json field=_raw \"access_device.ip\" as duo_ip\n| where (okta_event_type = \"user.authentication.sso\" AND okta_result = \"\
+    SUCCESS\") \n   OR (okta_event_type = \"user.session.start\" AND okta_result = \"SUCCESS\")\n   OR (azure_category = \"SignInLogs\" AND azure_result\
+    \ = \"0\")\n   OR (duo_result = \"SUCCESS\")\n| if (!isNull(okta_ip), okta_ip, if(!isNull(azure_ip), azure_ip, duo_ip)) as source_ip\n| lookup\
+    \ type, actor, raw, threatlevel as threat_level from https://check.torproject.org/torbulkexitlist on source_ip=ip\n| where !isNull(threat_level)\
+    \ OR type=\"tor_exit_node\"\n| fields _messageTime, _sourceCategory, source_ip, okta_event_type, azure_category, duo_result, threat_level\n"
 false_positives:
 - Authorized pen testing
 - Security research
@@ -95,7 +123,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Successful MFA Login Event \nFrom an external source\nWhere the Source IP is on the Tor Exit Node IP List"
 triage_steps:

@@ -15,71 +15,68 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=guardduty sourcetype=aws:guardduty (finding.type="Policy:S3/AccountBlockPublicAccessDisabled" OR finding.type="Policy:S3/BucketBlockPublicAccessDisabled")
-    | table _time, finding.type, finding.severity, finding.title, finding.description, account_id, region, resource.resourceType, resource.s3BucketDetails.name, service.action.actionType, user_name, finding.id
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: 'index=guardduty sourcetype=aws:guardduty (finding.type="Policy:S3/AccountBlockPublicAccessDisabled" OR finding.type="Policy:S3/BucketBlockPublicAccessDisabled")
 
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+    | table _time, finding.type, finding.severity, finding.title, finding.description, account_id, region, resource.resourceType, resource.s3BucketDetails.name,
+    service.action.actionType, user_name, finding.id
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000309 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Block Public Access Disabled  by Unauthorized User\
-    \ - GuardDuty\"\n    severity = \"LOW\"\n    tactic = \"TA0005\"\n    technique = \"T1562\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where EventType in ("Policy:S3/AccountBlockPublicAccessDisabled", "Policy:S3/BucketBlockPublicAccessDisabled")
+    | project TimeGenerated, EventType, AccountId, Region, ResourceType, ResourceId, Severity, Description
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS source, username, sourceip, "findingType" AS event_type, "resource.resourceType" AS resource_type, "resource.s3BucketDetails.name" AS bucket_name, COUNT(*) AS event_count
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%GuardDuty%'
+      AND ("findingType" = 'Policy:S3/AccountBlockPublicAccessDisabled' OR "findingType" = 'Policy:S3/BucketBlockPublicAccessDisabled')
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_s3_block_public_access_disabled {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects AWS S3 public access block being disabled via GuardDuty"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1562"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Amazon Web Services"
+        $e.metadata.product_name = "GuardDuty"
+        (
+          $e.metadata.product_event_type = "Policy:S3/AccountBlockPublicAccessDisabled" or
+          $e.metadata.product_event_type = "Policy:S3/BucketBlockPublicAccessDisabled"
+        )
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%GuardDuty%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("Policy:S3/AccountBlockPublicAccessDisabled", "Policy:S3/BucketBlockPublicAccessDisabled")
+    | KEEP @timestamp, cloud.account.id, cloud.region, aws.guardduty.resource.s3_bucket_details.name, event.type, event.severity, aws.guardduty.title, aws.guardduty.description
+  leql: |
+    where(source_json.type IN ["Policy:S3/AccountBlockPublicAccessDisabled", "Policy:S3/BucketBlockPublicAccessDisabled"])
+  crowdstrike: |
+    #type=guardduty (detail.type="Policy:S3/AccountBlockPublicAccessDisabled" OR detail.type="Policy:S3/BucketBlockPublicAccessDisabled")
+    | table([@timestamp, detail.type, detail.resource.resourceType, detail.resource.s3BucketDetails.name, account, region, detail.severity])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and resource_type = "GUARDDUTY_FINDING"
+    | filter json_extract_scalar(raw_log, "$.type") in ("Policy:S3/AccountBlockPublicAccessDisabled", "Policy:S3/BucketBlockPublicAccessDisabled")
+    | fields _time, cloud_provider, resource_type, resource_sub_type, identity_name, resource_name, raw_log
+  lucene: |
+    eventName:("Policy:S3/AccountBlockPublicAccessDisabled" OR "Policy:S3/BucketBlockPublicAccessDisabled")
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty* OR _source=*guardduty*
+    | json field=_raw "detail.type" as event_type
+    | where event_type in ("Policy:S3/AccountBlockPublicAccessDisabled", "Policy:S3/BucketBlockPublicAccessDisabled")
+    | fields _messageTime, _sourceHost, event_type, _raw
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -89,7 +86,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Guard Duty Event
 

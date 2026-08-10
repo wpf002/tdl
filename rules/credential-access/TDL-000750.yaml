@@ -17,87 +17,118 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=auth* (action=success OR action=accepted OR EventCode=4624) (mfa=* OR factor=* OR two_factor=* OR totp=* OR push=*)
+  spl: 'index=auth* (action=success OR action=accepted OR EventCode=4624) (mfa=* OR factor=* OR two_factor=* OR totp=* OR push=*)
+
     | eval mfa_code=coalesce(mfa, factor, two_factor, totp, push)
+
     | where isnotnull(mfa_code) AND mfa_code!=""
+
     | bin _time span=90s
+
     | stats dc(src_ip) as unique_ips values(src_ip) as source_ips earliest(_time) as first_time latest(_time) as last_time by _time, user, mfa_code
+
     | where unique_ips >= 2
+
     | eval time_diff=last_time-first_time
+
     | where time_diff <= 90
+
     | table first_time, last_time, user, mfa_code, unique_ips, source_ips, time_diff
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: |
+    SigninLogs
+    | where TimeGenerated > ago(1h)
+    | where ResultType == 0
+    | where AuthenticationDetails has "MFA" or AuthenticationRequirement == "multiFactorAuthentication"
+    | extend SourceIP = IPAddress
+    | summarize IPs = make_set(SourceIP), EventTimes = make_list(TimeGenerated) by UserPrincipalName, bin(TimeGenerated, 90s)
+    | where array_length(IPs) >= 2
+    | mv-expand EventTime = EventTimes to typeof(datetime)
+    | summarize min_time = min(EventTime), max_time = max(EventTime), IPList = any(IPs) by UserPrincipalName
+    | where datetime_diff('second', max_time, min_time) <= 90
+    | project UserPrincipalName, DistinctIPs = IPList, FirstAuth = min_time, LastAuth = max_time, TimeWindowSeconds = datetime_diff('second', max_time, min_time)
+  aql: |
+    SELECT username, "MFA Code" AS mfa_code, UNIQUECOUNT(sourceip) AS distinct_ips, COUNT(*) AS events, LIST(sourceip) AS source_ips, MIN(eventtime) AS first_seen, MAX(eventtime) AS last_seen
+    FROM events
+    WHERE "MFA Code" IS NOT NULL AND username IS NOT NULL
+    GROUP BY username, "MFA Code"
+    HAVING distinct_ips >= 2 AND (last_seen - first_seen) <= 90000
+    LAST 10 MINUTES
+  yara_l: |
+    rule mfa_proxy_credential_access {
+      meta:
+        author = "TDL"
+        description = "Detects same MFA token accepted from multiple source IPs within 90s - potential MFA proxy/interception (T1111)"
+        severity = "HIGH"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1111"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.security_result.action = "ALLOW"
+        $e.target.user.userid = $user
+        $e.principal.ip = $source_ip
+        // MFA-related fields - adjust based on your UDM mapping
+        ($e.extensions.auth.mechanism = /(?i)(totp|push|mfa|otp)/ or
+         $e.security_result.summary = /(?i)(mfa|multi.factor|two.factor|2fa)/)
 
-    WHERE "network.protocol" LIKE ''%tcp%''
+      match:
+        $user over 90s
 
-    GROUP BY sourceip, destinationip, destinationport
+      outcome:
+        $risk_score = 85
+        $distinct_ips = count_distinct($source_ip)
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_ca_000750 {\n  meta:\n    author = \"TDL\"\n    description = \"MFA Code Replayed From Multiple Source IPs\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0006\"\n    technique = \"T1111\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 2 and $distinct_ips >= 2
+    }
+  esql: |
+    FROM logs-system.auth*, logs-okta*, logs-duo*, logs-azure.signinlogs*, logs-google_workspace.login*
+    | WHERE @timestamp > NOW() - 5 minutes
+      AND event.action IN ("mfa-success", "user_login", "multi_factor_authentication_success", "UserLoginVerification", "login_success")
+      AND event.outcome == "success"
+    | EVAL time_bucket = BUCKET(@timestamp, 90 seconds)
+    | STATS distinct_ips = COUNT_DISTINCT(source.ip), first_ip = VALUES(source.ip) BY user.name, event.action, time_bucket
+    | WHERE distinct_ips >= 2
+    | KEEP user.name, time_bucket, distinct_ips, first_ip
+  leql: |
+    where(mfa_result=SUCCESS AND mfa_code EXISTS) groupby(user, mfa_code) calculate(unique:source_address) calculate(count)
+  crowdstrike: |
+    #type=auth* event_simpleName=*Auth* outcome=success (mfa_code=* OR totp_code=* OR push_id=* OR second_factor=*)
+    | bucket(span=90s, field=@timestamp, as=time_bucket)
+    | groupBy([UserName, time_bucket, mfa_code, totp_code, push_id, second_factor], function=[count(RemoteAddressIP4, distinct=true, as=distinct_ips), collect([RemoteAddressIP4, @timestamp, ComputerName])])
+    | distinct_ips >= 2
+    | table([UserName, time_bucket, mfa_code, totp_code, push_id, second_factor, distinct_ips, RemoteAddressIP4, @timestamp, ComputerName])
+  xql: |
+    dataset = auth_logs
+    | filter outcome = "success" and mfa_method in ("totp", "push")
+    | bin _time span=90s
+    | comp count_distinct(source_ip) as distinct_ips, values(source_ip) as ip_list by _time, user, mfa_token
+    | filter distinct_ips >= 2
+    | fields _time, user, mfa_token, distinct_ips, ip_list
+  lucene: |
+    (event.outcome:success OR action:success OR result:success) AND (event.category:authentication OR event.type:authentication) AND (_exists_:user.name OR _exists_:username OR _exists_:user_name) AND (_exists_:source.ip OR _exists_:src_ip OR _exists_:client_ip) AND (mfa OR "multi-factor" OR "two-factor" OR totp OR otp OR push OR duo OR okta.event_type:user.authentication.auth_via_mfa)
+  sumo: |
+    _sourceCategory=*Auth* OR _sourceCategory=*Authentication* OR _sourceCategory=*MFA*
+    | json field=_raw "user" as user
+    | json field=_raw "username" as username
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "source_ip" as source_ip
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "action" as action
+    | json field=_raw "result" as result
+    | json field=_raw "status" as status
+    | json field=_raw "mfa_method" as mfa_method
+    | json field=_raw "auth_method" as auth_method
+    | where (event_type matches "*mfa*" OR event_type matches "*2fa*" OR action matches "*mfa*" OR action matches "*authenticate*" OR auth_method matches "*otp*" OR auth_method matches "*push*" OR mfa_method matches "*") AND (result="success" OR status="success" OR result="accepted" OR status="accepted")
+    | if(isNull(user), username, user) as account
+    | if(isNull(src_ip), source_ip, src_ip) as source_ip_final
+    | where !isNull(account) and !isNull(source_ip_final)
+    | timeslice 90s
+    | count_distinct(source_ip_final) as unique_ips by _timeslice, account
+    | where unique_ips >= 2
+    | fields _timeslice, account, unique_ips
 pseudo_logic: Same TOTP / push code accepted from ≥2 distinct source IPs within 90s for the same user. MFA proxy / interception.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -114,7 +145,7 @@ references:
 - https://attack.mitre.org/techniques/T1111/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'

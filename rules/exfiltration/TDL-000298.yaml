@@ -16,71 +16,69 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=google_workspace sourcetype=gsuite:drive events.name="CREATE_DATA_TRANSFER_REQUEST" APPLICATION_NAME="*drive*"
+  spl: 'index=google_workspace sourcetype=gsuite:drive events.name="CREATE_DATA_TRANSFER_REQUEST" APPLICATION_NAME="*drive*"
+
     | table _time, actor.email, events.name, APPLICATION_NAME, id_application_name, events.parameters{}.value
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exf_000298 {\n  meta:\n    author = \"TDL\"\n    description = \"Google Drive Ownership Transferred via Google Workspace\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0010\"\n    technique = \"T1537\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    GWorkspaceActivityReports
+    | where TimeGenerated > ago(24h)
+    | where RecordType == "drive"
+    | where EventName == "CREATE_DATA_TRANSFER_REQUEST"
+    | project TimeGenerated, ActorIpAddress, ActorEmail = UserId, EventName, RecordType, ActivityDetails
+  aql: |
+    SELECT eventtime, username, sourceip, destinationip, "Application Name", "Event Name", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "Event Name" = 'CREATE_DATA_TRANSFER_REQUEST'
+      AND "Application Name" ILIKE '%drive%'
+    LAST 24 HOURS
+  yara_l: |
+    rule google_workspace_data_transfer_request {
+      meta:
+        author = "TDL"
+        description = "Detects Google Workspace data transfer requests for Drive - T1537 Exfiltration"
+        mitre_attack_tactic = "Exfiltration"
+        mitre_attack_technique = "T1537"
+        platform = "Google Workspace"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Google Workspace"
+        $e.metadata.product_event_type = "CREATE_DATA_TRANSFER_REQUEST"
+        re.regex($e.target.resource.name, `(?i)drive`)
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-google_workspace*
+    | WHERE event.action == "CREATE_DATA_TRANSFER_REQUEST" AND event.provider LIKE "*drive*"
+    | KEEP @timestamp, user.email, event.action, event.provider, source.ip, google_workspace.admin.application.name
+  leql: |
+    where(source_json.events.name="CREATE_DATA_TRANSFER_REQUEST" AND source_json.APPLICATION_NAME ICONTAINS "drive")
+  crowdstrike: |
+    #type=gsuite events.name=CREATE_DATA_TRANSFER_REQUEST APPLICATION_NAME=*drive*
+    | table([@timestamp, user_email, events.name, APPLICATION_NAME, id.applicationName, ipAddress])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud.provider = GCP and cloud.resource_type = "Google Workspace"
+    | filter action_name = "CREATE_DATA_TRANSFER_REQUEST"
+    | filter lowercase(action_resource) contains "drive"
+    | fields _time, actor_user, action_name, action_resource, cloud.project
+  lucene: |
+    events.name:"CREATE_DATA_TRANSFER_REQUEST" AND APPLICATION_NAME:*drive*
+  sumo: |
+    _sourceCategory=*Google*Workspace* "CREATE_DATA_TRANSFER_REQUEST"
+    | json field=_raw "events[*].name" as event_name
+    | json field=_raw "events[*].parameters[*].name" as param_names
+    | json field=_raw "events[*].parameters[*].value" as param_values
+    | where event_name = "CREATE_DATA_TRANSFER_REQUEST"
+    | where param_names contains "APPLICATION_NAME" and param_values matches "*drive*"
+    | fields _messageTime, _sourceHost, event_name, param_names, param_values
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +88,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Google Workspace Event
 

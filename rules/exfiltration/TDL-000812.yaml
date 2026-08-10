@@ -23,70 +23,101 @@ queries:
     \ as total_bytes values(file_path) as files values(dest_ip) as destinations values(bluetooth_device_id) as bt_devices by _time, host, user,\
     \ process_name, process_id\n| where total_bytes>10485760 OR isnotnull(bt_devices)\n| table _time, host, user, process_name, process_id, total_bytes,\
     \ files, destinations, bt_devices\n"
-  kql: 'DeviceFileEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where file_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, InitiatingProcessFileName, FolderPath, FileName
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"File Path\", \"Process Name\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n\
-    \  AND \"EventID\" IN ('11','23','26')\n  AND \"file_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exf_000812 {\n  meta:\n    author = \"TDL\"\n    description = \"Large File Transfer Over Bluetooth OBEX\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0010\"\n    technique = \"T1011\"\n  events:\n    $e.metadata.event_type = \"FILE_CREATION\"\n    $e.file_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "file" AND file_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, file.path, process.name
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND log_type = "file" AND file_name=/.+/)
-
-    groupby(asset, file_path, process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (FileWritten, NewExecutableWritten) AND file_name=*.+*
-
-    | stats count as writes by ComputerName, UserName, FileName, ImageFileName
-
-    | sort -writes
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.FILE AND file_name ~= ".+"
-
-    | comp count() as writes by agent_hostname, actor_effective_username, action_file_name, action_file_path
-
-    | sort desc writes
-
-    '
-  lucene: 'event.category:"file" AND file_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id IN ("11","23","26") AND file_name matches "*.+*"
-
-    | count by host, user, target_filename, image
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceFileEvents
+    | where TimeGenerated > ago(1h)
+    | where FolderPath has_any ("Bluetooth", "obex", "obexftp", "bluetooth-obex")
+        or InitiatingProcessFileName has_any ("obexd", "obex-client", "bluetoothd", "wpa_supplicant", "hostapd")
+    | extend FileSize = tolong(FileSize)
+    | where FileSize > 10485760
+    | join kind=leftouter (
+        DeviceNetworkEvents
+        | where TimeGenerated > ago(1h)
+        | where RemotePort in (650, 7)
+            or LocalPort in (650, 7)
+            or RemoteUrl has_any ("obex://", "bluetooth")
+        | project DeviceId, DeviceName, NetworkTimestamp = TimeGenerated, RemoteIP, RemotePort, LocalPort
+    ) on DeviceId
+    | where isnotempty(RemoteIP) or InitiatingProcessFileName in~ ("hostapd", "wpa_supplicant")
+    | summarize TotalBytes = sum(FileSize), FileCount = count(), Files = make_set(FileName, 10) by bin(TimeGenerated, 5m), DeviceId, DeviceName, AccountName, InitiatingProcessFileName, FolderPath
+    | where TotalBytes > 10485760
+    | project TimeGenerated, DeviceId, DeviceName, AccountName, InitiatingProcessFileName, FolderPath, TotalBytes, FileCount, Files
+  aql: |
+    SELECT "Process Name", "Process CommandLine", username, sourceip, destinationip, "Bytes Sent", "Device Name", "Connection Type", eventtime, LOGSOURCENAME(logsourceid) AS host
+    FROM events
+    WHERE (("Process Name" ILIKE '%obexftp%' OR "Process Name" ILIKE '%bluetooth%' OR "Process Name" ILIKE '%obex%' OR "Connection Type" ILIKE '%bluetooth%' OR "Connection Type" ILIKE '%OBEX%') AND ("Bytes Sent" > 10485760 OR "File Size" > 10485760) AND ("Device Paired" = 'false' OR "Device Paired" IS NULL OR "Device Status" ILIKE '%unpaired%'))
+    OR (("Process Name" ILIKE '%hostapd%' OR "Process Name" ILIKE '%wifiap%' OR "Process Name" ILIKE '%ICS%' OR "Process Name" ILIKE '%Internet Connection Sharing%' OR "Service Name" ILIKE '%hotspot%' OR "Service Name" ILIKE '%tethering%') AND ("File Operation" ILIKE '%write%' OR "File Operation" ILIKE '%create%' OR qidname(qid) ILIKE '%file%write%'))
+    LAST 1 HOURS
+  yara_l: "rule exfil_bluetooth_wifi_large_transfer {\n  meta:\n    author = \"TDL\"\n    description = \"Detects exfiltration via Bluetooth OBEX\
+    \ FTP/OPP >10MB to non-paired device or rogue Wi-Fi tether during file write\"\n    mitre_attack_tactic = \"Exfiltration\"\n    mitre_attack_technique\
+    \ = \"T1011\"\n    severity = \"HIGH\"\n\n  events:\n    // Bluetooth OBEX transfer to non-paired device\n    ($bt.metadata.event_type = \"\
+    NETWORK_CONNECTION\" or \n     $bt.metadata.event_type = \"FILE_COPY\")\n    (re.regex($bt.principal.process.file.full_path, `(?i)(obex|bluetooth|obexftp|obexpush)`)\
+    \ or\n     re.regex($bt.principal.process.command_line, `(?i)(obex|bluetooth|--channel|--device)`) or\n     re.regex($bt.target.resource.name,\
+    \ `(?i)(obex|bluetooth)`) or\n     $bt.target.port = 650 or\n     $bt.target.port = 651)\n    $bt.network.sent_bytes >= 10485760\n    not\
+    \ re.regex($bt.principal.process.command_line, `(?i)(paired|authorized|trusted)`)\n    $bt.principal.hostname = $host\n    $bt.target.user.userid\
+    \ = $user\n\n    // Rogue Wi-Fi tethering process during file write\n    ($wf.metadata.event_type = \"PROCESS_LAUNCH\" or\n     $wf.metadata.event_type\
+    \ = \"FILE_CREATION\")\n    (re.regex($wf.principal.process.file.full_path, `(?i)(hostapd|dnsmasq|wpa_supplicant|netsh|mobilehotspot|tether|internet.*shar)`)\
+    \ or\n     re.regex($wf.principal.process.command_line, `(?i)(hotspot|tether|ap.*mode|hosted.*network|internet.*connection.*sharing|ics)`)\
+    \ or\n     re.regex($wf.target.file.full_path, `(?i)(hostapd\\.conf|dnsmasq\\.conf)`))\n    $wf.principal.hostname = $host\n\n  match:\n \
+    \   $host, $user over 15m\n\n  outcome:\n    $risk_score = max(75)\n    $exfil_bytes = max($bt.network.sent_bytes)\n    $process_path = array_distinct($bt.principal.process.file.full_path)\n\
+    \    $command_line = array_distinct($bt.principal.process.command_line)\n    $tether_process = array_distinct($wf.principal.process.file.full_path)\n\
+    \n  condition:\n    $bt or $wf\n}\n"
+  esql: "FROM logs-endpoint.events.file*, logs-endpoint.events.process*, logs-endpoint.events.network*\n| WHERE @timestamp > NOW() - 1 hour\n\
+    \  AND (\n    (event.category == \"file\" AND event.action IN (\"creation\", \"modification\") \n     AND (file.path LIKE \"*bluetooth*\"\
+    \ OR file.path LIKE \"*obex*\" OR file.path LIKE \"*/dev/rfcomm*\" OR file.path LIKE \"*\\\\Bluetooth\\\\*\")\n     AND file.size >= 10485760)\n\
+    \    OR\n    (event.category == \"process\" AND process.name IN (\"obexd\", \"obex-client\", \"obexftp\", \"ussp-push\", \"bluetooth-sendto\"\
+    , \"gnome-obex-server\", \"kio_obexftp\", \"BthServ.exe\", \"fsquirt.exe\")\n     AND process.command_line LIKE \"*send*\")\n    OR\n    (event.category\
+    \ == \"network\" AND destination.port IN (650, 5257, 10001, 10002) AND network.protocol == \"rfcomm\")\n  )\n| EVAL is_bluetooth_transfer\
+    \ = CASE(\n    file.size >= 10485760 AND (file.path LIKE \"*bluetooth*\" OR file.path LIKE \"*obex*\" OR file.path LIKE \"*/dev/rfcomm*\"\
+    \ OR file.path LIKE \"*\\\\Bluetooth\\\\*\"), 1,\n    process.name IN (\"obexd\", \"obex-client\", \"obexftp\", \"ussp-push\", \"bluetooth-sendto\"\
+    , \"BthServ.exe\", \"fsquirt.exe\"), 1,\n    destination.port IN (650, 5257, 10001, 10002), 1,\n    0\n  )\n| WHERE is_bluetooth_transfer\
+    \ == 1\n| STATS total_bytes = SUM(file.size), event_count = COUNT(*) BY host.name, user.name, process.name, file.path, destination.ip, win\
+    \ = BUCKET(@timestamp, 5 minute)\n| WHERE total_bytes >= 10485760 OR event_count >= 1\n| KEEP @timestamp, host.name, user.name, process.name,\
+    \ file.path, destination.ip, total_bytes, event_count\n"
+  leql: |
+    where((process_name ICONTAINS "obexftp" OR process_name ICONTAINS "bluetooth" OR process_name ICONTAINS "obex") AND (process_cmd_line ICONTAINS "send" OR process_cmd_line ICONTAINS "put" OR process_cmd_line ICONTAINS "transfer")) OR (process_name ICONTAINS "tethering" OR process_name ICONTAINS "hotspot" OR process_name ICONTAINS "mobile_hotspot" OR process_cmd_line ICONTAINS "wifi" AND process_cmd_line ICONTAINS "share") groupby(asset, process_name, process_cmd_line, user) calculate(count)
+  crowdstrike: |
+    event_simpleName=FileWritten OR event_simpleName=ProcessRollup2 OR event_simpleName=NetworkConnectIP4
+    | case {
+        event_simpleName=FileWritten AND (FilePath=*/bluetooth/* OR FilePath=*/obex/* OR FilePath=*/obexftp/* OR FilePath=*/obexpush/* OR FilePath=*OBEX* OR FilePath=*obex* OR FileName=*obex*) | rename(TargetProcessId, as=pid) | rename(FileSizeBytes, as=filesize) | filesize >= 10485760 | groupBy([aid, ComputerName, pid], function=[sum(filesize, as=total_bytes), selectLast([FileName, FilePath, UserName])]);
+        event_simpleName=ProcessRollup2 AND (CommandLine=*bluetooth* OR CommandLine=*obex* OR CommandLine=*tether* OR CommandLine=*hotspot* OR FileName=*bluetooth* OR FileName=*obex* OR FileName=*NetworkManager* OR FileName=*hostapd* OR FileName=*dnsmasq* OR ParentBaseFileName=*tether* OR ParentBaseFileName=*hotspot*) | rename(TargetProcessId, as=pid) | groupBy([aid, ComputerName, pid], function=[selectLast([FileName, CommandLine, ParentBaseFileName, UserName])]);
+        * | drop([]);
+      }
+    | groupBy([aid, ComputerName], function=[count(as=events), selectLast([FileName, FilePath, CommandLine, ParentBaseFileName, UserName, total_bytes])])
+    | (total_bytes >= 10485760 OR CommandLine=*tether* OR CommandLine=*hotspot* OR FileName=*hostapd* OR FileName=*dnsmasq*)
+    | table([ComputerName, UserName, FileName, FilePath, CommandLine, ParentBaseFileName, total_bytes, events])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_NETWORK or event_type = ENUM.EVENT_TYPE_FILE
+    | filter (
+        (action_network_protocol in ("OBEX", "RFCOMM") and action_network_connection_direction = "OUTGOING")
+        or (lowercase(action_process_image_name) contains "obex" or lowercase(action_process_image_name) contains "bluetooth")
+        or (lowercase(action_process_image_name) ~= ".*tether.*|.*hotspot.*|.*wifiap.*")
+        or (action_file_path ~= ".*bluetooth.*|.*obex.*" and event_sub_type = ENUM.EVENT_SUB_TYPE_FILE_WRITE)
+    )
+    | alter is_bluetooth = if(action_network_protocol in ("OBEX", "RFCOMM") or lowercase(action_process_image_name) contains "obex" or lowercase(action_process_image_name) contains "bluetooth" or action_file_path ~= ".*bluetooth.*|.*obex.*", 1, 0)
+    | alter is_tether = if(lowercase(action_process_image_name) ~= ".*tether.*|.*hotspot.*|.*wifiap.*", 1, 0)
+    | alter file_size_mb = to_number(action_file_size) / 1048576
+    | bin _time span=5m
+    | comp sum(file_size_mb) as total_mb, max(is_tether) as has_tether by _time, agent_hostname, actor_effective_username, action_remote_ip, action_process_image_name
+    | filter (total_mb > 10 and action_remote_ip != null) or has_tether = 1
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_remote_ip, total_mb, has_tether
+  lucene: |
+    (event.action:"bluetooth-file-transfer" OR event.type:"file" AND process.name:(*obexftp* OR *obexpush* OR *bluetooth* OR *obex*)) AND (network.bytes:>10485760 OR file.size:>10485760) AND (event.outcome:"unknown-device" OR device.paired:false OR process.name:(*tether* OR *hotspot* OR *ap_start* OR *hostapd*) AND event.action:"file-write")
+  sumo: |
+    _sourceCategory=*EDR* (bluetooth OR obex OR ftp OR opp OR tether OR "Wi-Fi Direct")
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "process_name" as process_name
+    | json field=_raw "file_path" as file_path
+    | json field=_raw "bytes_written" as bytes_written
+    | json field=_raw "network_protocol" as network_protocol
+    | json field=_raw "bluetooth_device_paired" as device_paired
+    | json field=_raw "connection_type" as connection_type
+    | json field=_raw "device_address" as device_address
+    | json field=_raw "host" as host
+    | where (network_protocol matches "*obex*" OR network_protocol matches "*bluetooth*" OR process_name matches "*obex*" OR connection_type matches "*bluetooth*") AND (device_paired = "false" OR device_paired = "0" OR isNull(device_paired)) AND num(bytes_written) > 10485760
+       OR (process_name matches "*tether*" OR process_name matches "*hotspot*" OR process_name matches "*mobile*hotspot*" OR connection_type matches "*tether*" OR connection_type matches "*wifi*direct*") AND event_type = "file_write"
+    | fields _messageTime, host, process_name, file_path, bytes_written, network_protocol, device_paired, connection_type, device_address
 pseudo_logic: Bluetooth OBEX FTP/OPP transfer >10MB to a non-paired device, or rogue Wi-Fi tether process active during file write.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -103,7 +134,7 @@ references:
 - https://attack.mitre.org/techniques/T1011/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination, total bytes transferred, and the protocol used.'

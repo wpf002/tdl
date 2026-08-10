@@ -15,73 +15,84 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=github sourcetype=github:audit action="public_key.create"
+  spl: 'index=github sourcetype=github:audit action="public_key.create"
+
     | lookup threatintel_feed ip as actor_ip OUTPUT threat_score
+
     | where isnotnull(threat_score)
+
     | table _time, actor, actor_ip, action, public_key_id, threat_score
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
 
+    '
+  kql: |
+    let ThreatFeeds = externaldata(MaliciousIP: string)[@"https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt"] with(format="txt", ignoreFirstRecord=true);
+    GitHubAudit
     | where TimeGenerated > ago(1d)
+    | where Action == "public_key.create"
+    | extend ActorIP = tostring(parse_json(ActorLocation).ip)
+    | where isnotempty(ActorIP)
+    | join kind=inner (ThreatFeeds) on $left.ActorIP == $right.MaliciousIP
+    | project TimeGenerated, Actor, Action, ActorIP, Repository, Organization, Country = tostring(parse_json(ActorLocation).country_code)
+  aql: |
+    SELECT eventtime, sourceip, username, "action" AS github_action, "public_key_id", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "action" = 'public_key.create'
+      AND sourceip IN (SELECT sourceip FROM events WHERE category IN (SELECT category FROM categories WHERE high_level_category_id = 18000))
+    LAST 24 HOURS
+  yara_l: |
+    rule github_ssh_key_added_from_threat_ip {
+      meta:
+        author = "TDL"
+        description = "Detects SSH public key creation in GitHub from IP on threat feed - T1098 Persistence"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1098"
+        severity = "HIGH"
 
-    | where eventName matches regex ".+"
+      events:
+        $e.metadata.vendor_name = "GITHUB"
+        $e.metadata.product_event_type = "public_key.create"
+        $e.principal.ip = $ip
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+        $threat.graph.metadata.entity_type = "IP_ADDRESS"
+        $threat.graph.metadata.threat.threat_feed_name != ""
+        $threat.graph.entity.ip = $ip
 
-    | order by Count desc
+      match:
+        $ip over 5m
 
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000543 {\n  meta:\n    author = \"TDL\"\n    description = \"SSH Key added from Malicious IP\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+      outcome:
+        $risk_score = 85
+        $principal_user = array_distinct($e.principal.user.userid)
+        $threat_feed = array_distinct($threat.graph.metadata.threat.threat_feed_name)
 
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e and $threat
+    }
+  esql: "FROM logs-github.audit*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.action == \"public_key.create\"\n| ENRICH threat_indicator_feed\
+    \ ON source.ip\n| WHERE threat.indicator.ip IS NOT NULL\n| KEEP @timestamp, user.name, source.ip, event.action, threat.indicator.ip, threat.indicator.provider,\
+    \ github.repo\n"
+  leql: |
+    where(source_json.action="public_key.create" AND source_address IN threat_feed)
+  crowdstrike: |
+    #repo=github action="public_key.create"
+    | lookup(file="threat_feed.csv", field=src_ip, include=[threat_category], ignoreCase=true)
+    | isNotNull(threat_category)
+    | table([@timestamp, actor, src_ip, threat_category, public_key_id, repository])
+  xql: |
+    dataset = github_audit_logs
+    | filter action = "public_key.create"
+    | join type=inner (dataset = threat_intel_feed | fields indicator_value) as ti
+      ti.indicator_value = github_audit_logs.actor_ip
+    | fields _time, actor_ip, action, actor_login, repo, org
+  lucene: |
+    action:public_key.create AND _exists_:threat_intel_match
+  sumo: |
+    _sourceCategory=*Github*
+    | json field=_raw "action" as action
+    | json field=_raw "actor_ip" as actor_ip
+    | where action = "public_key.create"
+    | lookup type, malicious_confidence, threat_name from sumo://threat/cs on threat=actor_ip
+    | where !isNull(type)
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -91,7 +102,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Github event\n   where actions is \"public_key.create\"\nAND\n   IP is on Threat Feed"
 triage_steps:

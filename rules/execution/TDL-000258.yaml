@@ -17,74 +17,82 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=windows EventCode=4688 New_Process_Name="*\\cmd.exe" (CommandLine="*psinject*" OR CommandLine="*spawnas*" OR CommandLine="*make_token*" OR CommandLine="*remote-exec*" OR CommandLine="*rev2self*" OR CommandLine="*dcsync*" OR CommandLine="*logonpasswords*" OR CommandLine="*execute-assembly*" OR CommandLine="*getsystem*")
+  spl: 'index=windows EventCode=4688 New_Process_Name="*\\cmd.exe" (CommandLine="*psinject*" OR CommandLine="*spawnas*" OR CommandLine="*make_token*"
+    OR CommandLine="*remote-exec*" OR CommandLine="*rev2self*" OR CommandLine="*dcsync*" OR CommandLine="*logonpasswords*" OR CommandLine="*execute-assembly*"
+    OR CommandLine="*getsystem*")
+
     | table _time, ComputerName, Account_Name, New_Process_Name, CommandLine, Creator_Process_Name
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("cmd.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('cmd.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000258 {\n  meta:\n    author = \"TDL\"\n    description = \"Cobalt Strike Interactive Commands Entered in CMD\"\n\
-    \    severity = \"HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1059\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /(cmd.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where Process has "cmd.exe"
+    | where CommandLine has_any ("psinject","spawnas","make_token","remote-exec","rev2self","dcsync","logonpasswords","execute-assembly","getsystem")
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName
+  aql: "SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, \"Process Name\", \"Process CommandLine\", \"Parent Process\
+    \ Name\"\nFROM events\nWHERE \"EventID\" IN ('592', '4688')\n  AND \"Process Name\" ILIKE '%cmd.exe%'\n  AND (\"Process CommandLine\" ILIKE\
+    \ '%psinject%' \n       OR \"Process CommandLine\" ILIKE '%spawnas%' \n       OR \"Process CommandLine\" ILIKE '%make_token%' \n       OR\
+    \ \"Process CommandLine\" ILIKE '%remote-exec%' \n       OR \"Process CommandLine\" ILIKE '%rev2self%' \n       OR \"Process CommandLine\"\
+    \ ILIKE '%dcsync%' \n       OR \"Process CommandLine\" ILIKE '%logonpasswords%' \n       OR \"Process CommandLine\" ILIKE '%execute-assembly%'\
+    \ \n       OR \"Process CommandLine\" ILIKE '%getsystem%')\nLAST 24 HOURS\n"
+  yara_l: |
+    rule mitre_t1059_suspicious_cmd_execution {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects suspicious cmd.exe execution with command lines indicative of post-exploitation tools"
+        mitre_attack_technique = "T1059"
+        mitre_attack_tactic = "Execution"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688"
+        )
+        re.regex($e.target.process.file.full_path, `(?i)\\cmd\.exe$`)
+        re.regex($e.target.process.command_line, `(?i)(psinject|spawnas|make_token|remote-exec|rev2self|dcsync|logonpasswords|execute-assembly|getsystem)`)
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name IN ("cmd.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [cmd.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (cmd.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("cmd.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(cmd.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("cmd.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-windows.sysmon_operational*, logs-system.security*, winlogbeat-*\n| WHERE event.code IN (\"592\", \"4688\") \n  AND TO_LOWER(process.name)\
+    \ == \"cmd.exe\"\n  AND (process.command_line LIKE \"*psinject*\" \n    OR process.command_line LIKE \"*spawnas*\" \n    OR process.command_line\
+    \ LIKE \"*make_token*\" \n    OR process.command_line LIKE \"*remote-exec*\" \n    OR process.command_line LIKE \"*rev2self*\" \n    OR process.command_line\
+    \ LIKE \"*dcsync*\" \n    OR process.command_line LIKE \"*logonpasswords*\" \n    OR process.command_line LIKE \"*execute-assembly*\" \n \
+    \   OR process.command_line LIKE \"*getsystem*\")\n| KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name,\
+    \ process.executable\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND process_name="cmd.exe" AND (process_cmd_line ICONTAINS "psinject" OR process_cmd_line ICONTAINS "spawnas" OR process_cmd_line ICONTAINS "make_token" OR process_cmd_line ICONTAINS "remote-exec" OR process_cmd_line ICONTAINS "rev2self" OR process_cmd_line ICONTAINS "dcsync" OR process_cmd_line ICONTAINS "logonpasswords" OR process_cmd_line ICONTAINS "execute-assembly" OR process_cmd_line ICONTAINS "getsystem"))
+  crowdstrike: |
+    EventCode=4688 NewProcessName=*cmd.exe (CommandLine=*psinject* OR CommandLine=*spawnas* OR CommandLine=*make_token* OR CommandLine=*remote-exec* OR CommandLine=*rev2self* OR CommandLine=*dcsync* OR CommandLine=*logonpasswords* OR CommandLine=*execute-assembly* OR CommandLine=*getsystem*)
+    | table([@timestamp, ComputerName, SubjectUserName, NewProcessName, CommandLine, ParentProcessName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter lowercase(action_process_image_name) contains "cmd.exe"
+    | filter action_process_image_command_line ~= "(?i)(psinject|spawnas|make_token|remote-exec|rev2self|dcsync|logonpasswords|execute-assembly|getsystem)"
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:4688 AND process.name:cmd.exe AND process.command_line:(*psinject* OR *spawnas* OR *make_token* OR *remote-exec* OR *rev2self* OR *dcsync* OR *logonpasswords* OR *execute-assembly* OR *getsystem*)
+  sumo: |
+    _sourceCategory=*Windows* "4688"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | where event_id in ("592", "4688")
+    | where process_name matches "*cmd.exe"
+    | where command_line matches "*psinject*" or command_line matches "*spawnas*" or command_line matches "*make_token*" or command_line matches "*remote-exec*" or command_line matches "*rev2self*" or command_line matches "*dcsync*" or command_line matches "*logonpasswords*" or command_line matches "*execute-assembly*" or command_line matches "*getsystem*"
+    | fields _messageTime, _sourceHost, event_id, process_name, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +102,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Process Creation Event
 

@@ -16,83 +16,87 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol="*tcp*" (http_user_agent="*nmap*" OR user_agent="*nmap*" OR useragent="*nmap*" OR http.user_agent="*nmap*")
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol="*tcp*" (http_user_agent="*nmap*" OR user_agent="*nmap*" OR useragent="*nmap*"
+    OR http.user_agent="*nmap*")
+
     NOT (src_ip IN ("10.0.0.100", "10.0.0.101", "192.168.1.50") OR src IN ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
+
     | stats count as connection_attempts, dc(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
+
     | where connection_attempts >= 1
+
     | sort - bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(24h)\n| where DeviceVendor in (\"Palo Alto Networks\", \"Fortinet\", \"Check Point\", \"\
+    Cisco\") or DeviceProduct has_any (\"IDS\", \"IPS\", \"WAF\", \"Firewall\")\n| where Protocol has \"tcp\"\n| where RequestClientApplication\
+    \ has_any (\"Nmap\", \"nmap\") or AdditionalExtensions has_any (\"Nmap\", \"nmap\") or Message has_any (\"Nmap\", \"nmap\")\n| where SourceIP\
+    \ !in (\"10.0.0.100\", \"10.0.0.101\", \"192.168.1.50\")\n| summarize \n    connection_attempts = count(),\n    unique_dests = dcount(DestinationIP),\n\
+    \    bytes_out = sum(SentBytes)\n    by SourceIP, DestinationIP, DestinationPort\n| where connection_attempts >= 1\n| sort by bytes_out desc\n\
+    | project TimeGenerated = now(), SourceIP, DestinationIP, DestinationPort, connection_attempts, unique_dests, bytes_out\n"
+  aql: |
+    SELECT sourceip AS src_ip, destinationip AS dest_ip, destinationport AS dest_port, COUNT(*) AS connection_attempts, UNIQUECOUNT(destinationip) AS unique_dests, SUM(bytesout) AS bytes_out
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%firewall%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%ids%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%ips%' OR categoryname(category) ILIKE '%intrusion%' OR categoryname(category) ILIKE '%firewall%')
+      AND (payload ILIKE '%nmap%' OR "User Agent" ILIKE '%nmap%' OR UTF8(payload) ILIKE '%nmap%')
+      AND sourceip NOT IN ('10.0.0.100', '10.0.0.101', '192.168.1.50')
     GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000555 {\n  meta:\n    author = \"TDL\"\n    description = \"NMAP User Agent\"\n    severity = \"MEDIUM\"\n    tactic\
-    \ = \"TA0011\"\n    technique = \"T1595\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol = /tcp/\n\
-    \    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
+    HAVING connection_attempts >= 1
+    ORDER BY bytes_out DESC
+    LAST 24 HOURS
+  yara_l: "rule nmap_user_agent_detection {\n  meta:\n    author = \"TDL\"\n    description = \"Detects NMAP user agent signatures in network\
+    \ traffic indicating active reconnaissance (T1595)\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique = \"T1595\"\
+    \n    severity = \"Medium\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    (\n      $e.metadata.product_name = \"\
+    firewall\" or\n      $e.metadata.product_name = \"ids\" or\n      $e.metadata.product_name = \"ips\" or\n      $e.metadata.product_name =\
+    \ \"waf\"\n    )\n    re.regex($e.network.application_protocol, `(?i)tcp`)\n    (\n      re.regex($e.network.http.user_agent, `(?i)nmap`)\
+    \ or\n      re.regex($e.network.http.user_agent, `(?i)nmap scripting engine`) or\n      re.regex($e.about.labels.value, `(?i)nmap`)\n    )\n\
+    \    $e.principal.ip = $src_ip\n    $e.target.ip = $dest_ip\n    $e.target.port = $dest_port\n    \n    not (\n      net.ip_in_range_cidr($src_ip,\
+    \ \"10.0.0.0/8\") or\n      net.ip_in_range_cidr($src_ip, \"172.16.0.0/12\") or\n      net.ip_in_range_cidr($src_ip, \"192.168.0.0/16\")\n\
+    \    )\n\n  match:\n    $src_ip, $dest_ip, $dest_port over 1h\n\n  outcome:\n    $risk_score = max(65)\n    $connection_count = count_distinct($e.metadata.id)\n\
+    \    $unique_dest_count = count_distinct($dest_ip)\n    $bytes_out = sum($e.network.sent_bytes)\n\n  condition:\n    #e >= 1\n}\n"
+  esql: |
+    FROM logs-network.firewall*, logs-network.ids*, logs-network.waf*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND (http.request.headers.user_agent LIKE "*Nmap*" OR http.request.headers.user_agent LIKE "*nmap*" OR network.protocol LIKE "*tcp*")
+      AND source.ip NOT IN ("10.0.0.5", "10.0.0.10", "192.168.1.100")
+    | STATS count = COUNT(*), unique_dests = COUNT_DISTINCT(destination.ip), bytes_out = SUM(source.bytes) BY source.ip, destination.ip, destination.port
+    | WHERE count >= 1
     | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
+    | KEEP source.ip, destination.ip, destination.port, count, unique_dests, bytes_out
+  leql: |
+    where(http_user_agent ICONTAINS "nmap" OR http_user_agent=/.*nmap.*/i OR user_agent ICONTAINS "nmap" OR user_agent=/.*nmap.*/i) groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    (#type=firewall OR #type=ids) http.user_agent=*nmap* network.protocol=*tcp*
+    | !in(field=src_ip, values=[authorized_scanner_ips])
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=connection_attempts), count(dest_ip, distinct=true, as=unique_dests), sum(bytes_out, as=bytes_out)])
+    | connection_attempts >= 1
+    | sort(bytes_out, reverse=true)
+    | table([src_ip, dest_ip, dest_port, connection_attempts, unique_dests, bytes_out])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter lowercase(http_user_agent) ~= ".*nmap.*" and lowercase(ip_protocol) contains "tcp"
+    | filter action_source_ip not in ("10.0.1.100", "10.0.1.101", "10.0.1.102")
+    | comp count() as connection_attempts, count_distinct(action_destination_translated_ip) as unique_dests, sum(bytes_sent) as bytes_out by action_source_ip, action_destination_translated_ip, action_destination_translated_port
+    | filter connection_attempts >= 1
     | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    | fields action_source_ip, action_destination_translated_ip, action_destination_translated_port, connection_attempts, unique_dests, bytes_out
+  lucene: |
+    (sourcetype:firewall OR sourcetype:ids) AND network.protocol:*tcp* AND (http.request.headers.user_agent:*Nmap* OR http.user_agent:*Nmap* OR user_agent:*Nmap* OR http_user_agent:*Nmap*) AND NOT (src_ip:(authorized_scanner_ip_1 OR authorized_scanner_ip_2) OR source.ip:(authorized_scanner_ip_1 OR authorized_scanner_ip_2))
+  sumo: |
+    _sourceCategory=network OR _sourceCategory=ids OR _sourceCategory=waf
+    | where _sourceCategory matches "*firewall*" OR _sourceCategory matches "*ids*" OR _sourceCategory matches "*waf*"
+    | parse regex "(?i)user[-_\s]?agent[:\s]+(?<user_agent>[^\r\n]+)" nodrop
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dst[_\s]?ip[:\s=]+(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "dst[_\s]?port[:\s=]+(?<dest_port>\d+)" nodrop
+    | parse regex "bytes[_\s]?out[:\s=]+(?<bytes_out>\d+)" nodrop
+    | parse regex "protocol[:\s=]+(?<protocol>[^\s,]+)" nodrop
+    | where (user_agent matches "*nmap*" OR user_agent matches "*Nmap*" OR user_agent matches "*NMAP*") AND (protocol matches "*tcp*" OR protocol matches "*TCP*")
+    | where !(src_ip in ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
+    | count as connection_attempts, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | where connection_attempts >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, connection_attempts, unique_dests, total_bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -102,7 +106,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

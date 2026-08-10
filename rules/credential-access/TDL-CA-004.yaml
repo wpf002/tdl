@@ -16,70 +16,75 @@ queries:
   spl: "index=windows sourcetype=\"WinEventLog:Security\" EventCode=4662 \nNOT (Account_Name IN (\"MSOL_*\", \"AAD_*\", \"*backup*\", \"*sync*\"\
     ))\n| stats count dc(EventCode) as unique_events values(Logon_Type) as logon_types by Account_Name, IpAddress, ComputerName, EventCode\n|\
     \ where count >= 1\n| sort - count\n| table _time, Account_Name, IpAddress, ComputerName, EventCode, logon_types, count\n"
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4662")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4662')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_004 {\n  meta:\n    author = \"TDL\"\n    description = \"DCSync Attack - Replication Rights Abuse\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0006\"\n    technique = \"T1003.006\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id\
-    \ = /(4662)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("4662")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4662])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4662)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4662")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4662)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4662")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4662
+    | where SubjectUserName !has "MSOL_" and SubjectUserName !has "AAD_" and SubjectUserName !has "$"
+    | extend User = SubjectUserName, IpAddress = IpAddress, LogonType = LogonType, EventCode = EventID
+    | summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by User, IpAddress, LogonType, EventCode, Computer
+    | where Count >= 1
+    | sort by Count desc
+    | project FirstSeen, LastSeen, User, IpAddress, LogonType, EventCode, Computer, Count
+  aql: |
+    SELECT username, sourceip, "Logon Type", COUNT(*) AS event_count, LOGSOURCENAME(logsourceid) AS host
+    FROM events
+    WHERE "EventID" = '4662'
+      AND username NOT ILIKE '%azureadconnect%'
+      AND username NOT ILIKE '%backup%'
+      AND username NOT ILIKE '%veeam%'
+      AND username NOT ILIKE '%commvault%'
+    GROUP BY username, sourceip, "Logon Type", LOGSOURCENAME(logsourceid)
+    HAVING event_count >= 1
+    ORDER BY event_count DESC
+    LAST 1 HOURS
+  yara_l: "rule credential_access_sam_replication_attempt {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects potential\
+    \ SAM database replication attempts via Windows Event 4662\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique\
+    \ = \"T1003.006\"\n    severity = \"HIGH\"\n\n  events:\n    $e.metadata.event_type = \"GENERIC_EVENT\"\n    $e.metadata.product_event_type\
+    \ = \"4662\"\n    $e.metadata.product_name = \"Microsoft-Windows-Security-Auditing\"\n    \n    $e.principal.user.userid = $user\n    $e.principal.ip\
+    \ = $ip\n    \n    not re.regex($e.principal.user.userid, `(?i)(AAD_|MSOL_|backup|veeam|commvault)`)\n    not re.regex($e.principal.user.userid,\
+    \ `(?i)(_svc|service|admin)$`)\n\n  match:\n    $user, $ip over 5m\n\n  outcome:\n    $risk_score = 75\n    $event_count = count_distinct($e.metadata.id)\n\
+    \n  condition:\n    #e >= 1\n}\n"
+  esql: "FROM logs-system.security*, winlogbeat-*\n| WHERE event.code == \"4662\" AND @timestamp > NOW() - 24 hour\n| WHERE user.name IS NOT NULL\
+    \ \n  AND user.name NOT LIKE \"*MSOL_*\" \n  AND user.name NOT LIKE \"*AAD_*\"\n  AND user.name NOT LIKE \"*AzureAD*\"\n  AND user.name NOT\
+    \ LIKE \"*backup*\"\n  AND user.name NOT LIKE \"*Veeam*\"\n  AND user.name != \"SYSTEM\"\n| EVAL src_ip = COALESCE(source.ip, winlog.event_data.IpAddress)\n\
+    | EVAL logon_type = COALESCE(winlog.event_data.LogonType, winlog.logon.type)\n| STATS event_count = COUNT(*) BY user.name, src_ip, logon_type,\
+    \ event.code\n| WHERE event_count >= 1\n| SORT event_count DESC\n| KEEP user.name, src_ip, logon_type, event.code, event_count\n"
+  leql: |
+    where(source_json.EventID=4662 AND user!="MSOL_*" AND user!="*backup*" AND user!="*ADSync*") groupby(user, source_address) calculate(count)
+  crowdstrike: |
+    EventCode=4662
+    | !match(field=SubjectUserName, regex="^(MSOL_|AAD_|AADSync|ADSync|.*backup.*|.*svc.*)$", ignoreCase=true)
+    | groupBy([SubjectUserName, IpAddress], function=count(as=cnt))
+    | cnt >= 1
+    | sort(cnt, reverse=true)
+    | table([SubjectUserName, IpAddress, cnt])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4662
+    | alter user = coalesce(action_evtlog_event_data_SubjectUserName, actor_effective_username),
+            IpAddress = coalesce(action_evtlog_event_data_IpAddress, action_remote_ip),
+            LogonType = action_evtlog_event_data_LogonType,
+            EventCode = action_evtlog_event_id
+    | filter user != "MSOL_" and user != "AAD_" and not (lowercase(user) contains "backup" or lowercase(user) contains "sync")
+    | comp count() as occurrence_count by user, IpAddress, LogonType, EventCode, agent_hostname, _time
+    | filter occurrence_count >= 1
+    | sort desc occurrence_count
+    | fields _time, user, IpAddress, LogonType, EventCode, agent_hostname, occurrence_count
+  lucene: |
+    event.code:4662 AND NOT (user.name:("MSOL_*" OR "AAD_*" OR *backup* OR *replication*))
+  sumo: |
+    _sourceCategory=*Windows*Security* "4662"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "SubjectUserName" as user
+    | json field=_raw "IpAddress" as ip_address
+    | json field=_raw "LogonType" as logon_type
+    | json field=_raw "EventCode" as event_code
+    | where event_id = "4662"
+    | where !(user matches "*AzureAD*" or user matches "*ADConnect*" or user matches "*backup*" or user matches "*MSOL_*")
+    | count as occurrence_count by user, ip_address, logon_type, event_code
+    | where occurrence_count >= 1
+    | sort by occurrence_count desc
 false_positives:
 - Azure AD Connect
 - Backup solutions with AD replication permissions
@@ -91,7 +96,7 @@ tags:
 author: TDL
 created: '2024-02-04'
 test_method: purple_team
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
 - Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force pattern is consistent

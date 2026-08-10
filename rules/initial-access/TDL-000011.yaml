@@ -17,73 +17,64 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=528 OR EventCode=540 OR EventCode=4624) Logon_Type=8 Logon_Process!="Advapi"
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=528 OR EventCode=540 OR EventCode=4624) Logon_Type=8 Logon_Process!="Advapi"
+
     | table _time, ComputerName, Account_Name, TargetUserName, Logon_Type, Logon_Process, Source_Network_Address, Workstation_Name
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4624")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4624')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000011 {\n  meta:\n    author = \"TDL\"\n    description = \"Service Account Login with Cleartext Password\"\n  \
-    \  severity = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id\
-    \ = /(4624)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("4624")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4624])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4624)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4624")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4624)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4624")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (528, 540, 4624)
+    | where LogonType == 8 or (TargetUserName has "svc" or TargetUserName has "service")
+    | where LogonProcessName !has "Advapi"
+    | project TimeGenerated, Computer, TargetUserName, LogonType, LogonProcessName, IpAddress, WorkstationName
+  aql: |
+    SELECT username AS "Destination Username", sourceip, destinationip, LOGSOURCENAME(logsourceid) AS host, "Logon Type", "Logon Process", COUNT(*) AS logon_count
+    FROM events
+    WHERE "EventID" IN ('528', '540', '4624')
+      AND "Logon Type" = '8'
+      AND "Logon Process" NOT ILIKE 'Advapi'
+    GROUP BY username, sourceip, destinationip, LOGSOURCENAME(logsourceid), "Logon Type", "Logon Process"
+    LAST 24 HOURS
+  yara_l: "rule service_account_logon_t1078 {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects service account logins\
+    \ with suspicious logon types or processes - T1078 Initial Access\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1078\"\n    severity = \"Medium\"\n\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    (\n      $e.metadata.product_event_type\
+    \ = \"528\" or\n      $e.metadata.product_event_type = \"540\" or\n      $e.metadata.product_event_type = \"4624\"\n    )\n    $e.security_result.action\
+    \ = \"ALLOW\"\n    \n    // Logon Type 8 (NetworkCleartext) OR service account patterns\n    (\n      $e.extensions.auth.type = \"8\" or\n\
+    \      (\n        re.regex($e.target.user.userid, `(?i)(svc|service|_sa|_svc|srvc)`) and\n        not re.regex($e.security_result.summary,\
+    \ `(?i)Advapi`)\n      )\n    )\n    \n    // Exclude Advapi logon process\n    not re.regex($e.security_result.summary, `(?i)Advapi`)\n \
+    \   \n    $e.target.user.userid = $user\n    $e.principal.hostname = $host\n\n  match:\n    $user, $host over 5m\n\n  condition:\n    $e\n\
+    \n  outcome:\n    $risk_score = 55\n}\n"
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code IN ("528", "540", "4624")
+      AND winlog.event_data.LogonType == "8"
+      AND winlog.event_data.LogonProcessName != "Advapi"
+    | STATS count = COUNT(*) BY user.name, host.name, source.ip, winlog.event_data.LogonProcessName
+    | KEEP @timestamp, user.name, host.name, source.ip, winlog.event_data.LogonProcessName, count
+  leql: |
+    where(source_json.EventID IN [528, 540, 4624] AND source_json.LogonType=8 AND source_json.LogonProcess!=Advapi)
+  crowdstrike: "EventCode=4624 LogonType=8 \n| logon_process!=\"Advapi\"\n| table([@timestamp, ComputerName, TargetUserName, LogonType, logon_process,\
+    \ IpAddress, WorkstationName])\n"
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (528, 540, 4624)
+    | filter action_evtlog_event_data_LogonType = "8" or (action_evtlog_event_data_TargetUserName ~= "svc.*" or action_evtlog_event_data_TargetUserName ~= ".*service.*" or action_evtlog_event_data_TargetUserName ~= ".*_svc$")
+    | filter action_evtlog_event_data_LogonProcessName != "Advapi"
+    | fields _time, agent_hostname, action_evtlog_event_data_TargetUserName, action_evtlog_event_data_LogonType, action_evtlog_event_data_LogonProcessName, action_evtlog_event_data_IpAddress, action_evtlog_event_data_WorkstationName
+  lucene: |
+    event.code:4624 AND winlog.event_data.LogonType:8 AND NOT winlog.event_data.LogonProcess:Advapi
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Active*Directory* ("528" OR "540" OR "4624")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "LogonType" as logon_type
+    | json field=_raw "TargetUserName" as target_user
+    | json field=_raw "LogonProcessName" as logon_process
+    | where event_id in ("528", "540", "4624")
+    | where logon_type = "8" OR (target_user matches "*svc*" OR target_user matches "*service*")
+    | where !(logon_process matches "*Advapi*")
+    | fields _messageTime, _sourceHost, event_id, logon_type, target_user, logon_process
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -93,7 +84,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Authentication Success Event\nWhere the Event ID is in [528, 540, 4624]\nWhere the Logon Type is 8\nOR\n\tWhere the Destination\
   \ Username is on the Service Account List\n\tWhere the Destination Username matches the Service Account Naming Convention\nWhere Logon Process\

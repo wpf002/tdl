@@ -16,84 +16,141 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (dest_ip="*pastebin.com*" OR dest_ip="*raw.githubusercontent.com*" OR dest_ip="*paste.ee*" OR dest_ip="*hastebin.com*") (uri_path="*/raw/*" OR uri_path="*/raw" OR url="*pastebin.com/raw*" OR url="*raw.githubusercontent.com*" OR url="*paste.ee/r*" OR url="*hastebin.com/raw*")
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (dest_ip="*pastebin.com*" OR dest_ip="*raw.githubusercontent.com*"
+    OR dest_ip="*paste.ee*" OR dest_ip="*hastebin.com*") (uri_path="*/raw/*" OR uri_path="*/raw" OR url="*pastebin.com/raw*" OR url="*raw.githubusercontent.com*"
+    OR url="*paste.ee/r*" OR url="*hastebin.com/raw*")
+
     NOT [| inputlookup admin_allowlist_scanners.csv | fields src_ip]
+
     | stats sum(bytes_out) as total_bytes_out, count as session_count by src_ip, dest_ip
+
     | where session_count >= 1
+
     | sort - total_bytes_out
+
     | table src_ip, dest_ip, total_bytes_out, session_count
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceVendor has_any ("Palo Alto", "Fortinet", "Cisco", "Zscaler", "Check Point", "Squid") or DeviceProduct has_any ("Firewall", "Proxy", "IDS", "IPS")
+    | where Protocol =~ "tcp" or ApplicationProtocol =~ "tcp"
+    | where DestinationHostName has_any ("pastebin.com", "raw.githubusercontent.com", "paste.ee", "hastebin.com", "rentry.co", "ghostbin.com", "dpaste.com", "pastelink.net")
+        and (RequestURL has "/raw" or RequestURL has "/raw/" or DestinationHostName has "raw.")
+    | where SourceIP !in ("10.0.0.100", "10.0.0.101", "192.168.1.50")
+    | extend BytesOut = coalesce(SentBytes, BytesSent, 0)
+    | summarize TotalBytesOut = sum(BytesOut), SessionCount = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by SourceIP, DestinationIP, DestinationHostName, DestinationPort
+    | where SessionCount >= 1
+    | sort by TotalBytesOut desc
+    | project FirstSeen, LastSeen, SourceIP, DestinationIP, DestinationHostName, DestinationPort, SessionCount, TotalBytesOut
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(bytesout) AS total_bytes_out, COUNT(*) AS session_count
     FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+    WHERE protocol = 6
+      AND (destinationip IN (SELECT destinationip FROM flows WHERE (DOMAINNAME(destinationip) ILIKE '%pastebin.com%' OR DOMAINNAME(destinationip) ILIKE '%githubusercontent.com%' OR DOMAINNAME(destinationip) ILIKE '%paste.ee%' OR DOMAINNAME(destinationip) ILIKE '%hastebin.com%'))
+           OR "URL" ILIKE '%pastebin.com/raw%' OR "URL" ILIKE '%raw.githubusercontent.com%' OR "URL" ILIKE '%paste.ee/r%' OR "URL" ILIKE '%hastebin.com/raw%')
+      AND sourceip NOT IN (SELECT sourceip FROM flows WHERE "Scanner" = 'true' OR "Monitoring_Agent" = 'true')
     GROUP BY sourceip, destinationip, destinationport
+    HAVING session_count >= 1
+    ORDER BY total_bytes_out DESC
+    LAST 24 HOURS
+  yara_l: |
+    rule defense_evasion_raw_paste_site_access {
+      meta:
+        author = "TDL"
+        description = "T1071 - Application Layer Protocol - Access to raw paste service endpoints"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1071"
+        severity = "Medium"
 
-    LAST 1 HOURS
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.network.ip_protocol = "TCP"
+        (
+          re.regex($e.target.url, `(?i)pastebin\.com/raw`) or
+          re.regex($e.target.url, `(?i)raw\.githubusercontent\.com`) or
+          re.regex($e.target.url, `(?i)paste\.ee/r`) or
+          re.regex($e.target.url, `(?i)hastebin\.com/raw`) or
+          re.regex($e.target.hostname, `(?i)pastebin\.com`) and re.regex($e.target.url, `(?i)/raw/`) or
+          re.regex($e.target.hostname, `(?i)githubusercontent\.com`) and re.regex($e.target.url, `(?i)/raw/`) or
+          re.regex($e.target.hostname, `(?i)paste\.ee`) and re.regex($e.target.url, `(?i)/r/`) or
+          re.regex($e.target.hostname, `(?i)hastebin\.com`) and re.regex($e.target.url, `(?i)/raw/`)
+        )
+        not (
+          $e.principal.ip = "10.0.0.100" or
+          $e.principal.ip = "10.0.0.101" or
+          $e.principal.ip = "192.168.1.50"
+        )
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dest_ip
+        $e.network.sent_bytes > 0
 
-    '
-  yara_l: "rule tdl_tdl_de_000451 {\n  meta:\n    author = \"TDL\"\n    description = \"Raw Paste Service Access\"\n    severity = \"MEDIUM\"\n\
-    \    tactic = \"TA0005\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      match:
+        $src_ip, $dest_ip over 1h
 
-    | WHERE @timestamp > NOW() - 1 hour
+      outcome:
+        $risk_score = 50
+        $total_bytes_out = sum($e.network.sent_bytes)
+        $dest_port = array_distinct($e.target.port)
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-network.firewall*, logs-network.ids*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND network.protocol == "tcp"
+      AND (
+        destination.domain LIKE "*pastebin.com*" AND destination.domain LIKE "*raw*"
+        OR destination.domain LIKE "*raw.githubusercontent.com*"
+        OR destination.domain LIKE "*paste.ee*" AND destination.domain LIKE "*r/*"
+        OR destination.domain LIKE "*hastebin.com*" AND destination.domain LIKE "*raw*"
+        OR url.full LIKE "*pastebin.com/raw*"
+        OR url.full LIKE "*raw.githubusercontent.com*"
+        OR url.full LIKE "*paste.ee/r/*"
+        OR url.full LIKE "*hastebin.com/raw*"
+      )
+      AND source.ip NOT IN ("10.0.0.100", "10.0.0.101", "192.168.1.50")
+    | STATS bytes_out_total = SUM(network.bytes), session_count = COUNT(*) BY source.ip, destination.ip, destination.port
+    | WHERE session_count >= 1
+    | SORT bytes_out_total DESC
+    | KEEP source.ip, destination.ip, destination.port, bytes_out_total, session_count
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp" AND (destination_address ICONTAINS "pastebin.com/raw" OR destination_address ICONTAINS "raw.githubusercontent.com" OR destination_address ICONTAINS "paste.ee/r" OR destination_address ICONTAINS "hastebin.com/raw") AND source_address != "authorized_scanner_ip_1" AND source_address != "authorized_scanner_ip_2") groupby(source_address, destination_address) calculate(sum:bytes_out)
+  crowdstrike: |
+    #repo=network (sourcetype=firewall OR sourcetype=ids) network.protocol=*tcp*
+    | (dest_ip=*pastebin.com* OR dest_ip=*raw.githubusercontent.com* OR dest_ip=*paste.ee* OR dest_ip=*hastebin.com* OR url=*pastebin.com/raw* OR url=*raw.githubusercontent.com* OR url=*paste.ee/r* OR url=*hastebin.com/raw*)
+    | src_ip != /^(10\.10\.99\.|192\.168\.200\.)/
+    | groupBy([src_ip, dest_ip], function=[sum(bytes_out, as=total_bytes), count(as=session_count)])
+    | session_count >= 1
+    | sort(total_bytes, order=desc)
+    | table([src_ip, dest_ip, total_bytes, session_count])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter proto = \"tcp\"\n| alter raw_paste_domain = arrayindex(regextract(http_hostname, \"([^\\.]+\\\
+    .[^\\.]+)$\"), 0)\n| filter (http_hostname contains \"pastebin.com\" and http_url_path contains \"/raw\") \n   or (http_hostname contains\
+    \ \"githubusercontent.com\" and http_url_path contains \"/raw\")\n   or (http_hostname contains \"paste.ee\" and http_url_path contains \"\
+    /r\")\n   or (http_hostname contains \"hastebin.com\" and http_url_path contains \"/raw\")\n   or http_url_path ~= \".*/raw/.*\"\n| filter\
+    \ src_ip not in (\"10.0.0.100\", \"10.0.0.101\", \"192.168.1.50\")\n| comp sum(bytes_sent) as bytes_out, count() as session_count by src_ip,\
+    \ dst_ip, dst_port\n| filter session_count >= 1\n| sort desc bytes_out\n| fields src_ip, dst_ip, dst_port, bytes_out, session_count\n"
+  lucene: |
+    (sourcetype:(firewall OR ids)) AND network.protocol:tcp AND (dest_ip:*pastebin.com* OR dest_ip:*raw.githubusercontent.com* OR dest_ip:*paste.ee* OR dest_ip:*hastebin.com* OR url:*pastebin.com/raw* OR url:*raw.githubusercontent.com* OR url:*paste.ee/r* OR url:*hastebin.com/raw*) AND NOT (src_ip:(10.0.0.100 OR 10.0.0.101 OR 192.168.1.50))
+  sumo: |
+    _sourceCategory=*network* OR _sourceCategory=*firewall* OR _sourceCategory=*proxy*
+    | json field=_raw "protocol" as protocol
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "bytes_out" as bytes_out
+    | json field=_raw "dest_host" as dest_host
+    | json field=_raw "url" as url
+    | where protocol matches "*tcp*"
+    | where (dest_host matches "*pastebin.com/raw*" or dest_host matches "*raw.githubusercontent.com*" or dest_host matches "*paste.ee/r*" or dest_host matches "*hastebin.com/raw*" or url matches "*pastebin.com/raw*" or url matches "*raw.githubusercontent.com*" or url matches "*paste.ee/r*" or url matches "*hastebin.com/raw*")
+    | where !(src_ip in ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
+    | sum(bytes_out) as total_bytes_out by src_ip, dest_ip
+    | count as session_count by src_ip, dest_ip, total_bytes_out
+    | where session_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, total_bytes_out, session_count
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -103,7 +160,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

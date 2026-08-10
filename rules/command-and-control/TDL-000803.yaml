@@ -16,86 +16,137 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 50
 queries:
-  spl: |
-    index=network_ids sourcetype=ids OR sourcetype=suricata (event_type=tls OR event_type=alert) dest_port IN (443, 8443)
+  spl: 'index=network_ids sourcetype=ids OR sourcetype=suricata (event_type=tls OR event_type=alert) dest_port IN (443, 8443)
+
     | eval connection_id=src_ip.":".src_port.":".process_name
+
     | sort 0 _time
-    | streamstats earliest(_time) as first_time, latest(_time) as last_time, dc(dest_domain) as domain_count, dc(tls_fingerprint) as cert_count, count as conn_count by connection_id window=300
+
+    | streamstats earliest(_time) as first_time, latest(_time) as last_time, dc(dest_domain) as domain_count, dc(tls_fingerprint) as cert_count,
+    count as conn_count by connection_id window=300
+
     | where domain_count >= 2 AND (last_time - first_time) <= 300 AND cert_count >= 2
-    | stats values(dest_domain) as domains, values(dest_ip) as dest_ips, values(tls_fingerprint) as cert_fingerprints, dc(dest_domain) as unique_domains, dc(tls_fingerprint) as unique_certs, count as total_connections, min(_time) as first_conn, max(_time) as last_conn by src_ip, src_port, process_name
+
+    | stats values(dest_domain) as domains, values(dest_ip) as dest_ips, values(tls_fingerprint) as cert_fingerprints, dc(dest_domain) as unique_domains,
+    dc(tls_fingerprint) as unique_certs, count as total_connections, min(_time) as first_conn, max(_time) as last_conn by src_ip, src_port, process_name
+
     | where unique_domains >= 2 AND unique_certs >= 2 AND (last_conn - first_conn) <= 300
+
     | table first_conn, src_ip, src_port, process_name, domains, dest_ips, cert_fingerprints, unique_domains, unique_certs, total_connections
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(1h)\n| where DeviceVendor has \"Snort\" or DeviceVendor has \"Suricata\" or DeviceProduct\
+    \ has \"IDS\"\n| where DeviceAction != \"Block\" and DeviceAction != \"Deny\"\n| where isnotempty(DestinationHostName) and isnotempty(SourceIP)\n\
+    | extend ProcessIdentifier = coalesce(DeviceCustomString1, SourceIP)\n| summarize \n    Domains = make_set(DestinationHostName),\n    RequestTimes\
+    \ = make_list(TimeGenerated),\n    RequestCount = count(),\n    CertFingerprints = make_set(DeviceCustomString2)\n    by bin(TimeGenerated,\
+    \ 5m), ProcessIdentifier, SourceIP\n| where array_length(Domains) >= 2\n| where array_length(CertFingerprints) >= 2 or RequestCount >= 10\n\
+    | project TimeGenerated, SourceIP, ProcessIdentifier, Domains, RequestCount, CertFingerprints\n"
+  aql: |
+    SELECT sourceip, destinationip AS first_dest, destinationport AS first_port, eventtime AS first_time,
+           LAST(destinationip) AS second_dest, LAST(destinationport) AS second_port, LAST(eventtime) AS second_time,
+           COUNT(*) AS connection_count
+    FROM events
+    WHERE category IN (SELECT category FROM categories WHERE low_level_category_id = 3004)
+      AND destinationip IS NOT NULL
+    GROUP BY sourceip, destinationip, destinationport, eventtime
+    HAVING connection_count >= 1
+      AND (LAST(eventtime) - eventtime) <= 300000
+      AND LAST(destinationip) != destinationip
     LAST 1 HOURS
+  yara_l: |
+    rule domain_fronting_different_cadence {
+      meta:
+        author = "TDL"
+        description = "Detects potential domain fronting via outbound connections to different domains with different characteristics from same process"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1104"
+        severity = "HIGH"
 
-    '
-  yara_l: "rule tdl_tdl_c2_000803 {\n  meta:\n    author = \"TDL\"\n    description = \"Two-Domain Beacon Pattern (Stage1 → Stage2)\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1104\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        $e1.metadata.event_type = "NETWORK_CONNECTION"
+        $e1.network.direction = "OUTBOUND"
+        $e1.target.hostname = $domain1
+        $e1.principal.process.pid = $pid
+        $e1.principal.hostname = $host
+        $e1.network.tls.client.certificate.sha256 = $cert1
 
-    | WHERE @timestamp > NOW() - 1 hour
+        $e2.metadata.event_type = "NETWORK_CONNECTION"
+        $e2.network.direction = "OUTBOUND"
+        $e2.target.hostname = $domain2
+        $e2.principal.process.pid = $pid
+        $e2.principal.hostname = $host
+        $e2.network.tls.client.certificate.sha256 = $cert2
+        $domain1 != $domain2
+        $cert1 != $cert2
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
+      match:
+        $host, $pid over 5m
 
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
+      condition:
+        $e1 and $e2
+    }
+  esql: "FROM logs-network*\n| WHERE @timestamp > NOW() - 6 minutes AND event.category == \"network\" AND network.direction == \"outbound\" AND\
+    \ destination.domain IS NOT NULL\n| EVAL time_bucket = BUCKET(@timestamp, 5 minutes)\n| STATS \n    domains = COUNT_DISTINCT(destination.domain),\n\
+    \    conn_count = COUNT(*),\n    cert_fps = COUNT_DISTINCT(tls.server.hash.sha256),\n    min_time = MIN(@timestamp),\n    max_time = MAX(@timestamp)\n\
+    \  BY process.pid, host.name, time_bucket\n| WHERE domains >= 2 AND cert_fps >= 2\n| EVAL time_span = max_time - min_time\n| WHERE time_span\
+    \ <= 300000000000\n| KEEP @timestamp, host.name, process.pid, domains, conn_count, cert_fps, time_span\n"
+  leql: |
+    where(event_type="network_connection" AND direction="outbound") groupby(source_asset, process_name, destination_domain) calculate(unique:destination_domain)
+  crowdstrike: |
+    #type=NetworkConnectIP4 event_simpleName=NetworkConnectIP4
+    | groupBy([aid, ContextProcessId], function=[selectLast([RemoteAddressIP4, DomainName, timestamp]), count(DomainName, distinct=true, as=uniqueDomains)])
+    | uniqueDomains >= 2
+    | selfJoin(field=[aid, ContextProcessId], where=[{timestamp_max - timestamp_min <= 5m}], key=innerKey)
+    | table([aid, ContextProcessId, ComputerName, FileName, DomainName, RemoteAddressIP4, timestamp, uniqueDomains])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action in (XDR_ACTION_ALLOW, XDR_ACTION_CONTINUE) and dest_port in (443, 80)
+    | alter domain = coalesce(dst_host_name, repstr(dest_ip, ".", "_"))
+    | bin _time span=5m
+    | comp count() as conn_count, values(dest_ip) as dest_ips, count_distinct(ssl_cert_fingerprint) as cert_count by _time, source_ip, app_name, domain
+    | join type=inner (
+        dataset = panw_ngfw_traffic_raw
+        | filter action in (XDR_ACTION_ALLOW, XDR_ACTION_CONTINUE) and dest_port in (443, 80)
+        | alter domain = coalesce(dst_host_name, repstr(dest_ip, ".", "_"))
+        | bin _time span=5m
+        | comp count() as conn_count2, values(dest_ip) as dest_ips2, count_distinct(ssl_cert_fingerprint) as cert_count2 by _time, source_ip, app_name, domain
+    ) as d2 d2._time = _time and d2.source_ip = source_ip and d2.app_name = app_name and d2.domain != domain
+    | filter abs(conn_count - conn_count2) >= 5 or cert_count != cert_count2
+    | fields _time, source_ip, app_name, domain, conn_count, domain2 = d2.domain, conn_count2 = d2.conn_count2
+  lucene: |
+    I cannot write a valid Generic Lucene query for this detection logic.
 
-    | SORT bytes_out DESC
+    The requirement demands:
+    1. Temporal correlation (5-minute window between two events)
+    2. Grouping by process
+    3. Comparison of cadence/cert fingerprint between events
+    4. Stateful tracking of "first domain then second domain"
 
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
+    Generic Lucene query-string syntax is a **filter-only** language for single-document matching. It cannot:
+    - Correlate multiple events across time windows
+    - Perform aggregations or grouping
+    - Compare field values between different documents
+    - Maintain state about "first" vs "second" events
 
-    groupby(source_ip, destination_ip, destination_port)
+    This detection requires a stateful correlation engine (OpenSearch alerting with bucket-level monitors, Graylog correlation rules, Exabeam session logic, or Sigma correlation) — capabilities that exist **outside** the Lucene query string itself.
 
-    calculate(count, sum(bytes_out))
+    A Lucene query can only pre-filter candidate events, such as:
+    `event.type:connection AND destination.domain:* AND _exists_:process.pid`
 
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    But the actual detection logic must be implemented in the alerting/correlation layer above the query language.
+  sumo: |
+    _sourceCategory=*Network* OR _sourceCategory=*IDS* OR _sourceCategory=*zeek* OR _sourceCategory=*suricata*
+    | json field=_raw "dest_domain" as dest_domain
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "process" as process
+    | json field=_raw "cert_fingerprint" as cert_fingerprint
+    | json field=_raw "connection_interval" as interval
+    | where !isNull(dest_domain) and !isNull(src_ip) and !isNull(process)
+    | timeslice 5m
+    | count as conn_count, first(cert_fingerprint) as first_cert, last(cert_fingerprint) as last_cert, avg(interval) as avg_interval, stddev(interval) as stddev_interval by _timeslice, src_ip, process, dest_domain
+    | count_distinct(dest_domain) as domain_count, values(dest_domain) as domains, values(first_cert) as certs, stddev(avg_interval) as cadence_variance by _timeslice, src_ip, process
+    | where domain_count >= 2 and cadence_variance > 1000
+    | fields _timeslice, src_ip, process, domain_count, domains, certs, cadence_variance
 pseudo_logic: Outbound to one domain, then within 5m a second outbound to a different domain with markedly different cadence/cert fingerprint,
   from same process.
 false_positives:
@@ -112,7 +163,7 @@ references:
 - https://attack.mitre.org/techniques/T1104/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

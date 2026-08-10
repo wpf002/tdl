@@ -18,73 +18,88 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 60
 queries:
-  spl: |
-    index=cloud_audit (eventName=RunInstances OR eventName=ComputeEngine.instances.insert OR action="Microsoft.Compute/virtualMachines/write")
+  spl: 'index=cloud_audit (eventName=RunInstances OR eventName=ComputeEngine.instances.insert OR action="Microsoft.Compute/virtualMachines/write")
+
     | eval region=coalesce(awsRegion, resource.zone, location)
+
     | where NOT (region IN ("us-east-1", "us-west-2", "eu-west-1", "eastus", "westus2", "us-central1"))
+
     | table _time, user, eventName, action, region, sourceIPAddress, userAgent, accountId, projectId, subscriptionId
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000743 {\n  meta:\n    author = \"TDL\"\n    description = \"Resource Created in Non-Approved Cloud Region\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1535\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "AzureActivity\n| where TimeGenerated > ago(1h)\n| where OperationNameValue =~ \"Microsoft.Compute/virtualMachines/write\" \n   or OperationNameValue\
+    \ =~ \"MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE\"\n| extend Region = tostring(parse_json(Properties).location)\n| extend ApprovedRegions =\
+    \ dynamic([\"eastus\", \"westus\", \"centralus\", \"northeurope\", \"westeurope\"])\n| where Region !in (ApprovedRegions)\n| union (\n   \
+    \ AWSCloudTrail\n    | where TimeGenerated > ago(1h)\n    | where EventName == \"RunInstances\"\n    | extend Region = tostring(parse_json(RequestParameters).placement.availabilityZone)\n\
+    \    | extend ApprovedRegions = dynamic([\"us-east-1\", \"us-west-2\", \"eu-west-1\"])\n    | where not(Region startswith \"us-east-1\" or\
+    \ Region startswith \"us-west-2\" or Region startswith \"eu-west-1\")\n)\n| union (\n    GCPAuditLogs\n    | where TimeGenerated > ago(1h)\n\
+    \    | where ServiceName == \"compute.googleapis.com\"\n    | where MethodName has \"compute.instances.insert\"\n    | extend Region = tostring(parse_json(ResourceLocation).location)\n\
+    \    | extend ApprovedRegions = dynamic([\"us-central1\", \"us-east1\", \"europe-west1\"])\n    | where Region !in (ApprovedRegions)\n)\n\
+    | project TimeGenerated, OperationNameValue, EventName, MethodName, Region, Caller, CallerIpAddress, ResourceId, SubscriptionId, ResourceGroup\n"
+  aql: |
+    SELECT username, sourceip, "Cloud Provider", "Region", "Event Name", "Resource ID", COUNT(*) AS event_count
+    FROM events
+    WHERE (("Event Name" = 'RunInstances' OR "Event Name" ILIKE '%createVM%' OR "Event Name" ILIKE '%compute.instances.insert%')
+      AND "Region" NOT IN ('us-east-1', 'us-west-2', 'eu-west-1', 'eu-central-1', 'ap-southeast-1', 'ap-northeast-1'))
+    GROUP BY username, sourceip, "Cloud Provider", "Region", "Event Name", "Resource ID"
+    LAST 24 HOURS
+  yara_l: "rule cloud_vm_launch_in_unapproved_region {\n  meta:\n    author = \"TDL\"\n    description = \"Detects VM creation in regions outside\
+    \ approved allowlist (T1535 Defense Evasion)\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1535\"\n  \
+    \  severity = \"Medium\"\n\n  events:\n    (\n      // AWS RunInstances\n      ($e.metadata.product_name = \"AWS CloudTrail\" and\n      \
+    \ $e.metadata.product_event_type = \"RunInstances\" and\n       $e.principal.cloud.availability_zone = $region) or\n      \n      // Azure\
+    \ VM create\n      ($e.metadata.product_name = \"Azure\" and\n       re.regex($e.metadata.product_event_type, `(?i)Microsoft\\.Compute/virtualMachines/write`)\
+    \ and\n       $e.target.resource.attribute.labels[\"location\"] = $region) or\n      \n      // GCP ComputeEngine insert\n      ($e.metadata.product_name\
+    \ = \"GCP\" and\n       re.regex($e.metadata.product_event_type, `(?i)v1\\.compute\\.instances\\.insert`) and\n       $e.principal.cloud.availability_zone\
+    \ = $region)\n    )\n    \n    // Exclude approved regions\n    not re.regex($region, `(?i)(us-east-1|us-west-2|eu-west-1|eu-central-1|us-central1|europe-west1|eastus|westus2|northeurope|westeurope)`)\n\
+    \    \n    $e.principal.user.userid = $user\n    $e.target.resource.name = $resource\n\n  match:\n    $user over 5m\n\n  outcome:\n    $risk_score\
+    \ = 65\n    $region_used = array_distinct($region)\n    $resources_created = array_distinct($resource)\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-aws.cloudtrail*, logs-azure.activitylogs*, logs-gcp.audit*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (event.dataset == "aws.cloudtrail" AND event.action == "RunInstances")
+        OR (event.dataset == "azure.activitylogs" AND event.action == "Microsoft.Compute/virtualMachines/write")
+        OR (event.dataset == "gcp.audit" AND event.action == "v1.compute.instances.insert")
+      )
+      AND cloud.region NOT IN ("us-east-1", "us-west-2", "eu-west-1", "eu-central-1", "ap-southeast-1", "eastus", "westus2", "northeurope", "westeurope", "us-central1", "us-east1", "europe-west1", "europe-west4")
+    | KEEP @timestamp, cloud.provider, cloud.region, event.action, user.name, cloud.account.id, event.dataset
+  leql: |
+    where((source_json.eventName="RunInstances" OR source_json.eventName="ComputeEngine.insert" OR source_json.operationName="Microsoft.Compute/virtualMachines/write") AND NOT (source_json.awsRegion IN ["us-east-1", "us-west-2", "eu-west-1"] OR source_json.location IN ["us-east1", "us-west1", "europe-west1"] OR source_json.region IN ["eastus", "westus2", "westeurope"])) groupby(source_json.userIdentity.principalId, source_json.userPrincipalName, source_json.awsRegion, source_json.location, source_json.region) calculate(count)
+  crowdstrike: |
+    (#type=CloudAudit OR event_simpleName=CloudAuditEvent)
+    (eventName=RunInstances OR eventName="compute.instances.insert" OR eventName="Microsoft.Compute/virtualMachines/write")
+    | regex("(?<region>[a-z]{2}-[a-z]+-[0-9]|[a-z]+-[a-z0-9-]+)", field=awsRegion)
+    | regex("(?<region>[a-z]+-[a-z0-9]+)", field=location)
+    | regex("(?<region>[a-z]+[0-9]?)", field=azure_region)
+    | case {
+        awsRegion=* | region := awsRegion;
+        location=* | region := location;
+        azure_region=* | region := azure_region;
+        * | region := "unknown";
+      }
+    | region != "us-east-1" AND region != "us-west-2" AND region != "eu-west-1"
+    | table([@timestamp, eventName, region, userIdentity.principalId, sourceIPAddress, ComputerName])
+  xql: "dataset = cloud_audit_logs\n| filter (cloud_provider = \"AWS\" and action_cloud_audit_log_event_name in (\"RunInstances\", \"CreateInstances\"\
+    )) \n   or (cloud_provider = \"Azure\" and action_cloud_audit_log_event_name contains \"VirtualMachines\" and action_cloud_audit_log_event_name\
+    \ contains \"write\")\n   or (cloud_provider = \"GCP\" and action_cloud_audit_log_event_name = \"v1.compute.instances.insert\")\n| alter region\
+    \ = coalesce(\n    action_cloud_audit_log_aws_region,\n    action_cloud_audit_log_azure_region,\n    action_cloud_audit_log_gcp_region\n \
+    \ )\n| filter region not in (\"us-east-1\", \"us-west-2\", \"eu-west-1\", \"eu-central-1\", \"us-central1\", \"westus2\", \"eastus\")\n| fields\
+    \ _time, cloud_provider, action_cloud_audit_log_event_name, region, actor_cloud_audit_log_identity_name, action_cloud_audit_log_resource_name\n"
+  lucene: |
+    (eventName:"RunInstances" OR action:"microsoft.compute/virtualmachines/write" OR protoPayload.methodName:"v1.compute.instances.insert") AND NOT (awsRegion:(us-east-1 OR us-west-2 OR eu-west-1) OR location:(eastus OR westus2 OR northeurope) OR resource.labels.zone:(us-central1-* OR us-east1-* OR europe-west1-*))
+  sumo: |
+    _sourceCategory=*Cloud*Audit* (RunInstances OR "compute.instances.insert" OR "microsoft.compute/virtualmachines/write")
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "awsRegion" as aws_region
+    | json field=_raw "location" as gcp_location
+    | json field=_raw "properties.region" as azure_region
+    | json field=_raw "userIdentity.principalId" as user_id
+    | json field=_raw "protoPayload.authenticationInfo.principalEmail" as gcp_user
+    | json field=_raw "callerIdentity.principalId" as azure_user
+    | where event_name in ("RunInstances", "compute.instances.insert", "microsoft.compute/virtualmachines/write")
+    | if(isNull(aws_region), if(isNull(gcp_location), azure_region, gcp_location), aws_region) as region
+    | where !(region in ("us-east-1", "us-west-2", "us-central1", "eastus", "westus2"))
+    | fields _messageTime, event_name, region, user_id, gcp_user, azure_user, _sourceHost
 pseudo_logic: RunInstances / VM create / ComputeEngine.insert in a region outside the approved-region allowlist. Adversaries use exotic regions
   to evade region-scoped detections.
 false_positives:
@@ -103,7 +118,7 @@ references:
 - https://attack.mitre.org/techniques/T1535/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

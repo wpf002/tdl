@@ -15,72 +15,67 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=github action="git.clone"
+  spl: 'index=github action="git.clone"
+
     | stats count by user, repository
+
     | where count >= 5
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000538 {\n  meta:\n    author = \"TDL\"\n    description = \"Mass Repositories Cloned by User\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0009\"\n    technique = \"T1213\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    GitHubAuditLogEntries
+    | where TimeGenerated > ago(1h)
+    | where Action =~ "git.clone"
+    | summarize CloneCount = count() by bin(TimeGenerated, 10m), ActorLogin, Repository
+    | where CloneCount >= 5
+  aql: |
+    SELECT username, sourceip, COUNT(*) AS clone_count
+    FROM events
+    WHERE "Action" = 'git.clone'
+    GROUP BY username, sourceip
+    HAVING clone_count >= 5
+    LAST 1 HOURS
+  yara_l: |
+    rule github_clone_collection {
+      meta:
+        author = "TDL"
+        description = "Detects potential data collection via multiple git clone operations"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1213"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "GITHUB"
+        $e.metadata.product_event_type = "git.clone"
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 1h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 5
+    }
+  esql: |
+    FROM logs-github.audit-*
+    | WHERE @timestamp > NOW() - 1 hour AND event.action == "git.clone"
+    | STATS clone_count = COUNT(*) BY user.name, source.ip, window = BUCKET(@timestamp, 10 minute)
+    | WHERE clone_count >= 5
+    | KEEP window, user.name, source.ip, clone_count
+  leql: |
+    where(source_json.action="git.clone") groupby(source_json.actor, source_json.repo) calculate(count)
+  crowdstrike: |
+    #type=github action=git.clone
+    | groupBy([], function=count(as=clone_count))
+    | clone_count >= 5
+  xql: |
+    dataset = github_audit_log
+    | filter action = "git.clone"
+    | comp count() as clone_count
+    | filter clone_count >= 5
+  lucene: |
+    event.type:"github" AND action:"git.clone"
+  sumo: "_sourceCategory=*Github* \n| json field=_raw \"action\" as action\n| where action = \"git.clone\"\n| timeslice 1h\n| count as event_count\
+    \ by _timeslice\n| where event_count >= 5\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -90,7 +85,7 @@ tags:
 - collection
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "5 Github event\n   where actions is \"git.clone\""
 triage_steps:

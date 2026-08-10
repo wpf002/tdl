@@ -18,77 +18,57 @@ queries:
   spl: "index=firewall \n(dest_port IN (25, 110, 995, 143, 993) OR (Application IN (\"smtp\", \"SMTP\", \"Smtp\", \"pop\", \"POP\", \"Pop\", \"\
     imap\", \"IMAP\", \"Imap\")))\nNOT [| inputlookup mail_server_list.csv | fields src_ip]\n| stats count by _time, src_ip, dest_ip, dest_port,\
     \ Application\n| table _time, src_ip, dest_ip, dest_port, Application\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where destination_port in ("25", "110", "995", "143", "993")
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "destination_port" IN (''25'', ''110'', ''995'', ''143'', ''993'')
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(1h)
+    | where DeviceVendor has "Firewall" or DeviceProduct has "Firewall"
+    | where ipv4_is_private(SourceIP)
+    | where (DestinationPort in (25, 110, 995, 143, 993) or ApplicationProtocol in~ ("SMTP", "POP", "IMAP"))
+    | where SourceIP !in (dynamic(["mail_server_ip_1", "mail_server_ip_2", "mail_server_ip_3"]))
+    | summarize EventCount = count(), DestinationIPs = make_set(DestinationIP), DestinationPorts = make_set(DestinationPort), Applications = make_set(ApplicationProtocol) by SourceIP, DeviceName
+    | project TimeGenerated = now(), SourceIP, DeviceName, EventCount, DestinationIPs, DestinationPorts, Applications
+  aql: |
+    SELECT sourceip, destinationip, destinationport, QIDNAME(qid) AS event_name, LOGSOURCENAME(logsourceid) AS firewall, COUNT(*) AS event_count
+    FROM events
+    WHERE (destinationport IN (25, 110, 995, 143, 993) OR LOWER(QIDNAME(qid)) LIKE '%smtp%' OR LOWER(QIDNAME(qid)) LIKE '%pop%' OR LOWER(QIDNAME(qid)) LIKE '%imap%')
+    AND sourceip NOT IN (SELECT sourceip FROM reference_set WHERE name = 'Mail_Server_List')
+    AND INOFFENSE(sourceip) = FALSE
+    GROUP BY sourceip, destinationip, destinationport, QIDNAME(qid), LOGSOURCENAME(logsourceid)
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exf_000076 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized Mail Server\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0010\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.destination_port\
-    \ = /(25|110|995|143|993)/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND destination_port IN ("25", "110", "995", "143", "993")
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND destination_port IN [25, 110, 995, 143, 993])
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND destination_port IN (25, 110, 995, 143, 993)
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND destination_port in ("25", "110", "995", "143", "993")
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND destination_port:(25 OR 110 OR 995 OR 143 OR 993)
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where destination_port IN ("25", "110", "995", "143", "993")
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  yara_l: "rule email_exfiltration_non_mail_server {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects potential email\
+    \ exfiltration from non-mail server internal hosts\"\n    mitre_attack_tactic = \"Exfiltration\"\n    mitre_attack_technique = \"T1071\"\n\
+    \    severity = \"Medium\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.metadata.product_log_id = \"FIREWALL\"\
+    \n    \n    // Internal source (RFC 1918 private ranges)\n    (\n      net.ip_in_range_cidr($e.principal.ip, \"10.0.0.0/8\") or\n      net.ip_in_range_cidr($e.principal.ip,\
+    \ \"172.16.0.0/12\") or\n      net.ip_in_range_cidr($e.principal.ip, \"192.168.0.0/16\")\n    )\n    \n    // Email-related ports or applications\n\
+    \    (\n      $e.target.port = 25 or\n      $e.target.port = 110 or\n      $e.target.port = 995 or\n      $e.target.port = 143 or\n      $e.target.port\
+    \ = 993 or\n      re.regex($e.network.application_protocol, `(?i)(smtp|pop|imap)`)\n    )\n    \n    // Exclude known mail servers - NOT condition\n\
+    \    not (\n      net.ip_in_range_cidr($e.principal.ip, \"10.1.1.10/32\") or\n      net.ip_in_range_cidr($e.principal.ip, \"10.1.1.11/32\"\
+    )\n    )\n    \n    $e.principal.ip = $source_ip\n\n  match:\n    $source_ip over 5m\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-network.firewall*
+    | WHERE destination.port IN (25, 110, 995, 143, 993)
+      OR TO_LOWER(network.application) IN ("smtp", "pop", "imap")
+    | WHERE source.ip NOT IN ("10.0.1.10", "10.0.1.11", "10.0.1.12")
+    | STATS event_count = COUNT(*) BY source.ip, destination.ip, destination.port, network.application
+    | KEEP source.ip, destination.ip, destination.port, network.application, event_count
+  leql: |
+    where(destination_port IN [25, 110, 995, 143, 993] OR (application ICONTAINS "smtp" OR application ICONTAINS "pop" OR application ICONTAINS "imap")) AND source_address NOT IN [MailServerIP1, MailServerIP2]
+  crowdstrike: "#type=firewall \n(dest_port IN [25, 110, 995, 143, 993] OR /Application/i IN [smtp, pop, imap])\nsrc_ip IN [MailServerList]\n\
+    | groupBy([src_ip], function=count(as=events))\n| table([src_ip, events])\n"
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter action_source_translated_ip ~= \"^(10\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.|192\\.168\\.)\" \n\
+    | filter (dest_port in (25, 110, 995, 143, 993) or lowercase(app) in (\"smtp\", \"pop\", \"imap\"))\n| alter is_mail_server = if(action_source_translated_ip\
+    \ in (\"MAIL_SERVER_IP_1\", \"MAIL_SERVER_IP_2\"), false, true)\n| filter is_mail_server = true\n| fields _time, action_source_translated_ip,\
+    \ dest_ip, dest_port, app, bytes_sent\n"
+  lucene: |
+    (destination.port:(25 OR 110 OR 995 OR 143 OR 993) OR application:(/smtp/i OR /pop/i OR /imap/i)) AND NOT source.ip:(mail_server_1 OR mail_server_2 OR mail_server_3)
+  sumo: |
+    _sourceCategory=*Firewall* OR _sourceCategory=*firewall*
+    | parse regex "(?i)(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?i)(?<dest_port>\d+)" nodrop
+    | parse regex "(?i)(?<application>\S+)" nodrop
+    | where (dest_port in ("25", "110", "995", "143", "993")) OR (toLowerCase(application) in ("smtp", "pop", "imap"))
+    | where !(src_ip in ("10.0.1.10", "10.0.1.11", "192.168.1.50"))
+    | count by src_ip, dest_port, application, _sourceHost
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -98,7 +78,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Firewall Event \nFrom one internal source\nOR\n\tWhere the Destination Port is in [25, 110, 995, 143, 993]\n\t\n\tWhere the Application\
   \ is in [SMTP, POP, IMAP] case insensitive \n\nWhere the Source IP is on the Mail Server List"

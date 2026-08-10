@@ -16,83 +16,107 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=network sourcetype=ids* OR sourcetype=ips* action=blocked OR action=alert direction=inbound NOT src IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) dest IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+  spl: 'index=network sourcetype=ids* OR sourcetype=ips* action=blocked OR action=alert direction=inbound NOT src IN (10.0.0.0/8, 172.16.0.0/12,
+    192.168.0.0/16) dest IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+
     | bin _time span=5m
+
     | stats dc(dest) as unique_dests count by _time, src, signature
+
     | where count >= 10 AND unique_dests >= 10
+
     | table _time, src, signature, unique_dests, count
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(5m)\n| where DeviceVendor in (\"Palo Alto Networks\", \"Fortinet\", \"Check Point\", \"\
+    Cisco\", \"Snort\", \"Suricata\") or DeviceProduct has_any (\"IDS\", \"IPS\", \"Firewall\", \"NGFW\")\n| where DeviceEventCategory in (\"\
+    traffic\", \"exploit\", \"intrusion\", \"attack\") or Activity has_any (\"exploit\", \"intrusion\", \"attack\")\n| where DeviceAction !in\
+    \ (\"allow\", \"allowed\", \"accept\")\n| extend SourceIsExternal = not(ipv4_is_private(SourceIP))\n| extend DestIsInternal = ipv4_is_private(DestinationIP)\n\
+    | where SourceIsExternal and DestIsInternal\n| summarize \n    DestinationIPs = dcount(DestinationIP),\n    EventCount = count(),\n    Destinations\
+    \ = make_set(DestinationIP, 100),\n    FirstSeen = min(TimeGenerated),\n    LastSeen = max(TimeGenerated)\n    by bin(TimeGenerated, 5m),\
+    \ SourceIP, DeviceVendor, DeviceProduct, DeviceEventClassID, Activity\n| where EventCount >= 10 and DestinationIPs >= 2\n| project TimeGenerated,\
+    \ SourceIP, DeviceVendor, DeviceProduct, Signature=DeviceEventClassID, SignatureDescription=Activity, EventCount, UniqueDestinations=DestinationIPs,\
+    \ DestinationList=Destinations, FirstSeen, LastSeen\n"
+  aql: "SELECT sourceip, qidname(qid) AS signature, UNIQUECOUNT(destinationip) AS unique_dests, COUNT(*) AS event_count\nFROM events\nWHERE category\
+    \ IN (SELECT category FROM categories WHERE high_level_category_id = 6000) \n  AND sourceip NOT IN (SELECT sourceip FROM networks WHERE network\
+    \ = 'internal')\n  AND destinationip IN (SELECT destinationip FROM networks WHERE network = 'internal')\nGROUP BY sourceip, qid\nHAVING unique_dests\
+    \ >= 10 AND event_count >= 10\nLAST 5 MINUTES\n"
+  yara_l: |
+    rule mitre_t1046_network_scanning {
+      meta:
+        author = "TDL"
+        description = "Detects network scanning via IDS/IPS exploit events from single external source to multiple internal destinations"
+        mitre_attack_tactic = "Discovery"
+        mitre_attack_technique = "T1046"
+        severity = "Medium"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.security_result.action = "BLOCK"
+        $e.security_result.category = "EXPLOIT"
+        $e.network.direction = "INBOUND"
+        not net.ip_in_range_cidr($e.principal.ip, "10.0.0.0/8")
+        not net.ip_in_range_cidr($e.principal.ip, "172.16.0.0/12")
+        not net.ip_in_range_cidr($e.principal.ip, "192.168.0.0/16")
+        (net.ip_in_range_cidr($e.target.ip, "10.0.0.0/8") or
+         net.ip_in_range_cidr($e.target.ip, "172.16.0.0/12") or
+         net.ip_in_range_cidr($e.target.ip, "192.168.0.0/16"))
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dst_ip
+        $e.security_result.summary = $signature
 
-    WHERE "network.protocol" LIKE ''%tcp%''
+      match:
+        $src_ip, $signature over 5m
 
-    GROUP BY sourceip, destinationip, destinationport
+      outcome:
+        $risk_score = 65
+        $unique_destinations = count_distinct($dst_ip)
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_dis_000079 {\n  meta:\n    author = \"TDL\"\n    description = \"Vulnerability Sweep - Inbound\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0007\"\n    technique = \"T1046\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 10 and $unique_destinations >= 10
+    }
+  esql: |
+    FROM logs-network_traffic.idsips*
+    | WHERE @timestamp > NOW() - 5 minutes
+      AND network.direction == "inbound"
+      AND event.category == "intrusion_detection"
+      AND source.ip NOT LIKE "10.*" AND source.ip NOT LIKE "172.16.*" AND source.ip NOT LIKE "192.168.*"
+      AND (destination.ip LIKE "10.*" OR destination.ip LIKE "172.16.*" OR destination.ip LIKE "192.168.*")
+    | STATS unique_destinations = COUNT_DISTINCT(destination.ip), event_count = COUNT(*) BY source.ip, event.signature = COALESCE(rule.name, event.action)
+    | WHERE event_count >= 10 AND unique_destinations >= 5
+    | KEEP source.ip, event.signature, unique_destinations, event_count
+  leql: |
+    where(source_json.event_type="exploit" AND direction="INBOUND" AND source_address NOT ICONTAINS "10." AND source_address NOT ICONTAINS "172.16." AND source_address NOT ICONTAINS "192.168.") groupby(source_address, source_json.signature) calculate(unique:destination_address)
+  crowdstrike: |
+    #type=ids OR #type=ips OR event_simpleName=*IDS* OR event_simpleName=*IPS*
+    | regex("exploit", field=signature, flags=i)
+    | direction=inbound OR direction=Inbound OR traffic_direction=inbound
+    | groupBy([src_ip, signature], function=[count(as=events), count(dest_ip, distinct=true, as=unique_dests)], span=5m)
+    | events >= 10 AND unique_dests >= 2
+    | table([src_ip, signature, events, unique_dests, _bucket])
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter threat_category = "network" and action in ("alert", "block-ip")
+    | filter direction = "inbound" and not incidr(source_ip, "10.0.0.0/8") and not incidr(source_ip, "172.16.0.0/12") and not incidr(source_ip, "192.168.0.0/16")
+    | filter incidr(destination_ip, "10.0.0.0/8") or incidr(destination_ip, "172.16.0.0/12") or incidr(destination_ip, "192.168.0.0/16")
+    | bin _time span=5m
+    | comp count_distinct(destination_ip) as unique_dests, count() as total_events by _time, source_ip, threat_name
+    | filter unique_dests >= 10 and total_events >= 10
+    | fields _time, source_ip, threat_name, unique_dests, total_events
+  lucene: |
+    event.type:"ids_alert" AND source.ip:* AND NOT source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND event.category:"intrusion_detection"
+  sumo: |
+    _sourceCategory=*IDS* OR _sourceCategory=*IPS*
+    | json field=_raw "signature" as signature
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "direction" as direction
+    | json field=_raw "event_type" as event_type
+    | where event_type matches "*exploit*" and direction matches "*inbound*"
+    | timeslice 5m
+    | count_distinct(dest_ip) as unique_dests, count as total_events by _timeslice, src_ip, signature
+    | where unique_dests >= 10 and total_events >= 10
+    | fields _timeslice, src_ip, signature, unique_dests, total_events
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -102,7 +126,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "10 IDS/IPS Exploit Events \nFrom one external source to many internal destinations (Inbound)\nWith the same Siganture\nWith unique\
   \ Destination IPs\nWithin 5 minutes"

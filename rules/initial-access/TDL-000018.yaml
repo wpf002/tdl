@@ -16,80 +16,102 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=windows sourcetype=WinEventLog:Security (EventCode=628 OR EventCode=4724)
+  spl: 'index=windows sourcetype=WinEventLog:Security (EventCode=628 OR EventCode=4724)
+
     | eval DestUserName=coalesce(TargetUserName, Target_User_Name, User_Name)
+
     | eval SrcUserName=coalesce(SubjectUserName, Subject_User_Name, Account_Name)
+
     | where NOT match(DestUserName, "(?i)(Administrator|Domain Admin|Enterprise Admin)")
+
     | where NOT match(SrcUserName, "(?i)(helpdesk|admin)")
+
     | where NOT match(SrcUserName, "\$$")
+
     | where NOT match(DestUserName, "\$$")
+
     | table _time, ComputerName, SrcUserName, DestUserName, EventCode
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4724")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4724')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000018 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized Password Reset Attempt\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id\
-    \ = /(4724)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (628, 4724)
+    | where TargetAccount !endswith "$"
+    | where SubjectUserName !endswith "$"
+    | where TargetAccount !in ("Administrator", "krbtgt", "SYSTEM")
+    | where SubjectUserName !in ("Administrator", "SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE")
+    | project TimeGenerated, Computer, EventID, SubjectUserName, TargetAccount, SubjectDomainName, TargetDomainName, Activity
+  aql: |
+    SELECT sourceip, username AS source_user, "Target Username" AS dest_user, LOGSOURCENAME(logsourceid) AS host, eventtime, COUNT(*) AS event_count
+    FROM events
+    WHERE "EventID" IN ('628', '4724')
+      AND "Target Username" NOT IN ('Administrator', 'Domain Admin', 'Enterprise Admin')
+      AND username NOT IN ('AdminAccount1', 'PasswordResetService', 'HelpDesk')
+      AND username NOT LIKE '%$'
+      AND "Target Username" NOT LIKE '%$'
+    GROUP BY sourceip, username, "Target Username", LOGSOURCENAME(logsourceid), eventtime
+    LAST 24 HOURS
+  yara_l: |
+    rule windows_unauthorized_password_reset {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects unauthorized password reset attempts (T1078 - Valid Accounts)"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT"
+        ($e.metadata.product_event_type = "628" or $e.metadata.product_event_type = "4724")
+        $e.target.user.userid = $dest_user
+        $e.principal.user.userid = $src_user
+        not re.regex($src_user, `\$$`)
+        not re.regex($dest_user, `\$$`)
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND event_id IN ("4724")
+      match:
+        $host, $src_user, $dest_user over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4724])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4724)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4724")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4724)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4724")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-windows.security*, logs-system.security*, winlogbeat-*\n| WHERE event.code IN (\"628\", \"4724\") \n  AND NOT ENDS_WITH(winlog.event_data.SubjectUserName,\
+    \ \"$\")\n  AND NOT ENDS_WITH(winlog.event_data.TargetUserName, \"$\")\n  AND winlog.event_data.TargetUserName NOT IN (\"Administrator\",\
+    \ \"admin\", \"root\", \"Domain Admin\", \"Enterprise Admin\")\n  AND winlog.event_data.SubjectUserName NOT IN (\"svc_helpdesk\", \"Administrator\"\
+    , \"IT_Admin\", \"PasswordResetService\")\n| KEEP @timestamp, host.name, winlog.event_data.SubjectUserName, winlog.event_data.TargetUserName,\
+    \ winlog.event_data.SubjectDomainName, winlog.event_data.TargetDomainName\n"
+  leql: |
+    where(source_json.EventID=4724 AND destination_user NOT ENDS-WITH "$" AND source_user NOT ENDS-WITH "$")
+  crowdstrike: |
+    EventCode=4724
+    | SubjectUserName != /.*\$$/
+    | TargetUserName != /.*\$$/
+    | table([@timestamp, ComputerName, SubjectUserName, TargetUserName, SubjectDomainName, TargetDomainName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (628, 4724)
+    | alter dest_user = action_evtlog_event_data_TargetUserName,
+            source_user = coalesce(action_evtlog_event_data_SubjectUserName, actor_effective_username)
+    | filter dest_user not in ("Administrator", "admin", "root", "domain_admin")
+    | filter source_user not in ("Administrator", "admin", "svc_account_mgmt", "helpdesk_admin")
+    | filter source_user !~= "\$$"
+    | filter dest_user !~= "\$$"
+    | fields _time, agent_hostname, source_user, dest_user, action_evtlog_event_id, action_evtlog_message
+  lucene: |
+    event.code:4724 AND NOT user.target.name:(HighValueUser1 OR HighValueUser2 OR HighValueUser3) AND NOT user.name:(AuthorizedAdmin1 OR AuthorizedAdmin2 OR AuthorizedAdmin3) AND NOT user.name:*$ AND NOT user.target.name:*$
+  sumo: |
+    _sourceCategory=*Windows*Security* ("628" OR "4724")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetUserName" as dest_user
+    | json field=_raw "SubjectUserName" as src_user
+    | where event_id in ("628", "4724")
+    | where !(dest_user matches "*$")
+    | where !(src_user matches "*$")
+    | fields _messageTime, _sourceHost, event_id, src_user, dest_user
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -99,7 +121,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows Password Reset Event\nWhere the Event ID is in [628, 4724] \nWhere the Destination Username is NOT in the High Value\
   \ Target User List\nWhere the Source Username is NOT in the Users Authorized to Modify User Accounts List\nWhere the Source Username does NOT\

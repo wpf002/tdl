@@ -16,74 +16,78 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 95
 queries:
-  spl: |
-    (index=wineventlog sourcetype=WinEventLog:System EventCode=7045 Service_File_Name="*.exe*" Service_File_Name="*ADMIN$*") OR (index=wineventlog sourcetype=WinEventLog:Security EventCode=4697 Service_File_Name="*.exe*" Service_File_Name="*ADMIN$*")
+  spl: '(index=wineventlog sourcetype=WinEventLog:System EventCode=7045 Service_File_Name="*.exe*" Service_File_Name="*ADMIN$*") OR (index=wineventlog
+    sourcetype=WinEventLog:Security EventCode=4697 Service_File_Name="*.exe*" Service_File_Name="*ADMIN$*")
+
     | table _time, ComputerName, EventCode, Service_Name, Service_File_Name, ServiceFileName
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("7045", "4697")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('7045', '4697')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000657 {\n  meta:\n    author = \"TDL\"\n    description = \"Cobalt Strike Installation via Executable\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0002\"\n    technique = \"T1569\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id\
-    \ = /(7045|4697)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: "union \n(SecurityEvent\n| where TimeGenerated > ago(24h)\n| where EventID == 4697\n| where ServiceFileName contains \".exe\" and ServiceFileName\
+    \ contains \"ADMIN$\"\n| extend ServiceName = ServiceName, ImagePath = ServiceFileName, EventSource = \"SecurityEvent\"\n| project TimeGenerated,\
+    \ Computer, Account, ServiceName, ImagePath, EventID, EventSource),\n(Event\n| where TimeGenerated > ago(24h)\n| where EventLog == \"System\"\
+    \ and Source == \"Service Control Manager\"\n| where EventID == 7045\n| extend ImagePath = tostring(EventData.ImagePath)\n| where ImagePath\
+    \ contains \".exe\" and ImagePath contains \"ADMIN$\"\n| extend ServiceName = tostring(EventData.ServiceName)\n| project TimeGenerated, Computer,\
+    \ Account = UserName, ServiceName, ImagePath, EventID, EventSource = \"SystemEvent\")\n| project TimeGenerated, Computer, Account, ServiceName,\
+    \ ImagePath, EventID, EventSource\n"
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Service Name", "Service File Name", "ImagePath", qidname(qid)
+    FROM events
+    WHERE ("EventID" = '7045' AND "ImagePath" ILIKE '%.exe%' AND "ImagePath" ILIKE '%ADMIN$%')
+       OR ("EventID" = '4697' AND "Service File Name" ILIKE '%.exe%' AND "Service File Name" ILIKE '%ADMIN$%')
+    LAST 24 HOURS
+  yara_l: |
+    rule mitre_t1569_service_execution_admin_share {
+      meta:
+        author = "Detection Logic Translation"
+        description = "Detects service creation with executable in ADMIN$ share - T1569 System Services"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1569"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        // Event ID 7045 - Service Control Manager
+        $e1.metadata.product_event_type = "7045"
+        re.regex($e1.metadata.product_log_id, `(?i)System`)
+        re.regex($e1.principal.process.command_line, `(?i)ADMIN\$`) or
+        re.regex($e1.target.process.file.full_path, `(?i)ADMIN\$`)
+        re.regex($e1.principal.process.command_line, `(?i)\.exe`) or
+        re.regex($e1.target.process.file.full_path, `(?i)\.exe`)
+        $e1.principal.hostname = $host
 
-    | WHERE event.category == "process" AND event_id IN ("7045", "4697")
+        // Event ID 4697 - Service Installation
+        $e2.metadata.product_event_type = "4697"
+        re.regex($e2.target.process.file.full_path, `(?i)ADMIN\$`)
+        re.regex($e2.target.process.file.full_path, `(?i)\.exe`)
+        $e2.principal.hostname = $host
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      match:
+        $host over 5m
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [7045, 4697])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (7045, 4697)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("7045", "4697")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(7045 OR 4697)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("7045", "4697")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e1 or $e2
+    }
+  esql: |
+    FROM logs-system.system*, logs-system.security*
+    | WHERE (event.code == "7045" AND winlog.event_data.ImagePath LIKE "*.exe*" AND winlog.event_data.ImagePath LIKE "*ADMIN$*")
+       OR (event.code == "4697" AND winlog.event_data.ServiceFileName LIKE "*.exe*" AND winlog.event_data.ServiceFileName LIKE "*ADMIN$*")
+    | KEEP @timestamp, host.name, event.code, winlog.event_data.ServiceName, winlog.event_data.ImagePath, winlog.event_data.ServiceFileName, user.name
+  leql: |
+    where((source_json.EventID=7045 AND source_json.ImagePath ICONTAINS ".exe" AND source_json.ImagePath ICONTAINS "ADMIN$") OR (source_json.EventID=4697 AND source_json.ServiceFileName ICONTAINS ".exe" AND source_json.ServiceFileName ICONTAINS "ADMIN$"))
+  crowdstrike: |
+    (EventCode=7045 ImagePath=*.exe* ImagePath=*ADMIN$*) OR (EventCode=4697 ServiceFileName=*.exe* ServiceFileName=*ADMIN$*)
+    | table([@timestamp, ComputerName, EventCode, ServiceName, ImagePath, ServiceFileName])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id = 7045 and action_evtlog_source_name = "Service Control Manager" and action_evtlog_event_data_ImagePath contains ".exe" and action_evtlog_event_data_ImagePath contains "ADMIN$")
+       or (action_evtlog_event_id = 4697 and action_evtlog_event_data_ServiceFileName contains ".exe" and action_evtlog_event_data_ServiceFileName contains "ADMIN$")
+    | fields _time, agent_hostname, action_evtlog_event_id, action_evtlog_event_data_ServiceName, action_evtlog_event_data_ImagePath, action_evtlog_event_data_ServiceFileName, actor_effective_username
+  lucene: |
+    (EventSourceName:"Service Control Manager" AND event.code:7045 AND ImagePath:*.exe* AND ImagePath:*ADMIN$*) OR (event.code:4697 AND ServiceFileName:*.exe* AND ServiceFileName:*ADMIN$*)
+  sumo: "_sourceCategory=*Windows* (EventID=7045 OR EventID=4697)\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"EventSourceName\"\
+    \ as event_source\n| json field=_raw \"ImagePath\" as image_path\n| json field=_raw \"ServiceFileName\" as service_file_name\n| where (event_id\
+    \ = \"7045\" and event_source = \"Service Control Manager\" and image_path matches \"*.exe*\" and image_path matches \"*ADMIN$*\") \n   OR\
+    \ (event_id = \"4697\" and service_file_name matches \"*.exe*\" and service_file_name matches \"*ADMIN$*\")\n| fields _messageTime, _sourceHost,\
+    \ event_id, event_source, image_path, service_file_name\n"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +97,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows System Event \nWhere EventSourceName is \"Service Control Manager\"\nWhere the Event ID is 7045 \nWhere ImagePath contains\
   \ \".exe\" AND \"ADMIN$\"\n\n--------------------------------------------------------------------\n\n1 Windows Security event\nWhere the Event\

@@ -25,68 +25,82 @@ queries:
     )\n| table _time, finding.type, resource.instanceDetails.instanceId, resource.instanceDetails.networkInterfaces{}.privateIpAddress, resource.instanceDetails.networkInterfaces{}.publicIp,\
     \ service.action.networkConnectionAction.remoteIpDetails.ipAddressV4, service.action.dnsRequestAction.domain, finding.severity, finding.title,\
     \ finding.description\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(24h)
+    | where Type in ("Backdoor:EC2/C&CActivity.B!DNS", "Impact:EC2/MaliciousDomainRequest.Reputation", "Impact:EC2/AbusedDomainRequest.Reputation", "Trojan:EC2/BlackholeTraffic!DNS", "Trojan:EC2/DriveBySourceTraffic!DNS", "Trojan:EC2/DropPoint!DNS", "Trojan:EC2/PhishingDomainRequest!DNS", "Backdoor:Runtime/C&CActivity.B!DNS", "Impact:Runtime/AbusedDomainRequest.Reputation", "Impact:Runtime/MaliciousDomainRequest.Reputation", "Trojan:Runtime/PhishingDomainRequest!DNS", "Trojan:Lambda/BlackholeTraffic", "Trojan:Runtime/BlackholeTraffic", "Trojan:Runtime/BlackholeTraffic!DNS", "Trojan:Runtime/DriveBySourceTraffic!DNS", "Trojan:Runtime/DropPoint!DNS", "Backdoor:Runtime/C&CActivity.B!DNS")
+    | project TimeGenerated, Type, Severity, Title, Description, AccountId, Region, ResourceType, InstanceId, RemoteIpDetails, DomainDetails
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS log_source, \"finding.type\" AS finding_type, \"resource.instanceDetails.instanceId\"\
+    \ AS instance_id, \"service.action.networkConnectionAction.remoteIpDetails.ipAddressV4\" AS remote_ip, \"service.action.dnsRequestAction.domain\"\
+    \ AS domain, \"resource.resourceType\" AS resource_type, \"severity\" AS severity\nFROM events\nWHERE LOGSOURCENAME(logsourceid) ILIKE '%guardduty%'\
+    \ \n  AND \"finding.type\" IN ('Backdoor:EC2/C&CActivity.B!DNS', 'Impact:EC2/MaliciousDomainRequest.Reputation', 'Impact:EC2/AbusedDomainRequest.Reputation',\
+    \ 'Trojan:EC2/BlackholeTraffic!DNS', 'Trojan:EC2/DriveBySourceTraffic!DNS', 'Trojan:EC2/DropPoint!DNS', 'Trojan:EC2/PhishingDomainRequest!DNS',\
+    \ 'Backdoor:Runtime/C&CActivity.B!DNS', 'Impact:Runtime/AbusedDomainRequest.Reputation', 'Impact:Runtime/MaliciousDomainRequest.Reputation',\
+    \ 'Trojan:Runtime/PhishingDomainRequest!DNS', 'Trojan:Lambda/BlackholeTraffic', 'Trojan:Runtime/BlackholeTraffic', 'Trojan:Runtime/BlackholeTraffic!DNS',\
+    \ 'Trojan:Runtime/DriveBySourceTraffic!DNS', 'Trojan:Runtime/DropPoint!DNS', 'Backdoor:Runtime/C&CActivity.B!DNS')\nLAST 24 HOURS\n"
+  yara_l: |
+    rule aws_guardduty_drive_by_compromise_indicators {
+      meta:
+        author = "TDL"
+        description = "Detects AWS GuardDuty findings indicative of drive-by compromise or malicious domain access"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1189"
+        severity = "High"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.vendor_name = "Amazon AWS"
+        $e.metadata.product_name = "GuardDuty"
+        (
+          $e.metadata.product_event_type = "Backdoor:EC2/C&CActivity.B!DNS" or
+          $e.metadata.product_event_type = "Impact:EC2/MaliciousDomainRequest.Reputation" or
+          $e.metadata.product_event_type = "Impact:EC2/AbusedDomainRequest.Reputation" or
+          $e.metadata.product_event_type = "Trojan:EC2/BlackholeTraffic!DNS" or
+          $e.metadata.product_event_type = "Trojan:EC2/DriveBySourceTraffic!DNS" or
+          $e.metadata.product_event_type = "Trojan:EC2/DropPoint!DNS" or
+          $e.metadata.product_event_type = "Trojan:EC2/PhishingDomainRequest!DNS" or
+          $e.metadata.product_event_type = "Backdoor:Runtime/C&CActivity.B!DNS" or
+          $e.metadata.product_event_type = "Impact:Runtime/AbusedDomainRequest.Reputation" or
+          $e.metadata.product_event_type = "Impact:Runtime/MaliciousDomainRequest.Reputation" or
+          $e.metadata.product_event_type = "Trojan:Runtime/PhishingDomainRequest!DNS" or
+          $e.metadata.product_event_type = "Trojan:Lambda/BlackholeTraffic" or
+          $e.metadata.product_event_type = "Trojan:Runtime/BlackholeTraffic" or
+          $e.metadata.product_event_type = "Trojan:Runtime/BlackholeTraffic!DNS" or
+          $e.metadata.product_event_type = "Trojan:Runtime/DriveBySourceTraffic!DNS" or
+          $e.metadata.product_event_type = "Trojan:Runtime/DropPoint!DNS"
+        )
+        $e.principal.resource.id = $resource_id
 
-    | where eventName matches regex "GuardDuty"
+      match:
+        $resource_id over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000340 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS DNS Request to Malicious Domain - GuardDuty\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1189\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("Backdoor:EC2/C&CActivity.B!DNS", "Impact:EC2/MaliciousDomainRequest.Reputation", "Impact:EC2/AbusedDomainRequest.Reputation", "Trojan:EC2/BlackholeTraffic!DNS", "Trojan:EC2/DriveBySourceTraffic!DNS", "Trojan:EC2/DropPoint!DNS", "Trojan:EC2/PhishingDomainRequest!DNS", "Backdoor:Runtime/C&CActivity.B!DNS", "Impact:Runtime/AbusedDomainRequest.Reputation", "Impact:Runtime/MaliciousDomainRequest.Reputation", "Trojan:Runtime/PhishingDomainRequest!DNS", "Trojan:Lambda/BlackholeTraffic", "Trojan:Runtime/BlackholeTraffic", "Trojan:Runtime/BlackholeTraffic!DNS", "Trojan:Runtime/DriveBySourceTraffic!DNS", "Trojan:Runtime/DropPoint!DNS", "Backdoor:Runtime/C&CActivity.B!DNS")
+    | KEEP @timestamp, event.type, cloud.account.id, cloud.region, cloud.instance.id, source.ip, destination.ip, destination.domain, aws.guardduty.severity
+  leql: |
+    where(source_json.type IN ["Backdoor:EC2/C&CActivity.B!DNS", "Impact:EC2/MaliciousDomainRequest.Reputation", "Impact:EC2/AbusedDomainRequest.Reputation", "Trojan:EC2/BlackholeTraffic!DNS", "Trojan:EC2/DriveBySourceTraffic!DNS", "Trojan:EC2/DropPoint!DNS", "Trojan:EC2/PhishingDomainRequest!DNS", "Backdoor:Runtime/C&CActivity.B!DNS", "Impact:Runtime/AbusedDomainRequest.Reputation", "Impact:Runtime/MaliciousDomainRequest.Reputation", "Trojan:Runtime/PhishingDomainRequest!DNS", "Trojan:Lambda/BlackholeTraffic", "Trojan:Runtime/BlackholeTraffic", "Trojan:Runtime/BlackholeTraffic!DNS", "Trojan:Runtime/DriveBySourceTraffic!DNS", "Trojan:Runtime/DropPoint!DNS", "Backdoor:Runtime/C&CActivity.B!DNS"])
+  crowdstrike: |
+    #type=guardduty (event.Type="Backdoor:EC2/C&CActivity.B!DNS" OR event.Type="Impact:EC2/MaliciousDomainRequest.Reputation" OR event.Type="Impact:EC2/AbusedDomainRequest.Reputation" OR event.Type="Trojan:EC2/BlackholeTraffic!DNS" OR event.Type="Trojan:EC2/DriveBySourceTraffic!DNS" OR event.Type="Trojan:EC2/DropPoint!DNS" OR event.Type="Trojan:EC2/PhishingDomainRequest!DNS" OR event.Type="Backdoor:Runtime/C&CActivity.B!DNS" OR event.Type="Impact:Runtime/AbusedDomainRequest.Reputation" OR event.Type="Impact:Runtime/MaliciousDomainRequest.Reputation" OR event.Type="Trojan:Runtime/PhishingDomainRequest!DNS" OR event.Type="Trojan:Lambda/BlackholeTraffic" OR event.Type="Trojan:Runtime/BlackholeTraffic" OR event.Type="Trojan:Runtime/BlackholeTraffic!DNS" OR event.Type="Trojan:Runtime/DriveBySourceTraffic!DNS" OR event.Type="Trojan:Runtime/DropPoint!DNS")
+    | table([@timestamp, event.Type, accountId, region, resource.instanceDetails.instanceId, service.action.dnsRequestAction.domain])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and raw_log_type = "guardduty"
+      and event_type in ("Backdoor:EC2/C&CActivity.B!DNS", "Impact:EC2/MaliciousDomainRequest.Reputation", "Impact:EC2/AbusedDomainRequest.Reputation", "Trojan:EC2/BlackholeTraffic!DNS", "Trojan:EC2/DriveBySourceTraffic!DNS", "Trojan:EC2/DropPoint!DNS", "Trojan:EC2/PhishingDomainRequest!DNS", "Backdoor:Runtime/C&CActivity.B!DNS", "Impact:Runtime/AbusedDomainRequest.Reputation", "Impact:Runtime/MaliciousDomainRequest.Reputation", "Trojan:Runtime/PhishingDomainRequest!DNS", "Trojan:Lambda/BlackholeTraffic", "Trojan:Runtime/BlackholeTraffic", "Trojan:Runtime/BlackholeTraffic!DNS", "Trojan:Runtime/DriveBySourceTraffic!DNS", "Trojan:Runtime/DropPoint!DNS", "Backdoor:Runtime/C&CActivity.B!DNS")
+    | fields _time, event_type, resource_name, resource_sub_type, identity_name, cloud_provider_account_id
+  lucene: |
+    aws.guardduty.finding.type:("Backdoor:EC2/C&CActivity.B!DNS" OR "Impact:EC2/MaliciousDomainRequest.Reputation" OR "Impact:EC2/AbusedDomainRequest.Reputation" OR "Trojan:EC2/BlackholeTraffic!DNS" OR "Trojan:EC2/DriveBySourceTraffic!DNS" OR "Trojan:EC2/DropPoint!DNS" OR "Trojan:EC2/PhishingDomainRequest!DNS" OR "Backdoor:Runtime/C&CActivity.B!DNS" OR "Impact:Runtime/AbusedDomainRequest.Reputation" OR "Impact:Runtime/MaliciousDomainRequest.Reputation" OR "Trojan:Runtime/PhishingDomainRequest!DNS" OR "Trojan:Lambda/BlackholeTraffic" OR "Trojan:Runtime/BlackholeTraffic" OR "Trojan:Runtime/BlackholeTraffic!DNS" OR "Trojan:Runtime/DriveBySourceTraffic!DNS" OR "Trojan:Runtime/DropPoint!DNS")
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("Backdoor:EC2/C&CActivity.B!DNS", "Impact:EC2/MaliciousDomainRequest.Reputation", "Impact:EC2/AbusedDomainRequest.Reputation", "Trojan:EC2/BlackholeTraffic!DNS", "Trojan:EC2/DriveBySourceTraffic!DNS", "Trojan:EC2/DropPoint!DNS", "Trojan:EC2/PhishingDomainRequest!DNS", "Backdoor:Runtime/C&CActivity.B!DNS", "Impact:Runtime/AbusedDomainRequest.Reputation", "Impact:Runtime/MaliciousDomainRequest.Reputation", "Trojan:Runtime/PhishingDomainRequest!DNS", "Trojan:Lambda/BlackholeTraffic", "Trojan:Runtime/BlackholeTraffic", "Trojan:Runtime/BlackholeTraffic!DNS", "Trojan:Runtime/DriveBySourceTraffic!DNS", "Trojan:Runtime/DropPoint!DNS", "Backdoor:Runtime/C&CActivity.B!DNS")
+    | json field=_raw "id" as finding_id
+    | json field=_raw "severity" as severity
+    | json field=_raw "resource.instanceDetails.instanceId" as instance_id
+    | json field=_raw "service.action.networkConnectionAction.remoteIpDetails.ipAddressV4" as remote_ip
+    | fields _messageTime, event_type, finding_id, severity, instance_id, remote_ip, _sourceHost
 false_positives:
 - Authorized pen testing
 - Security research
@@ -96,7 +110,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Backdoor:EC2/C&CActivity.B!DNS\", \"Impact:EC2/MaliciousDomainRequest.Reputation\"\
   , \"Impact:EC2/AbusedDomainRequest.Reputation\", \"Trojan:EC2/BlackholeTraffic!DNS\", \"Trojan:EC2/DriveBySourceTraffic!DNS\", \"Trojan:EC2/DropPoint!DNS\"\

@@ -20,71 +20,83 @@ queries:
   spl: "index=windows EventCode=4688 New_Process_Name=\"*\\\\smss.exe\" \n| where isnotnull(Creator_Process_Name) \n| where NOT (match(Creator_Process_Name,\
     \ \"ntoskrnl\\.exe$\") OR match(Creator_Process_Name, \"System$\") OR match(Creator_Process_Name, \"smss\\.exe$\"))\n| table _time, ComputerName,\
     \ Creator_Process_Name, New_Process_Name, Process_Command_Line, Account_Name\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (592, 4688)
+    | where Process has "smss.exe"
+    | where ParentProcessName != "" and isnotempty(ParentProcessName)
+    | where ParentProcessName !has_any ("ntoskrnl.exe", "System", "smss.exe")
+    | project TimeGenerated, Computer, Account, Process, ParentProcessName, CommandLine, NewProcessName, ProcessId
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process Name", "Parent Process Name", "Process CommandLine"
+    FROM events
+    WHERE ("EventID" = '592' OR "EventID" = '4688')
+      AND "Process Name" ILIKE '%smss.exe'
+      AND "Parent Process Name" IS NOT NULL
+      AND "Parent Process Name" NOT ILIKE '%ntoskrnl.exe%'
+      AND "Parent Process Name" NOT ILIKE '%System%'
+      AND "Parent Process Name" NOT ILIKE '%smss.exe%'
+    LAST 24 HOURS
+  yara_l: |
+    rule suspicious_smss_execution {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects smss.exe spawned by unexpected parent processes - T1569 Execution"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1569"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688"
+        )
+        re.regex($e.target.process.file.full_path, `(?i)\\smss\.exe$`) nocase
+        $e.principal.process.file.full_path != ""
+        not re.regex($e.principal.process.file.full_path, `(?i)\\ntoskrnl\.exe$`) nocase
+        not re.regex($e.principal.process.file.full_path, `(?i)\\System$`) nocase
+        not re.regex($e.principal.process.file.full_path, `(?i)\\smss\.exe$`) nocase
+        $e.principal.hostname = $host
 
-    | where process_name in ("smss.exe", "ntoskrnl.exe")
+      match:
+        $host over 5m
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      outcome:
+        $risk_score = 75
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('smss.exe', 'ntoskrnl.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000211 {\n  meta:\n    author = \"TDL\"\n    description = \"Non-standard Process Launching SMSS\"\n    severity =\
-    \ \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1569\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(smss.exe|ntoskrnl.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("smss.exe", "ntoskrnl.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [smss.exe, ntoskrnl.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (smss.exe, ntoskrnl.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("smss.exe", "ntoskrnl.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(smss.exe OR ntoskrnl.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("smss.exe", "ntoskrnl.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.security*, logs-system.security*, winlogbeat-*
+    | WHERE event.code IN ("592", "4688")
+      AND process.name == "smss.exe"
+      AND process.parent.name IS NOT NULL
+      AND process.parent.name NOT IN ("ntoskrnl.exe", "System", "smss.exe")
+    | KEEP @timestamp, host.name, user.name, process.name, process.parent.name, process.command_line, process.executable
+  leql: |
+    where(source_json.EventID=4688 AND process_name="smss.exe" AND parent_process_name!=null AND parent_process_name!=ntoskrnl.exe AND parent_process_name!=System AND parent_process_name!=smss.exe)
+  crowdstrike: |
+    EventCode=4688 FileName=smss.exe ParentBaseFileName=* NOT ParentBaseFileName IN [ntoskrnl.exe, System, smss.exe]
+    | table([@timestamp, ComputerName, UserName, FileName, ParentBaseFileName, CommandLine])
+  xql: "dataset = xdr_data\n| filter action_evtlog_event_id in (592, 4688)\n| filter lowercase(action_process_image_name) contains \"smss.exe\"\
+    \n| filter actor_process_image_name != null\n| filter lowercase(actor_process_image_name) not contains \"ntoskrnl.exe\" \n  and lowercase(actor_process_image_name)\
+    \ not contains \"system\" \n  and lowercase(actor_process_image_name) not contains \"smss.exe\"\n| fields _time, agent_hostname, actor_effective_username,\
+    \ action_process_image_name, actor_process_image_name, action_process_image_command_line\n"
+  lucene: |
+    event.code:4688 AND process.name:"smss.exe" AND _exists_:process.parent.name AND NOT (process.parent.name:("ntoskrnl.exe" OR "System" OR "smss.exe"))
+  sumo: |
+    _sourceCategory=*Windows* "4688"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "ParentProcessName" as parent_process_name
+    | where event_id in ("592", "4688")
+    | where process_name matches "*\\smss.exe"
+    | where !isNull(parent_process_name) and parent_process_name != ""
+    | where !(parent_process_name matches "*\\ntoskrnl.exe" or parent_process_name matches "*\\System" or parent_process_name matches "*\\smss.exe")
+    | fields _messageTime, _sourceHost, process_name, parent_process_name, event_id
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +106,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Process Creation Event
 

@@ -22,77 +22,72 @@ queries:
     , dest_ip), 0, 1)\n| where is_internal_src=1 AND is_external_dest=1\n| bin _time span=5m\n| stats dc(dest_ip) as unique_dest_ips, values(dest_ip)\
     \ as dest_ips, values(dest_port) as dest_ports by _time, src_ip, dest_port\n| where unique_dest_ips >= 10\n| table _time, src_ip, dest_port,\
     \ unique_dest_ips, dest_ips\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where destination_port in ("139", "445")
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "destination_port" IN (''139'', ''445'')
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_dis_000035 {\n  meta:\n    author = \"TDL\"\n    description = \"SMB Scan - Outbound\"\n    severity = \"MEDIUM\"\n  \
-    \  tactic = \"TA0007\"\n    technique = \"T1046\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.destination_port\
-    \ = /(139|445)/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND destination_port IN ("139", "445")
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND destination_port IN [139, 445])
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND destination_port IN (139, 445)
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND destination_port in ("139", "445")
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND destination_port:(139 OR 445)
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where destination_port IN ("139", "445")
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(5m)
+    | where DeviceDirection =~ "Outbound"
+    | where (DestinationPort in (139, 445) or DeviceCustomString2 in~ ("SMB", "Samba") or ApplicationProtocol in~ ("SMB", "Samba"))
+    | summarize DestinationCount = dcount(DestinationIP), DestinationIPs = make_set(DestinationIP), Ports = make_set(DestinationPort) by SourceIP, DestinationPort, bin(TimeGenerated, 5m)
+    | where DestinationCount >= 10
+    | project TimeGenerated, SourceIP, DestinationPort, DestinationCount, DestinationIPs, Ports
+  aql: |
+    SELECT sourceip, destinationport, UNIQUECOUNT(destinationip) AS unique_destinations, COUNT(*) AS event_count
+    FROM events
+    WHERE (destinationport IN (139, 445) OR LOWER(applicationname) IN ('smb', 'samba'))
+      AND sourceip IN (SELECT sourceip FROM events WHERE sourceip MATCHES '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')
+      AND destinationip NOT IN (SELECT destinationip FROM events WHERE destinationip MATCHES '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')
+    GROUP BY sourceip, destinationport
+    HAVING unique_destinations >= 10
+    LAST 5 MINUTES
+  yara_l: "rule network_port_scanning_t1046 {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects potential network scanning\
+    \ activity - single internal source scanning multiple external destinations on common SMB ports\"\n    mitre_attack_tactic = \"Discovery\"\
+    \n    mitre_attack_technique = \"T1046\"\n    severity = \"Medium\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n  \
+    \  $e.metadata.product_log_id = \"FIREWALL\"\n    $e.network.direction = \"OUTBOUND\"\n    \n    (\n      $e.target.port = 139 or\n      $e.target.port\
+    \ = 445\n    )\n    \n    (\n      re.regex($e.network.application_protocol, `(?i)smb`) or\n      re.regex($e.network.application_protocol,\
+    \ `(?i)samba`)\n    )\n    \n    $e.principal.ip = $src_ip\n    $e.target.ip = $dst_ip\n    $e.target.port = $port\n\n  match:\n    $src_ip,\
+    \ $port over 5m\n\n  condition:\n    #dst_ip >= 10\n}\n"
+  esql: |
+    FROM logs-firewall*
+    | WHERE @timestamp > NOW() - 5 minutes
+      AND network.direction == "outbound"
+      AND (destination.port IN (139, 445) OR TO_LOWER(network.application) IN ("smb", "samba"))
+    | STATS dest_count = COUNT_DISTINCT(destination.ip), event_count = COUNT(*) BY source.ip, destination.port, bucket = BUCKET(@timestamp, 5 minutes)
+    | WHERE dest_count >= 10 AND event_count >= 10
+    | KEEP source.ip, destination.port, dest_count, event_count, bucket
+  leql: |
+    where(direction=OUTBOUND AND (destination_port IN [139, 445] OR application ICONTAINS "smb" OR application ICONTAINS "samba")) groupby(source_address, destination_port) calculate(unique:destination_address)
+  crowdstrike: |
+    #type=firewall action=allowed direction=outbound (dest_port=139 OR dest_port=445 OR application=/(?i)smb/ OR application=/(?i)samba/)
+    | groupBy([src_ip, dest_port], function=[count(as=event_count), count(dest_ip, distinct=true, as=unique_destinations)], limit=max)
+    | event_count >= 10 AND unique_destinations >= 10
+    | table([src_ip, dest_port, event_count, unique_destinations])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter dest_port in (139, 445) or lowercase(app) in ("smb", "samba")
+    | filter action_source_translated_ip_type = "Private" and action_destination_translated_ip_type != "Private"
+    | bin _time span=5m
+    | comp count_distinct(dest_ip) as unique_dests by _time, source_ip, dest_port
+    | filter unique_dests >= 10
+  lucene: |
+    (destination.port:(139 OR 445) OR application:(/[Ss][Mm][Bb]/ OR /[Ss][Aa][Mm][Bb][Aa]/)) AND source.ip:/10\.\d+\.\d+\.\d+|172\.(1[6-9]|2[0-9]|3[0-1])\.\d+\.\d+|192\.168\.\d+\.\d+/ AND NOT destination.ip:/10\.\d+\.\d+\.\d+|172\.(1[6-9]|2[0-9]|3[0-1])\.\d+\.\d+|192\.168\.\d+\.\d+/
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*Firewall*
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "application" as application
+    | json field=_raw "direction" as direction
+    | parse "src_ip=*;" as src_ip nodrop
+    | parse "dest_ip=*;" as dest_ip nodrop
+    | parse "dest_port=*;" as dest_port nodrop
+    | parse "application=*;" as application nodrop
+    | parse "direction=*;" as direction nodrop
+    | where (dest_port in ("139", "445") OR toLowerCase(application) matches "*smb*" OR toLowerCase(application) matches "*samba*")
+    | where direction matches "*outbound*" OR direction matches "*out*"
+    | timeslice 5m
+    | count_distinct(dest_ip) as unique_destinations by _timeslice, src_ip, dest_port
+    | where unique_destinations >= 10
+    | fields _timeslice, src_ip, dest_port, unique_destinations
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -102,7 +97,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "10 Firewall Event \nFrom one internal source to many external destinations (Outbound)\nOR\n\tWhere the Destination Port is in [139,\
   \ 445]\n\t\n\tWhere the Application is in [SMB, Samba] case insensitive \n\t\nWith the same Destination Port\nWith unique Destination IPs\n\

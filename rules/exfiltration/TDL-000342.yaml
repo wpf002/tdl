@@ -18,68 +18,59 @@ risk_score: 30
 queries:
   spl: "index=aws sourcetype=aws:cloudwatch:guardduty finding.type=\"Trojan:EC2/DNSDataExfiltration\" \n| table _time, finding.type, resource.instanceDetails.instanceId,\
     \ resource.instanceDetails.networkInterfaces{}.privateIpAddress, severity, region, accountId, description\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(24h)
+    | where ActivityType == "Trojan:EC2/DNSDataExfiltration"
+    | project TimeGenerated, AwsAccountId, Region, Title, Description, Severity, ResourceType, ResourceId = InstanceId, FindingId, Type = ActivityType
+  aql: |
+    SELECT sourceip, destinationip, qidname(qid) AS event_name, LOGSOURCENAME(logsourceid) AS log_source, "Event Type" AS event_type, COUNT(*) AS event_count
+    FROM events
+    WHERE "Event Type" = 'Trojan:EC2/DNSDataExfiltration'
+    GROUP BY sourceip, destinationip, qid, logsourceid, "Event Type"
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_dns_data_exfiltration {
+      meta:
+        author = "TDL"
+        description = "Detects AWS GuardDuty findings for DNS Data Exfiltration (T1048)"
+        mitre_attack_tactic = "Exfiltration"
+        mitre_attack_technique = "T1048"
+        platform = "AWS"
+        data_source = "AWS GuardDuty"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.product_name = "Amazon GuardDuty"
+        $e.metadata.product_event_type = "Trojan:EC2/DNSDataExfiltration"
+        $e.principal.resource.name = $resource
 
-    | where eventName matches regex "GuardDuty"
+      match:
+        $resource over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exf_000342 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS DNS Exfiltration Attempt - GuardDuty\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0010\"\n    technique = \"T1048\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM .ds-logs-aws.guardduty-*
+    | WHERE event.type == "Trojan:EC2/DNSDataExfiltration"
+    | KEEP @timestamp, cloud.account.id, cloud.region, aws.guardduty.severity, aws.guardduty.resource.instance_details.instance_id, source.ip, destination.ip, dns.question.name, event.id
+  leql: |
+    where(source_json.type="Trojan:EC2/DNSDataExfiltration")
+  crowdstrike: |
+    #type=guardduty finding.type="Trojan:EC2/DNSDataExfiltration"
+    | table([@timestamp, account.id, region, resource.instanceDetails.instanceId, finding.type, severity, description])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and raw_log_type = "guardduty"
+    | filter json_extract_scalar(event_data, "$.detail.type") in ("Trojan:EC2/DNSDataExfiltration")
+    | fields _time, cloud_provider, cloud_provider_account, json_extract_scalar(event_data, "$.detail.type") as finding_type, json_extract_scalar(event_data, "$.detail.severity") as severity, json_extract_scalar(event_data, "$.detail.resource.instanceDetails.instanceId") as instance_id, json_extract_scalar(event_data, "$.detail.description") as description
+  lucene: |
+    event.type:"Trojan:EC2/DNSDataExfiltration"
+  sumo: |
+    _sourceCategory=*GuardDuty* OR _source=*guardduty*
+    | json field=_raw "type" as event_type
+    | where event_type = "Trojan:EC2/DNSDataExfiltration"
+    | fields _messageTime, _sourceHost, event_type, _raw
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -89,7 +80,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Trojan:EC2/DNSDataExfiltration\"]"
 suppression:

@@ -17,71 +17,77 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=google_workspace sourcetype="google:gws:admin" eventName="CHANGE_APPLICATION_SETTING" parameters.SETTING_NAME=bitlocker* parameters.NEW_VALUE="disabled"
+  spl: 'index=google_workspace sourcetype="google:gws:admin" eventName="CHANGE_APPLICATION_SETTING" parameters.SETTING_NAME=bitlocker* parameters.NEW_VALUE="disabled"
+
     | table _time, actor.email, parameters.SETTING_NAME, parameters.NEW_VALUE, parameters.OLD_VALUE, ipAddress
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000303 {\n  meta:\n    author = \"TDL\"\n    description = \"Google Workspace Bitlocker Setting Disabled\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1562\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    GoogleWorkspaceActivityEvents
+    | where TimeGenerated > ago(1h)
+    | where EventName == "CHANGE_APPLICATION_SETTING"
+    | where AdditionalDetails has "SETTING_NAME"
+    | extend SettingName = tostring(parse_json(AdditionalDetails).SETTING_NAME)
+    | extend NewValue = tostring(parse_json(AdditionalDetails).NEW_VALUE)
+    | where SettingName startswith "bitlocker"
+    | where NewValue == "disabled"
+    | project TimeGenerated, UserPrincipalName, EventName, SettingName, NewValue, AdditionalDetails
+  aql: |
+    SELECT eventtime, username, sourceip, "Application", "SETTING_NAME", "NEW_VALUE", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "Event Name" = 'CHANGE_APPLICATION_SETTING'
+      AND "SETTING_NAME" ILIKE 'bitlocker%'
+      AND "NEW_VALUE" = 'disabled'
+    LAST 24 HOURS
+  yara_l: |
+    rule gws_bitlocker_disabled {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects BitLocker being disabled in Google Workspace settings - T1562 Defense Evasion"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1562"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Google Workspace"
+        $e.metadata.vendor_name = "Google"
+        $e.metadata.product_event_type = "CHANGE_APPLICATION_SETTING"
+        re.regex($e.target.resource.attribute.labels["SETTING_NAME"], `^bitlocker`)
+        $e.target.resource.attribute.labels["NEW_VALUE"] = "disabled"
+        $e.principal.user.userid = $user
+        $e.principal.hostname = $host
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-google_workspace*\n| WHERE event.action == \"CHANGE_APPLICATION_SETTING\" \n  AND STARTS_WITH(TO_LOWER(google_workspace.admin.setting.name),\
+    \ \"bitlocker\") \n  AND TO_LOWER(google_workspace.admin.new_value) == \"disabled\"\n| KEEP @timestamp, user.name, user.email, host.name,\
+    \ source.ip, google_workspace.admin.setting.name, google_workspace.admin.new_value, google_workspace.admin.old_value\n"
+  leql: |
+    where(source_json.events.name="CHANGE_APPLICATION_SETTING" AND source_json.SETTING_NAME STARTS-WITH "bitlocker" AND source_json.NEW_VALUE="disabled")
+  crowdstrike: |
+    #type=google_workspace events.name="CHANGE_APPLICATION_SETTING" SETTING_NAME=bitlocker* NEW_VALUE="disabled"
+    | table([@timestamp, actor.email, ipAddress, SETTING_NAME, NEW_VALUE, OLD_VALUE])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Google" and cloud_provider = "GCP"
+    | filter event_name = "CHANGE_APPLICATION_SETTING"
+    | filter parameters.SETTING_NAME ~= "^bitlocker"
+    | filter parameters.NEW_VALUE = "disabled"
+    | fields _time, actor_user, event_name, parameters.SETTING_NAME, parameters.NEW_VALUE, target_resource
+  lucene: |
+    events.name:"CHANGE_APPLICATION_SETTING" AND SETTING_NAME:bitlocker* AND NEW_VALUE:"disabled"
+  sumo: |
+    _sourceCategory=*Google*Workspace* "CHANGE_APPLICATION_SETTING"
+    | json field=_raw "events[*].name" as event_name
+    | json field=_raw "events[*].parameters[*].name" as param_name
+    | json field=_raw "events[*].parameters[*].value" as param_value
+    | where event_name = "CHANGE_APPLICATION_SETTING"
+    | where param_name matches "bitlocker*" and param_value = "disabled"
+    | fields _messageTime, _sourceHost, event_name, param_name, param_value
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +97,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Google Workspace Event
 

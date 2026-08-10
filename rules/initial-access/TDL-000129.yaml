@@ -16,73 +16,67 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail eventName=ConsoleLogin userIdentity.type=IAMUser responseElements.ConsoleLogin=Failure
+  spl: 'index=aws sourcetype=aws:cloudtrail eventName=ConsoleLogin userIdentity.type=IAMUser responseElements.ConsoleLogin=Failure
+
     | bin _time span=5m
+
     | stats dc(userIdentity.userName) as unique_users, values(userIdentity.userName) as attempted_users by _time, sourceIPAddress
+
     | where unique_users >= 5
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000129 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Password Spraying\"\n    severity = \"MEDIUM\"\n\
-    \    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(1h)
+    | where EventName == "ConsoleLogin"
+    | where UserIdentityType == "IAMUser"
+    | where ResponseElements has "Failure"
+    | extend DestinationUserName = UserIdentityUserName
+    | summarize DistinctUsers = dcount(DestinationUserName), UserNameList = make_set(DestinationUserName) by SourceIpAddress, bin(TimeGenerated, 5m)
+    | where DistinctUsers >= 5
+    | project TimeGenerated, SourceIpAddress, DistinctUsers, UserNameList
+  aql: "SELECT sourceip, UNIQUECOUNT(username) AS unique_users, COUNT(*) AS failed_attempts\nFROM events\nWHERE qidname(qid) ILIKE '%ConsoleLogin%'\
+    \ \n  AND \"userIdentity.type\" = 'IAMUser'\n  AND \"responseElements.ConsoleLogin\" = 'Failure'\nGROUP BY sourceip\nHAVING failed_attempts\
+    \ >= 5 AND unique_users >= 5\nLAST 5 MINUTES\n"
+  yara_l: "rule aws_iam_user_console_login_brute_force {\n  meta:\n    author = \"TDL\"\n    description = \"Detects multiple failed IAM user\
+    \ console login attempts from the same source IP within 5 minutes\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique\
+    \ = \"T1078\"\n    severity = \"HIGH\"\n\n  events:\n    $e.metadata.vendor_name = \"AMAZON\"\n    $e.metadata.product_name = \"AWS CloudTrail\"\
+    \n    $e.metadata.product_event_type = \"ConsoleLogin\"\n    $e.security_result.action = \"BLOCK\"\n    $e.target.user.userid = $user\n  \
+    \  $e.principal.ip = $source_ip\n    \n    // userIdentity.type = \"IAMUser\"\n    $e.target.resource.attribute.labels[\"userIdentity.type\"\
+    ] = \"IAMUser\"\n    \n    // responseElements.ConsoleLogin = \"Failure\"\n    $e.security_result.summary = \"Failure\"\n\n  match:\n    $source_ip\
+    \ over 5m\n\n  outcome:\n    $risk_score = max(75)\n    $failed_users = array_distinct($user)\n    $failed_user_count = count_distinct($user)\n\
+    \n  condition:\n    #e >= 5 and $failed_user_count >= 5\n}\n"
+  esql: "FROM logs-aws.cloudtrail*\n| WHERE @timestamp > NOW() - 5 minutes \n  AND event.action == \"ConsoleLogin\"\n  AND aws.cloudtrail.user_identity.type\
+    \ == \"IAMUser\"\n  AND aws.cloudtrail.console_login.additional_eventdata.MFAUsed == \"No\"\n  AND event.outcome == \"failure\"\n| STATS \n\
+    \    unique_users = COUNT_DISTINCT(user.name),\n    total_failures = COUNT(*)\n    BY source.ip, bucket = BUCKET(@timestamp, 5 minutes)\n\
+    | WHERE unique_users >= 5 AND total_failures >= 5\n"
+  leql: |
+    where(source_json.eventName="ConsoleLogin" AND source_json.userIdentity.type="IAMUser" AND source_json.responseElements.ConsoleLogin="Failure") groupby(source_address) calculate(unique:user)
+  crowdstrike: |
+    #repo=cloudtrail eventName=ConsoleLogin userIdentity.type=IAMUser responseElements.ConsoleLogin=Failure
+    | bucket(span=5m, field=@timestamp, as=time_bucket)
+    | groupBy([sourceIPAddress, time_bucket], function=[count(userIdentity.userName, distinct=true, as=unique_users), count(as=total_events)])
+    | unique_users >= 5
+    | table([sourceIPAddress, time_bucket, unique_users, total_events])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and raw_log_type = "CloudTrail" and action_name = "ConsoleLogin" and outcome = "Failure" and json_extract_scalar(raw_log, "$.userIdentity.type") = "IAMUser"
+    | bin _time span=5m
+    | comp count_distinct(actor_effective_username) as unique_users by _time, action_network_protocol_source_ip
+    | filter unique_users >= 5
+  lucene: |
+    eventName:ConsoleLogin AND userIdentity.type:IAMUser AND responseElements.ConsoleLogin:Failure
+  sumo: |
+    _sourceCategory=*cloudtrail* "ConsoleLogin"
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "userIdentity.type" as user_type
+    | json field=_raw "responseElements.ConsoleLogin" as result
+    | json field=_raw "sourceIPAddress" as source_ip
+    | json field=_raw "userIdentity.userName" as username
+    | where event_name = "ConsoleLogin" and user_type = "IAMUser" and result = "Failure"
+    | timeslice 5m
+    | count_distinct(username) as unique_users by _timeslice, source_ip
+    | where unique_users >= 5
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -92,7 +86,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '5 AWS CloudTrail Events
 

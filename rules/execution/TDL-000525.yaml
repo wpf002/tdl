@@ -16,74 +16,76 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=windows (EventCode=592 OR EventCode=4688) process_name="*cmd.exe" parent_process_name="*screenconnect*"
+  spl: 'index=windows (EventCode=592 OR EventCode=4688) process_name="*cmd.exe" parent_process_name="*screenconnect*"
+
     | table _time, ComputerName, User, process_name, parent_process_name, command_line
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("cmd.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('cmd.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000525 {\n  meta:\n    author = \"TDL\"\n    description = \"ScreenConnect CMD Command Execution\"\n    severity =\
-    \ \"HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(cmd.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (592, 4688)
+    | where Process has "cmd.exe"
+    | where ParentProcessName contains "screenconnect"
+    | project TimeGenerated, Computer, Account, Process, ParentProcessName, CommandLine, ProcessId, SubjectUserName, SubjectDomainName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Parent Process Name", "Process CommandLine"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Process Name" ILIKE '%cmd.exe%'
+      AND "Parent Process Name" ILIKE '%screenconnect%'
+    LAST 24 HOURS
+  yara_l: |
+    rule screenconnect_cmd_execution {
+      meta:
+        author = "TDL"
+        description = "Detects cmd.exe execution spawned by ScreenConnect process - T1204"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688"
+        )
+        re.regex($e.target.process.file.full_path, `(?i)\\cmd\.exe$`)
+        re.regex($e.principal.process.file.full_path, `(?i)screenconnect`)
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name IN ("cmd.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [cmd.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (cmd.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("cmd.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(cmd.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("cmd.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.security*, winlogbeat-*, logs-system.security*
+    | WHERE winlog.event_id IN (592, 4688) AND process.name == "cmd.exe" AND process.parent.name LIKE "*screenconnect*"
+    | KEEP @timestamp, host.name, user.name, process.name, process.parent.name, process.command_line, process.executable
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND process_name ICONTAINS "cmd.exe" AND parent_process_name ICONTAINS "screenconnect")
+  crowdstrike: |
+    EventCode IN [592, 4688] FileName=cmd.exe ParentBaseFileName=*screenconnect*
+    | table([@timestamp, ComputerName, UserName, FileName, ParentBaseFileName, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter lowercase(action_process_image_name) contains "cmd.exe"
+    | filter lowercase(actor_process_image_name) contains "screenconnect"
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:(592 OR 4688) AND process.name:cmd.exe AND process.parent.name:*screenconnect*
+  sumo: |
+    _sourceCategory=*Windows* (EventID=4688 OR EventID=592)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "ParentProcessName" as parent_process_name
+    | where event_id in ("4688", "592")
+    | where process_name matches "*cmd.exe"
+    | where parent_process_name matches "*screenconnect*"
+    | fields _messageTime, _sourceHost, event_id, process_name, parent_process_name
 false_positives:
 - 'ref: https://www.huntandhackett.com/blog/revil-the-usage-of-legitimate-remote-admin-tooling'
 tuning_guidance: Tune per environment baseline.
@@ -92,7 +94,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is cmd.exe\nWhere the Parent Process\
   \ Name contains \"screenconnect\""

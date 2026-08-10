@@ -28,71 +28,136 @@ queries:
     \ as write_host by file_hash, volume\n| where action=\"execute\" AND isnotnull(write_time) AND write_host!=host_normalized AND (_time - write_time\
     \ <= 86400) AND (_time >= write_time)\n| table _time, host_normalized, write_host, write_time, action, volume, file_name, file_hash, Image,\
     \ TargetFilename\n"
-  kql: 'DeviceProcessEvents
+  kql: "let WriteEvents = \n    DeviceFileEvents\n    | where TimeGenerated > ago(25h)\n    | where ActionType == \"FileCreated\"\n    | where\
+    \ FolderPath has_any (@\"\\E:\\\", @\"\\F:\\\", @\"\\G:\\\", @\"\\H:\\\", @\"/media/\", @\"/mnt/\", @\"/Volumes/\")\n    | where FileName\
+    \ endswith \".exe\" or FileName endswith \".dll\" or FileName endswith \".sh\" or FileName endswith \".bin\" or FileName endswith \".elf\"\
+    \ or FileName endswith \".app\"\n    | project WriteTime = TimeGenerated, WriterDevice = DeviceName, WriterAccount = InitiatingProcessAccountName,\
+    \ FileName, SHA256, FolderPath;\nlet ExecuteEvents =\n    DeviceProcessEvents\n    | where TimeGenerated > ago(24h)\n    | where FolderPath\
+    \ has_any (@\"\\E:\\\", @\"\\F:\\\", @\"\\G:\\\", @\"\\H:\\\", @\"/media/\", @\"/mnt/\", @\"/Volumes/\")\n    | project ExecuteTime = TimeGenerated,\
+    \ ExecutorDevice = DeviceName, ExecutorAccount = AccountName, FileName, SHA256, ProcessCommandLine, FolderPath;\nWriteEvents\n| join kind=inner\
+    \ (ExecuteEvents) on FileName, SHA256\n| where WriterDevice != ExecutorDevice\n| where ExecuteTime > WriteTime and ExecuteTime <= WriteTime\
+    \ + 24h\n| project WriteTime, WriterDevice, WriterAccount, ExecuteTime, ExecutorDevice, ExecutorAccount, FileName, SHA256, ProcessCommandLine,\
+    \ FolderPath\n| sort by WriteTime desc\n"
+  aql: "SELECT \n    w.\"Process Name\" AS write_process,\n    w.sourceip AS write_host,\n    w.\"Target File Name\" AS file_path,\n    w.eventtime\
+    \ AS write_time,\n    e.\"Process Name\" AS exec_process,\n    e.sourceip AS exec_host,\n    e.\"Process CommandLine\" AS exec_cmdline,\n\
+    \    e.eventtime AS exec_time\nFROM events w\nJOIN events e ON w.\"Target File Name\" = e.\"Image\"\nWHERE w.\"EventID\" IN ('11', '15')\n\
+    \    AND (w.\"Target File Name\" ILIKE 'D:\\%' \n         OR w.\"Target File Name\" ILIKE 'E:\\%'\n         OR w.\"Target File Name\" ILIKE\
+    \ 'F:\\%'\n         OR w.\"Target File Name\" ILIKE 'G:\\%'\n         OR w.\"Target File Name\" ILIKE '/media/%'\n         OR w.\"Target File\
+    \ Name\" ILIKE '/mnt/%'\n         OR w.\"Target File Name\" ILIKE '/Volumes/%')\n    AND (w.\"Target File Name\" ILIKE '%.exe' \n        \
+    \ OR w.\"Target File Name\" ILIKE '%.dll'\n         OR w.\"Target File Name\" ILIKE '%.scr'\n         OR w.\"Target File Name\" ILIKE '%.bat'\n\
+    \         OR w.\"Target File Name\" ILIKE '%.sh'\n         OR w.\"Target File Name\" ILIKE '%.app')\n    AND e.\"EventID\" = '1'\n    AND\
+    \ w.sourceip != e.sourceip\n    AND e.eventtime > w.eventtime\n    AND e.eventtime <= (w.eventtime + 86400000)\nLAST 24 HOURS\n"
+  yara_l: |
+    rule t1091_usb_worm_lateral_movement {
+      meta:
+        author = "TDL"
+        description = "Detects lateral movement via removable media - file written to USB on one host then executed on another within 24h"
+        mitre_attack_tactic = "Lateral Movement"
+        mitre_attack_technique = "T1091"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        // File write to removable media
+        $write.metadata.event_type = "FILE_CREATION"
+        re.regex($write.target.file.full_path, `(?i)^[D-Z]:\\`) or
+        re.regex($write.target.file.full_path, `(?i)/media/|/mnt/|/Volumes/`)
+        (
+          re.regex($write.target.file.full_path, `(?i)\.(exe|dll|scr|com|bat|cmd|ps1|sh|elf|bin)$`) or
+          $write.target.file.mime_type = "application/x-executable" or
+          $write.target.file.mime_type = "application/x-msdos-program"
+        )
+        $write.principal.hostname = $source_host
+        $write.target.file.full_path = $file_path
 
-    | where process_name matches regex ".+"
+        // File execution from removable media
+        $exec.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          re.regex($exec.principal.process.file.full_path, `(?i)^[D-Z]:\\`) or
+          re.regex($exec.principal.process.file.full_path, `(?i)/media/|/mnt/|/Volumes/`)
+        )
+        $exec.principal.hostname = $target_host
+        $exec.principal.process.file.full_path = $exec_path
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+        // Match file paths (normalized)
+        re.capture($file_path, `(?i)^[A-Z]:\\(.+)$`, $path_suffix1) or
+        re.capture($file_path, `(?i)^/(?:media|mnt|Volumes)/[^/]+/(.+)$`, $path_suffix1)
+        re.capture($exec_path, `(?i)^[A-Z]:\\(.+)$`, $path_suffix2) or
+        re.capture($exec_path, `(?i)^/(?:media|mnt|Volumes)/[^/]+/(.+)$`, $path_suffix2)
+        $path_suffix1 = $path_suffix2
 
-    | order by Count desc
+        // Different hosts
+        $source_host != $target_host
 
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_lm_000779 {\n  meta:\n    author = \"TDL\"\n    description = \"Lateral Spread via Removable Media Write+Execute\"\n \
-    \   severity = \"HIGH\"\n    tactic = \"TA0008\"\n    technique = \"T1091\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+        // Execution after write
+        $exec.metadata.event_timestamp.seconds >= $write.metadata.event_timestamp.seconds
 
-    | WHERE @timestamp > NOW() - 1 hour
+      match:
+        $source_host, $target_host, $path_suffix1 over 24h
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      outcome:
+        $risk_score = 85
+        $source_hostname = $source_host
+        $target_hostname = $target_host
+        $file_written = $file_path
+        $file_executed = $exec_path
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $write and $exec
+    }
+  esql: |
+    FROM logs-endpoint.events.file*, logs-windows.sysmon_operational*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (event.category == "file" AND event.action IN ("creation", "modification") AND file.extension IN ("exe", "dll", "scr", "com", "bat", "sh", "elf"))
+        OR (winlog.event_id == 11 AND winlog.event_data.TargetFilename RLIKE ".*\\.(exe|dll|scr|com|bat|sh|elf)$")
+      )
+      AND (file.path LIKE "*removable*" OR file.path RLIKE "^[D-Z]:\\\\" OR file.path LIKE "/media/*" OR file.path LIKE "/Volumes/*" OR winlog.event_data.TargetFilename RLIKE "^[D-Z]:\\\\")
+    | EVAL normalized_path = COALESCE(file.path, winlog.event_data.TargetFilename)
+    | EVAL normalized_name = COALESCE(file.name, CASE(normalized_path RLIKE ".*\\\\([^\\\\]+)$", normalized_path, normalized_path RLIKE ".*/([^/]+)$", normalized_path, normalized_path))
+    | STATS write_hosts = VALUES(host.name), write_time = MIN(@timestamp), exec_hosts = VALUES(CASE(event.action == "execution" OR process.name IS NOT NULL, host.name, null)), exec_time = MAX(CASE(event.action == "execution" OR process.name IS NOT NULL, @timestamp, null)) BY normalized_name
+    | WHERE write_hosts != exec_hosts AND exec_time > write_time
+    | KEEP normalized_name, write_hosts, write_time, exec_hosts, exec_time
+  leql: |
+    where(file_path CONTAINS "/media/" OR file_path CONTAINS "/mnt/" OR file_path CONTAINS "/Volumes/" OR file_path=/[A-Z]:\\/(?!Windows|Program Files).*\\.exe/i) groupby(file_path, file_hash) calculate(unique:asset)
+  crowdstrike: |
+    (event_simpleName=ProcessRollup2 OR event_simpleName=AsepValueUpdate OR EventCode IN [11, 23])
+    | case {
+        event_simpleName=ProcessRollup2 AND (FileName=/.*\.exe$/i OR FileName=/.*\.dll$/i OR FileName=/.*\.scr$/i OR FileName=/.*\.bat$/i OR FileName=/.*\.sh$/i OR FileName=/.*\.elf$/i OR FileName=/.*\.app$/i OR FileName=/.*\.dmg$/i) AND (FilePath=/^[D-Z]:\\/i OR FilePath=/^\\/media\\// OR FilePath=/^\\/mnt\\// OR FilePath=/^\\/Volumes\\//);
+        EventCode IN [11, 23] AND (TargetFilename=/.*\.exe$/i OR TargetFilename=/.*\.dll$/i OR TargetFilename=/.*\.scr$/i OR TargetFilename=/.*\.bat$/i OR TargetFilename=/.*\.sh$/i OR TargetFilename=/.*\.elf$/i OR TargetFilename=/.*\.app$/i OR TargetFilename=/.*\.dmg$/i) AND (TargetFilename=/^[D-Z]:\\/i OR TargetFilename=/^\\/media\\// OR TargetFilename=/^\\/mnt\\// OR TargetFilename=/^\\/Volumes\\//);
+        * | drop();
+      }
+    | regex("(?<RemovableVolume>[D-Z]:|/media/[^/]+|/mnt/[^/]+|/Volumes/[^/]+)", field=coalesce([FilePath, TargetFilename]), strict=false)
+    | regex("(?<ExecutableName>[^\\\\/]+)$", field=coalesce([FilePath, TargetFilename]), strict=false)
+    | table([@timestamp, event_simpleName, EventCode, ComputerName, ExecutableName, RemovableVolume, FilePath, TargetFilename, SHA256HashData])
+    | rename(field=ComputerName, as=Host)
+    | selfJoin(field=[ExecutableName, RemovableVolume], include=[Host, @timestamp], where=[{field="Host", op="!=", to="Host"}], limit=max)
+    | @timestamp - @timestamp_join <= 86400000
+    | groupBy([ExecutableName, RemovableVolume, Host, Host_join], function=count(as=matches))
+    | matches >= 1
+    | table([ExecutableName, RemovableVolume, Host, Host_join, matches])
+  xql: "dataset = xdr_data\n| filter event_type in (ENUM.EVENT_TYPE_FILE, ENUM.EVENT_TYPE_PROCESS)\n| filter (event_type = ENUM.EVENT_TYPE_FILE\
+    \ and event_sub_type = ENUM.EVENT_SUB_TYPE_FILE_WRITE and action_file_path ~= \"^[D-Z]:\\\\\\\\\" and (action_file_path ~= \"\\\\.exe$\" or\
+    \ action_file_path ~= \"\\\\.dll$\" or action_file_path ~= \"\\\\.bat$\" or action_file_path ~= \"\\\\.ps1$\"))\n   or (event_type = ENUM.EVENT_TYPE_PROCESS\
+    \ and action_process_image_path ~= \"^[D-Z]:\\\\\\\\\")\n| alter \n    drive_letter = arrayindex(regextract(coalesce(action_file_path, action_process_image_path),\
+    \ \"^([D-Z]:)\"), 0),\n    file_path_normalized = coalesce(action_file_path, action_process_image_path),\n    is_write = if(event_type = ENUM.EVENT_TYPE_FILE,\
+    \ 1, 0),\n    is_execute = if(event_type = ENUM.EVENT_TYPE_PROCESS, 1, 0),\n    write_host = if(event_type = ENUM.EVENT_TYPE_FILE, agent_hostname,\
+    \ null),\n    exec_host = if(event_type = ENUM.EVENT_TYPE_PROCESS, agent_hostname, null)\n| comp min(_time) as first_write_time, max(_time)\
+    \ as last_exec_time, values(write_host) as write_hosts, values(exec_host) as exec_hosts by file_path_normalized, drive_letter\n| filter array_length(write_hosts)\
+    \ > 0 and array_length(exec_hosts) > 0\n| alter time_diff_ms = timestamp_diff(last_exec_time, first_write_time, \"MILLISECOND\")\n| filter\
+    \ time_diff_ms >= 0 and time_diff_ms <= 86400000\n| arrayexpand write_hosts\n| arrayexpand exec_hosts\n| filter write_hosts != exec_hosts\n\
+    | fields first_write_time, last_exec_time, file_path_normalized, drive_letter, write_hosts, exec_hosts, time_diff_ms\n"
+  lucene: |
+    (event.code:(11 OR 23) AND file.path:(*\D:\* OR *\E:\* OR *\F:\* OR *\G:\* OR */media/* OR */mnt/*) AND file.extension:(exe OR dll OR scr OR com OR bat OR sh OR elf)) OR (event.code:(1 OR 4688) AND process.executable:(*\D:\* OR *\E:\* OR *\F:\* OR *\G:\* OR */media/* OR */mnt/*))
+  sumo: "_sourceCategory=*Sysmon* OR _sourceCategory=*EDR*\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"Image\" as image\n\
+    | json field=_raw \"TargetFilename\" as target_file\n| json field=_raw \"Computer\" as computer\n| json field=_raw \"CommandLine\" as cmd\n\
+    | json field=_raw \"ProcessName\" as process_name\n| json field=_raw \"FilePath\" as file_path\n| where (event_id = \"11\" and (target_file\
+    \ matches \"*:\\\\*\" and target_file matches regex \"^[D-Z]:\\\\.*\\.(exe|dll|bat|ps1|vbs|js)$\")) \n   OR (event_id = \"1\" and (image matches\
+    \ regex \"^[D-Z]:\\\\.*\\.(exe|dll|bat|ps1|vbs|js)$\" OR cmd matches regex \"^[D-Z]:\\\\.*\\.(exe|dll|bat|ps1|vbs|js)\"))\n| if(event_id=\"\
+    11\", target_file, if(image matches regex \"^[D-Z]:\\\\.*\", image, \"\")) as executable_path\n| if(event_id=\"11\", \"write\", \"execute\"\
+    ) as action\n| where executable_path != \"\"\n| fields _messageTime, computer, action, executable_path, event_id\n| sort by executable_path,\
+    \ _messageTime\n| transpose row computer column action as write, execute\n| where isNull(write) = false and isNull(execute) = false\n| parse\
+    \ field=write \"(*)\" as write_host\n| parse field=execute \"(*)\" as exec_host\n| where write_host != exec_host\n| timeslice 24h\n| count\
+    \ by executable_path, write_host, exec_host, _timeslice\n"
 pseudo_logic: Same host writes an executable to a removable volume then a different host executes it within 24h. Suggests USB-borne worm spread.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -110,7 +175,7 @@ references:
 - https://attack.mitre.org/techniques/T1091/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, target host, and the protocol / credential used.'

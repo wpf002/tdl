@@ -21,71 +21,80 @@ queries:
     | stats dc(process_id) as child_count, values(process_name) as children by _time, parent_process_id, parent_process_name, host\n| where child_count\
     \ > 500 \n  AND NOT (parent_process_name IN (\"make\", \"cmake\", \"gcc\", \"g++\", \"javac\", \"msbuild.exe\", \"devenv.exe\", \"ninja\"\
     , \"bazel\", \"cargo\"))\n| table _time, host, parent_process_name, parent_process_id, child_count, children\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_000818 {\n  meta:\n    author = \"TDL\"\n    description = \"Process Forking Storm Saturating CPU\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0040\"\n    technique = \"T1499\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceProcessEvents
+    | where TimeGenerated > ago(1h)
+    | where InitiatingProcessFileName !has_any ("make", "msbuild.exe", "cmake", "ninja", "gcc", "g++", "clang", "devenv.exe", "cl.exe")
+    | summarize ChildCount = dcount(ProcessId), Children = make_set(FileName, 100) by bin(TimeGenerated, 60s), DeviceName, InitiatingProcessId, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName
+    | where ChildCount > 500
+    | project TimeGenerated, DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessId, ChildCount, Children
+  aql: |
+    SELECT "Parent Process Name", "Parent Process ID", sourceip, LOGSOURCENAME(logsourceid) AS hostname, COUNT(*) AS child_count, UNIQUECOUNT("Process Name") AS unique_children
+    FROM events
+    WHERE ("EventID" = '1' OR "EventID" = '4688' OR categoryname(category) ILIKE '%process%creation%')
+      AND "Parent Process Name" IS NOT NULL
+      AND "Parent Process Name" NOT ILIKE '%msbuild.exe%'
+      AND "Parent Process Name" NOT ILIKE '%devenv.exe%'
+      AND "Parent Process Name" NOT ILIKE '%cmake%'
+      AND "Parent Process Name" NOT ILIKE '%make%'
+      AND "Parent Process Name" NOT ILIKE '%gcc%'
+      AND "Parent Process Name" NOT ILIKE '%cl.exe%'
+    GROUP BY "Parent Process Name", "Parent Process ID", sourceip, LOGSOURCENAME(logsourceid)
+    HAVING child_count > 500
+    LAST 1 MINUTES
+  yara_l: "rule endpoint_dos_process_fork_bomb {\n  meta:\n    author = \"TDL\"\n    description = \"T1499: Endpoint Denial of Service - Fork\
+    \ bomb or excessive child process spawning\"\n    mitre_attack_tactic = \"Impact\"\n    mitre_attack_technique = \"T1499\"\n    severity =\
+    \ \"High\"\n\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.principal.process.pid = $parent_pid\n    $e.principal.process.file.full_path\
+    \ = $parent_path\n    $e.principal.hostname = $host\n    \n    not re.regex($e.principal.process.file.full_path, `(?i)(make|gcc|g\\+\\+|cc|clang|cmake|ninja|gradle|maven|javac|msbuild|devenv|bazel)`)\n\
+    \n  match:\n    $host, $parent_pid, $parent_path over 60s\n\n  condition:\n    #e > 500\n}\n"
+  esql: |
+    FROM logs-endpoint.events.process*
+    | WHERE @timestamp > NOW() - 60 seconds AND event.action == "start"
+    | STATS child_count = COUNT(*) BY process.parent.entity_id, process.parent.name, process.parent.executable, host.name, user.name
+    | WHERE child_count > 500
+    | EVAL is_build_process = CASE(
+        process.parent.name IN ("make", "cmake", "msbuild.exe", "devenv.exe", "ninja", "gcc", "g++", "clang", "javac", "cargo", "npm", "yarn", "gradle", "mvn", "ant"), 1,
+        0
+      )
+    | WHERE is_build_process == 0
+    | KEEP @timestamp, host.name, user.name, process.parent.name, process.parent.executable, process.parent.entity_id, child_count
+  leql: |
+    where(parent_process_id=*) groupby(parent_process_id, parent_process_name, asset) calculate(count) having(count>500)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2
+    | bucket(limit=60, field=@timestamp, span=60s, as=window)
+    | groupBy([window, aid, ParentBaseFileName, ContextProcessId], function=count(as=child_count))
+    | child_count > 500
+    | table([window, aid, ComputerName, ParentBaseFileName, ContextProcessId, child_count])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | bin _time span=60s
+    | comp count() as child_count by _time, actor_process_instance_id, actor_process_image_name, agent_hostname
+    | filter child_count > 500
+    | filter actor_process_image_name not in ("make", "gcc", "g++", "clang", "msbuild.exe", "devenv.exe", "cmake", "ninja", "bazel")
+    | fields _time, agent_hostname, actor_process_image_name, actor_process_instance_id, child_count
+  lucene: |
+    (event.type:process_start OR event.category:process) AND _exists_:process.parent.pid AND NOT (process.parent.name:(make OR gcc OR javac OR msbuild.exe OR devenv.exe OR cmake OR ninja OR bazel))
+  sumo: |
+    _sourceCategory=*EDR* OR _sourceCategory=*Sysmon* OR _sourceCategory=*Windows* OR _sourceCategory=*Linux*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ParentProcessId" as parent_pid
+    | json field=_raw "ProcessId" as process_id
+    | json field=_raw "ParentImage" as parent_image
+    | json field=_raw "ParentProcessName" as parent_process
+    | json field=_raw "Image" as process_image
+    | json field=_raw "Process" as process_name
+    | json field=_raw "Computer" as computer
+    | json field=_raw "host" as host
+    | where event_id = "1" OR event_id = "4688" OR process_id matches "*"
+    | if(isNull(parent_image), parent_process, parent_image) as parent_proc
+    | if(isNull(computer), host, computer) as hostname
+    | where !(parent_proc matches "*msbuild*" OR parent_proc matches "*make*" OR parent_proc matches "*gcc*" OR parent_proc matches "*cmake*" OR parent_proc matches "*bazel*" OR parent_proc matches "*ninja*")
+    | timeslice 60s
+    | count as child_count by _timeslice, hostname, parent_pid, parent_proc
+    | where child_count > 500
+    | fields _timeslice, hostname, parent_pid, parent_proc, child_count
 pseudo_logic: Single parent spawning >500 children in 60s, or fork-bomb pattern from a non-build process. Endpoint DoS.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -102,7 +111,7 @@ references:
 - https://attack.mitre.org/techniques/T1499/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'

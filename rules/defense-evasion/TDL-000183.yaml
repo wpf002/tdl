@@ -16,75 +16,96 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail (eventName=TerminateInstances OR eventName=DeleteInstance)
+  spl: 'index=aws sourcetype=aws:cloudtrail (eventName=TerminateInstances OR eventName=DeleteInstance)
+
     | lookup aws_non_production_instances instanceId OUTPUT environment
+
     | where isnotnull(environment)
+
     | bin _time span=5m
+
     | stats count dc(instanceId) as unique_instances values(instanceId) as instances values(eventName) as actions by _time, userIdentity.userName
+
     | where count >= 5
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000183 {\n  meta:\n    author = \"TDL\"\n    description = \"Multiple Instance Terminations from Single Source\"\n\
-    \    severity = \"LOW\"\n    tactic = \"TA0005\"\n    technique = \"T1489\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(5m)
+    | where EventName in ("TerminateInstances", "DeleteInstance")
+    | where InstanceId in (toscalar(AWSNonProductionInstances | project InstanceId))
+    | summarize EventCount = count(), InstancesAffected = dcount(InstanceId), FirstEvent = min(TimeGenerated), LastEvent = max(TimeGenerated) by UserIdentityUserName, bin(TimeGenerated, 5m)
+    | where EventCount >= 5
+    | project TimeGenerated, UserIdentityUserName, EventCount, InstancesAffected, FirstEvent, LastEvent
+  aql: |
+    SELECT username, sourceip, COUNT(*) AS terminate_count, UNIQUECOUNT("Instance ID") AS unique_instances
+    FROM events
+    WHERE "EventName" IN ('TerminateInstances', 'DeleteInstance')
+      AND "Instance ID" IN (SELECT "Instance ID" FROM referencedata WHERE "Reference Set Name" = 'AWS Non-Production Instances List')
+    GROUP BY username, sourceip
+    HAVING terminate_count >= 5
+    LAST 5 MINUTES
+  yara_l: "rule aws_instance_termination_defense_evasion {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects potential\
+    \ defense evasion via rapid termination of multiple AWS non-production instances\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique\
+    \ = \"T1489\"\n    severity = \"Medium\"\n    \n  events:\n    $cloudtrail.metadata.vendor_name = \"AMAZON\"\n    $cloudtrail.metadata.product_name\
+    \ = \"AWS CloudTrail\"\n    (\n      $cloudtrail.metadata.product_event_type = \"TerminateInstances\" or\n      $cloudtrail.metadata.product_event_type\
+    \ = \"DeleteInstance\"\n    )\n    $cloudtrail.principal.user.userid = $user\n    $cloudtrail.target.resource.name = $instance\n    \n  match:\n\
+    \    $user over 5m\n    \n  outcome:\n    $risk_score = max(65)\n    \n  condition:\n    #cloudtrail >= 5\n}\n"
+  esql: "FROM logs-aws.cloudtrail*\n| WHERE @timestamp > NOW() - 5 minutes \n  AND event.action IN (\"TerminateInstances\", \"DeleteInstance\"\
+    )\n| STATS event_count = COUNT(*) BY user.name, bucket = BUCKET(@timestamp, 5 minutes)\n| WHERE event_count >= 5\n"
+  leql: |
+    where(source_json.eventName IN [TerminateInstances, DeleteInstance] AND source_json.requestParameters.instancesSet.items.instanceId IN AWS_Non_Production_Instances) groupby(source_json.userIdentity.userName) calculate(count)
+  crowdstrike: |
+    #type=cloudtrail EventName IN [TerminateInstances, DeleteInstance]
+    | groupBy([userIdentity.userName], function=[count(as=event_count), collect([instanceId, eventTime])])
+    | event_count >= 5
+    | timeChart(span=5m, function=max(event_count), limit=max)
+    ```
 
-    | WHERE @timestamp > NOW() - 1 hour
+    Wait, let me reconsider the time window requirement. The query needs to find 5 events within a 5-minute sliding window:
 
-    | WHERE eventName LIKE "%.+%"
+    ```
+    #type=cloudtrail EventName IN [TerminateInstances, DeleteInstance]
+    | bucket(span=5m, function=[count(as=event_count), selectLast([userIdentity.userName])], limit=max)
+    | event_count >= 5
+    | table([@timestamp, userIdentity.userName, event_count])
+    ```
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+    Actually, for a proper sliding window per username:
 
-    | SORT count DESC
+    ```
+    #type=cloudtrail (EventName=TerminateInstances OR EventName=DeleteInstance)
+    | timechart(span=5m, function=count(as=event_count), series=userIdentity.userName)
+    | event_count >= 5
+    ```
 
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+    Let me correct this to properly handle the grouping and time window:
 
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    ```
+    #type=cloudtrail (EventName=TerminateInstances OR EventName=DeleteInstance)
+    | bucket(@timestamp, span=5m, as=time_bucket)
+    | groupBy([time_bucket, userIdentity.userName], function=count(as=event_count))
+    | event_count >= 5
+    | table([time_bucket, userIdentity.userName, event_count])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and resource_type = "AWS.EC2.Instance" and operation in ("TerminateInstances", "DeleteInstance")
+    | bin _time span=5m
+    | comp count() as event_count by _time, actor_user_name, resource_sub_type
+    | filter event_count >= 5
+  lucene: |
+    eventName:(TerminateInstances OR DeleteInstance) AND userIdentity.principalId:* AND NOT tags.environment:"production"
+  sumo: |
+    _sourceCategory=*CloudTrail* (TerminateInstances OR DeleteInstance)
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "userIdentity.userName" as source_username
+    | json field=_raw "requestParameters.instancesSet.items[*].instanceId" as instance_id
+    | where event_name in ("TerminateInstances", "DeleteInstance")
+    | lookup instance_type from shared://AWS_NonProduction_Instances on instance_id=instance_id
+    | where !isNull(instance_type)
+    | timeslice 5m
+    | count as event_count by _timeslice, source_username
+    | where event_count >= 5
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -94,7 +115,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '5 AWS CloudTrail Events
 

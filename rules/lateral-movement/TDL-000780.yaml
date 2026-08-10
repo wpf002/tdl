@@ -20,77 +20,126 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=* (sourcetype=edr OR sourcetype=mdm OR sourcetype=rmm OR sourcetype=sccm) (action IN("install","execute","deploy","script_execution") OR EventType IN("SoftwareInstall","ScriptExecution","RemoteExecution"))
+  spl: 'index=* (sourcetype=edr OR sourcetype=mdm OR sourcetype=rmm OR sourcetype=sccm) (action IN("install","execute","deploy","script_execution")
+    OR EventType IN("SoftwareInstall","ScriptExecution","RemoteExecution"))
+
     | bin _time span=30m
+
     | stats dc(dest) as endpoint_count values(dest) as endpoints values(action) as actions values(EventType) as event_types by _time, user, src
+
     | where endpoint_count >= 10
+
     | table _time, user, src, endpoint_count, endpoints, actions, event_types
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_lm_000780 {\n  meta:\n    author = \"TDL\"\n    description = \"Mass Software Push from RMM Console\"\n    severity =\
-    \ \"HIGH\"\n    tactic = \"TA0008\"\n    technique = \"T1072\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: "let timeWindow = 30m;\nlet threshold = 10;\nunion \n    (DeviceProcessEvents\n    | where TimeGenerated > ago(timeWindow)\n    | where\
+    \ InitiatingProcessFileName has_any (\"CCMExec.exe\", \"TeamViewer.exe\", \"ScreenConnect.exe\", \"AnyDesk.exe\", \"VNCServer.exe\", \"RemoteDesktop.exe\"\
+    , \"mstsc.exe\", \"sccm\", \"rmm\")\n       or ProcessCommandLine has_any (\"install\", \"msiexec\", \"wscript\", \"cscript\", \"powershell\"\
+    )\n    | extend TargetDevice = DeviceName, Identity = AccountName, Action = \"ProcessExecution\", Tool = InitiatingProcessFileName\n    |\
+    \ project TimeGenerated, Identity, TargetDevice, Action, Tool, ProcessCommandLine),\n    (DeviceFileEvents\n    | where TimeGenerated > ago(timeWindow)\n\
+    \    | where InitiatingProcessFileName has_any (\"CCMExec.exe\", \"TeamViewer.exe\", \"ScreenConnect.exe\", \"AnyDesk.exe\", \"VNCServer.exe\"\
+    , \"sccm\", \"rmm\")\n    | where FileName endswith_any (\".msi\", \".exe\", \".ps1\", \".vbs\", \".bat\", \".cmd\")\n    | extend TargetDevice\
+    \ = DeviceName, Identity = InitiatingProcessAccountName, Action = \"FileCreation\", Tool = InitiatingProcessFileName\n    | project TimeGenerated,\
+    \ Identity, TargetDevice, Action, Tool, FileName),\n    (Event\n    | where TimeGenerated > ago(timeWindow)\n    | where Source in (\"SCCM\"\
+    , \"Configuration Manager\", \"RMM\")\n       or RenderedDescription has_any (\"software installation\", \"deployment\", \"remote execution\"\
+    )\n    | extend TargetDevice = Computer, Identity = UserName, Action = \"LogEntry\", Tool = Source\n    | project TimeGenerated, Identity,\
+    \ TargetDevice, Action, Tool)\n| where isnotempty(Identity) and isnotempty(TargetDevice)\n| summarize DistinctEndpoints = dcount(TargetDevice),\
+    \ Endpoints = make_set(TargetDevice), Actions = make_set(Action), Tools = make_set(Tool), StartTime = min(TimeGenerated), EndTime = max(TimeGenerated)\
+    \ by Identity\n| where DistinctEndpoints >= threshold\n| project Identity, DistinctEndpoints, Endpoints, Actions, Tools, StartTime, EndTime\n"
+  aql: |
+    SELECT "Source Username" AS rmm_identity, sourceip, UNIQUECOUNT(destinationip) AS target_count, COUNT(*) AS total_actions
+    FROM events
+    WHERE (categoryname(category) ILIKE '%software%deploy%' OR categoryname(category) ILIKE '%remote%management%' OR categoryname(category) ILIKE '%configuration%management%' OR "Process Name" ILIKE '%sccm%' OR "Process Name" ILIKE '%ccmexec%' OR "Process Name" ILIKE '%RemoteManagement%' OR "EventID" IN ('7045','4688','1','4697') AND ("Process CommandLine" ILIKE '%install%' OR "Process CommandLine" ILIKE '%deploy%' OR "Process CommandLine" ILIKE '%script%' OR "Service File Name" IS NOT NULL))
+    GROUP BY "Source Username", sourceip
+    HAVING target_count >= 10
+    LAST 30 MINUTES
+  yara_l: |
+    rule rmm_sccm_suspicious_fanout {
+      meta:
+        author = "TDL"
+        description = "Detects single RMM/SCCM identity initiating software install or script execution against 10+ distinct endpoints in 30m"
+        mitre_attack_tactic = "Lateral Movement"
+        mitre_attack_technique = "T1072"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        (
+          $e.metadata.event_type = "PROCESS_LAUNCH" or
+          $e.metadata.event_type = "SOFTWARE_INSTALLATION"
+        )
+        (
+          re.regex($e.principal.process.file.full_path, `(?i)(sccm|ccmexec|TeamViewer|AnyDesk|LogMeIn|ScreenConnect|Dameware|Kaseya|N-able|ConnectWise|BeyondTrust|RemotePC|Splashtop|RemoteUtilities|psexec|paexec|winexesvc)`) or
+          re.regex($e.principal.process.command_line, `(?i)(sccm|ccmexec|TeamViewer|AnyDesk|LogMeIn|ScreenConnect|Dameware|Kaseya|N-able|ConnectWise|BeyondTrust|RemotePC|Splashtop|RemoteUtilities|psexec|paexec)`) or
+          re.regex($e.metadata.description, `(?i)(deployment|remote management|remote monitoring|RMM|SCCM|software distribution)`)
+        )
+        $e.principal.user.userid = $identity
+        $e.target.hostname = $target_host
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $identity over 30m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
+        $distinct_targets = count_distinct($target_host)
+        $identity_name = $identity
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        #target_host >= 10
+    }
+  esql: |
+    FROM logs-endpoint.events.process*, logs-*
+    | WHERE @timestamp > NOW() - 30 minutes
+      AND (
+        (process.name IN ("ccmexec.exe", "TeamViewer.exe", "ScreenConnect.exe", "AnyDesk.exe", "LogMeIn.exe", "Splashtop.exe", "ConnectWise.exe", "RemotePC.exe", "bomgar-scc.exe", "BeyondTrust.exe", "RemoteUtilities.exe", "Dameware.exe", "VNC.exe", "msiexec.exe", "powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe", "psexec.exe", "winrm.exe", "wmic.exe")
+          AND process.parent.name IN ("ccmexec.exe", "CcmExec.exe", "TSManager.exe", "RemoteControl.exe", "TeamViewer_Service.exe", "screenconnect.windowsclient.exe", "AnyDesk.exe", "LogMeIn.exe", "strwinclt.exe", "Splashtop.exe", "ScreenConnect.Service.exe", "bomgar-scc.exe", "BeyondTrust.exe"))
+        OR event.action IN ("software_install", "script_execution", "remote_execution", "package_install", "deployment")
+      )
+    | EVAL deployment_identity = COALESCE(user.name, process.parent.executable, source.ip, agent.id)
+    | STATS endpoint_count = COUNT_DISTINCT(host.name) BY deployment_identity
+    | WHERE endpoint_count >= 10
+  leql: |
+    where(source_json.EventID IN [4688, 7045, 7036] OR process_name ICONTAINS "sccm" OR process_name ICONTAINS "ccmexec" OR process_name ICONTAINS "softwareCenter" OR source_json.ServiceName ICONTAINS "sccm" OR process_cmd_line ICONTAINS "install" OR process_cmd_line ICONTAINS "msiexec" OR process_cmd_line ICONTAINS "setup") groupby(source_user, source_asset) calculate(unique:asset)
+  crowdstrike: |
+    (event_simpleName IN [ProcessRollup2, RemoteServiceCreation, "SoftwareInstall"] OR #type IN ["mdm_logs", "rmm_logs"])
+    (FileName IN [*sccm*, *mecm*, *configmgr*, *psexec*, *teamviewer*, *bomgar*, *anydesk*, *logmein*, *connectwise*] OR ServiceName IN [*sccm*, *mecm*, *remote*] OR UserName IN [*sccm*, *system*, *admin*, *deploy*])
+    | bucket(limit=30m, function=[count(ComputerName, distinct=true, as=endpoint_count)])
+    | groupBy([UserName, ParentBaseFileName, FileName], function=max(endpoint_count, as=max_endpoints))
+    | max_endpoints >= 10
+    | table([UserName, ParentBaseFileName, FileName, max_endpoints])
+  xql: "preset = xdr_data\n| filter event_type in (ENUM.EVENT_TYPE_PROCESS, ENUM.EVENT_TYPE_FILE) \n  and (actor_process_image_name contains \"\
+    sccm\" \n       or actor_process_image_name contains \"ccmexec\" \n       or actor_process_image_name contains \"screenconnect\"\n       or\
+    \ actor_process_image_name contains \"teamviewer\"\n       or actor_process_image_name contains \"bomgar\"\n       or actor_process_image_name\
+    \ contains \"logmein\"\n       or action_process_image_name contains \"psexec\"\n       or action_process_image_command_line contains \"msiexec\"\
+    \n       or action_process_image_command_line contains \"powershell\"\n       or action_process_image_command_line contains \"wscript\"\n\
+    \       or action_process_image_command_line contains \"cscript\")\n| bin _time span=30m\n| comp count_distinct(agent_hostname) as endpoints\
+    \ by _time, actor_effective_username, actor_process_image_name\n| filter endpoints >= 10\n| fields _time, actor_effective_username, actor_process_image_name,\
+    \ endpoints\n"
+  lucene: |
+    (event.category:process OR event.action:(software_install OR script_execution OR deployment)) AND (process.parent.name:(sccm* OR *deployment* OR *rmm* OR managementclient OR pdq* OR ansible* OR salt*) OR source.process.name:(sccm* OR *deployment* OR *rmm* OR managementclient OR pdq* OR ansible* OR salt*) OR agent.type:(sccm OR rmm OR mdm OR deployment))
+  sumo: |
+    _sourceCategory=*RMM* OR _sourceCategory=*SCCM* OR _sourceCategory=*MDM* OR _sourceCategory=*Deployment*
+    | parse regex "(?<action>install|execute|deployment|script)" nodrop
+    | parse regex "(?<identity>\S+@\S+|\S+\\[^\s,]+|[\w\-\.]+)" as identity nodrop
+    | parse regex "(?<endpoint>[\w\-\.]+)" as endpoint nodrop
+    | json field=_raw "identity" as identity nodrop
+    | json field=_raw "user" as user nodrop
+    | json field=_raw "account" as account nodrop
+    | json field=_raw "endpoint" as endpoint nodrop
+    | json field=_raw "target" as target nodrop
+    | json field=_raw "host" as target_host nodrop
+    | json field=_raw "action" as event_action nodrop
+    | json field=_raw "event_type" as event_type nodrop
+    | where event_action matches "*install*" or event_action matches "*execute*" or event_action matches "*script*" or event_action matches "*deploy*" or event_type matches "*install*" or event_type matches "*execute*" or event_type matches "*script*" or event_type matches "*deploy*"
+    | fields identity, user, account, endpoint, target, target_host
+    | if(isNull(identity) and !isNull(user), user, identity) as rmm_identity
+    | if(isNull(rmm_identity) and !isNull(account), account, rmm_identity) as rmm_identity
+    | if(isNull(endpoint) and !isNull(target), target, endpoint) as target_endpoint
+    | if(isNull(target_endpoint) and !isNull(target_host), target_host, target_endpoint) as target_endpoint
+    | where !isNull(rmm_identity) and !isNull(target_endpoint)
+    | timeslice 30m
+    | count_distinct(target_endpoint) as distinct_endpoints by _timeslice, rmm_identity
+    | where distinct_endpoints >= 10
+    | fields _timeslice, rmm_identity, distinct_endpoints
 pseudo_logic: Single RMM/SCCM identity initiates software install or script execution against ≥10 distinct endpoints in 30m. Anomalous fan-out
   from deployment tooling.
 false_positives:
@@ -110,7 +159,7 @@ references:
 - https://attack.mitre.org/techniques/T1072/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, target host, and the protocol / credential used.'

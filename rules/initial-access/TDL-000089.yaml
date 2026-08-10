@@ -16,80 +16,225 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=email_security email_label="Phish"
+  spl: 'index=email_security email_label="Phish"
+
     | bin _time span=5m
+
     | stats dc(recipient) as unique_recipients by _time, sender
+
     | where unique_recipients >= 20
-    ```
 
     ```
+
+
+    ```
+
     index=email_security email_label="Phish"
+
     | bin _time span=5m
+
     | stats dc(recipient) as unique_recipients by _time, subject
+
     | where unique_recipients >= 20
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000089 {\n  meta:\n    author = \"TDL\"\n    description = \"Potential Phishing Campaign\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1566\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    // Version 1: Same Sender
+    EmailEvents
+    | where TimeGenerated > ago(5m)
+    | where ThreatTypes has "Phish" or PhishFilterVerdict == "Phish" or EmailDirection == "Inbound" and (Subject has "phish" or SenderFromAddress has "phish")
+    | where isnotempty(SenderFromAddress)
+    | summarize UniqueRecipients = dcount(RecipientEmailAddress), Recipients = make_set(RecipientEmailAddress), Subjects = make_set(Subject) by bin(TimeGenerated, 5m), SenderFromAddress, Subject
+    | where UniqueRecipients >= 20
 
-    | WHERE @timestamp > NOW() - 1 hour
+    // Version 2: Same Subject
+    EmailEvents
+    | where TimeGenerated > ago(5m)
+    | where ThreatTypes has "Phish" or PhishFilterVerdict == "Phish" or EmailDirection == "Inbound" and (Subject has "phish" or SenderFromAddress has "phish")
+    | where isnotempty(Subject)
+    | summarize UniqueRecipients = dcount(RecipientEmailAddress), Recipients = make_set(RecipientEmailAddress), Senders = make_set(SenderFromAddress) by bin(TimeGenerated, 5m), Subject
+    | where UniqueRecipients >= 20
+  aql: |
+    SELECT "Sender Email", "Subject", UNIQUECOUNT("Recipient Email") AS unique_recipients, COUNT(*) AS event_count
+    FROM events
+    WHERE LOWER(categoryname(category)) ILIKE '%email%' AND ("Email Classification" ILIKE '%phish%' OR "Email Label" ILIKE '%phish%' OR "Threat Classification" ILIKE '%phish%')
+    GROUP BY "Sender Email", "Subject"
+    HAVING unique_recipients >= 20
+    LAST 5 MINUTES
+    ```
 
-    | WHERE eventName LIKE "%.+%"
+    ```
+    SELECT "Sender Email", "Subject", UNIQUECOUNT("Recipient Email") AS unique_recipients, COUNT(*) AS event_count
+    FROM events
+    WHERE LOWER(categoryname(category)) ILIKE '%email%' AND ("Email Classification" ILIKE '%phish%' OR "Email Label" ILIKE '%phish%' OR "Threat Classification" ILIKE '%phish%')
+    GROUP BY "Subject"
+    HAVING unique_recipients >= 20
+    LAST 5 MINUTES
+    ```
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+    ```
+    SELECT "Sender Email", "Subject", UNIQUECOUNT("Recipient Email") AS unique_recipients, COUNT(*) AS event_count
+    FROM events
+    WHERE LOWER(categoryname(category)) ILIKE '%email%' AND ("Email Classification" ILIKE '%phish%' OR "Email Label" ILIKE '%phish%' OR "Threat Classification" ILIKE '%phish%')
+    GROUP BY "Sender Email"
+    HAVING unique_recipients >= 20
+    LAST 5 MINUTES
+  yara_l: |
+    rule email_phishing_same_sender {
+      meta:
+        author = "Chronicle Detection"
+        description = "Detects 20+ phishing emails from same sender to unique recipients within 5 minutes"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1566"
+        severity = "High"
 
-    | SORT count DESC
+      events:
+        $e.metadata.event_type = "EMAIL_UNCATEGORIZED"
+        $e.security_result.summary = "Phish"
+        $e.principal.user.email_addresses = $sender
+        $e.target.user.email_addresses = $recipient
+        $e.network.email.subject = $subject
 
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
+      match:
+        $sender over 5m
 
-    groupby(actor, event_name)
+      outcome:
+        $risk_score = 75
+        $unique_recipients = count_distinct($recipient)
+        $sample_subject = array_distinct($subject)
 
-    calculate(count)
+      condition:
+        #e >= 20 and $unique_recipients >= 20
+    }
 
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
+    rule email_phishing_same_subject {
+      meta:
+        author = "Chronicle Detection"
+        description = "Detects 20+ phishing emails with same subject to unique recipients within 5 minutes"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1566"
+        severity = "High"
 
-    | stats count as calls by Actor, ApiName, SourceIPAddress
+      events:
+        $e.metadata.event_type = "EMAIL_UNCATEGORIZED"
+        $e.security_result.summary = "Phish"
+        $e.principal.user.email_addresses = $sender
+        $e.target.user.email_addresses = $recipient
+        $e.network.email.subject = $subject
 
-    | sort -calls
+      match:
+        $subject over 5m
 
-    '
-  xql: 'dataset = cloud_audit_logs
+      outcome:
+        $risk_score = 75
+        $unique_recipients = count_distinct($recipient)
+        $sample_sender = array_distinct($sender)
 
-    | filter eventName ~= ".+"
+      condition:
+        #e >= 20 and $unique_recipients >= 20
+    }
+  esql: |
+    FROM logs-email.security*
+    | WHERE @timestamp > NOW() - 5 minutes AND email.label == "Phish"
+    | STATS recipient_count = COUNT_DISTINCT(email.recipient), event_count = COUNT(*) BY email.sender, email.subject, window = BUCKET(@timestamp, 5 minutes)
+    | WHERE recipient_count >= 20 AND event_count >= 20
+    ```
 
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
+    ```
+    FROM logs-email.security*
+    | WHERE @timestamp > NOW() - 5 minutes AND email.label == "Phish"
+    | STATS recipient_count = COUNT_DISTINCT(email.recipient), event_count = COUNT(*) BY email.sender, window = BUCKET(@timestamp, 5 minutes)
+    | WHERE recipient_count >= 20 AND event_count >= 20
+    ```
 
-    | sort desc calls
+    ```
+    FROM logs-email.security*
+    | WHERE @timestamp > NOW() - 5 minutes AND email.label == "Phish"
+    | STATS recipient_count = COUNT_DISTINCT(email.recipient), event_count = COUNT(*) BY email.subject, window = BUCKET(@timestamp, 5 minutes)
+    | WHERE recipient_count >= 20 AND event_count >= 20
+  leql: |
+    where(event_type="Email Security" AND label="Phish") groupby(sender, subject) calculate(unique:recipient)
+    ```
 
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
+    ```
+    where(event_type="Email Security" AND label="Phish") groupby(sender) calculate(unique:recipient)
+    ```
 
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
+    ```
+    where(event_type="Email Security" AND label="Phish") groupby(subject) calculate(unique:recipient)
+  crowdstrike: |
+    #type=email event_simpleName=EmailSecurityEvent EmailLabel=Phish
+    | groupBy([SenderEmail, Subject], function=[count(as=total_events), count(RecipientEmail, distinct=true, as=unique_recipients)], limit=max)
+    | total_events >= 20 AND unique_recipients >= 20
+    | table([SenderEmail, Subject, total_events, unique_recipients])
+    ```
 
-    | where eventName matches "*.+*"
+    ```
+    #type=email event_simpleName=EmailSecurityEvent EmailLabel=Phish
+    | bucket(span=5m, field=@timestamp, as=time_bucket)
+    | groupBy([time_bucket, SenderEmail], function=[count(as=total_events), count(RecipientEmail, distinct=true, as=unique_recipients)], limit=max)
+    | total_events >= 20 AND unique_recipients >= 20
+    | table([time_bucket, SenderEmail, total_events, unique_recipients])
+    ```
 
-    | count by userIdentity_arn, eventName, sourceIPAddress
+    ```
+    #type=email event_simpleName=EmailSecurityEvent EmailLabel=Phish
+    | bucket(span=5m, field=@timestamp, as=time_bucket)
+    | groupBy([time_bucket, Subject], function=[count(as=total_events), count(RecipientEmail, distinct=true, as=unique_recipients)], limit=max)
+    | total_events >= 20 AND unique_recipients >= 20
+    | table([time_bucket, Subject, total_events, unique_recipients])
+  xql: |
+    dataset = email_security_events
+    | filter email_label = "Phish"
+    | bin _time span=5m
+    | comp count() as email_count, count_distinct(recipient_email) as unique_recipients by _time, sender_email, email_subject
+    | filter email_count >= 20 and unique_recipients >= 20
+    ```
 
-    | sort by _count desc
+    ```xql
+    dataset = email_security_events
+    | filter email_label = "Phish"
+    | bin _time span=5m
+    | comp count() as email_count, count_distinct(recipient_email) as unique_recipients by _time, sender_email
+    | filter email_count >= 20 and unique_recipients >= 20
+    ```
 
-    '
+    ```xql
+    dataset = email_security_events
+    | filter email_label = "Phish"
+    | bin _time span=5m
+    | comp count() as email_count, count_distinct(recipient_email) as unique_recipients by _time, email_subject
+    | filter email_count >= 20 and unique_recipients >= 20
+  lucene: |
+    **Version 1 (Same Sender):**
+
+    event.category:"email" AND email.threat.label:"Phish" AND _exists_:email.from.address AND _exists_:email.to.address
+
+    **Version 2 (Same Subject):**
+
+    event.category:"email" AND email.threat.label:"Phish" AND _exists_:email.subject AND _exists_:email.to.address
+  sumo: |
+    _sourceCategory=*Email* "Phish"
+    | json field=_raw "label" as email_label
+    | json field=_raw "sender" as sender
+    | json field=_raw "subject" as subject
+    | json field=_raw "recipient" as recipient
+    | where email_label = "Phish"
+    | timeslice 5m
+    | count_distinct(recipient) as unique_recipients by _timeslice, sender
+    | where unique_recipients >= 20
+    ```
+
+    ```
+    _sourceCategory=*Email* "Phish"
+    | json field=_raw "label" as email_label
+    | json field=_raw "sender" as sender
+    | json field=_raw "subject" as subject
+    | json field=_raw "recipient" as recipient
+    | where email_label = "Phish"
+    | timeslice 5m
+    | count_distinct(recipient) as unique_recipients by _timeslice, subject
+    | where unique_recipients >= 20
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -99,7 +244,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '20 Email Security Events
 

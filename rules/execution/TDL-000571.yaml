@@ -19,68 +19,72 @@ queries:
     \ \nNOT user.username=\"system:serviceaccount:kube-system:job-controller\" \nNOT user.username=\"system:serviceaccount:kube-system:daemon-set-controller\"\
     \nNOT [| inputlookup kubernetes_admin_list | fields user.username]\n| table _time, user.username, objectRef.namespace, objectRef.name, verb,\
     \ objectRef.resource, sourceIPs{}\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000571 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubernetes Pod Created by Unauthorized User\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1611\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    KubernetesAudit
+    | where TimeGenerated > ago(1h)
+    | where ObjectRef_Resource =~ "pods"
+    | where Verb =~ "create"
+    | where UserAgent_User != "system:serviceaccount:kube-system:replicaset-controller"
+    | where UserAgent_User != "system:serviceaccount:kube-system:job-controller"
+    | where UserAgent_User != "system:serviceaccount:kube-system:daemon-set-controller"
+    | join kind=leftanti (
+        _GetWatchlist('KubernetesAdminList')
+        | project AdminUser = SearchKey
+    ) on $left.UserAgent_User == $right.AdminUser
+    | project TimeGenerated, UserAgent_User, ObjectRef_Namespace, ObjectRef_Name, SourceIPs, ResponseStatus_Code
+  aql: |
+    SELECT username, sourceip, "ObjectRef.Resource", "Verb", COUNT(*) AS event_count
+    FROM events
+    WHERE "ObjectRef.Resource" = 'pods'
+      AND "Verb" = 'create'
+      AND username != 'system:serviceaccount:kube-system:replicaset-controller'
+      AND username != 'system:serviceaccount:kube-system:job-controller'
+      AND username != 'system:serviceaccount:kube-system:daemon-set-controller'
+      AND username NOT IN (SELECT username FROM referencedata WHERE reference_set_name = 'Kubernetes_Admin_List')
+    LAST 24 HOURS
+  yara_l: "rule k8s_suspicious_pod_creation {\n  meta:\n    author = \"TDL\"\n    description = \"Detects suspicious pod creation in Kubernetes\
+    \ that is not from expected service accounts or admins - T1611\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"\
+    T1611\"\n    severity = \"MEDIUM\"\n    \n  events:\n    $e.metadata.event_type = \"RESOURCE_CREATION\"\n    $e.target.resource.type = \"\
+    pods\"\n    $e.security_result.action = \"ALLOW\"\n    re.regex($e.metadata.description, `(?i)verb.*create`)\n    $e.principal.user.userid\
+    \ = $user\n    $user != \"system:serviceaccount:kube-system:replicaset-controller\"\n    $user != \"system:serviceaccount:kube-system:job-controller\"\
+    \n    $user != \"system:serviceaccount:kube-system:daemon-set-controller\"\n    not re.regex($user, `(?i)(system:masters|cluster-admin|kube-admin)`)\n\
+    \    \n  match:\n    $user over 5m\n    \n  outcome:\n    $risk_score = 55\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-kubernetes.audit*\n| WHERE kubernetes.audit.verb == \"create\" \n  AND kubernetes.audit.objectRef.resource == \"pods\"\n  AND\
+    \ kubernetes.audit.user.username != \"system:serviceaccount:kube-system:replicaset-controller\"\n  AND kubernetes.audit.user.username != \"\
+    system:serviceaccount:kube-system:job-controller\"\n  AND kubernetes.audit.user.username != \"system:serviceaccount:kube-system:daemon-set-controller\"\
+    \n  AND NOT (kubernetes.audit.user.username LIKE \"system:masters*\" OR kubernetes.audit.user.username LIKE \"*:admin\" OR kubernetes.audit.user.username\
+    \ LIKE \"system:kube-*\")\n| KEEP @timestamp, host.name, kubernetes.audit.user.username, kubernetes.audit.objectRef.namespace, kubernetes.audit.objectRef.name,\
+    \ kubernetes.audit.sourceIPs\n"
+  leql: |
+    where(source_json.objectRef.resource="pods" AND source_json.verb="create" AND source_json.user.username!="system:serviceaccount:kube-system:replicaset-controller" AND source_json.user.username!="system:serviceaccount:kube-system:job-controller" AND source_json.user.username!="system:serviceaccount:kube-system:daemon-set-controller")
+  crowdstrike: "#type=kubernetes objectRef.resource=\"pods\" verb=\"create\" \n| user.username != \"system:serviceaccount:kube-system:replicaset-controller\"\
+    \n| user.username != \"system:serviceaccount:kube-system:job-controller\"\n| user.username != \"system:serviceaccount:kube-system:daemon-set-controller\"\
+    \n| not (user.username = /^system:serviceaccount:kube-system:(admin|cluster-admin|.*-admin)$/)\n| table([@timestamp, user.username, objectRef.name,\
+    \ objectRef.namespace, sourceIPs])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "GCP" and resource_type = "k8s_cluster"
+    | filter json_extract_scalar(resource_json_data, "$.objectRef.resource") = "pods"
+    | filter json_extract_scalar(resource_json_data, "$.verb") = "create"
+    | filter json_extract_scalar(resource_json_data, "$.user.username") != "system:serviceaccount:kube-system:replicaset-controller"
+    | filter json_extract_scalar(resource_json_data, "$.user.username") != "system:serviceaccount:kube-system:job-controller"
+    | filter json_extract_scalar(resource_json_data, "$.user.username") != "system:serviceaccount:kube-system:daemon-set-controller"
+    | alter source_username = json_extract_scalar(resource_json_data, "$.user.username")
+    | filter source_username not in ("cluster-admin", "system:admin", "kubernetes-admin")
+    | fields _time, source_username, json_extract_scalar(resource_json_data, "$.objectRef.namespace") as namespace, json_extract_scalar(resource_json_data, "$.objectRef.name") as pod_name, json_extract_scalar(resource_json_data, "$.sourceIPs") as source_ips
+  lucene: |
+    objectRef.resource:pods AND verb:create AND NOT user.username:("system:serviceaccount:kube-system:replicaset-controller" OR "system:serviceaccount:kube-system:job-controller" OR "system:serviceaccount:kube-system:daemon-set-controller")
+  sumo: |
+    _sourceCategory=*Kubernetes* "pods" "create"
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "verb" as verb
+    | json field=_raw "user.username" as source_username
+    | where resource = "pods" and verb = "create"
+    | where !(source_username = "system:serviceaccount:kube-system:replicaset-controller")
+    | where !(source_username = "system:serviceaccount:kube-system:job-controller")
+    | where !(source_username = "system:serviceaccount:kube-system:daemon-set-controller")
+    | where !(source_username matches "system:masters*" or source_username matches "*admin*" or source_username matches "system:serviceaccount:kube-system*")
+    | fields _messageTime, _sourceHost, source_username, resource, verb
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +94,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere the Resource is \"pods\"\nWhere Verb is \"create\"\nWhere the Source Username is NOT \"system:serviceaccount:kube-system:replicaset-controller\"\
   \nWhere the Source Username is NOT \"system:serviceaccount:kube-system:job-controller\"\nWhere the Source Username is NOT \"system:serviceaccount:kube-system:daemon-set-controller\"\

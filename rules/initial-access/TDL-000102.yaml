@@ -15,71 +15,63 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=guardduty sourcetype=aws:cloudtrail:guardduty type="*S3*"
-    | table _time, type, severity, region, accountId, resource.resourceType, resource.s3BucketDetails.name, service.action.actionType, title, description
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: 'index=guardduty sourcetype=aws:cloudtrail:guardduty type="*S3*"
 
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+    | table _time, type, severity, region, accountId, resource.resourceType, resource.s3BucketDetails.name, service.action.actionType, title,
+    description
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000102 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Suspicious S3 Behavior\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(24h)
+    | where Type has "S3"
+    | project TimeGenerated, Type, Severity, Title, Description, Resource, AccountId, Region, Id
+  aql: |
+    SELECT QIDNAME(qid) AS event_name, sourceip, destinationip, username, CATEGORYNAME(category) AS category, "findingType" AS finding_type, "resource.resourceType" AS resource_type, COUNT(*) AS event_count
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%guard%duty%' AND ("findingType" ILIKE '%S3%' OR "resource.resourceType" = 'S3Bucket')
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_s3_initial_access {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects AWS GuardDuty findings related to S3 that may indicate initial access attempts (T1098)"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1098"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $guardduty.metadata.vendor_name = "Amazon AWS"
+        $guardduty.metadata.product_name = "GuardDuty"
+        re.regex($guardduty.metadata.product_event_type, `(?i)S3`)
+        $guardduty.principal.resource.name = $resource
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $resource over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $guardduty
+    }
+  esql: "FROM .ds-logs-aws.guardduty*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.dataset == \"aws.guardduty\" \n  AND TO_LOWER(aws.guardduty.resource.resource_type)\
+    \ == \"s3\"\n| KEEP @timestamp, host.name, user.name, aws.guardduty.type, aws.guardduty.severity, aws.guardduty.resource.resource_type, aws.guardduty.service.action.action_type,\
+    \ event.id\n"
+  leql: |
+    where(source_json.type ICONTAINS "S3")
+  crowdstrike: "#repo=guardduty \n| type=*S3* \n| table([@timestamp, accountId, region, type, severity, resource.resourceType, service.action.actionType,\
+    \ service.serviceName, title, description])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = ENUM.CLOUD_PROVIDER_AWS and raw_log_json.service = "guardduty"
+    | alter finding_type = json_extract_scalar(raw_log_json, "$.type")
+    | filter finding_type ~= ".*S3.*"
+    | fields _time, cloud_provider, finding_type, raw_log_json
+  lucene: |
+    guardduty.finding.type:(*S3* OR *s3*)
+  sumo: |
+    _sourceCategory=*GuardDuty* OR _sourceCategory=*guardduty* OR _sourceCategory=*Guard*
+    | json field=_raw "type" as finding_type
+    | where finding_type matches "*S3*"
+    | fields _messageTime, _sourceHost, finding_type, _raw
 false_positives:
 - Security software
 - Authorized admin tools
@@ -89,7 +81,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 AWS Guard Duty Event
 

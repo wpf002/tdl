@@ -15,74 +15,62 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=* sourcetype=wiz rule_type="Cloud Event Rule" status="OPEN" severity="MEDIUM"
+  spl: 'index=* sourcetype=wiz rule_type="Cloud Event Rule" status="OPEN" severity="MEDIUM"
+
     | table _time, rule_type, status, severity, user, source, dest, action
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000606 {\n  meta:\n    author = \"TDL\"\n    description = \"Wiz Medium Severity Detection\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    WizAlerts
+    | where TimeGenerated > ago(24h)
+    | where RuleType == "Cloud Event Rule"
+    | where Status == "OPEN"
+    | where Severity == "MEDIUM"
+    | project TimeGenerated, RuleName, Severity, Status, RuleType, ResourceName, CloudProvider, Description, RemediationSteps
+  aql: "SELECT DATEFORMAT(eventtime, 'YYYY-MM-dd HH:mm:ss') AS event_time, \n       LOGSOURCENAME(logsourceid) AS log_source,\n       sourceip,\n\
+    \       username,\n       qidname(qid) AS event_name,\n       \"rule_type\",\n       \"status\",\n       \"severity\"\nFROM events\nWHERE\
+    \ LOGSOURCENAME(logsourceid) ILIKE '%Wiz%'\n  AND \"rule_type\" = 'Cloud Event Rule'\n  AND \"status\" = 'OPEN'\n  AND \"severity\" = 'MEDIUM'\n\
+    LAST 24 HOURS\n"
+  yara_l: |
+    rule wiz_cloud_event_medium_open {
+      meta:
+        author = "TDL"
+        description = "Detects Wiz Cloud Event Rule findings with MEDIUM severity and OPEN status - T1078 Valid Accounts"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Wiz"
+        $e.metadata.vendor_name = "Wiz"
+        $e.security_result.rule_type = "Cloud Event Rule"
+        $e.security_result.detection_fields["status"] = "OPEN"
+        $e.security_result.severity = "MEDIUM"
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host over 1h
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-wiz.alerts*
+    | WHERE rule_type == "Cloud Event Rule" AND status == "OPEN" AND severity == "MEDIUM"
+    | KEEP @timestamp, host.name, user.name, rule_type, status, severity, event.id, source.ip, destination.ip
+  leql: |
+    where(source_json.rule_type="Cloud Event Rule" AND source_json.status="OPEN" AND source_json.severity="MEDIUM")
+  crowdstrike: |
+    #type=wiz rule_type="Cloud Event Rule" status="OPEN" severity="MEDIUM"
+    | table([@timestamp, ComputerName, UserName, rule_type, status, severity, *])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Wiz" and rule_type = "Cloud Event Rule" and status = "OPEN" and severity = "MEDIUM"
+    | fields _time, rule_name, resource_name, resource_type, cloud_provider, account_id, description
+  lucene: |
+    rule_type:"Cloud Event Rule" AND status:"OPEN" AND severity:"MEDIUM"
+  sumo: "_sourceCategory=*Wiz* \n| json field=_raw \"rule_type\" as rule_type\n| json field=_raw \"status\" as status\n| json field=_raw \"severity\"\
+    \ as severity\n| where rule_type = \"Cloud Event Rule\" AND status = \"OPEN\" AND severity = \"MEDIUM\"\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -92,7 +80,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Wiz event \n   where rule_type is \"Cloud Event Rule\" \n   AND status is \"OPEN\" \n   AND severity is \"MEDIUM\""
 triage_steps:

@@ -24,68 +24,91 @@ queries:
     \ OR Role=\"Exchange Administrator\" OR Role=\"SharePoint Administrator\" OR Role=\"Compliance Administrator\"\n| search NOT [ | inputlookup\
     \ known_admins.csv | fields UserId | rename UserId as user ]\n| eval user=coalesce(UserId, Actor, user, ActorUser)\n| table _time, user, Operation,\
     \ Role, ObjectId, TargetUser, ClientIP, UserAgent\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AuditLogs
+    | where TimeGenerated > ago(24h)
+    | where OperationName == "Add member to role"
+    | where TargetResources has "administrator" or TargetResources has "Admin" or TargetResources has_any ("Global", "Privileged", "Security", "Compliance", "Exchange", "SharePoint", "Teams", "User", "Billing", "Service", "Application", "Cloud", "Authentication", "Helpdesk", "Password")
+    | extend InitiatedBy = tostring(InitiatedBy.user.userPrincipalName)
+    | extend TargetUser = tostring(TargetResources[0].userPrincipalName)
+    | extend RoleName = tostring(TargetResources[0].modifiedProperties[1].newValue)
+    | where InitiatedBy !has_any ("admin@", "_admin", "-admin", ".admin")
+    | where InitiatedBy !in~ ("sync_", "aad_", "azureadssoacc")
+    | project TimeGenerated, InitiatedBy, TargetUser, RoleName, OperationName, ResultDescription, CorrelationId
+  aql: "SELECT username, \"TargetUser\", \"RoleName\", sourceip, COUNT(*) AS role_additions\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
+    \ ILIKE '%Office 365%' \n  AND (qidname(qid) ILIKE '%Add member to role%' OR qidname(qid) ILIKE '%role assignment%')\n  AND (\"RoleName\"\
+    \ ILIKE '%admin%' OR \"RoleName\" ILIKE '%privileged%' OR \"RoleName\" IN ('Global Administrator', 'Security Administrator', 'Privileged Role\
+    \ Administrator', 'User Administrator', 'Exchange Administrator', 'SharePoint Administrator'))\n  AND username NOT IN ('admin@company.com',\
+    \ 'globaladmin@company.com', 'service_account@company.com')\nGROUP BY username, \"TargetUser\", \"RoleName\", sourceip\nLAST 24 HOURS\n"
+  yara_l: |
+    rule o365_privileged_role_assignment_non_admin {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects addition of members to privileged Azure AD roles by non-admin users - T1078 Initial Access"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.product_name = "Office 365"
+        $e.metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT"
+        (
+          $e.metadata.product_event_type = "Add member to role" or
+          re.regex($e.security_result.summary, `(?i)add.*member.*role`)
+        )
+        (
+          re.regex($e.target.resource.attribute.labels.value, `(?i)(admin|privileged|global|directory|security|compliance|helpdesk|user.*admin|exchange.*admin|sharepoint.*admin)`) or
+          re.regex($e.target.resource.name, `(?i)(admin|privileged|global|directory|security|compliance|helpdesk|user.*admin|exchange.*admin|sharepoint.*admin)`)
+        )
+        not re.regex($e.principal.user.userid, `(?i)(admin|svc|service|system|automation)`)
+        $e.principal.user.userid = $source_user
+        $e.target.user.userid = $target_user
+        $e.principal.hostname = $host
 
-    | where eventName matches regex ".+"
+      match:
+        $source_user over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+      outcome:
+        $risk_score = 75
+        $target_users = array_distinct($target_user)
+        $event_count = count_distinct($e.metadata.id)
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000364 {\n  meta:\n    author = \"TDL\"\n    description = \"Privilege Escalation via HVT Role - Azure\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-o365.audit*, logs-azure.audit*, logs-azure.auditlogs*\n| WHERE @timestamp > NOW() - 24 hour \n  AND event.action == \"Add member\
+    \ to role\"\n  AND (winlog.event_data.Role LIKE \"*administrator*\" OR winlog.event_data.Role LIKE \"*admin*\" OR azure.auditlogs.properties.target_resources.modified_properties.new_value\
+    \ LIKE \"*administrator*\" OR azure.auditlogs.properties.target_resources.modified_properties.new_value LIKE \"*admin*\" OR o365.audit.ModifiedProperties.Role_DisplayName\
+    \ LIKE \"*administrator*\" OR o365.audit.ModifiedProperties.Role_DisplayName LIKE \"*admin*\")\n  AND user.name NOT IN (\"admin@company.com\"\
+    , \"svc_admin@company.com\", \"global_admin@company.com\")\n| KEEP @timestamp, event.action, user.name, azure.auditlogs.properties.target_resources.display_name,\
+    \ azure.auditlogs.properties.target_resources.modified_properties.new_value, o365.audit.ModifiedProperties.Role_DisplayName, host.name, source.ip\n"
+  leql: |
+    where(source_json.Operation="Add member to role" AND source_json.Role ICONTAINS "administrator" AND NOT(source_user IN ["known_admin1@domain.com", "known_admin2@domain.com"])) groupby(source_user, source_json.Role, source_json.ObjectId) calculate(count)
+  crowdstrike: |
+    #type=O365Azure Operation="Add member to role."
+    | RoleName=/.*admin.*/i OR RoleName=/.*privileged.*/i
+    | not (UserId=*admin@* OR UserId=*svc-*)
+    | table([@timestamp, UserId, TargetUserId, RoleName, Operation, ClientIP, ResultStatus])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Microsoft" and cloud_provider = "AZURE" and operation_name = "Add member to role"
+    | filter lowercase(operation_name_orig) contains "administrator" or lowercase(operation_name_orig) in ("Global Administrator", "Privileged Role Administrator", "Security Administrator", "Application Administrator", "Cloud Application Administrator", "User Administrator", "Exchange Administrator", "SharePoint Administrator", "Intune Administrator", "Compliance Administrator", "Helpdesk Administrator", "Billing Administrator", "Authentication Administrator", "Privileged Authentication Administrator")
+    | alter is_known_admin = if(actor_user_name in ("admin@company.com", "globaladmin@company.com"), true, false)
+    | filter is_known_admin = false
+    | fields _time, actor_user_name, operation_name, operation_name_orig, target_user_name, cloud_resource_id, cloud_provider_project
+  lucene: |
+    event.name:"Add member to role" AND (role.name:*administrator* OR role.name:*admin* OR role.name:"Global Administrator" OR role.name:"Privileged Role Administrator" OR role.name:"Security Administrator" OR role.name:"Compliance Administrator" OR role.name:"Exchange Administrator" OR role.name:"SharePoint Administrator" OR role.name:"User Administrator") AND NOT (user.name:(admin* OR svc-* OR service-*) OR user.id:(known-admin-id-1 OR known-admin-id-2))
+  sumo: |
+    _sourceCategory=*Azure* OR _sourceCategory=*Office* OR _sourceCategory=*O365*
+    | json field=_raw "Operation" as operation
+    | json field=_raw "ResultStatus" as result_status
+    | json field=_raw "UserId" as source_user
+    | json field=_raw "ModifiedProperties" as modified_props
+    | json field=_raw "Role.DisplayName" as role_name
+    | where operation = "Add member to role" and result_status = "Success"
+    | where role_name matches "*administrator*" or role_name matches "*admin*" or role_name matches "*privileged*" or role_name = "Global Administrator" or role_name = "Privileged Role Administrator" or role_name = "Security Administrator" or role_name = "User Administrator"
+    | where !(source_user matches "*admin@*" or source_user matches "*svc-*" or source_user matches "*service@*")
+    | fields _messageTime, source_user, role_name, operation, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -95,7 +118,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 O365 Azure Event
 

@@ -21,78 +21,87 @@ queries:
     \ app IN (ftp, ssh, telnet, tftp, sftp, ftps) NOT dest_port IN (20, 21, 22, 23, 69, 115, 989, 990) \n| lookup passive_ftp_tracker src_ip OUTPUT\
     \ is_passive_ftp \n| where isnull(is_passive_ftp) \n| lookup ftp_server_list src_ip OUTPUT is_ftp_server \n| where NOT (is_ftp_server=\"true\"\
     \ AND (src_port=20 OR src_port=21)) \n| table _time, src_ip, src_port, dest_ip, dest_port, app, bytes_out, bytes_in\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where destination_port in ("20", "21", "22", "23", "69", "115", "989", "990")
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "destination_port" IN (''20'', ''21'', ''22'', ''23'', ''69'', ''115'', ''989'', ''990'')
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exf_000073 {\n  meta:\n    author = \"TDL\"\n    description = \"Hidden Data Transfer\"\n    severity = \"MEDIUM\"\n \
-    \   tactic = \"TA0010\"\n    technique = \"T1571\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.destination_port\
-    \ = /(20|21|22|23|69|115|989|990)/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND destination_port IN ("20", "21", "22", "23", "69", "115", "989", "990")
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND destination_port IN [20, 21, 22, 23, 69, 115, 989, 990])
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND destination_port IN (20, 21, 22, 23, 69, 115, 989,
-    990)
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND destination_port in ("20", "21", "22", "23", "69", "115", "989", "990")
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND destination_port:(20 OR 21 OR 22 OR 23 OR 69 OR 115 OR 989 OR 990)
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where destination_port IN ("20", "21", "22", "23", "69", "115", "989", "990")
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(1h)
+    | where DeviceAction != "Deny" and DeviceAction != "Drop"
+    | where DeviceDirection == "Outbound"
+    | where SimplifiedDeviceAction == "Allow" or SimplifiedDeviceAction == "" or isempty(SimplifiedDeviceAction)
+    | where ApplicationProtocol in~ ("ftp", "ssh", "telnet", "tftp", "sftp", "ftps")
+    | where DestinationPort !in (20, 21, 22, 23, 69, 115, 989, 990)
+    | where not(ipv4_is_private(SourceIP)) or ipv4_is_private(SourceIP)
+    | where not(ipv4_is_private(DestinationIP))
+    | join kind=leftanti (
+        _GetWatchlist("Passive_FTP_Tracker")
+        | project SourceIP = SearchKey
+    ) on SourceIP
+    | join kind=leftanti (
+        _GetWatchlist("FTP_Server_List")
+        | project SourceIP = SearchKey
+        | extend SourcePort = dynamic([20, 21])
+        | mv-expand SourcePort to typeof(int)
+    ) on SourceIP, SourcePort
+    | project TimeGenerated, SourceIP, SourcePort, DestinationIP, DestinationPort, ApplicationProtocol, DeviceVendor, DeviceProduct, DeviceAction
+  aql: "SELECT sourceip, destinationip, destinationport, QIDNAME(qid) AS event_name, CATEGORYNAME(category) AS category, \"Application Protocol\"\
+    \ AS application, COUNT(*) AS event_count\nFROM events\nWHERE INOFFENSE('*') = FALSE\n  AND sourceip IN (SELECT sourceip FROM events WHERE\
+    \ category IN (SELECT category FROM categories WHERE low_level_category_id = 1000)) \n  AND destinationip NOT IN (SELECT sourceip FROM events\
+    \ WHERE category IN (SELECT category FROM categories WHERE low_level_category_id = 1000))\n  AND \"Application Protocol\" IN ('ftp', 'ssh',\
+    \ 'telnet', 'tftp', 'sftp', 'ftps')\n  AND destinationport NOT IN (20, 21, 22, 23, 69, 115, 989, 990)\n  AND sourceip NOT IN (SELECT sourceip\
+    \ FROM events WHERE \"Application Protocol\" = 'ftp' AND category = 'Passive FTP')\n  AND NOT (sourceip IN (SELECT sourceip FROM reference_set\
+    \ WHERE name = 'FTP Server List') AND sourceport IN (20, 21))\nGROUP BY sourceip, destinationip, destinationport, qid, category, \"Application\
+    \ Protocol\"\nLAST 1 HOURS\n"
+  yara_l: "rule exfiltration_non_standard_port {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"T1571 - Non-Standard Port\
+    \ - Detects file transfer applications on non-standard ports\"\n    mitre_attack_tactic = \"Exfiltration\"\n    mitre_attack_technique = \"\
+    T1571\"\n    severity = \"Medium\"\n  \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.direction = \"OUTBOUND\"\
+    \n    (\n      $e.network.application_protocol = \"ftp\" or\n      $e.network.application_protocol = \"ssh\" or\n      $e.network.application_protocol\
+    \ = \"telnet\" or\n      $e.network.application_protocol = \"tftp\" or\n      $e.network.application_protocol = \"sftp\" or\n      $e.network.application_protocol\
+    \ = \"ftps\"\n    )\n    not (\n      $e.target.port = 20 or\n      $e.target.port = 21 or\n      $e.target.port = 22 or\n      $e.target.port\
+    \ = 23 or\n      $e.target.port = 69 or\n      $e.target.port = 115 or\n      $e.target.port = 989 or\n      $e.target.port = 990\n    )\n\
+    \    not $e.principal.ip in %passive_ftp_tracker\n    not (\n      $e.principal.ip in %ftp_server_list and\n      ($e.principal.port = 20\
+    \ or $e.principal.port = 21)\n    )\n    net.ip_in_range_cidr($e.principal.ip, \"10.0.0.0/8\") or\n    net.ip_in_range_cidr($e.principal.ip,\
+    \ \"172.16.0.0/12\") or\n    net.ip_in_range_cidr($e.principal.ip, \"192.168.0.0/16\")\n    $e.principal.ip = $src_ip\n    $e.target.ip =\
+    \ $dst_ip\n\n  match:\n    $src_ip, $dst_ip over 5m\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-network.firewall*
+    | WHERE network.direction == "outbound"
+      AND network.transport IN ("ftp", "ssh", "telnet", "tftp", "sftp", "ftps")
+      AND destination.port NOT IN (20, 21, 22, 23, 69, 115, 989, 990)
+      AND source.ip NOT IN (SELECT source.ip FROM logs-network.firewall* WHERE network.transport == "ftp" AND network.direction == "inbound")
+      AND NOT (source.ip IN (SELECT source.ip FROM asset-list-ftp-servers*) AND source.port IN (20, 21))
+    | STATS count = COUNT(*) BY source.ip, destination.ip, destination.port, network.transport
+    | KEEP source.ip, destination.ip, destination.port, network.transport, count
+  leql: |
+    where(direction=OUTBOUND AND destination_internal=false AND source_internal=true AND application IN [ftp, ssh, telnet, tftp, sftp, ftps] AND destination_port NOT IN [20, 21, 22, 23, 69, 115, 989, 990]) groupby(source_address, destination_address, application, destination_port) calculate(count)
+  crowdstrike: "#type=firewall direction=outbound app_name IN [ftp, ssh, telnet, tftp, sftp, ftps] \n| !in(field=dest_port, values=[20, 21, 22,\
+    \ 23, 69, 115, 989, 990])\n| !match(file=\"passive_ftp_tracker.csv\", field=src_ip, include=src_ip, strict=false)\n| !(match(file=\"ftp_server_list.csv\"\
+    , field=src_ip, include=src_ip, strict=false) AND in(field=src_port, values=[20, 21]))\n| table([@timestamp, src_ip, dest_ip, dest_port, app_name,\
+    \ src_port])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_source_translated_ip_is_global = true and action_destination_translated_ip_is_global = false
+    | filter app in ("ftp", "ssh", "telnet", "tftp", "sftp", "ftps")
+    | filter dest_port not in (20, 21, 22, 23, 69, 115, 989, 990)
+    | filter action_source_ip not in (/* Passive_FTP_Tracker_IPs */)
+    | filter not (action_source_ip in (/* FTP_Server_List_IPs */) and source_port in (20, 21))
+    | fields _time, action_source_ip, source_port, action_destination_ip, dest_port, app, action_total_upload, action_total_download
+  lucene: |
+    (firewall.direction:outbound OR network.direction:outbound OR direction:outbound) AND (application:(ftp OR ssh OR telnet OR tftp OR sftp OR ftps) OR app:(ftp OR ssh OR telnet OR tftp OR sftp OR ftps)) AND NOT (destination.port:(20 OR 21 OR 22 OR 23 OR 69 OR 115 OR 989 OR 990) OR dest_port:(20 OR 21 OR 22 OR 23 OR 69 OR 115 OR 989 OR 990)) AND NOT (source.ip:PassiveFTPTracker OR src_ip:PassiveFTPTracker) AND NOT ((source.ip:FTPServerList OR src_ip:FTPServerList) AND (source.port:(20 OR 21) OR src_port:(20 OR 21)))
+  sumo: |
+    _sourceCategory=*Firewall* OR _sourceCategory=*firewall*
+    | json field=_raw "direction" as direction
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "src_port" as src_port
+    | json field=_raw "application" as application
+    | where direction = "outbound" OR direction = "Outbound"
+    | where application in ("ftp", "ssh", "telnet", "tftp", "sftp", "ftps")
+    | where !(dest_port in ("20", "21", "22", "23", "69", "115", "989", "990"))
+    | lookup passive_ftp_tracker on src_ip = ip as is_passive_ftp
+    | lookup ftp_server_list on src_ip = server_ip as is_ftp_server
+    | where isNull(is_passive_ftp)
+    | where !(is_ftp_server = "true" AND (src_port = "20" OR src_port = "21"))
+    | fields _messageTime, src_ip, dest_ip, dest_port, src_port, application, _sourceHost
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -102,7 +111,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Firewall Event
 

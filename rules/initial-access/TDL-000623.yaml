@@ -16,71 +16,81 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=azure sourcetype="azure:audit" (operation_name="Invite external user" OR (operation_name="*Add user*" AND additionalDetails="*Microsoft Azure Graph Client Library 1.0*"))
+  spl: 'index=azure sourcetype="azure:audit" (operation_name="Invite external user" OR (operation_name="*Add user*" AND additionalDetails="*Microsoft
+    Azure Graph Client Library 1.0*"))
+
     | table _time, user, operation_name, result, target_user, additionalDetails, ip_address
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GraphRunner"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GraphRunner%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000623 {\n  meta:\n    author = \"TDL\"\n    description = \"Potential GraphRunner Invoke-InviteGuest Usage\"\n \
-    \   severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GraphRunner/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AuditLogs
+    | where TimeGenerated > ago(90d)
+    | where OperationName == "Invite external user" or (OperationName has "Add user" and tostring(AdditionalDetails) has "Microsoft Azure Graph Client Library 1.0")
+    | project TimeGenerated, OperationName, Identity, InitiatedBy, TargetResources, ResultReason, AdditionalDetails, CorrelationId
+  aql: |
+    SELECT eventtime, username, sourceip, "Operation Name", "Additional Details", "Target User"
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%Azure%' OR categoryname(category) ILIKE '%Azure%')
+      AND (("Operation Name" = 'Invite external user')
+           OR ("Operation Name" ILIKE '%Add user%' AND "Additional Details" = 'Microsoft Azure Graph Client Library 1.0'))
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_external_user_invite_or_graph_add {
+      meta:
+        author = "TDL"
+        description = "Detects external user invitation or user addition via Azure Graph Client Library"
+        mitre_attack_technique = "T1078"
+        mitre_attack_tactic = "Initial Access"
+        platform = "Azure"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        (
+          $e.metadata.product_name = "Azure"
+          $e.metadata.event_type = "USER_CREATION"
+          $e.metadata.product_event_type = "Invite external user"
+        )
+        or
+        (
+          $e.metadata.product_name = "Azure"
+          $e.metadata.event_type = "USER_CREATION"
+          re.regex($e.metadata.product_event_type, `(?i)Add user`)
+          re.regex($e.about.labels.value, `(?i)Microsoft Azure Graph Client Library 1\.0`)
+        )
 
-    | WHERE eventName LIKE "%GraphRunner%"
+      match:
+        $e.principal.user.userid over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GraphRunner/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GraphRunner*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GraphRunner"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GraphRunner*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GraphRunner*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-azure.auditlogs*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND (
+        azure.auditlogs.operation_name == "Invite external user"
+        OR (
+          azure.auditlogs.operation_name LIKE "*Add user*"
+          AND azure.auditlogs.properties.additional_details LIKE "*Microsoft Azure Graph Client Library 1.0*"
+        )
+      )
+    | KEEP @timestamp, azure.auditlogs.operation_name, azure.activitylogs.identity.name, azure.auditlogs.properties.initiated_by.user.user_principal_name, azure.auditlogs.properties.target_resources, azure.auditlogs.properties.additional_details
+  leql: |
+    where((source_json.operationName="Invite external user") OR (source_json.operationName ICONTAINS "Add user" AND source_json.additionalDetails="Microsoft Azure Graph Client Library 1.0"))
+  crowdstrike: |
+    #type=azure_audit (OperationName="Invite external user" OR (OperationName=*"Add user"* AdditionalDetails="Microsoft Azure Graph Client Library 1.0"))
+    | table([@timestamp, OperationName, Actor, TargetResources, AdditionalDetails, ComputerName])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AZURE" and (operation_name = "Invite external user" or (operation_name contains "Add user" and json_extract_scalar(additional_details, "$.userAgent") = "Microsoft Azure Graph Client Library 1.0"))
+    | fields _time, operation_name, actor_user, target_user, additional_details, cloud_provider
+  lucene: |
+    (operation_name:"Invite external user") OR (operation_name:*Add\ user* AND additional_details:"Microsoft Azure Graph Client Library 1.0")
+  sumo: |
+    _sourceCategory=*Azure*Audit*
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "properties.additionalDetails" as additional_details
+    | where (operation_name = "Invite external user") OR (operation_name matches "*Add user*" AND additional_details matches "*Microsoft Azure Graph Client Library 1.0*")
+    | fields _messageTime, _sourceHost, operation_name, additional_details
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +100,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Azure Audit Event \nOR\nWhere the Operation Name is \"Invite external user\"\n\nWhere the Operation Name contains \"Add user\"\
   \nAND Where the Additional Details is \"Microsoft Azure Graph Client Library 1.0\""

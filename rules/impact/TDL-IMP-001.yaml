@@ -16,71 +16,67 @@ risk_score: 100
 queries:
   spl: "index=endpoint sourcetype=Sysmon EventCode=1 \n| regex process_name=\".*\\..*\"\n| stats count values(host) as hosts values(user) as users\
     \ by process_name, parent_process_name, command_line\n| where count >= 1\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_001 {\n  meta:\n    author = \"TDL\"\n    description = \"Ransomware Staging - Mass File Rename\"\n    severity =\
-    \ \"CRITICAL\"\n    tactic = \"TA0040\"\n    technique = \"T1486\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    Event
+    | where TimeGenerated > ago(90d)
+    | where Source == "Microsoft-Windows-Sysmon" and EventID == 1
+    | extend EventData = parse_xml(EventData)
+    | extend ProcessName = tostring(EventData.DataItem.EventData.Data[4]["#text"])
+    | extend ParentProcessName = tostring(EventData.DataItem.EventData.Data[20]["#text"])
+    | extend CommandLine = tostring(EventData.DataItem.EventData.Data[10]["#text"])
+    | extend User = tostring(EventData.DataItem.EventData.Data[12]["#text"])
+    | where ProcessName matches regex @".*\..*"
+    | summarize EventCount = count(), Hosts = make_set(Computer), Users = make_set(User) by ProcessName, ParentProcessName, CommandLine
+    | where EventCount >= 1
+    | project ProcessName, ParentProcessName, CommandLine, EventCount, Hosts, Users
+  aql: |
+    SELECT "Process Name" AS process_name, "Parent Process Name" AS parent_process_name, "Process CommandLine" AS command_line, LOGSOURCENAME(logsourceid) AS host, username AS user, COUNT(*) AS event_count
+    FROM events
+    WHERE "EventID" = '1' AND "Process Name" MATCHES '.*\..*'
+    GROUP BY "Process Name", "Parent Process Name", "Process CommandLine", LOGSOURCENAME(logsourceid), username
+    HAVING event_count >= 1
+    LAST 24 HOURS
+  yara_l: "rule ransomware_suspicious_process_name_pattern {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects processes\
+    \ with suspicious naming patterns potentially indicative of ransomware (T1486)\"\n    mitre_attack_tactic = \"Impact\"\n    mitre_attack_technique\
+    \ = \"T1486\"\n    severity = \"High\"\n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.metadata.product_event_type\
+    \ = \"1\"\n    re.regex($e.principal.process.file.full_path, `[^\\\\]+\\..+$`)\n    $e.principal.process.file.full_path = $process_name\n\
+    \    $e.principal.process.parent_process.file.full_path = $parent_process_name\n    $e.principal.process.command_line = $command_line\n  \
+    \  $e.principal.hostname = $host\n    $e.principal.user.userid = $user\n    \n  match:\n    $process_name, $parent_process_name, $command_line\
+    \ over 24h\n    \n  outcome:\n    $risk_score = 65\n    $hosts = array_distinct($host)\n    $users = array_distinct($user)\n    \n  condition:\n\
+    \    #e >= 1\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.process*
+    | WHERE (winlog.event_id == 1 OR event.category == "process") AND event.type == "start"
+    | WHERE process.name RLIKE ".+\\..+"
+    | STATS event_count = COUNT(*), hosts = VALUES(host.name), users = VALUES(user.name) BY process.name, process.parent.name, process.command_line
+    | WHERE event_count >= 1
+  leql: |
+    where(source_json.EventID=1 AND process_name=/.*\..+.*/) groupby(process_name, parent_process_name, process_cmd_line) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 FileName=*.+*
+    | groupBy([FileName, ParentBaseFileName, CommandLine], function=[count(as=event_count), collect([ComputerName, UserName])])
+    | event_count >= 1
+    | table([FileName, ParentBaseFileName, CommandLine, event_count, ComputerName, UserName])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS and action_process_image_name ~= ".*\..*"
+    | comp count() as event_count, values(agent_hostname) as hosts, values(actor_effective_username) as users by action_process_image_name, actor_process_image_name, action_process_image_command_line
+    | filter event_count >= 1
+    | fields action_process_image_name, actor_process_image_name, action_process_image_command_line, event_count, hosts, users
+  lucene: |
+    winlog.event_id:1 AND process.name:*.+*
+  sumo: |
+    _sourceCategory=*Sysmon* "1"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Image" as process_name
+    | json field=_raw "ParentImage" as parent_process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "Computer" as host
+    | json field=_raw "User" as user
+    | where event_id = "1" and process_name matches "*.+*"
+    | count as event_count by process_name, parent_process_name, command_line
+    | where event_count >= 1
+    | fields process_name, parent_process_name, command_line, event_count
 false_positives:
 - File sync clients during bulk sync
 tags:
@@ -90,7 +86,7 @@ tags:
 author: TDL
 created: '2024-03-01'
 test_method: synthetic
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host(s) affected, scope of impact (count of files / accounts / services).'
 - Inspect the file path, file hash, parent process, and any prior network/email delivery — characterize the destructive action (encrypt, delete,

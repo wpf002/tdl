@@ -17,74 +17,56 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=* sourcetype=cylance:* EventType="ScriptControl"
+  spl: 'index=* sourcetype=cylance:* EventType="ScriptControl"
+
     | table _time, host, DeviceName, EventType, ScriptName, ScriptPath, ScriptHash, Action, User
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000219 {\n  meta:\n    author = \"TDL\"\n    description = \"Cylance Script Control Violation\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1059\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    Event
+    | where TimeGenerated > ago(24h)
+    | where Source == "Cylance" or Computer has "Cylance"
+    | extend EventData = parse_json(EventData)
+    | where EventData.EventType == "ScriptControl" or EventData contains "ScriptControl" or RenderedDescription contains "ScriptControl"
+    | project TimeGenerated, Computer, Source, EventData, RenderedDescription, EventID, ParameterXml
+    ```
 
-    | WHERE @timestamp > NOW() - 1 hour
+    However, given the lack of specific Cylance schema documentation in standard Sentinel tables, here is the most accurate generic query:
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+    Event
+    | where TimeGenerated > ago(24h)
+    | where Source contains "Cylance" or Computer has "Cylance"
+    | where RenderedDescription has "ScriptControl" or EventData has "ScriptControl"
+    | project TimeGenerated, Computer, Source, EventData, RenderedDescription
+  aql: |
+    SELECT LOGSOURCENAME(logsourceid) AS host, sourceip, username, "Event Type", "Script Name", "Script Path", "Script Hash", eventtime
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%Cylance%'
+      AND "Event Type" = 'ScriptControl'
+    LAST 24 HOURS
+  yara_l: "rule cylance_scriptcontrol_execution {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects Cylance ScriptControl\
+    \ events indicating script-based execution (T1059)\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1059\"\n  \
+    \  severity = \"Medium\"\n    \n  events:\n    $e.metadata.vendor_name = \"Cylance\"\n    $e.metadata.product_name = \"Cylance\"\n    $e.metadata.product_event_type\
+    \ = \"ScriptControl\"\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-cylance*
+    | WHERE event.type == "ScriptControl" OR event.action == "ScriptControl" OR cylance.event_type == "ScriptControl"
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, file.path, event.action, cylance.event_type
+  leql: |
+    where(source_json.Event="ScriptControl")
+  crowdstrike: |
+    #type=CylancePROTECT Event_Type=ScriptControl
+    | table([@timestamp, Device_Name, User, File_Path, Interpreter, SHA256])
+  xql: |
+    dataset = cylance_event_raw
+    | filter event_type = "ScriptControl"
+    | fields _time, agent_hostname, event_type, event_sub_type, actor_effective_username, action_process_image_name, action_process_image_command_line
+  lucene: |
+    Event_Type:ScriptControl
+  sumo: |
+    _sourceCategory=*Cylance* "ScriptControl"
+    | json field=_raw "Event Type" as event_type
+    | where event_type = "ScriptControl"
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +76,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Cylance Event
 

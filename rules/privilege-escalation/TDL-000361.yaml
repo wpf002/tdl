@@ -17,73 +17,95 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=windows sourcetype=WinEventLog:Security EventCode IN (592, 4688) (Process_Name="*\\explorer.exe" OR Process_Name="*\\wermgr.exe") (CommandLine="*whoami*-all*" OR CommandLine="*whoami*/all*" OR CommandLine="*arp*-a*" OR CommandLine="*arp*/a*" OR CommandLine="*ipconfig*-all*" OR CommandLine="*ipconfig*/all*" OR CommandLine="*net view*-all*" OR CommandLine="*net view*/all*" OR CommandLine="*cmd /c set*" OR CommandLine="*nslookup -querytype=all*" OR CommandLine="*nltest*-domain_trusts*-all_trusts*" OR CommandLine="*nltest*/domain_trusts*-all_trusts*" OR CommandLine="*nltest*-domain_trusts*/all_trusts*" OR CommandLine="*nltest*/domain_trusts*/all_trusts*" OR CommandLine="*net share*" OR CommandLine="*netstat*-nao*" OR CommandLine="*netstat*/nao*" OR CommandLine="*net localgroup*" OR CommandLine="*qwinsta*") | table _time, ComputerName, Account_Name, Process_Name, CommandLine
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("explorer.exe", "wermgr.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
+  spl: 'index=windows sourcetype=WinEventLog:Security EventCode IN (592, 4688) (Process_Name="*\\explorer.exe" OR Process_Name="*\\wermgr.exe")
+    (CommandLine="*whoami*-all*" OR CommandLine="*whoami*/all*" OR CommandLine="*arp*-a*" OR CommandLine="*arp*/a*" OR CommandLine="*ipconfig*-all*"
+    OR CommandLine="*ipconfig*/all*" OR CommandLine="*net view*-all*" OR CommandLine="*net view*/all*" OR CommandLine="*cmd /c set*" OR CommandLine="*nslookup
+    -querytype=all*" OR CommandLine="*nltest*-domain_trusts*-all_trusts*" OR CommandLine="*nltest*/domain_trusts*-all_trusts*" OR CommandLine="*nltest*-domain_trusts*/all_trusts*"
+    OR CommandLine="*nltest*/domain_trusts*/all_trusts*" OR CommandLine="*net share*" OR CommandLine="*netstat*-nao*" OR CommandLine="*netstat*/nao*"
+    OR CommandLine="*net localgroup*" OR CommandLine="*qwinsta*") | table _time, ComputerName, Account_Name, Process_Name, CommandLine
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('explorer.exe', 'wermgr.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_pe_000361 {\n  meta:\n    author = \"TDL\"\n    description = \"Explorer Wermgr Potential Process Injection\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0004\"\n    technique = \"T1055\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(explorer.exe|wermgr.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4688
+    | where Process has_any ("explorer.exe", "wermgr.exe")
+    | where CommandLine matches regex @"(whoami\s*(-|/)all|arp\s*(-|/)a|ipconfig\s*(-|/)all|net view\s*(-|/)all|cmd /c set|nslookup -querytype=all|nltest\s*(-|/)domain_trusts\s*(-|/)all_trusts|net\s+share|netstat\s+(-|/)nao|net\s+localgroup|qwinsta)"
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", sourceip
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Process Name" IN ('explorer.exe', 'wermgr.exe')
+      AND ("Process CommandLine" MATCHES '.*whoami\s*(-|\/)all.*'
+           OR "Process CommandLine" MATCHES '.*arp\s*(-|\/)a.*'
+           OR "Process CommandLine" MATCHES '.*ipconfig\s*(-|\/)all.*'
+           OR "Process CommandLine" MATCHES '.*net view\s*(-|\/)all.*'
+           OR "Process CommandLine" MATCHES '.*cmd \/c set.*'
+           OR "Process CommandLine" MATCHES '.*nslookup -querytype=all.*'
+           OR "Process CommandLine" MATCHES '.*nltest\s*(-|\/)domain_trusts\s*(-|\/)all_trusts.*'
+           OR "Process CommandLine" MATCHES '.*net\s+share.*'
+           OR "Process CommandLine" MATCHES '.*netstat\s+(-|\/)nao.*'
+           OR "Process CommandLine" MATCHES '.*net\s+localgroup.*'
+           OR "Process CommandLine" MATCHES '.*qwinsta.*')
+    LAST 24 HOURS
+  yara_l: |
+    rule privilege_escalation_t1055_reconnaissance_commands {
+      meta:
+        author = "TDL"
+        description = "Detects reconnaissance commands executed via explorer.exe or wermgr.exe indicating process injection (T1055)"
+        mitre_attack_tactic = "Privilege Escalation"
+        mitre_attack_technique = "T1055"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "592" or
+          $e.metadata.product_event_type = "4688"
+        )
+        (
+          re.regex($e.principal.process.file.full_path, `(?i)\\explorer\.exe$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)\\wermgr\.exe$`)
+        )
+        re.regex($e.principal.process.command_line, `(?i)(whoami\s*(-|\/)all|arp\s*(-|\/)a|ipconfig\s*(-|\/)all|net\s+view\s*(-|\/)all|cmd\s+\/c\s+set|nslookup\s+-querytype=all|nltest\s*(-|\/)domain_trusts\s*(-|\/)all_trusts|net\s+share|netstat\s+(-|\/)nao|net\s+localgroup|qwinsta)`)
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name IN ("explorer.exe", "wermgr.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [explorer.exe, wermgr.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (explorer.exe, wermgr.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("explorer.exe", "wermgr.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(explorer.exe OR wermgr.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("explorer.exe", "wermgr.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*, logs-windows.security*, winlogbeat-*
+    | WHERE event.code IN ("592", "4688")
+      AND process.name IN ("explorer.exe", "wermgr.exe")
+      AND process.command_line RLIKE ".*(whoami\\s*(-|/)all|arp\\s*(-|/)a|ipconfig\\s*(-|/)all|net view\\s*(-|/)all|cmd /c set|nslookup -querytype=all|nltest\\s*(-|/)domain_trusts\\s*(-|/)all_trusts|net\\s+share|netstat\\s+(-|/)nao|net\\s+localgroup|qwinsta).*"
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.executable
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND process_name IN ["explorer.exe", "wermgr.exe"] AND (process_cmd_line=/.*whoami\s*(-|\/)all.*/ OR process_cmd_line=/.*arp\s*(-|\/)a.*/ OR process_cmd_line=/.*ipconfig\s*(-|\/)all.*/ OR process_cmd_line=/.*net view\s*(-|\/)all.*/ OR process_cmd_line=/.*cmd \/c set.*/ OR process_cmd_line=/.*nslookup -querytype=all.*/ OR process_cmd_line=/.*nltest\s*(-|\/)domain_trusts\s*(-|\/)all_trusts.*/ OR process_cmd_line=/.*net\s+share.*/ OR process_cmd_line=/.*netstat\s+(-|\/)nao.*/ OR process_cmd_line=/.*net\s+localgroup.*/ OR process_cmd_line=/.*qwinsta.*/))
+  crowdstrike: "EventCode=4688 \n(NewProcessName=*explorer.exe OR NewProcessName=*wermgr.exe)\n(CommandLine=/.*whoami\\s*(-|\\/)all.*/ OR CommandLine=/.*arp\\\
+    s*(-|\\/)a.*/ OR CommandLine=/.*ipconfig\\s*(-|\\/)all.*/ OR CommandLine=/.*net view\\s*(-|\\/)all.*/ OR CommandLine=/.*cmd \\/c set.*/ OR\
+    \ CommandLine=/.*nslookup -querytype=all.*/ OR CommandLine=/.*nltest\\s*(-|\\/)domain_trusts\\s*(-|\\/)all_trusts.*/ OR CommandLine=/.*net\\\
+    s+share.*/ OR CommandLine=/.*netstat\\s+(-|\\/)nao.*/ OR CommandLine=/.*net\\s+localgroup.*/ OR CommandLine=/.*qwinsta.*/)\n| table([@timestamp,\
+    \ ComputerName, SubjectUserName, NewProcessName, CommandLine, ParentProcessName])\n"
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter lowercase(action_process_image_name) in ("explorer.exe", "wermgr.exe")
+    | filter action_process_image_command_line ~= ".*(?:whoami\s*(?:-|/)all|arp\s*(?:-|/)a|ipconfig\s*(?:-|/)all|net\s+view\s*(?:-|/)all|cmd\s+/c\s+set|nslookup\s+-querytype=all|nltest\s*(?:-|/)domain_trusts\s*(?:-|/)all_trusts|net\s+share|netstat\s+(?:-|/)nao|net\s+localgroup|qwinsta).*"
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, actor_process_image_name
+  lucene: |
+    event.code:4688 AND process.name:(explorer.exe OR wermgr.exe) AND process.command_line:/(whoami\s*(-|\/)all|arp\s*(-|\/)a|ipconfig\s*(-|\/)all|net view\s*(-|\/)all|cmd \/c set|nslookup -querytype=all|nltest\s*(-|\/)domain_trusts\s*(-|\/)all_trusts|net\s+share|netstat\s+(-|\/)nao|net\s+localgroup|qwinsta)/
+  sumo: |
+    _sourceCategory=*Windows* ("4688" OR "592")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | where event_id in ("4688", "592")
+    | where (process_name matches "*\\explorer.exe" OR process_name matches "*\\wermgr.exe")
+    | where command_line matches regex "(?i).*(whoami\s*(-|\/)all|arp\s*(-|\/)a|ipconfig\s*(-|\/)all|net\s+view\s*(-|\/)all|cmd\s+\/c\s+set|nslookup\s+-querytype=all|nltest\s*(-|\/)domain_trusts\s*(-|\/)all_trusts|net\s+share|netstat\s+(-|\/)nao|net\s+localgroup|qwinsta).*"
+    | fields _messageTime, _sourceHost, event_id, process_name, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +115,7 @@ tags:
 - privilege-escalation
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Windows Process Creation Event
 

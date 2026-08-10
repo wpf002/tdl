@@ -21,77 +21,66 @@ queries:
     \ span=1d\n| stats count as daily_count by _time, src_ip\n| eventstats avg(daily_count) as avg_count, stdev(daily_count) as stdev_count by\
     \ src_ip\n| where daily_count >= 3 AND daily_count > (avg_count + (3 * stdev_count))\n| where _time >= relative_time(now(), \"-90d\")\n| table\
     \ _time, src_ip, daily_count, avg_count, stdev_count\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000478 {\n  meta:\n    author = \"TDL\"\n    description = \"Spike in Inbound Connections from External IP\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: "let LearningPeriod = 30d;\nlet DetectionPeriod = 1d;\nlet Sensitivity = 3;\nlet MinimumThreshold = 3;\nlet BaselineData = \n    CommonSecurityLog\n\
+    \    | where TimeGenerated between (ago(LearningPeriod + DetectionPeriod) .. ago(DetectionPeriod))\n    | where DeviceAction in (\"Accept\"\
+    , \"Allow\", \"Permitted\")\n    | where CommunicationDirection == \"Inbound\" or (isnotempty(DestinationIP) and ipv4_is_private(DestinationIP)\
+    \ and isnotempty(SourceIP) and not(ipv4_is_private(SourceIP)))\n    | summarize BaselineCount = count() by SourceIP, bin(TimeGenerated, 1d)\n\
+    \    | summarize avg_count = avg(BaselineCount), stdev_count = stdev(BaselineCount) by SourceIP;\nlet CurrentData = \n    CommonSecurityLog\n\
+    \    | where TimeGenerated > ago(DetectionPeriod)\n    | where DeviceAction in (\"Accept\", \"Allow\", \"Permitted\")\n    | where CommunicationDirection\
+    \ == \"Inbound\" or (isnotempty(DestinationIP) and ipv4_is_private(DestinationIP) and isnotempty(SourceIP) and not(ipv4_is_private(SourceIP)))\n\
+    \    | summarize CurrentCount = count() by SourceIP, DestinationIP, DestinationPort;\nCurrentData\n| summarize TotalCurrentCount = sum(CurrentCount),\
+    \ DestinationIPs = make_set(DestinationIP), DestinationPorts = make_set(DestinationPort) by SourceIP\n| join kind=inner (BaselineData) on\
+    \ SourceIP\n| extend threshold = avg_count + (Sensitivity * stdev_count)\n| where TotalCurrentCount >= MinimumThreshold\n| where TotalCurrentCount\
+    \ > threshold\n| project SourceIP, TotalCurrentCount, BaselineAverage = avg_count, Threshold = threshold, DestinationIPs, DestinationPorts\n"
+  aql: "SELECT sourceip, destinationip, COUNT(*) AS connection_count, UNIQUECOUNT(destinationip) AS unique_destinations\nFROM flows\nWHERE destinationip\
+    \ IN (SELECT destinationip FROM flows WHERE destinationip MATCHES '^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)') \n  AND sourceip\
+    \ NOT IN (SELECT sourceip FROM flows WHERE sourceip MATCHES '^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)')\nGROUP BY sourceip, destinationip\n\
+    HAVING connection_count >= 3\nLAST 24 HOURS\n"
+  yara_l: "rule mitre_t1078_anomalous_inbound_firewall_connections {\n  meta:\n    author = \"TDL\"\n    description = \"Detects anomalous inbound\
+    \ firewall connections from external source IPs - MITRE T1078 Command and Control\"\n    mitre_tactic = \"Command and Control\"\n    mitre_technique\
+    \ = \"T1078\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.metadata.product_log_id\
+    \ = \"firewall\"\n    $e.network.direction = \"INBOUND\"\n    not net.ip_in_range_cidr($e.principal.ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($e.principal.ip,\
+    \ \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($e.principal.ip, \"192.168.0.0/16\")\n    net.ip_in_range_cidr($e.target.ip, \"10.0.0.0/8\"\
+    ) or\n    net.ip_in_range_cidr($e.target.ip, \"172.16.0.0/12\") or\n    net.ip_in_range_cidr($e.target.ip, \"192.168.0.0/16\")\n    $e.principal.ip\
+    \ = $src_ip\n    \n  match:\n    $src_ip over 24h\n    \n  outcome:\n    $risk_score = max(35)\n    $connection_count = count_distinct($e.target.ip)\n\
+    \    \n  condition:\n    #e >= 3\n}\n"
+  esql: "FROM logs-network.firewall*\n| WHERE @timestamp > NOW() - 90 days\n  AND network.direction == \"inbound\"\n  AND source.ip IS NOT NULL\n\
+    \  AND destination.ip IS NOT NULL\n| EVAL day = DATE_TRUNC(1 day, @timestamp)\n| STATS daily_count = COUNT(*) BY source.ip, day\n| STATS \n\
+    \    avg_daily = AVG(daily_count),\n    stddev_daily = STDEV(daily_count),\n    recent_count = CASE(\n      DATE_TRUNC(1 day, @timestamp)\
+    \ >= DATE_TRUNC(1 day, NOW()),\n      daily_count,\n      0\n    )\n    BY source.ip\n| EVAL threshold = avg_daily + (3 * stddev_daily)\n\
+    | WHERE recent_count >= 3 AND recent_count > threshold\n| KEEP source.ip, recent_count, avg_daily, threshold\n"
+  leql: |
+    where(source_address_type=EXTERNAL AND destination_address_type=INTERNAL) groupby(source_address) calculate(count)
+  crowdstrike: |
+    #type=firewall direction=inbound
+    | groupBy([src_ip], function=count(dst_ip, distinct=true, as=unique_destinations))
+    | unique_destinations >= 3
+    | bucket(function=[avg(unique_destinations, as=baseline_avg), stdev(unique_destinations, as=baseline_stdev)], span=1d, limit=90)
+    | eval(threshold=baseline_avg + (3 * baseline_stdev))
+    | unique_destinations > threshold
+    | table([src_ip, unique_destinations, baseline_avg, baseline_stdev, threshold])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_source_translated_ip != null and action_destination_translated_ip != null
+    | filter not incidr(action_source_ip, "10.0.0.0/8") and not incidr(action_source_ip, "172.16.0.0/12") and not incidr(action_source_ip, "192.168.0.0/16")
+    | filter incidr(action_destination_ip, "10.0.0.0/8") or incidr(action_destination_ip, "172.16.0.0/12") or incidr(action_destination_ip, "192.168.0.0/16")
+    | bin _time span = 1d
+    | comp count_distinct(action_destination_ip) as dest_count by _time, action_source_ip
+    | filter dest_count >= 3
+  lucene: |
+    _exists_:source.ip AND _exists_:destination.ip AND NOT source.ip:[10.0.0.0 TO 10.255.255.255] AND NOT source.ip:[172.16.0.0 TO 172.31.255.255] AND NOT source.ip:[192.168.0.0 TO 192.168.255.255] AND (destination.ip:[10.0.0.0 TO 10.255.255.255] OR destination.ip:[172.16.0.0 TO 172.31.255.255] OR destination.ip:[192.168.0.0 TO 192.168.255.255])
+  sumo: |
+    _sourceCategory=*Firewall* AND direction=inbound
+    | parse "src_ip=*" as src_ip nodrop
+    | parse "dest_ip=*" as dest_ip nodrop
+    | where !isPrivateIP(src_ip) AND isPrivateIP(dest_ip)
+    | timeslice 1d
+    | count as daily_count by _timeslice, src_ip
+    | sort by _timeslice asc
+    | rollingstd daily_count by src_ip over 30d as baseline_stddev
+    | rollingavg daily_count by src_ip over 30d as baseline_avg
+    | where daily_count > (baseline_avg + (3 * baseline_stddev)) AND daily_count >= 3
+    | fields _timeslice, src_ip, daily_count, baseline_avg, baseline_stddev
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -101,7 +90,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: 'Firewall Events
 

@@ -18,94 +18,197 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    (index=waf OR index=web OR index=proxy OR index=network)
-    (
-        (sourcetype=waf Action=blocked)
-        OR
-        (sourcetype=waf (signature IN ("*xss*", "*csrf*") OR (signature="*cross*" AND signature="*site*")))
-        OR
-        (
-            (sourcetype=access_combined OR sourcetype=apache* OR sourcetype=nginx* OR sourcetype=iis OR sourcetype=proxy)
-            (
-                uri IN ("*=<script>*", "*=%3cscript%3e*", "*=%253cscript%253e*", "*<iframe *", "*%3ciframe *", "*<svg *", "*%3csvg *", "*document.cookie*", "*document.domain*", "* onerror=*", "* onresize=*", "* onload=\"*", "*onmouseover=*", "*${alert*", "*javascript:alert*", "*javascript%3aalert*", "*backurl=*")
-                OR
-                (status IN ("4*", "5*"))
+  spl: "(index=waf OR index=web OR index=proxy OR index=network)\n(\n    (sourcetype=waf Action=blocked)\n    OR\n    (sourcetype=waf (signature\
+    \ IN (\"*xss*\", \"*csrf*\") OR (signature=\"*cross*\" AND signature=\"*site*\")))\n    OR\n    (\n        (sourcetype=access_combined OR\
+    \ sourcetype=apache* OR sourcetype=nginx* OR sourcetype=iis OR sourcetype=proxy)\n        (\n            uri IN (\"*=<script>*\", \"*=%3cscript%3e*\"\
+    , \"*=%253cscript%253e*\", \"*<iframe *\", \"*%3ciframe *\", \"*<svg *\", \"*%3csvg *\", \"*document.cookie*\", \"*document.domain*\", \"\
+    * onerror=*\", \"* onresize=*\", \"* onload=\\\"*\", \"*onmouseover=*\", \"*${alert*\", \"*javascript:alert*\", \"*javascript%3aalert*\",\
+    \ \"*backurl=*\")\n            OR\n            (status IN (\"4*\", \"5*\"))\n        )\n    )\n)\n| table _time, host, src_ip, dest_ip, uri,\
+    \ status, Action, signature, sourcetype\n"
+  kql: "let waf_events = \n    CommonSecurityLog\n    | where TimeGenerated > ago(1h)\n    | where DeviceVendor has_any (\"Imperva\", \"F5\",\
+    \ \"Fortinet\", \"Barracuda\", \"Cloudflare\", \"AWS\", \"Azure\", \"Palo Alto\")\n    | where DeviceAction == \"Blocked\"\n        or Message\
+    \ has_any (\"xss\", \"csrf\")\n        or (Message has \"cross\" and Message has \"site\")\n    | project TimeGenerated, SourceIP, DestinationIP,\
+    \ RequestURL, DeviceAction, Message, DeviceVendor, DeviceProduct;\nlet proxy_web_xss = \n    W3CIISLog\n    | where TimeGenerated > ago(1h)\n\
+    \    | where csUriQuery has_any (\"=<script>\", \"=%3cscript%3e\", \"=%253cscript%253e\", \"<iframe \", \"%3ciframe \", \"<svg \", \"%3csvg\
+    \ \", \"document.cookie\", \"document.domain\", \" onerror=\", \" onresize=\", \" onload=\\\"\", \"onmouseover=\", \"${alert\", \"javascript:alert\"\
+    , \"javascript%3aalert\", \"backurl=\")\n        or scStatus startswith \"4\"\n        or scStatus startswith \"5\"\n    | project TimeGenerated,\
+    \ cIP, sIP, csUriStem, csUriQuery, scStatus, csUserAgent, csMethod, csReferer\n    | extend SourceIP = cIP, DestinationIP = sIP, RequestURL\
+    \ = strcat(csUriStem, \"?\", csUriQuery), ResponseCode = scStatus;\nwaf_events\n| union (proxy_web_xss | project TimeGenerated, SourceIP,\
+    \ DestinationIP, RequestURL, ResponseCode)\n| project TimeGenerated, SourceIP, DestinationIP, RequestURL\n"
+  aql: |
+    SELECT sourceip, destinationip, username, qidname(qid), CATEGORYNAME(category), LOGSOURCENAME(logsourceid), "URL", "URI", "Signature", "Action", "Response Code", COUNT(*) AS event_count
+    FROM events
+    WHERE (
+        (CATEGORYNAME(category) ILIKE '%firewall%' AND (
+            "Action" ILIKE '%blocked%'
+            OR "Signature" ILIKE '%xss%'
+            OR "Signature" ILIKE '%csrf%'
+            OR ("Signature" ILIKE '%cross%' AND "Signature" ILIKE '%site%')
+        ))
+        OR (
+            (CATEGORYNAME(category) ILIKE '%web%' OR CATEGORYNAME(category) ILIKE '%proxy%' OR CATEGORYNAME(category) ILIKE '%http%') AND (
+                "URI" LIKE '%=<script>%'
+                OR "URI" LIKE '%=%3cscript%3e%'
+                OR "URI" LIKE '%=%253cscript%253e%'
+                OR "URI" LIKE '%<iframe %'
+                OR "URI" LIKE '%<svg %'
+                OR "URI" LIKE '%document.cookie%'
+                OR "URI" LIKE '%document.domain%'
+                OR "URI" LIKE '% onerror=%'
+                OR "URI" LIKE '% onresize=%'
+                OR "URI" LIKE '% onload=\"%'
+                OR "URI" LIKE '%onmouseover=%'
+                OR "URI" LIKE '%${alert%'
+                OR "URI" LIKE '%javascript:alert%'
+                OR "URI" LIKE '%javascript%3aalert%'
+                OR "URI" LIKE '%backurl=%'
+                OR "Response Code" LIKE '4%'
+                OR "Response Code" LIKE '5%'
             )
         )
     )
-    | table _time, host, src_ip, dest_ip, uri, status, Action, signature, sourcetype
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+    GROUP BY sourceip, destinationip, username, qidname(qid), CATEGORYNAME(category), LOGSOURCENAME(logsourceid), "URL", "URI", "Signature", "Action", "Response Code"
     LAST 1 HOURS
+  yara_l: |
+    rule exploit_public_facing_application_xss_csrf {
+      meta:
+        author = "TDL"
+        description = "Detects XSS/CSRF attempts via WAF blocks and suspicious web requests (T1190)"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1190"
 
-    '
-  yara_l: "rule tdl_tdl_auth_000501 {\n  meta:\n    author = \"TDL\"\n    description = \"Blocked Cross Site Scripting Traffic\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        // WAF blocked events
+        (
+          $waf.metadata.product_event_type = "WAF_BLOCK" or
+          $waf.security_result.action = "BLOCK"
+        ) and
+        (
+          re.regex($waf.security_result.summary, `(?i)xss`) or
+          re.regex($waf.security_result.summary, `(?i)csrf`) or
+          (
+            re.regex($waf.security_result.summary, `(?i)cross`) and
+            re.regex($waf.security_result.summary, `(?i)site`)
+          )
+        ) and
+        $waf.target.ip = $target_ip and
+        $waf.principal.ip = $source_ip
 
+        or
+
+        // Suspicious URI patterns from webserver/reverse proxy
+        $web.metadata.event_type = "NETWORK_HTTP" and
+        (
+          re.regex($web.target.url, `=<script>`) or
+          re.regex($web.target.url, `=%3cscript%3e`) or
+          re.regex($web.target.url, `=%253cscript%253e`) or
+          re.regex($web.target.url, `<iframe `) or
+          re.regex($web.target.url, `%3ciframe `) or
+          re.regex($web.target.url, `<svg `) or
+          re.regex($web.target.url, `%3csvg `) or
+          re.regex($web.target.url, `document\.cookie`) or
+          re.regex($web.target.url, `document\.domain`) or
+          re.regex($web.target.url, ` onerror=`) or
+          re.regex($web.target.url, ` onresize=`) or
+          re.regex($web.target.url, ` onload=`) or
+          re.regex($web.target.url, `onmouseover=`) or
+          re.regex($web.target.url, `\$\{alert`) or
+          re.regex($web.target.url, `javascript:alert`) or
+          re.regex($web.target.url, `javascript%3aalert`) or
+          re.regex($web.target.url, `backurl=`)
+        ) and
+        $web.target.ip = $target_ip and
+        $web.principal.ip = $source_ip
+
+        or
+
+        // HTTP error responses (4xx/5xx)
+        $web_err.metadata.event_type = "NETWORK_HTTP" and
+        (
+          re.regex($web_err.network.http.response_code, `^4\d{2}`) or
+          re.regex($web_err.network.http.response_code, `^5\d{2}`)
+        ) and
+        $web_err.target.ip = $target_ip and
+        $web_err.principal.ip = $source_ip
+
+      match:
+        $source_ip, $target_ip over 5m
+
+      condition:
+        $waf or $web or $web_err
+    }
+  esql: |
+    FROM logs-*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      AND (
+        (event.category == "web" AND event.action == "blocked")
+        OR (event.category == "web" AND (
+          TO_LOWER(rule.name) LIKE "*xss*"
+          OR TO_LOWER(rule.name) LIKE "*csrf*"
+          OR (TO_LOWER(rule.name) LIKE "*cross*" AND TO_LOWER(rule.name) LIKE "*site*")
+        ))
+        OR (
+          url.original LIKE "*=<script>*"
+          OR url.original LIKE "*=%3cscript%3e*"
+          OR url.original LIKE "*=%253cscript%253e*"
+          OR url.original LIKE "*<iframe *"
+          OR url.original LIKE "*%3ciframe *"
+          OR url.original LIKE "*<svg *"
+          OR url.original LIKE "*%3csvg *"
+          OR url.original LIKE "*document.cookie*"
+          OR url.original LIKE "*document.domain*"
+          OR url.original LIKE "* onerror=*"
+          OR url.original LIKE "* onresize=*"
+          OR url.original LIKE "* onload=\\\"*"
+          OR url.original LIKE "*onmouseover=*"
+          OR url.original LIKE "*${alert*"
+          OR url.original LIKE "*javascript:alert*"
+          OR url.original LIKE "*javascript%3aalert*"
+          OR url.original LIKE "*backurl=*"
+        )
+        OR STARTS_WITH(TO_STRING(http.response.status_code), "4")
+        OR STARTS_WITH(TO_STRING(http.response.status_code), "5")
+      )
+    | KEEP @timestamp, host.name, source.ip, destination.ip, url.original, http.response.status_code, event.action, rule.name, user.name
+  leql: |
+    where((source_json.action=blocked) OR (source_json.signature ICONTAINS "xss") OR (source_json.signature ICONTAINS "csrf") OR (source_json.signature ICONTAINS "cross" AND source_json.signature ICONTAINS "site") OR (uri ICONTAINS "=<script>") OR (uri ICONTAINS "=%3cscript%3e") OR (uri ICONTAINS "=%253cscript%253e") OR (uri ICONTAINS "<iframe ") OR (uri ICONTAINS "%3ciframe ") OR (uri ICONTAINS "<svg ") OR (uri ICONTAINS "%3csvg ") OR (uri ICONTAINS "document.cookie") OR (uri ICONTAINS "document.domain") OR (uri ICONTAINS " onerror=") OR (uri ICONTAINS " onresize=") OR (uri ICONTAINS " onload=\"") OR (uri ICONTAINS "onmouseover=") OR (uri ICONTAINS "${alert") OR (uri ICONTAINS "javascript:alert") OR (uri ICONTAINS "javascript%3aalert") OR (uri ICONTAINS "backurl=") OR (response_code STARTS-WITH "4") OR (response_code STARTS-WITH "5"))
+  crowdstrike: "(#type=waf action=*blocked* OR signature=*xss* OR signature=*csrf* OR (signature=*cross* signature=*site*))\nOR\n(#type=webserver\
+    \ OR #type=reverseproxy) \n(uri=*=<script>* OR uri=*=%3cscript%3e* OR uri=*=%253cscript%253e* OR uri=*<iframe * OR uri=*%3ciframe * OR uri=*<svg\
+    \ * OR uri=*%3csvg * OR uri=*document.cookie* OR uri=*document.domain* OR uri=* onerror=* OR uri=* onresize=* OR uri=* onload=\\\"* OR uri=*onmouseover=*\
+    \ OR uri=*${alert* OR uri=*javascript:alert* OR uri=*javascript%3aalert* OR uri=*backurl=* OR response_code=4* OR response_code=5*)\n| table([@timestamp,\
+    \ #type, ComputerName, action, signature, uri, response_code, src_ip, dest_ip])\n"
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter (
+        (action_firewall_rule_name = "deny" or action_firewall_rule_name = "block" or action_firewall_rule_name = "alert" or action_firewall_rule_name = "reset")
+        or (lowercase(threat_name) contains "xss")
+        or (lowercase(threat_name) contains "csrf")
+        or (lowercase(threat_name) contains "cross" and lowercase(threat_name) contains "site")
+        or (lowercase(action_app_id_category) contains "<script>" or lowercase(action_app_id_category) contains "%3cscript%3e" or lowercase(action_app_id_category) contains "%253cscript%253e")
+        or (lowercase(action_app_id_category) contains "<iframe " or lowercase(action_app_id_category) contains "%3ciframe ")
+        or (lowercase(action_app_id_category) contains "<svg " or lowercase(action_app_id_category) contains "%3csvg ")
+        or (lowercase(action_app_id_category) contains "document.cookie" or lowercase(action_app_id_category) contains "document.domain")
+        or (lowercase(action_app_id_category) contains " onerror=" or lowercase(action_app_id_category) contains " onresize=" or lowercase(action_app_id_category) contains " onload=\"" or lowercase(action_app_id_category) contains "onmouseover=")
+        or (lowercase(action_app_id_category) contains "${alert" or lowercase(action_app_id_category) contains "javascript:alert" or lowercase(action_app_id_category) contains "javascript%3aalert")
+        or (lowercase(action_app_id_category) contains "backurl=")
+        or (action_http_response_code ~= "^4" or action_http_response_code ~= "^5")
+    )
+    | fields _time, action_source_ip, action_destination_ip, action_destination_port, threat_name, action_firewall_rule_name, action_app_id_category, action_http_response_code
+  lucene: |
+    (event_type:"waf" AND (action:"Blocked" OR signature:(*xss* OR *csrf* OR (*cross* AND *site*)))) OR (event_type:("reverse_proxy" OR "webserver") AND (uri:(*=\<script\>* OR *=%3cscript%3e* OR *=%253cscript%253e* OR *\<iframe\ * OR *%3ciframe\ * OR *\<svg\ * OR *%3csvg\ * OR *document.cookie* OR *document.domain* OR *\ onerror\=* OR *\ onresize\=* OR *\ onload\=\\\"* OR *onmouseover\=* OR *$\{alert* OR *javascript\:alert* OR *javascript%3aalert* OR *backurl\=*) OR response_code:(4* OR 5*)))
+  sumo: "(_sourceCategory=*WAF* OR _sourceCategory=*IDS* OR _sourceCategory=*IPS* OR _sourceCategory=*web* OR _sourceCategory=*proxy* OR _sourceCategory=*nginx*\
+    \ OR _sourceCategory=*apache*)\n| parse regex \"(?i)(?<action>block|denied|reject|alert|drop)\" nodrop\n| parse regex \"(?i)signature[\\\"\
+    :\\s]+(?<signature>[^\\\",\\s]+)\" nodrop\n| parse regex \"(?i)uri[\\\":\\s]+(?<uri>[^\\s\\\"]+)\" nodrop\n| parse regex \"(?i)status[\\\"\
+    :\\s]+(?<status_code>\\d{3})\" nodrop\n| parse regex \"(?i)(?<uri_alt>\\/[^\\s\\\"]*)\" nodrop\n| if(isEmpty(uri), uri_alt, uri) as uri\n\
+    | where \n    (action matches \"*block*\" or action matches \"*denied*\" or action matches \"*reject*\" or action matches \"*alert*\" or action\
+    \ matches \"*drop*\")\n    OR (signature matches \"*xss*\")\n    OR (signature matches \"*csrf*\")\n    OR (signature matches \"*cross*\"\
+    \ and signature matches \"*site*\")\n    OR (uri matches \"*=<script>*\")\n    OR (uri matches \"*=%3cscript%3e*\")\n    OR (uri matches \"\
+    *=%253cscript%253e*\")\n    OR (uri matches \"*<iframe *\")\n    OR (uri matches \"*%3ciframe *\")\n    OR (uri matches \"*<svg *\")\n   \
+    \ OR (uri matches \"*%3csvg *\")\n    OR (uri matches \"*document.cookie*\")\n    OR (uri matches \"*document.domain*\")\n    OR (uri matches\
+    \ \"* onerror=*\")\n    OR (uri matches \"* onresize=*\")\n    OR (uri matches \"* onload=\\\\\\\"*\")\n    OR (uri matches \"*onmouseover=*\"\
+    )\n    OR (uri matches \"*${alert*\")\n    OR (uri matches \"*javascript:alert*\")\n    OR (uri matches \"*javascript%3aalert*\")\n    OR\
+    \ (uri matches \"*backurl=*\")\n    OR (status_code matches \"4*\")\n    OR (status_code matches \"5*\")\n| fields _messageTime, _sourceHost,\
+    \ _sourceCategory, action, signature, uri, status_code\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -115,7 +218,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Web Application Firewall Event\nWhere Action is Blocked\nOR\n    Where the Signature contains \"xss\"\n\n    Where the Signature\
   \ contains \"csrf\"\n\n    Where the Signature contains \"cross\"\n    Where the Signature contains \"site\"\n\n--------------------------------------------------\n\

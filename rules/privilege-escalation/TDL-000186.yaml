@@ -17,74 +17,76 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=linux sourcetype IN (linux_secure, syslog) (CommandLine="*visudo*" OR command="*visudo*" OR bash_command="*visudo*") (CommandLine="*etc/sudoers*" OR CommandLine="*sudoers*" OR command="*etc/sudoers*" OR command="*sudoers*" OR bash_command="*etc/sudoers*" OR bash_command="*sudoers*")
+  spl: 'index=linux sourcetype IN (linux_secure, syslog) (CommandLine="*visudo*" OR command="*visudo*" OR bash_command="*visudo*") (CommandLine="*etc/sudoers*"
+    OR CommandLine="*sudoers*" OR command="*etc/sudoers*" OR command="*sudoers*" OR bash_command="*etc/sudoers*" OR bash_command="*sudoers*")
+
     | table _time, host, user, CommandLine, command, bash_command
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_pe_000186 {\n  meta:\n    author = \"TDL\"\n    description = \"Sudo File Modified\"\n    severity = \"HIGH\"\n    tactic\
-    \ = \"TA0004\"\n    technique = \"T1548\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n    $host\
-    \ = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    Syslog
+    | where TimeGenerated > ago(24h)
+    | where ProcessName has "bash" or ProcessName has "sh" or ProcessName has "zsh" or ProcessName has "dash" or SyslogMessage has "COMMAND="
+    | where SyslogMessage has "visudo" and (SyslogMessage has "etc/sudoers" or SyslogMessage has "sudoers")
+    | project TimeGenerated, Computer, ProcessName, SyslogMessage, HostIP, _ResourceId
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Command Line" AS command
+    FROM events
+    WHERE LOWER("Command Line") LIKE '%visudo%'
+      AND (LOWER("Command Line") LIKE '%etc/sudoers%' OR LOWER("Command Line") LIKE '%sudoers%')
+    LAST 24 HOURS
+  yara_l: |
+    rule linux_sudoers_modification_via_visudo {
+      meta:
+        author = "TDL"
+        description = "Detects potential privilege escalation through sudoers file modification via visudo command"
+        mitre_attack_tactic = "Privilege Escalation"
+        mitre_attack_technique = "T1548"
+        severity = "MEDIUM"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        re.regex($e.principal.process.command_line, `(?i)visudo`)
+        (
+          re.regex($e.principal.process.command_line, `(?i)etc/sudoers`) or
+          re.regex($e.principal.process.command_line, `(?i)sudoers`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint.events.process-*, logs-system.auth-*, logs-*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.category == "process"
+      AND host.os.type == "linux"
+      AND process.command_line IS NOT NULL
+      AND process.command_line LIKE "*visudo*"
+      AND (process.command_line LIKE "*etc/sudoers*" OR process.command_line LIKE "*sudoers*")
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.executable
+  leql: |
+    where(process_cmd_line ICONTAINS "visudo" AND (process_cmd_line ICONTAINS "etc/sudoers" OR process_cmd_line ICONTAINS "sudoers"))
+  crowdstrike: |
+    event_platform=Lin event_simpleName=ProcessRollup2 CommandLine=*visudo* (CommandLine=*etc/sudoers* OR CommandLine=*sudoers*)
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName])
+  xql: |
+    dataset = xdr_data
+    | filter agent_os_type = AGENT_OS_LINUX
+      and event_type = ENUM.EVENT_TYPE_PROCESS
+      and (action_process_image_command_line contains "visudo" or actor_process_image_command_line contains "visudo")
+      and (action_process_image_command_line ~= "(?i)(etc/sudoers|sudoers)" or actor_process_image_command_line ~= "(?i)(etc/sudoers|sudoers)")
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.category:process AND (process.command_line:*visudo* AND (process.command_line:*etc\/sudoers* OR process.command_line:*sudoers*))
+  sumo: |
+    _sourceCategory=*Linux* (visudo AND (sudoers OR "etc/sudoers"))
+    | parse regex "(?<command_line>.*)"
+    | where command_line matches "*visudo*" and (command_line matches "*etc/sudoers*" or command_line matches "*sudoers*")
+    | fields _messageTime, _sourceHost, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +96,7 @@ tags:
 - privilege-escalation
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Linux Command Line Event
 

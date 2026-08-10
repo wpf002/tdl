@@ -23,71 +23,121 @@ queries:
     \  (ScriptBlockText=\"*Invoke-DomainPasswordSpray*\" OR ScriptBlockText=\"*Get-DomainUserList*\" OR ScriptBlockText=\"*Invoke-SpraySinglePassword*\"\
     \ OR ScriptBlockText=\"*Get-ObservationWindow*\")\n)\n| table _time, ComputerName, EventCode, User, Image, NewProcessName, process_name, CommandLine,\
     \ ScriptBlockText\n"
-  kql: 'DeviceProcessEvents
+  kql: "union \n(SecurityEvent\n| where TimeGenerated > ago(1h)\n| where EventID in (592, 4688)\n| where Process has \"powershell.exe\" or CommandLine\
+    \ has_any (\"Invoke-DomainPasswordSpray\", \"Get-DomainUserList\", \"Invoke-SpraySinglePassword\", \"Get-ObservationWindow\")\n| project TimeGenerated,\
+    \ Computer, Account, EventID, Process, CommandLine, ParentProcessName),\n(Event\n| where TimeGenerated > ago(1h)\n| where EventID == 4104\n\
+    | where RenderedDescription has_any (\"Invoke-DomainPasswordSpray\", \"Get-DomainUserList\", \"Invoke-SpraySinglePassword\", \"Get-ObservationWindow\"\
+    )\n| project TimeGenerated, Computer, UserName, EventID, ScriptBlock = RenderedDescription)\n"
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, \"EventID\", \"Process Name\", \"Process CommandLine\", \"ScriptBlockText\"\
+    \nFROM events\nWHERE (\n  (\"EventID\" IN ('592', '4688') \n   AND \"Process Name\" ILIKE '%powershell.exe%'\n   AND (\"Process CommandLine\"\
+    \ ILIKE '%Invoke-DomainPasswordSpray%' \n        OR \"Process CommandLine\" ILIKE '%Get-DomainUserList%'\n        OR \"Process CommandLine\"\
+    \ ILIKE '%Invoke-SpraySinglePassword%'\n        OR \"Process CommandLine\" ILIKE '%Get-ObservationWindow%'))\n  OR\n  (\"EventID\" = '4104'\n\
+    \   AND (\"ScriptBlockText\" ILIKE '%Invoke-DomainPasswordSpray%'\n        OR \"ScriptBlockText\" ILIKE '%Get-DomainUserList%'\n        OR\
+    \ \"ScriptBlockText\" ILIKE '%Invoke-SpraySinglePassword%'\n        OR \"ScriptBlockText\" ILIKE '%Get-ObservationWindow%'))\n)\nLAST 1 HOURS\n"
+  yara_l: |
+    rule powershell_domainpasswordspray_execution {
+      meta:
+        author = "TDL"
+        description = "Detects execution of DomainPasswordSpray PowerShell module via process execution or script block logging"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1204"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        // Process execution events (4688)
+        $proc.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $proc.metadata.product_event_type = "592" or
+          $proc.metadata.product_event_type = "4688"
+        )
+        (
+          re.regex($proc.principal.process.file.full_path, `(?i)powershell\.exe$`) or
+          (
+            re.regex($proc.principal.process.command_line, `Invoke-DomainPasswordSpray`) and
+            re.regex($proc.principal.process.command_line, `Get-DomainUserList`) and
+            re.regex($proc.principal.process.command_line, `Invoke-SpraySinglePassword`) and
+            re.regex($proc.principal.process.command_line, `Get-ObservationWindow`)
+          )
+        )
+        $proc.principal.hostname = $host
 
-    | where process_name in ("powershell.exe")
+        // PowerShell Script Block events (4104)
+        $script.metadata.product_event_type = "4104"
+        (
+          re.regex($script.security_result.description, `Invoke-DomainPasswordSpray`) and
+          re.regex($script.security_result.description, `Get-DomainUserList`) and
+          re.regex($script.security_result.description, `Invoke-SpraySinglePassword`) and
+          re.regex($script.security_result.description, `Get-ObservationWindow`)
+        )
+        $script.principal.hostname = $host
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      match:
+        $host over 5m
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('powershell.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000514 {\n  meta:\n    author = \"TDL\"\n    description = \"Domain Password Spray Commandlet Activity\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(powershell.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("powershell.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [powershell.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $proc or $script
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-system.security*, winlogbeat-*, logs-windows.powershell_operational*
+    | WHERE @timestamp > NOW() - 24 hours
+    | WHERE (
+        (event.code IN ("592", "4688") AND process.name == "powershell.exe" AND (
+          process.command_line LIKE "*Invoke-DomainPasswordSpray*" OR
+          process.command_line LIKE "*Get-DomainUserList*" OR
+          process.command_line LIKE "*Invoke-SpraySinglePassword*" OR
+          process.command_line LIKE "*Get-ObservationWindow*"
+        ))
+        OR
+        (event.code == "4104" AND (
+          winlog.event_data.ScriptBlockText LIKE "*Invoke-DomainPasswordSpray*" OR
+          winlog.event_data.ScriptBlockText LIKE "*Get-DomainUserList*" OR
+          winlog.event_data.ScriptBlockText LIKE "*Invoke-SpraySinglePassword*" OR
+          winlog.event_data.ScriptBlockText LIKE "*Get-ObservationWindow*"
+        ))
+      )
+    | KEEP @timestamp, host.name, user.name, event.code, process.name, process.command_line, winlog.event_data.ScriptBlockText
+  leql: |
+    where((source_json.EventID IN [592, 4688] AND (process_name ICONTAINS "powershell.exe" OR process_cmd_line ICONTAINS "Invoke-DomainPasswordSpray" OR process_cmd_line ICONTAINS "Get-DomainUserList" OR process_cmd_line ICONTAINS "Invoke-SpraySinglePassword" OR process_cmd_line ICONTAINS "Get-ObservationWindow")) OR (source_json.EventID=4104 AND (source_json.ScriptBlockText ICONTAINS "Invoke-DomainPasswordSpray" OR source_json.ScriptBlockText ICONTAINS "Get-DomainUserList" OR source_json.ScriptBlockText ICONTAINS "Invoke-SpraySinglePassword" OR source_json.ScriptBlockText ICONTAINS "Get-ObservationWindow")))
+  crowdstrike: |
+    (EventCode=4688 OR EventCode=592 OR EventCode=4104)
+    (
+      (
+        (EventCode=4688 OR EventCode=592)
+        (
+          (FileName=powershell.exe OR NewProcessName=*powershell.exe)
+          OR
+          (CommandLine=*Invoke-DomainPasswordSpray* AND CommandLine=*Get-DomainUserList* AND CommandLine=*Invoke-SpraySinglePassword* AND CommandLine=*Get-ObservationWindow*)
+        )
+      )
+      OR
+      (
+        EventCode=4104
+        (ScriptBlockText=*Invoke-DomainPasswordSpray* AND ScriptBlockText=*Get-DomainUserList* AND ScriptBlockText=*Invoke-SpraySinglePassword* AND ScriptBlockText=*Get-ObservationWindow*)
+      )
+    )
+    | table([@timestamp, ComputerName, EventCode, FileName, NewProcessName, CommandLine, ScriptBlockText, UserName])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) and (lowercase(action_process_image_name) contains "powershell.exe" or action_process_image_command_line ~= "(?i)(Invoke-DomainPasswordSpray|Get-DomainUserList|Invoke-SpraySinglePassword|Get-ObservationWindow)"))
+        or (action_evtlog_event_id = 4104 and action_evtlog_message ~= "(?i)(Invoke-DomainPasswordSpray|Get-DomainUserList|Invoke-SpraySinglePassword|Get-ObservationWindow)")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_id, action_process_image_name, action_process_image_command_line, action_evtlog_message
+  lucene: |
+    (event.code:(592 OR 4688) AND process.name:*powershell.exe AND (process.command_line:*Invoke-DomainPasswordSpray* OR process.command_line:*Get-DomainUserList* OR process.command_line:*Invoke-SpraySinglePassword* OR process.command_line:*Get-ObservationWindow*)) OR (event.code:4104 AND (powershell.file.script_block_text:*Invoke-DomainPasswordSpray* OR powershell.file.script_block_text:*Get-DomainUserList* OR powershell.file.script_block_text:*Invoke-SpraySinglePassword* OR powershell.file.script_block_text:*Get-ObservationWindow*))
+  sumo: |
+    (_sourceCategory=*Windows* OR _sourceCategory=*Powershell*) AND (4688 OR 4104 OR 592)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "ProcessName" as process_name_alt
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "ScriptBlockText" as script_block
+    | json field=_raw "Computer" as computer
+    | json field=_raw "TargetUserName" as user
+    | where (
+        (event_id in ("592", "4688") and (process_name matches "*powershell.exe" or process_name_alt matches "*powershell.exe" or command_line matches "*Invoke-DomainPasswordSpray*" or command_line matches "*Get-DomainUserList*" or command_line matches "*Invoke-SpraySinglePassword*" or command_line matches "*Get-ObservationWindow*"))
+        or
+        (event_id = "4104" and (script_block matches "*Invoke-DomainPasswordSpray*" or script_block matches "*Get-DomainUserList*" or script_block matches "*Invoke-SpraySinglePassword*" or script_block matches "*Get-ObservationWindow*"))
+    )
+    | fields _messageTime, computer, user, event_id, process_name, process_name_alt, command_line, script_block
 false_positives:
 - Security software
 - Authorized admin tools
@@ -97,7 +147,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe\nOR\n    Where\
   \ the Command Line contains \"Invoke-DomainPasswordSpray\"\n    Where the Command Line contains \"Get-DomainUserList\"\n    Where the Command\

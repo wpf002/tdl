@@ -21,77 +21,74 @@ queries:
     | lookup vulnerability_scanners.csv src_ip OUTPUT is_scanner\n| where isnull(is_scanner) OR is_scanner!=1\n| bin _time span=1d\n| stats count\
     \ by _time, src_ip\n| eventstats avg(count) as avg_count, stdev(count) as stdev_count by src_ip\n| where count > (avg_count + (3 * stdev_count))\
     \ AND count >= 2\n| where _time >= relative_time(now(), \"-90d\")\n| table _time, src_ip, count, avg_count, stdev_count\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000492 {\n  meta:\n    author = \"TDL\"\n    description = \"Spike in Exploit Detections from Internal Host\"\n   \
-    \ severity = \"LOW\"\n    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n\
-    \    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: "let VulnerabilityScanners = dynamic([\"10.0.0.100\", \"192.168.1.50\"]); // Replace with your vulnerability scanner IPs\nlet LearningPeriod\
+    \ = 30d;\nlet DetectionPeriod = 1d;\nlet Sensitivity = 3;\nlet MinimumThreshold = 2;\nlet BaselineData = \n    CommonSecurityLog\n    | where\
+    \ TimeGenerated between (ago(LearningPeriod + DetectionPeriod) .. ago(DetectionPeriod))\n    | where DeviceVendor has_any (\"IDS\", \"IPS\"\
+    , \"Intrusion\", \"Snort\", \"Suricata\")\n    | where DeviceEventCategory =~ \"Exploit\" or Activity has \"Exploit\"\n    | where isnotempty(SourceIP)\
+    \ and isnotempty(DestinationIP)\n    | where ipv4_is_private(SourceIP) and ipv4_is_private(DestinationIP)\n    | where SourceIP !in (VulnerabilityScanners)\n\
+    \    | summarize BaselineCount = count() by SourceIP, bin(TimeGenerated, 1d)\n    | summarize avg_count = avg(BaselineCount), stdev_count\
+    \ = stdev(BaselineCount) by SourceIP;\nlet CurrentData = \n    CommonSecurityLog\n    | where TimeGenerated > ago(DetectionPeriod)\n    |\
+    \ where DeviceVendor has_any (\"IDS\", \"IPS\", \"Intrusion\", \"Snort\", \"Suricata\")\n    | where DeviceEventCategory =~ \"Exploit\" or\
+    \ Activity has \"Exploit\"\n    | where isnotempty(SourceIP) and isnotempty(DestinationIP)\n    | where ipv4_is_private(SourceIP) and ipv4_is_private(DestinationIP)\n\
+    \    | where SourceIP !in (VulnerabilityScanners)\n    | summarize CurrentCount = count(), DestinationIPs = make_set(DestinationIP), EventTimes\
+    \ = make_set(TimeGenerated) by SourceIP;\nCurrentData\n| join kind=inner (BaselineData) on SourceIP\n| extend threshold = avg_count + (Sensitivity\
+    \ * stdev_count)\n| where CurrentCount > threshold and CurrentCount >= MinimumThreshold\n| project SourceIP, CurrentCount, BaselineAverage\
+    \ = avg_count, BaselineStdDev = stdev_count, Threshold = threshold, DestinationIPs, EventTimes\n"
+  aql: |
+    SELECT sourceip, destinationip, COUNT(*) AS event_count
+    FROM events
+    WHERE INOFFENSE(sourceip) = 'false'
+      AND INOFFENSE(destinationip) = 'false'
+      AND CATEGORYNAME(category) ILIKE '%IDS%' OR CATEGORYNAME(category) ILIKE '%IPS%' OR CATEGORYNAME(category) ILIKE '%Exploit%'
+      AND sourceip IN (SELECT sourceip FROM events WHERE sourceip << '10.0.0.0/8' OR sourceip << '172.16.0.0/12' OR sourceip << '192.168.0.0/16' LAST 90 DAYS)
+      AND destinationip IN (SELECT destinationip FROM events WHERE destinationip << '10.0.0.0/8' OR destinationip << '172.16.0.0/12' OR destinationip << '192.168.0.0/16' LAST 90 DAYS)
+      AND sourceip NOT IN (SELECT sourceip FROM events WHERE LOGSOURCENAME(logsourceid) ILIKE '%vulnerability%' OR LOGSOURCENAME(logsourceid) ILIKE '%scanner%' OR LOGSOURCENAME(logsourceid) ILIKE '%nessus%' OR LOGSOURCENAME(logsourceid) ILIKE '%qualys%' LAST 90 DAYS)
+    GROUP BY sourceip, destinationip
+    HAVING event_count >= 2
+    LAST 24 HOURS
+  yara_l: "rule internal_ids_exploit_outlier {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects internal to internal\
+    \ IDS/IPS exploit events from non-scanner sources with outlier detection\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique\
+    \ = \"T1078\"\n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.security_result.summary\
+    \ = \"exploit\"\n    (\n      $e.security_result.detection_fields.value = \"exploit\" or\n      $e.security_result.category = \"EXPLOIT\"\
+    \ or\n      re.regex($e.security_result.summary, `(?i)exploit`)\n    )\n    \n    net.ip_in_range_cidr($e.principal.ip, \"10.0.0.0/8\") or\n\
+    \    net.ip_in_range_cidr($e.principal.ip, \"172.16.0.0/12\") or\n    net.ip_in_range_cidr($e.principal.ip, \"192.168.0.0/16\")\n    \n  \
+    \  net.ip_in_range_cidr($e.target.ip, \"10.0.0.0/8\") or\n    net.ip_in_range_cidr($e.target.ip, \"172.16.0.0/12\") or\n    net.ip_in_range_cidr($e.target.ip,\
+    \ \"192.168.0.0/16\")\n    \n    not (\n      $e.principal.asset.asset_id = \"vulnerability_scanner\" or\n      re.regex($e.principal.hostname,\
+    \ `(?i)(vuln|scan|nessus|qualys|rapid7)`)\n    )\n    \n    $e.principal.ip = $source_ip\n    \n  match:\n    $source_ip over 1d\n    \n \
+    \ outcome:\n    $risk_score = max(75)\n    $event_count = count_distinct($e.metadata.id)\n    \n  condition:\n    #e >= 2\n}\n"
+  esql: "FROM logs-network.ids* \n| WHERE @timestamp > NOW() - 90 days \n  AND event.kind == \"alert\" \n  AND event.category == \"intrusion_detection\"\
+    \n  AND source.ip RLIKE \"^(10\\\\.|172\\\\.(1[6-9]|2[0-9]|3[01])\\\\.|192\\\\.168\\\\.)\"\n  AND destination.ip RLIKE \"^(10\\\\.|172\\\\\
+    .(1[6-9]|2[0-9]|3[01])\\\\.|192\\\\.168\\\\.)\"\n  AND NOT source.ip IN (\"10.0.0.100\", \"10.0.0.101\")\n| EVAL day = DATE_TRUNC(1 day, @timestamp)\n\
+    | STATS daily_count = COUNT(*) BY source.ip, day\n| EVAL baseline_period = CASE(day >= NOW() - 30 days, \"baseline\", \"current\")\n| STATS\
+    \ \n    baseline_avg = AVG(CASE(baseline_period == \"baseline\", daily_count, null)),\n    baseline_stddev = SQRT(AVG(CASE(baseline_period\
+    \ == \"baseline\", daily_count * daily_count, null)) - AVG(CASE(baseline_period == \"baseline\", daily_count, null)) * AVG(CASE(baseline_period\
+    \ == \"baseline\", daily_count, null))),\n    current_count = SUM(CASE(baseline_period == \"current\", daily_count, 0))\n  BY source.ip\n\
+    | WHERE current_count >= 2 \n  AND current_count > (baseline_avg + 3 * baseline_stddev)\n| KEEP source.ip, current_count, baseline_avg, baseline_stddev\n"
+  leql: |
+    where(event_type="IDS/IPS Exploit" AND direction="Internal" AND source_asset NOT IN [<vulnerability_scanner_ips>]) groupby(source_address) calculate(count)
+  crowdstrike: |
+    #type=ids event_type=exploit src_ip_internal=true dst_ip_internal=true NOT (src_ip IN file("vuln_scanners.csv"))
+    | groupBy([src_ip], function=count(as=exploit_count), limit=max)
+    | exploit_count >= 2
+  xql: "dataset = intrusion_detection_events\n| filter threat_detected = true \n  and incidr(source_ip, \"10.0.0.0/8\") = true or incidr(source_ip,\
+    \ \"172.16.0.0/12\") = true or incidr(source_ip, \"192.168.0.0/16\") = true\n| filter incidr(destination_ip, \"10.0.0.0/8\") = true or incidr(destination_ip,\
+    \ \"172.16.0.0/12\") = true or incidr(destination_ip, \"192.168.0.0/16\") = true\n| filter source_ip not in (vulnerability_scanner_ips)\n\
+    | bin _time span=1d\n| comp count() as event_count by _time, source_ip\n| filter event_count >= 2\n"
+  lucene: |
+    event_category:"ids" AND threat.indicator.type:"exploit" AND (source.ip:10.0.0.0/8 OR source.ip:172.16.0.0/12 OR source.ip:192.168.0.0/16) AND (destination.ip:10.0.0.0/8 OR destination.ip:172.16.0.0/12 OR destination.ip:192.168.0.0/16) AND NOT tags:"vulnerability_scanner"
+  sumo: |
+    _sourceCategory=*IDS* OR _sourceCategory=*IPS*
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "classification" as classification
+    | where event_type matches "*exploit*" OR classification matches "*exploit*"
+    | where !isPrivateIP(src_ip) = false AND !isPrivateIP(dest_ip) = false
+    | where !(src_ip in ("10.0.0.50", "10.0.0.51", "192.168.1.100"))
+    | timeslice 1d
+    | count as daily_count by _timeslice, src_ip
+    | outlier daily_count by src_ip window=30, threshold=3, consecutive=1, direction=+
+    | where daily_count >= 2
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -101,7 +98,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: 'IDS/IPS Exploit Event
 

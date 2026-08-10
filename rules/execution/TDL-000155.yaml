@@ -23,71 +23,70 @@ queries:
     \ [\n  search index=* sourcetype=WinEventLog:Security EventCode=4657 \n  | eval registry_time=_time, registry_host=ComputerName, registry_user=SubjectUserName\
     \ \n  | rename malware_host as registry_host\n] \n| where (registry_time >= malware_time) AND (registry_time <= (malware_time + 900))\n| table\
     \ malware_time, registry_time, malware_host, malware_user, registry_user, Object_Name, Process_Name\n"
-  kql: 'DeviceRegistryEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where registry_key matches regex ".+"
-
-    | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Registry Key\", \"Registry Value Name\", \"Registry Value Data\", \"Process Name\"\nFROM events\nWHERE\
-    \ LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n  AND \"EventID\" IN ('12','13','14')\n  AND \"registry_key\" LIKE '%.+%'\n\
-    LAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000155 {\n  meta:\n    author = \"TDL\"\n    description = \"Malware Found with Registry Modification\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"REGISTRY_MODIFICATION\"\n    $e.registry_key\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "registry" AND registry_key LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/.+/)
-
-    groupby(asset, registry_key, registry_value)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*.+*
-
-    | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
-
-    | sort -changes
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.REGISTRY AND registry_key ~= ".+"
-
-    | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
-
-    | sort desc changes
-
-    '
-  lucene: 'event.category:"registry" AND registry_key:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id IN ("12","13","14") AND registry_key matches "*.+*"
-
-    | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc
-
-    '
+  kql: "let MalwareDetections = \n    SecurityAlert\n    | where TimeGenerated > ago(1h)\n    | where AlertType has_any (\"Malware\", \"Virus\"\
+    , \"Trojan\", \"Backdoor\")\n    | extend MalwareTime = TimeGenerated, MalwareComputer = Computer, MalwareAlertName = AlertName\n    | project\
+    \ MalwareTime, MalwareComputer, MalwareAlertName;\nlet RegistryMods = \n    SecurityEvent\n    | where TimeGenerated > ago(1h)\n    | where\
+    \ EventID == 4657\n    | extend RegTime = TimeGenerated, RegComputer = Computer\n    | project RegTime, RegComputer, ObjectName, SubjectUserName,\
+    \ Process;\nMalwareDetections\n| join kind=inner (RegistryMods) on $left.MalwareComputer == $right.RegComputer\n| where RegTime between (MalwareTime\
+    \ .. (MalwareTime + 15m))\n| project MalwareTime, RegTime, Computer = MalwareComputer, MalwareAlertName, ObjectName, SubjectUserName, Process\n"
+  aql: "SELECT \n    av.eventtime AS malware_time,\n    reg.eventtime AS registry_time,\n    av.sourceip,\n    av.username,\n    LOGSOURCENAME(av.logsourceid)\
+    \ AS host,\n    av.qidname(av.qid) AS malware_event,\n    reg.\"Object Name\" AS registry_key,\n    reg.\"Object Value Name\" AS registry_value\n\
+    FROM events av\nJOIN events reg ON av.sourceip = reg.sourceip\nWHERE av.category IN (6000, 6001, 6002, 6003, 6004, 6005, 6006, 6007, 6008,\
+    \ 6009, 6010)\n    AND reg.\"EventID\" IN ('567', '4657')\n    AND reg.eventtime BETWEEN av.eventtime AND (av.eventtime + 900000)\nLAST 24\
+    \ HOURS\n"
+  yara_l: "rule malware_followed_by_registry_modification {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects malware\
+    \ detection followed by registry modification within 15 minutes\"\n    mitre_tactic = \"Execution\"\n    mitre_technique = \"T1204\"\n   \
+    \ \n  events:\n    $malware.metadata.event_type = \"SCAN_UNCATEGORIZED\"\n    $malware.security_result.detection_fields[\"malware_detected\"\
+    ] != \"\"\n    $malware.principal.hostname = $host\n    \n    $registry.metadata.event_type = \"REGISTRY_MODIFICATION\"\n    ($registry.metadata.product_event_type\
+    \ = \"567\" or $registry.metadata.product_event_type = \"4657\")\n    $registry.principal.hostname = $host\n    $registry.metadata.event_timestamp.seconds\
+    \ >= $malware.metadata.event_timestamp.seconds\n    \n  match:\n    $host over 15m\n    \n  condition:\n    $malware and $registry\n}\n"
+  esql: "FROM logs-windows.security*, logs-system.security*, winlogbeat-*\n| WHERE @timestamp > NOW() - 24 hours\n| EVAL event_type = CASE(\n\
+    \    event.code == \"4657\" OR winlog.event_id == 4657, \"registry_mod\",\n    event.category == \"malware\" OR event.type == \"malware\"\
+    , \"malware\",\n    \"other\"\n  )\n| WHERE event_type IN (\"malware\", \"registry_mod\")\n| SORT @timestamp ASC\n| STATS \n    malware_time\
+    \ = MIN(CASE(event_type == \"malware\", @timestamp, null)),\n    registry_time = MIN(CASE(event_type == \"registry_mod\", @timestamp, null)),\n\
+    \    malware_count = COUNT(CASE(event_type == \"malware\", 1, null)),\n    registry_count = COUNT(CASE(event_type == \"registry_mod\", 1,\
+    \ null))\n  BY host.name, user.name, bucket = BUCKET(@timestamp, 15 minutes)\n| WHERE malware_count >= 1 AND registry_count >= 1 AND registry_time\
+    \ > malware_time AND (registry_time - malware_time) <= 900000000000\n| KEEP host.name, user.name, bucket, malware_time, registry_time, malware_count,\
+    \ registry_count\n"
+  leql: |
+    where(source_json.EventID IN [567, 4657]) groupby(asset, user) calculate(count)
+  crowdstrike: |
+    #event_simpleName=DetectionSummaryEvent OR EventCode IN [567, 4657]
+    | case {
+        #event_simpleName=DetectionSummaryEvent | detection_time := @timestamp | ComputerName=* | aid_detection := aid ;
+        EventCode IN [567, 4657] | registry_time := @timestamp | ComputerName=* | aid_registry := aid ;
+        * | drop();
+      }
+    | aid := coalesce([aid_detection, aid_registry])
+    | selfJoinFilter([aid], where=[{detection_time := *}, {registry_time := *}])
+    | time_diff := registry_time - detection_time
+    | time_diff >= 0 AND time_diff <= 900000
+    | groupBy([aid, detection_time], function=([selectLast(registry_time, as=last_registry_time)]))
+    | table([aid, detection_time, last_registry_time, time_diff])
+  xql: |
+    dataset = xdr_data
+    | filter event_type in (ENUM.EVENT_TYPE_THREAT_DETECTION, ENUM.EVENT_TYPE_REGISTRY)
+    | alter is_malware = if(event_type = ENUM.EVENT_TYPE_THREAT_DETECTION, 1, 0),
+            is_registry = if(event_type = ENUM.EVENT_TYPE_REGISTRY and action_evtlog_event_id in (567, 4657), 1, 0)
+    | bin _time span=15m
+    | comp sum(is_malware) as malware_count, sum(is_registry) as registry_count by _time, agent_hostname
+    | filter malware_count >= 1 and registry_count >= 1
+  lucene: |
+    event.code:(567 OR 4657) AND _exists_:antivirus.detection
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Antivirus*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Computer" as computer
+    | json field=_raw "TimeCreated" as event_time
+    | json field=_raw "SubjectUserName" as user
+    | json field=_raw "ObjectName" as registry_path
+    | where (event_id in ("567", "4657") OR _raw matches "*malware*" OR _raw matches "*virus*" OR _raw matches "*threat*")
+    | if(event_id in ("567", "4657"), "registry", "malware") as event_type
+    | sort by computer, event_time asc
+    | transpose row computer column event_type as *
+    | where !isNull(malware) and !isNull(registry)
+    | where (registry_time - malware_time) / 1000 / 60 <= 15 and (registry_time - malware_time) >= 0
+    | fields computer, malware_time, registry_time
 false_positives:
 - Security software
 - Authorized admin tools
@@ -97,7 +96,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Malware Detection Event
 

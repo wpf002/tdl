@@ -15,83 +15,88 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol=dns (dest IN ("*.ddns.net", "*.duckdns.org", "*.no-ip.org", "*.freedns.afraid.org", "*.dynu.com", "*.dyn.com", "*.noip.com", "*.changeip.com", "*.hopto.org", "*.zapto.org", "*.myddns.me", "*.servebeer.com", "*.servegame.com") OR dest="*ddns*" OR dest="*dyndns*" OR dest="*no-ip*" OR dest="*changeip*")
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol=dns (dest IN ("*.ddns.net", "*.duckdns.org", "*.no-ip.org", "*.freedns.afraid.org",
+    "*.dynu.com", "*.dyn.com", "*.noip.com", "*.changeip.com", "*.hopto.org", "*.zapto.org", "*.myddns.me", "*.servebeer.com", "*.servegame.com")
+    OR dest="*ddns*" OR dest="*dyndns*" OR dest="*no-ip*" OR dest="*changeip*")
+
     | stats count as request_count, dc(dest_ip) as unique_dest_ips, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+
     | where request_count >= 1
+
     | sort - total_bytes_out
+
     | table src_ip, dest_ip, dest_port, request_count, unique_dest_ips, total_bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "dns"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%dns%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000462 {\n  meta:\n    author = \"TDL\"\n    description = \"Web Request to Possible Dynamic DNS\"\n    severity =\
-    \ \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /dns/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%dns%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/dns/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*dns*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "dns"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*dns*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*dns*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceVendor has_any ("Palo Alto", "Fortinet", "Cisco", "Zscaler", "Squid", "Barracuda", "Check Point") or DeviceProduct has_any ("Firewall", "Proxy", "Web Security")
+    | where ApplicationProtocol =~ "DNS" or DestinationPort == 53 or RequestURL has_any (".ddns.", ".dyndns.", ".no-ip.", ".freedns.", ".dynalias.")
+    | extend dest_domain = coalesce(RequestURL, DestinationHostName, DestinationIP)
+    | where dest_domain has_any (".ddns.", ".dyndns.", ".no-ip.", ".freedns.", ".dynalias.", ".zapto.", ".redirectme.", ".serveftp.", ".myftp.", ".biz.nf")
+    | summarize request_count = count(), unique_dest_ips = dcount(DestinationIP), total_bytes_out = sum(SentBytes) by SourceIP, DestinationIP, DestinationPort
+    | where request_count >= 1
+    | sort by total_bytes_out desc
+    | project TimeGenerated = now(), SourceIP, DestinationIP, DestinationPort, request_count, unique_dest_ips, total_bytes_out
+  aql: "SELECT sourceip, destinationip, destinationport, QIDNAME(qid) AS event_name, COUNT(*) AS request_count, UNIQUECOUNT(destinationip) AS\
+    \ unique_destinations, SUM(bytessentrate) AS total_bytes_out\nFROM events\nWHERE (QIDNAME(qid) ILIKE '%HTTP%' OR QIDNAME(qid) ILIKE '%Web%'\
+    \ OR QIDNAME(qid) ILIKE '%Proxy%')\n  AND (destinationip MATCHES '.*\\.ddns\\.net$|.*\\.duckdns\\.org$|.*\\.no-ip\\.(com|org|biz|info|net)$|.*\\\
+    .dynu\\.(com|net)$|.*\\.afraid\\.org$|.*\\.changeip\\.com$|.*\\.3utilities\\.com$|.*\\.bounceme\\.net$|.*\\.freedynamicdns\\.org$|.*\\.dyndns\\\
+    .(org|info|com)$|.*\\.hopto\\.org$|.*\\.zapto\\.org$' \n       OR LOGSOURCETYPENAME(devicetype) ILIKE '%proxy%' AND (URL ILIKE '%.ddns.net%'\
+    \ OR URL ILIKE '%.duckdns.org%' OR URL ILIKE '%.no-ip.%' OR URL ILIKE '%.dynu.%' OR URL ILIKE '%.afraid.org%' OR URL ILIKE '%.changeip.com%'\
+    \ OR URL ILIKE '%.3utilities.com%' OR URL ILIKE '%.bounceme.net%' OR URL ILIKE '%.freedynamicdns.org%' OR URL ILIKE '%.dyndns.%' OR URL ILIKE\
+    \ '%.hopto.org%' OR URL ILIKE '%.zapto.org%'))\nGROUP BY sourceip, destinationip, destinationport, QIDNAME(qid)\nHAVING request_count >= 1\n\
+    ORDER BY total_bytes_out DESC\nLAST 24 HOURS\n"
+  yara_l: "rule dynamic_dns_c2_traffic {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects potential C2 traffic via dynamic\
+    \ DNS domains\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique = \"T1071\"\n    severity = \"Medium\"\n  \
+    \  \n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    (\n      re.regex($e.target.hostname, `(?i)\\.(ddns\\.net|duckdns\\.org|no-ip\\\
+    .(org|com|biz|info)|hopto\\.org|zapto\\.org|servebeer\\.com|serveftp\\.com|servehttp\\.com|servegame\\.com|sytes\\.net|myddns\\.me|dynu\\\
+    .net|afraid\\.org|changeip\\.com|freedns\\.afraid\\.org)$`) or\n      re.regex($e.network.dns.questions.name, `(?i)\\.(ddns\\.net|duckdns\\\
+    .org|no-ip\\.(org|com|biz|info)|hopto\\.org|zapto\\.org|servebeer\\.com|serveftp\\.com|servehttp\\.com|servegame\\.com|sytes\\.net|myddns\\\
+    .me|dynu\\.net|afraid\\.org|changeip\\.com|freedns\\.afraid\\.org)$`)\n    )\n    $e.principal.ip = $src_ip\n    $e.target.ip = $dest_ip\n\
+    \    $e.target.port = $dest_port\n    \n  match:\n    $src_ip, $dest_ip, $dest_port over 1h\n    \n  outcome:\n    $risk_score = 50\n    $total_bytes_out\
+    \ = sum($e.network.sent_bytes)\n    $request_count = count_distinct($e.metadata.id)\n    $unique_dest_ips = count_distinct($e.target.ip)\n\
+    \    \n  condition:\n    #e >= 1\n}\n"
+  esql: |
+    FROM logs-network.proxy*, logs-network.firewall*, logs-network.ids*
+    | WHERE network.protocol == "dns" OR network.transport == "dns" OR destination.port == 53
+    | WHERE destination.domain LIKE "*.ddns.net" OR destination.domain LIKE "*.duckdns.org" OR destination.domain LIKE "*.no-ip.org" OR destination.domain LIKE "*.no-ip.com" OR destination.domain LIKE "*.no-ip.biz" OR destination.domain LIKE "*.freedns.afraid.org" OR destination.domain LIKE "*.dynu.com" OR destination.domain LIKE "*.changeip.com" OR destination.domain LIKE "*.sytes.net" OR destination.domain LIKE "*.zapto.org" OR destination.domain LIKE "*.hopto.org"
+    | STATS request_count = COUNT(*), unique_dest_ips = COUNT_DISTINCT(destination.ip), total_bytes_out = SUM(source.bytes) BY source.ip, destination.ip, destination.port
+    | WHERE request_count >= 1
+    | SORT total_bytes_out DESC
+    | KEEP source.ip, destination.ip, destination.port, request_count, unique_dest_ips, total_bytes_out
+  leql: |
+    where(source_json.destination_domain ICONTAINS "ddns" OR source_json.destination_domain ICONTAINS "dyndns" OR source_json.destination_domain ICONTAINS "no-ip" OR source_json.destination_domain ICONTAINS "freedns" OR source_json.destination_domain ICONTAINS "dynu" OR source_json.destination_domain ICONTAINS "dnsdynamic" OR source_json.destination_domain ICONTAINS "changeip" OR source_json.destination_domain ICONTAINS "afraid.org" OR source_json.destination_domain ICONTAINS "sytes.net" OR source_json.destination_domain ICONTAINS "zapto.org" OR source_json.destination_domain ICONTAINS "duckdns.org") groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    #type=firewall OR #type=ids network.protocol=*dns*
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=request_count), count(dest_ip, distinct=true, as=unique_dest_ips), sum(bytes_out, as=total_bytes_out)])
+    | request_count >= 1
+    | sort(field=total_bytes_out, order=desc, limit=10000)
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_app_id_category = "dns" or dest_port = 53
+    | filter dest_hostname ~= ".*\.(ddns\.net|duckdns\.org|no-ip\.(com|org|biz|info)|freedns\.afraid\.org|dynalias\.com|dyndns\.(org|com)|changeip\.com|zapto\.org|myftp\.biz|servebeer\.com|serveftp\.com|servegame\.com)$"
+    | comp count() as request_count, count_distinct(dest_ip) as unique_dest_ips, sum(bytes_out) as total_bytes_out by source_ip, dest_ip, dest_port
+    | filter request_count >= 1
+    | sort desc total_bytes_out
+    | fields source_ip, dest_ip, dest_port, dest_hostname, request_count, unique_dest_ips, total_bytes_out
+  lucene: |
+    network.protocol:dns AND (_exists_:dest_ip OR _exists_:destination.ip) AND (dest_domain:*.ddns.net OR dest_domain:*.duckdns.org OR dest_domain:*.no-ip.* OR dest_domain:*.hopto.org OR dest_domain:*.zapto.org OR dest_domain:*.myddns.me OR dest_domain:*.servebeer.com OR dest_domain:*.serveftp.com OR dest_domain:*.servegame.com OR dest_domain:*.sytes.net OR dest_domain:*.afraid.org OR dest_domain:*.chickenkiller.com OR dest_domain:*.crabdance.com OR dest_domain:*.ignorelist.com OR dest_domain:*.jumpingcrab.com OR dest_domain:*.loseyourip.com OR dest_domain:*.mydyndns.org OR dest_domain:*.now-dns.com OR dest_domain:*.changeip.com OR dest_domain:*.dns-cloud.net OR dest_domain:*.freeddns.org OR dest_domain:*.strangled.net OR dest_domain:*.twiddly.net OR dest_domain:*.us.to OR dest_domain:*.eu.org OR dest_domain:*.dns.navy OR dest_domain:*.dynu.net OR domain:*.ddns.net OR domain:*.duckdns.org OR domain:*.no-ip.* OR domain:*.hopto.org OR domain:*.zapto.org OR domain:*.myddns.me OR domain:*.servebeer.com OR domain:*.serveftp.com OR domain:*.servegame.com OR domain:*.sytes.net OR domain:*.afraid.org OR domain:*.chickenkiller.com OR domain:*.crabdance.com OR domain:*.ignorelist.com OR domain:*.jumpingcrab.com OR domain:*.loseyourip.com OR domain:*.mydyndns.org OR domain:*.now-dns.com OR domain:*.changeip.com OR domain:*.dns-cloud.net OR domain:*.freeddns.org OR domain:*.strangled.net OR domain:*.twiddly.net OR domain:*.us.to OR domain:*.eu.org OR domain:*.dns.navy OR domain:*.dynu.net OR query:*.ddns.net OR query:*.duckdns.org OR query:*.no-ip.* OR query:*.hopto.org OR query:*.zapto.org OR query:*.myddns.me OR query:*.servebeer.com OR query:*.serveftp.com OR query:*.servegame.com OR query:*.sytes.net OR query:*.afraid.org OR query:*.chickenkiller.com OR query:*.crabdance.com OR query:*.ignorelist.com OR query:*.jumpingcrab.com OR query:*.loseyourip.com OR query:*.mydyndns.org OR query:*.now-dns.com OR query:*.changeip.com OR query:*.dns-cloud.net OR query:*.freeddns.org OR query:*.strangled.net OR query:*.twiddly.net OR query:*.us.to OR query:*.eu.org OR query:*.dns.navy OR query:*.dynu.net)
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*network*
+    | where _raw matches "*dyndns*" OR _raw matches "*no-ip*" OR _raw matches "*ddns*" OR _raw matches "*changeip*" OR _raw matches "*duckdns*" OR _raw matches "*freedns*" OR _raw matches "*afraid.org*" OR _raw matches "*dynv6*" OR _raw matches "*spdyn*" OR _raw matches "*dynu*"
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?:port|:)[\s=](?<dest_port>\d+)" nodrop
+    | parse regex "(?:bytes_out|sent)[\s=:](?<bytes_out>\d+)" nodrop
+    | where !isNull(src_ip) and !isNull(dest_ip)
+    | if(isNull(dest_port), "0", dest_port) as dest_port
+    | if(isNull(bytes_out), "0", bytes_out) as bytes_out
+    | count as request_count, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as total_bytes by src_ip, dest_ip, dest_port
+    | where request_count >= 1
+    | sort by total_bytes desc
+    | fields src_ip, dest_ip, dest_port, request_count, unique_dests, total_bytes
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -101,7 +106,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

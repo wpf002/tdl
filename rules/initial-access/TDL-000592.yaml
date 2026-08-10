@@ -19,78 +19,113 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    (index=okta OR index=azure OR index=duo) (eventType=user.authentication.auth_via_mfa OR eventType=system.push.send_factor.deny OR Category=SignInLogs OR eventtype=authentication) (result=failure OR status=failure OR ResultType!=0 OR factor_result=DENIED OR factor_result=FAILURE)
+  spl: '(index=okta OR index=azure OR index=duo) (eventType=user.authentication.auth_via_mfa OR eventType=system.push.send_factor.deny OR Category=SignInLogs
+    OR eventtype=authentication) (result=failure OR status=failure OR ResultType!=0 OR factor_result=DENIED OR factor_result=FAILURE)
+
     | eval mfa_factor=coalesce(factor, authenticationMethod, authenticationDetails)
+
     | where (mfa_factor="pin" OR mfa_factor="device_code" OR mfa_factor="passcode" OR like(mfa_factor, "%PIN%") OR like(mfa_factor, "%passcode%"))
+
     | eval src_ip=coalesce(client.ipAddress, src, ipAddress, access_device.ip)
+
     | eval dest_user=coalesce(actor.alternateId, user, userPrincipalName, username, User)
+
     | search NOT [| inputlookup high_value_target_users.csv | fields dest_user]
+
     | bin _time span=3m
+
     | stats count by _time, src_ip, dest_user
+
     | where count >= 5
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000592 {\n  meta:\n    author = \"TDL\"\n    description = \"MFA Pin Guessing\"\n    severity = \"LOW\"\n    tactic\
-    \ = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n   \
-    \ $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: "let TimeWindow = 3m;\nlet FailureThreshold = 5;\nlet HighValueUsers = dynamic([\"admin@company.com\", \"ceo@company.com\"]);\nunion \n\
+    \    (SigninLogs\n    | where TimeGenerated > ago(1h)\n    | where ResultType != 0\n    | where AuthenticationDetails has_any (\"push\", \"\
+    pin\", \"code\", \"device\")\n    | extend SourceIP = IPAddress, DestinationUser = UserPrincipalName, MFAFactor = tostring(parse_json(AuthenticationDetails)[0].authenticationMethod)\n\
+    \    | where MFAFactor has_any (\"pin\", \"devicecode\", \"device code\")\n    | where DestinationUser !in (HighValueUsers)\n    | project\
+    \ TimeGenerated, SourceIP, DestinationUser, MFAFactor, ResultType, Location),\n    (OfficeActivity\n    | where TimeGenerated > ago(1h)\n\
+    \    | where Operation == \"UserLoginFailed\"\n    | where ExtendedProperties has_any (\"MFA\", \"pin\", \"device\")\n    | extend SourceIP\
+    \ = ClientIP, DestinationUser = UserId, MFAFactor = tostring(parse_json(ExtendedProperties))\n    | where MFAFactor has_any (\"pin\", \"devicecode\"\
+    , \"device code\")\n    | where DestinationUser !in (HighValueUsers)\n    | project TimeGenerated, SourceIP, DestinationUser, MFAFactor, Operation)\n\
+    | summarize FailureCount = count(), FailureTimes = make_list(TimeGenerated), MinTime = min(TimeGenerated), MaxTime = max(TimeGenerated) by\
+    \ SourceIP, DestinationUser\n| where FailureCount >= FailureThreshold\n| where MaxTime - MinTime <= TimeWindow\n| project SourceIP, DestinationUser,\
+    \ FailureCount, MinTime, MaxTime, TimeWindow = MaxTime - MinTime\n"
+  aql: |
+    SELECT sourceip, username, COUNT(*) AS mfa_failures
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%Duo%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%Okta%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%Azure%')
+      AND (QIDNAME(qid) ILIKE '%authentication%fail%' OR QIDNAME(qid) ILIKE '%login%fail%' OR QIDNAME(qid) ILIKE '%mfa%fail%' OR categoryname(category) ILIKE '%authentication%fail%')
+      AND ("MFA Factor" ILIKE '%pin%' OR "MFA Factor" ILIKE '%device%code%' OR "Factor" ILIKE '%pin%' OR "Factor" ILIKE '%device%code%')
+      AND username NOT IN (SELECT username FROM referencedata WHERE "ReferenceSet" = 'High_Value_Target_Users')
+    GROUP BY sourceip, username
+    HAVING mfa_failures >= 5
+    LAST 3 MINUTES
+  yara_l: |
+    rule mfa_login_failures_same_source {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects 5 MFA login failures from same external source with Pin/Device Code factor targeting non-HVT users"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.security_result.action = "BLOCK"
+        (
+          re.regex($e.security_result.summary, "(?i)(mfa.*fail|factor.*fail|pin.*fail|device.*code.*fail)") or
+          re.regex($e.metadata.description, "(?i)(mfa.*fail|factor.*fail|pin.*fail|device.*code.*fail)") or
+          re.regex($e.security_result.detection_fields["mfa_result"], "(?i)fail") or
+          re.regex($e.security_result.detection_fields["factor_type"], "(?i)(pin|device.*code)")
+        )
+        (
+          re.regex($e.security_result.detection_fields["factor_type"], "(?i)(pin|device.*code)") or
+          re.regex($e.metadata.description, "(?i)(pin|device.*code)")
+        )
+        not re.regex($e.target.user.userid, "(?i)(admin|service|hvt|executive|ceo|cfo|cto|ciso)")
+        $e.principal.ip = $source_ip
+        $e.target.user.userid = $target_user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $source_ip, $target_user over 3m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 5
+    }
+  esql: "FROM logs-okta*, logs-azure*, logs-duo*\n| WHERE @timestamp > NOW() - 3 minutes\n  AND event.outcome == \"failure\"\n  AND (event.action\
+    \ LIKE \"*mfa*\" OR event.action LIKE \"*authentication*\" OR event.category == \"authentication\")\n  AND (okta.authentication_context.credential_type\
+    \ IN (\"OTP\", \"token:software:totp\", \"DUO\", \"pin\") \n       OR azure.signinlogs.authentication_method IN (\"PhoneAppNotification\"\
+    , \"PhoneAppOTP\", \"OneWaySMS\", \"TwoWayVoiceMobile\", \"TwoWayVoiceMobileMFA\")\n       OR duo.factor IN (\"passcode\", \"sms\", \"phone\"\
+    ))\n  AND user.name NOT IN (\"admin@company.com\", \"service-account@company.com\")\n| STATS failure_count = COUNT(*) BY source.ip, user.name,\
+    \ window = BUCKET(@timestamp, 3 minutes)\n| WHERE failure_count >= 5\n| KEEP window, source.ip, user.name, failure_count\n"
+  leql: |
+    where(result=MFA_DENIED AND (source_json.factor ICONTAINS "pin" OR source_json.factor ICONTAINS "device" OR source_json.factor ICONTAINS "code") AND user NOT IN [high_value_users]) groupby(source_address, user) calculate(count)
+  crowdstrike: |
+    (#type=okta OR #type=azure OR #type=duo) (outcome.result=FAILURE OR status=failure OR result=FAILURE) (factor.type=token:software:totp OR factor.type=pin OR authenticationMethod="Device code" OR factor="passcode" OR factor="phone")
+    | NOT UserName IN ["hvt_user1", "hvt_user2"]
+    | bucket(span=3m, field=@timestamp, as=time_window)
+    | groupBy([time_window, UserName, src_ip], function=count(as=failure_count))
+    | failure_count >= 5
+    | table([time_window, UserName, src_ip, failure_count])
+  xql: |
+    dataset = okta_raw
+    | filter outcome_result = "FAILURE" and (authentication_context_authentication_provider ~= "(?i)(duo|okta)" or authentication_context_credential_provider ~= "(?i)(duo|okta)") and (debug_context_debug_data_factor ~= "(?i)(pin|device_code|devicecode)" or authentication_context_authentication_step contains "pin" or authentication_context_authentication_step contains "device")
+    | alter source_ip = coalesce(client_ip_address, actor_alternate_id, client_geographical_context_ip_address)
+    | alter username = coalesce(target_0_alternate_id, actor_alternate_id, target_0_display_name)
+    | filter username not in ("hvt_user1", "hvt_user2", "hvt_user3")
+    | bin _time span=3m
+    | comp count() as failure_count by _time, source_ip, username
+    | filter failure_count >= 5
+    | fields _time, source_ip, username, failure_count
+  lucene: |
+    (event.category:authentication OR event.type:authentication) AND (event.outcome:failure OR result:failure OR outcome:failure) AND (mfa.factor_type:("pin" OR "device_code" OR "passcode" OR "token:software:totp") OR factor_type:("pin" OR "device_code" OR "passcode" OR "token:software:totp") OR authentication.factor:("pin" OR "device_code" OR "passcode" OR "token:software:totp")) AND NOT user.name:(admin* OR svc* OR service* OR *_admin)
+  sumo: "_sourceCategory=*Okta* OR _sourceCategory=*Azure* OR _sourceCategory=*Duo*\n| json field=_raw \"eventType\" as event_type\n| json field=_raw\
+    \ \"outcome.result\" as outcome\n| json field=_raw \"actor.alternateId\" as username\n| json field=_raw \"client.ipAddress\" as src_ip\n|\
+    \ json field=_raw \"authenticationContext.credentialType\" as factor_type\n| json field=_raw \"debugContext.debugData.factor\" as factor\n\
+    | where (event_type matches \"*mfa*\" OR event_type matches \"*authentication*\" OR event_type matches \"*login*\") \n  AND (outcome = \"\
+    FAILURE\" OR outcome = \"DENIED\" OR outcome matches \"*fail*\")\n  AND (factor matches \"*pin*\" OR factor matches \"*device*code*\" OR factor_type\
+    \ matches \"*pin*\" OR factor_type matches \"*device*code*\")\n  AND !(username in (\"admin@example.com\", \"executive@example.com\"))\n|\
+    \ timeslice 3m\n| count as failures by _timeslice, src_ip, username\n| where failures >= 5\n| fields _timeslice, src_ip, username, failures\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -100,7 +135,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '5 MFA Login Failures
 

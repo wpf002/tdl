@@ -17,68 +17,58 @@ risk_score: 75
 queries:
   spl: "index=slack sourcetype=slack:events action=pref* \n| lookup slack_admins.csv user_id OUTPUT is_admin \n| where isnull(is_admin) OR is_admin=\"\
     false\"\n| table _time, user_id, user_name, action, details, src_ip\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    Slack_CL
+    | where TimeGenerated > ago(24h)
+    | where action_s matches regex "pref.*"
+    | where initiating_user_s !in (dynamic(["admin1","admin2","admin3"]))
+    | project TimeGenerated, initiating_user_s, action_s, affected_user_s, workspace_s, details_s
+  aql: |
+    SELECT eventtime, username AS source_user, "Action", sourceip, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%slack%'
+      AND "Action" MATCHES 'pref.*'
+      AND username NOT IN (SELECT username FROM reference_set WHERE name = 'Slack_Admins')
+    LAST 24 HOURS
+  yara_l: |
+    rule slack_account_manipulation_persistence {
+      meta:
+        author = "TDL"
+        description = "Detects Slack preference changes by non-admin users indicating potential account manipulation (MITRE T1098)"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1098"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.vendor_name = "Slack"
+        re.regex($e.metadata.product_event_type, `(?i)pref.*`)
+        $e.principal.user.userid = $user
+        not $e.principal.user.attribute.roles.name = "admin"
 
-    | where eventName matches regex ".+"
+      match:
+        $user over 1h
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+      outcome:
+        $risk_score = 50
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000690 {\n  meta:\n    author = \"TDL\"\n    description = \"Slack Settings Changed by Unauthorized User\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0003\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-slack.audit*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.action RLIKE \"pref.*\" \n  AND NOT user.name IN (\"slack_admin_user1\"\
+    , \"slack_admin_user2\", \"slack_admin_user3\")\n| KEEP @timestamp, user.name, event.action, source.ip, user.target.name\n"
+  leql: |
+    where(source_json.action=/^pref.*/ AND NOT(source_user IN [slack_admins_list]))
+  crowdstrike: |
+    #type=slack action=pref.* NOT (source_user IN ["slack_admin1", "slack_admin2", "slack_admin3"])
+    | table([@timestamp, source_user, action, target_user, details])
+  xql: |
+    dataset = slack_audit_logs
+    | filter action ~= "pref.*" and actor_user_id not in ("admin1", "admin2", "admin3")
+    | fields _time, actor_user_id, action, entity_type, entity_id, context_ua, context_ip_address
+  lucene: |
+    event.action:pref.* AND NOT source.user:(admin1 OR admin2 OR admin3)
+  sumo: "_sourceCategory=*Slack* \n| json field=_raw \"action\" as action\n| json field=_raw \"user.name\" as source_user\n| where action matches\
+    \ \"pref.*\"\n| where !(source_user in (\"admin1\", \"admin2\", \"admin3\"))\n| fields _messageTime, source_user, action, _sourceHost\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -88,7 +78,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Slack Event
 

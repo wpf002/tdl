@@ -23,72 +23,88 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 85
 queries:
-  spl: |
-    index=wineventlog (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13) OR (sourcetype=WinEventLog:Security EventCode=4657)
-    (TargetObject="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Security Packages*" OR TargetObject="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Authentication Packages*" OR ObjectName="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Security Packages*" OR ObjectName="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Authentication Packages*")
+  spl: 'index=wineventlog (sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13) OR (sourcetype=WinEventLog:Security EventCode=4657)
+
+    (TargetObject="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Security Packages*" OR TargetObject="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Authentication
+    Packages*" OR ObjectName="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Security Packages*" OR ObjectName="*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Authentication
+    Packages*")
+
     | table _time, ComputerName, User, EventCode, TargetObject, ObjectName, Details, NewValue, Image, ProcessId
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000710 {\n  meta:\n    author = \"TDL\"\n    description = \"LSA Security Package or Authentication Package Registered\"\
-    \n    severity = \"CRITICAL\"\n    tactic = \"TA0003\"\n    technique = \"T1556\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 4657
+    | where ObjectName has @"HKLM\SYSTEM\CurrentControlSet\Control\Lsa"
+    | where ObjectName has_any ("Security Packages", "Authentication Packages")
+    | where OperationType == "%%1904"
+    | project TimeGenerated, Computer, SubjectUserName, SubjectDomainName, ProcessName, ObjectName, ObjectValueName, NewValue = NewValueType
+  aql: "SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, \"Image\" AS process, \"TargetObject\" AS registry_key, \"Details\"\
+    \ AS registry_value\nFROM events\nWHERE (\"EventID\" = '13' OR \"EventID\" = '12')\n  AND (\"TargetObject\" ILIKE '%HKLM\\\\SYSTEM\\\\CurrentControlSet\\\
+    \\Control\\\\Lsa\\\\Security Packages%' \n       OR \"TargetObject\" ILIKE '%HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\Lsa\\\\Authentication\
+    \ Packages%')\nLAST 24 HOURS\n"
+  yara_l: |
+    rule mitre_t1556_ssp_dll_registration {
+      meta:
+        author = "TDL"
+        description = "Detects modification of LSA Security Packages or Authentication Packages registry keys used for SSP DLL persistence"
+        mitre_attack_technique = "T1556"
+        mitre_attack_tactic = "Persistence"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "REGISTRY_MODIFICATION"
+        (
+          re.regex($e.target.registry.registry_key, `(?i)HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa`) or
+          re.regex($e.target.registry.registry_key, `(?i)HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Lsa`)
+        )
+        (
+          re.regex($e.target.registry.registry_value_name, `(?i)Security Packages`) or
+          re.regex($e.target.registry.registry_value_name, `(?i)Authentication Packages`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 85
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.registry*, winlogbeat-*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (winlog.event_id == "13" OR event.code == "13" OR event.action == "modification")
+        AND (
+          TO_LOWER(registry.path) LIKE "*\\system\\currentcontrolset\\control\\lsa\\security packages*"
+          OR TO_LOWER(registry.path) LIKE "*\\system\\currentcontrolset\\control\\lsa\\authentication packages*"
+          OR TO_LOWER(winlog.event_data.TargetObject) LIKE "*\\system\\currentcontrolset\\control\\lsa\\security packages*"
+          OR TO_LOWER(winlog.event_data.TargetObject) LIKE "*\\system\\currentcontrolset\\control\\lsa\\authentication packages*"
+        )
+      )
+    | EVAL target_path = COALESCE(registry.path, winlog.event_data.TargetObject)
+    | EVAL registry_value = COALESCE(registry.data.strings, winlog.event_data.Details)
+    | KEEP @timestamp, host.name, user.name, process.name, process.executable, target_path, registry_value, event.code, winlog.event_id
+  leql: |
+    where(source_json.EventID=13 AND source_json.TargetObject ICONTAINS "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" AND (source_json.TargetObject ICONTAINS "Security Packages" OR source_json.TargetObject ICONTAINS "Authentication Packages"))
+  crowdstrike: |
+    event_simpleName=RegSetValue RegistryPath=*\SYSTEM\CurrentControlSet\Control\Lsa* (RegistryPath=*SecurityPackages* OR RegistryPath=*AuthenticationPackages*)
+    | table([@timestamp, ComputerName, UserName, RegistryPath, RegistryValueName, RegistryValueData, ContextProcessId, ImageFileName])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_REGISTRY and action_registry_key_name ~= ".*\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\Lsa.*" and (action_registry_key_name ~= ".*Security Packages.*" or action_registry_key_name ~= ".*Authentication Packages.*") and action_registry_value_name != null
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_registry_key_name, action_registry_value_name, action_registry_data
+  lucene: |
+    (event.code:(4657 OR 13) AND (registry.path:(*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Security?Packages* OR *\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Authentication?Packages*) OR winlog.event_data.TargetObject:(*\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Security?Packages* OR *\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Authentication?Packages*))) OR (auditd.data.key:*lsa* AND auditd.data.syscall:(2 OR 257) AND file.path:*/etc/pam.d/*)
+  sumo: "_sourceCategory=*Windows* OR _sourceCategory=*Sysmon* (\"13\" OR \"RegistryEvent\")\n| json field=_raw \"EventID\" as event_id\n| json\
+    \ field=_raw \"TargetObject\" as target_object\n| json field=_raw \"Details\" as details\n| json field=_raw \"Image\" as image\n| json field=_raw\
+    \ \"Computer\" as computer\n| where event_id = \"13\" \n  and (target_object matches \"*\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\Lsa\\\
+    \\Security Packages*\" \n       or target_object matches \"*\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\Lsa\\\\Authentication Packages*\"\
+    )\n| fields _messageTime, computer, image, target_object, details\n"
 pseudo_logic: HKLM\SYSTEM\CurrentControlSet\Control\Lsa Security Packages / Authentication Packages key written. Adversaries register a malicious
   SSP DLL for credential capture and persistence.
 false_positives:
@@ -108,7 +124,7 @@ references:
 - https://attack.mitre.org/techniques/T1556/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'

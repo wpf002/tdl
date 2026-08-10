@@ -17,79 +17,118 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    (index=wineventlog (sourcetype=WinEventLog:Security EventCode=4688) OR (sourcetype=WinEventLog:Microsoft-Windows-PowerShell/Operational EventCode=4104))
+  spl: '(index=wineventlog (sourcetype=WinEventLog:Security EventCode=4688) OR (sourcetype=WinEventLog:Microsoft-Windows-PowerShell/Operational
+    EventCode=4104))
+
     ((EventCode=4688 New_Process_Name="*\\powershell.exe" Process_Command_Line="*")
+
     OR (EventCode=592 Image="*\\powershell.exe" CommandLine="*")
+
     OR (EventCode=4104 ScriptBlockText="*"))
+
     | eval command_field=coalesce(Process_Command_Line, CommandLine, ScriptBlockText)
+
     | regex command_field="(?i).*\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b.*"
+
     | table _time, ComputerName, EventCode, User, command_field, ParentProcessName, New_Process_Name, Image
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("powershell.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('powershell.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000508 {\n  meta:\n    author = \"TDL\"\n    description = \"Powershell Mimikatz Commandlet Activity\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(powershell.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    union
+    (SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (592, 4688)
+    | where Process has "powershell.exe"
+    | where CommandLine matches regex @".*\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b.*"
+    | project TimeGenerated, Computer, Account, EventID, Process, CommandLine),
+    (Event
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4104
+    | where ParameterXml matches regex @".*\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b.*" or RenderedDescription matches regex @".*\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b.*"
+    | project TimeGenerated, Computer, UserName, EventID, ScriptBlockText = ParameterXml)
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "EventID", "Process Name", "Process CommandLine", "ScriptBlockText"
+    FROM events
+    WHERE (
+      ("EventID" IN ('592', '4688') AND "Process Name" ILIKE '%powershell.exe%' AND "Process CommandLine" MATCHES '.*\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b.*')
+      OR
+      ("EventID" = '4104' AND "ScriptBlockText" MATCHES '.*\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b.*')
+    )
+    LAST 24 HOURS
+  yara_l: |
+    rule mimikatz_execution_windows {
+      meta:
+        author = "TDL"
+        description = "Detects Mimikatz execution via process launch or PowerShell script block logging"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1204"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        // Process execution events (4688, 592)
+        (
+          $proc.metadata.event_type = "PROCESS_LAUNCH"
+          (
+            $proc.metadata.product_event_type = "4688" or
+            $proc.metadata.product_event_type = "592"
+          )
+          re.regex($proc.principal.process.file.full_path, `(?i)powershell\.exe$`)
+          re.regex($proc.principal.process.command_line, `(?i)\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b`)
+          $proc.principal.hostname = $host
+        )
+        or
+        // PowerShell script block execution (4104)
+        (
+          $script.metadata.event_type = "SCRIPT_RUN"
+          $script.metadata.product_event_type = "4104"
+          re.regex($script.target.process.command_line, `(?i)\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b`)
+          $script.principal.hostname = $host
+        )
 
-    | WHERE event.category == "process" AND process_name IN ("powershell.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 85
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [powershell.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (powershell.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("powershell.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(powershell.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("powershell.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $proc or $script
+    }
+  esql: "FROM logs-windows.powershell*, logs-system.security*, logs-endpoint.events.process*, winlogbeat-*\n| WHERE @timestamp > NOW() - 1 hour\n\
+    \  AND (\n    (event.code IN (\"592\", \"4688\") AND process.name == \"powershell.exe\" \n     AND process.command_line RLIKE \".*\\\\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\\\
+    \\b.*\")\n    OR\n    (event.code == \"4104\" AND powershell.file.script_block_text RLIKE \".*\\\\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\\\
+    \\b.*\")\n  )\n| KEEP @timestamp, host.name, user.name, event.code, process.name, process.command_line, powershell.file.script_block_text\n"
+  leql: |
+    where((source_json.EventID IN [592, 4688] AND process_name ICONTAINS "powershell.exe" AND process_cmd_line=/.*\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b.*/i) OR (source_json.EventID=4104 AND source_json.ScriptBlockText=/.*\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b.*/i))
+  crowdstrike: |
+    (EventCode=4688 OR EventCode=592 OR EventCode=4104)
+    | case {
+        EventCode=4688 OR EventCode=592 | FileName=*powershell.exe CommandLine=/.*\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b.*/i;
+        EventCode=4104 | ScriptBlockText=/.*\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b.*/i;
+        * | drop();
+      }
+    | table([@timestamp, ComputerName, UserName, EventCode, FileName, CommandLine, ScriptBlockText])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) and lowercase(actor_process_image_name) contains "powershell.exe" and action_process_image_command_line ~= ".*\\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\\b.*")
+       or (action_evtlog_event_id = 4104 and action_evtlog_message ~= ".*\\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\\b.*")
+    | fields _time, agent_hostname, actor_effective_username, action_evtlog_event_id, actor_process_image_name, action_process_image_command_line, action_evtlog_message
+  lucene: |
+    (event.code:(592 OR 4688) AND process.name:powershell.exe AND process.command_line:/(invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)/) OR (event.code:4104 AND winlog.event_data.ScriptBlockText:/(invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)/)
+  sumo: |
+    _sourceCategory=*Windows* (("4688" OR "592") OR "4104")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "ProcessName" as process_name_alt
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "ScriptBlockText" as script_block
+    | json field=_raw "Computer" as computer
+    | where (
+        (event_id in ("4688", "592") and (process_name matches "*powershell.exe" or process_name_alt matches "*powershell.exe") and command_line matches regex ".*\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b.*")
+        or
+        (event_id = "4104" and script_block matches regex ".*\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\b.*")
+    )
+    | fields _messageTime, computer, event_id, process_name, process_name_alt, command_line, script_block
 false_positives:
 - Security software
 - Authorized admin tools
@@ -99,7 +138,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event \nWhere the Event ID is in [592, 4688]\nWhere the Process Name is powershell.exe\nWhere Command\
   \ matches the regex \".*\\b(?:invoke-mimikatz|mimikatz|dumpcreds|dumpcerts|sekurlsa::logonpasswords|crypto::certificates|cert_system_store_local_machine)\\\

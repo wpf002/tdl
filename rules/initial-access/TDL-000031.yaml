@@ -44,68 +44,179 @@ queries:
     \ event_type=\"aws_success\"))\n| stats min(_time) as first_event max(_time) as last_event values(event_type) as event_types dc(event_type)\
     \ as event_type_count count by src_ip dest_user\n| where event_type_count >= 2\n| table first_event last_event src_ip dest_user event_types\
     \ count\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000031 {\n  meta:\n    author = \"TDL\"\n    description = \"Successful Remote Brute Force\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName =\
-    \ /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    let FailedLogins = union SigninLogs, OfficeActivity, AWSCloudTrail
+    | where TimeGenerated > ago(15m)
+    | extend SourceIP = coalesce(IPAddress, ClientIP, SourceIpAddress, column_ifexists("UserIp", ""))
+    | extend DestinationUser = coalesce(UserPrincipalName, UserId, column_ifexists("User", ""))
+    | extend IsFailure = case(
+        ResultType != "0" and isnotempty(ResultType), 1,
+        Operation == "UserLoginFailed", 1,
+        EventName == "ConsoleLogin" and ResponseElements has "Failure", 1,
+        0)
+    | where IsFailure == 1
+    | summarize FailureCount = count(), FirstFailure = min(TimeGenerated), LastFailure = max(TimeGenerated) by SourceIP, DestinationUser
+    | where FailureCount >= 10 and datetime_diff('minute', LastFailure, FirstFailure) <= 3;
+    let SuccessfulLogins = union SigninLogs, OfficeActivity, AWSCloudTrail
+    | where TimeGenerated > ago(18m)
+    | extend SourceIP = coalesce(IPAddress, ClientIP, SourceIpAddress, column_ifexists("UserIp", ""))
+    | extend DestinationUser = coalesce(UserPrincipalName, UserId, column_ifexists("User", ""))
+    | extend IsSuccess = case(
+        ResultType == "0", 1,
+        Operation == "UserLoggedIn", 1,
+        EventName == "ConsoleLogin" and ResponseElements has "Success", 1,
+        0)
+    | where IsSuccess == 1
+    | project SuccessTime = TimeGenerated, SourceIP, DestinationUser;
+    let BruteForceFollowedBySuccess = FailedLogins
+    | join kind=inner (SuccessfulLogins) on SourceIP, DestinationUser
+    | where datetime_diff('minute', SuccessTime, LastFailure) <= 15 and SuccessTime > LastFailure
+    | project SourceIP, DestinationUser, FailureCount, FirstFailure, LastFailure, SuccessTime;
+    let GuardDutyBruteForce = AWSGuardDuty
+    | where TimeGenerated > ago(15m)
+    | where Title has_any ("WinRMBruteForce", "RDPBruteForce", "SSHBruteForce")
+    | extend SourceIP = tostring(parse_json(tostring(Service.Action)).NetworkConnectionAction.RemoteIpDetails.IpAddressV4)
+    | project GDTime = TimeGenerated, SourceIP, Title;
+    let AWSConsoleSuccess = AWSCloudTrail
+    | where TimeGenerated > ago(18m)
+    | where EventName == "ConsoleLogin"
+    | extend UserType = tostring(parse_json(UserIdentityUserName).type)
+    | extend ConsoleLoginResult = tostring(parse_json(ResponseElements).ConsoleLogin)
+    | where UserType == "IAMUser" and ConsoleLoginResult == "Success"
+    | extend SourceIP = SourceIpAddress
+    | extend SourceUsername = UserIdentityUserName
+    | project ConsoleTime = TimeGenerated, SourceIP, SourceUsername;
+    let GuardDutyFollowedByConsole = GuardDutyBruteForce
+    | join kind=inner (AWSConsoleSuccess) on SourceIP
+    | where datetime_diff('minute', ConsoleTime, GDTime) <= 15 and ConsoleTime > GDTime
+    | project SourceIP, SourceUsername, GDTime, ConsoleTime, Title;
+    union BruteForceFollowedBySuccess, GuardDutyFollowedByConsole
+    | project TimeGenerated = coalesce(SuccessTime, ConsoleTime), SourceIP, User = coalesce(DestinationUser, SourceUsername), FailureCount, FirstFailure, LastFailure, SuccessTime, GDTime, ConsoleTime, Title
+  aql: |
+    SELECT FIRST(t1.eventtime) AS first_failure_time, LAST(t2.eventtime) AS success_time, t1.sourceip, t1.username AS target_user, COUNT(t1.qid) AS failure_count, t2.qid AS success_qid, QIDNAME(t2.qid) AS success_event_name, t2."eventName" AS aws_event_name, t2."responseElements.ConsoleLogin" AS console_login_result, t2."userIdentity.type" AS user_type
+    FROM events t1 JOIN events t2 ON t1.sourceip = t2.sourceip AND t1.username = t2.username
+    WHERE (t1.category IN (6003, 6004, 38750002) OR t1."eventType" IN ('Impact:EC2/WinRMBruteForce', 'UnauthorizedAccess:EC2/RDPBruteForce', 'UnauthorizedAccess:EC2/SSHBruteForce'))
+    AND (t2.category = 6002 OR (t2."eventName" = 'ConsoleLogin' AND t2."userIdentity.type" = 'IAMUser' AND t2."responseElements.ConsoleLogin" = 'Success'))
+    AND t2.eventtime BETWEEN t1.eventtime AND (t1.eventtime + 900000)
+    GROUP BY t1.sourceip, t1.username, t2.qid, t2."eventName", t2."responseElements.ConsoleLogin", t2."userIdentity.type"
+    HAVING failure_count >= 10 AND (MAX(t1.eventtime) - MIN(t1.eventtime)) <= 180000
+    LAST 24 HOURS
+  yara_l: "rule valid_accounts_brute_force_followed_by_success {\n  meta:\n    author = \"TDL\"\n    description = \"Detects brute force authentication\
+    \ attempts followed by successful login across VPN, Azure AD, Office 365, AWS GuardDuty and CloudTrail\"\n    mitre_attack_tactic = \"Initial\
+    \ Access\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"HIGH\"\n\n  events:\n    // Failed authentication events (VPN, Azure\
+    \ AD, Office 365)\n    $failed.metadata.event_type = \"USER_LOGIN\"\n    $failed.security_result.action = \"BLOCK\"\n    $failed.principal.ip\
+    \ = $source_ip\n    $failed.target.user.userid = $user\n    $failed.principal.location.country_or_region != \"\"  // External source indicator\n\
+    \    \n    // Successful authentication event (VPN, Azure AD, Office 365)\n    $success.metadata.event_type = \"USER_LOGIN\"\n    $success.security_result.action\
+    \ = \"ALLOW\"\n    $success.principal.ip = $source_ip\n    $success.target.user.userid = $user\n    $success.target.resource.name = $failed.target.resource.name\n\
+    \    \n    // GuardDuty brute force alerts\n    $gd.metadata.product_name = \"AWS GuardDuty\"\n    (\n      $gd.metadata.product_event_type\
+    \ = \"Impact:EC2/WinRMBruteForce\" or\n      $gd.metadata.product_event_type = \"UnauthorizedAccess:EC2/RDPBruteForce\" or\n      $gd.metadata.product_event_type\
+    \ = \"UnauthorizedAccess:EC2/SSHBruteForce\"\n    )\n    $gd.principal.ip = $aws_source_ip\n    \n    // AWS CloudTrail Console Login\n  \
+    \  $cloudtrail.metadata.product_name = \"AWS CloudTrail\"\n    $cloudtrail.metadata.product_event_type = \"ConsoleLogin\"\n    $cloudtrail.principal.ip\
+    \ = $aws_source_ip\n    $cloudtrail.target.user.userid = $aws_user\n    $cloudtrail.security_result.summary = \"Success\"\n    $cloudtrail.target.user.user_authentication_status\
+    \ = \"IAMUser\"\n\n  match:\n    $source_ip, $user over 18m\n    $aws_source_ip, $aws_user over 15m\n\n  outcome:\n    $risk_score = 85\n\
+    \    $source_ip\n    $user\n    $aws_source_ip\n    $aws_user\n    $failed_count = count_distinct($failed.metadata.id)\n    $gd_event_type\
+    \ = $gd.metadata.product_event_type\n\n  condition:\n    // Pattern 1: 10 failed logins within 3 minutes followed by success within 15 minutes\n\
+    \    (#failed >= 10 and $success) or\n    // Pattern 2: GuardDuty brute force alert followed by successful CloudTrail console login\n    ($gd\
+    \ and $cloudtrail)\n}\n"
+  esql: "FROM logs-aws.guardduty*, logs-azure.signinlogs*, logs-o365.audit*, logs-aws.cloudtrail*\n| WHERE @timestamp > NOW() - 18 minutes\n|\
+    \ EVAL event_type = CASE(\n    event.dataset == \"aws.guardduty\" AND event.action IN (\"Impact:EC2/WinRMBruteForce\", \"UnauthorizedAccess:EC2/RDPBruteForce\"\
+    , \"UnauthorizedAccess:EC2/SSHBruteForce\"), \"guardduty_brute\",\n    event.dataset == \"aws.cloudtrail\" AND event.action == \"ConsoleLogin\"\
+    \ AND user.type == \"IAMUser\" AND event.outcome == \"success\", \"aws_success\",\n    event.dataset == \"azure.signinlogs\" AND event.outcome\
+    \ == \"failure\", \"auth_fail\",\n    event.dataset == \"azure.signinlogs\" AND event.outcome == \"success\", \"auth_success\",\n    event.dataset\
+    \ == \"o365.audit\" AND event.outcome == \"failure\", \"auth_fail\",\n    event.dataset == \"o365.audit\" AND event.outcome == \"success\"\
+    , \"auth_success\",\n    \"other\"\n  )\n| WHERE event_type IN (\"guardduty_brute\", \"aws_success\", \"auth_fail\", \"auth_success\")\n|\
+    \ EVAL src_ip = COALESCE(source.ip, source.address)\n| EVAL dst_user = COALESCE(user.target.name, user.name)\n| STATS \n    fail_count = COUNT(*)\
+    \ WHERE event_type == \"auth_fail\",\n    success_count = COUNT(*) WHERE event_type == \"auth_success\",\n    guardduty_count = COUNT(*) WHERE\
+    \ event_type == \"guardduty_brute\",\n    aws_success_count = COUNT(*) WHERE event_type == \"aws_success\",\n    min_fail_time = MIN(@timestamp)\
+    \ WHERE event_type == \"auth_fail\",\n    max_fail_time = MAX(@timestamp) WHERE event_type == \"auth_fail\",\n    min_success_time = MIN(@timestamp)\
+    \ WHERE event_type == \"auth_success\",\n    min_guardduty_time = MIN(@timestamp) WHERE event_type == \"guardduty_brute\",\n    min_aws_success_time\
+    \ = MIN(@timestamp) WHERE event_type == \"aws_success\"\n  BY src_ip, dst_user\n| WHERE (\n    (fail_count >= 10 AND success_count >= 1 \n\
+    \     AND (max_fail_time - min_fail_time) <= 180000 \n     AND (min_success_time - max_fail_time) <= 900000)\n    OR\n    (guardduty_count\
+    \ >= 1 AND aws_success_count >= 1\n     AND (min_aws_success_time - min_guardduty_time) <= 900000)\n  )\n| KEEP src_ip, dst_user, fail_count,\
+    \ success_count, guardduty_count, aws_success_count, min_fail_time, min_success_time, min_guardduty_time, min_aws_success_time\n"
+  leql: |
+    where(log_source_name="AWS GuardDuty" AND source_json.type IN ["Impact:EC2/WinRMBruteForce", "UnauthorizedAccess:EC2/RDPBruteForce", "UnauthorizedAccess:EC2/SSHBruteForce"]) OR (log_source_name="AWS CloudTrail" AND source_json.eventName="ConsoleLogin" AND source_json.userIdentity.type="IAMUser" AND source_json.responseElements.ConsoleLogin="Success") OR (log_source_name IN ["Azure AD", "Office 365", "VPN"] AND result ICONTAINS "fail") OR (log_source_name IN ["Azure AD", "Office 365", "VPN"] AND result ICONTAINS "success") groupby(source_address, user) calculate(count)
+  crowdstrike: |
+    (#type=vpn OR #type=azuread OR #type=o365 OR event_simpleName=*Login* OR event_simpleName=*Auth*)
+    (
+      (ResultType="Failure" OR responseElements.ConsoleLogin="Failure" OR event_outcome="failure" OR ResultDescription=*fail*)
+      OR
+      (ResultType="Success" OR responseElements.ConsoleLogin="Success" OR event_outcome="success" OR ResultDescription=*success*)
+      OR
+      (event.dataset="aws.guardduty" detail.type=["Impact:EC2/WinRMBruteForce", "UnauthorizedAccess:EC2/RDPBruteForce", "UnauthorizedAccess:EC2/SSHBruteForce"])
+      OR
+      (eventName="ConsoleLogin" userIdentity.type="IAMUser")
+    )
+    | case {
+        ResultType="Failure" OR responseElements.ConsoleLogin="Failure" OR event_outcome="failure" OR ResultDescription=*fail* | event_type := "failure";
+        ResultType="Success" OR responseElements.ConsoleLogin="Success" OR event_outcome="success" OR ResultDescription=*success* | event_type := "success";
+        event.dataset="aws.guardduty" | event_type := "guardduty";
+        eventName="ConsoleLogin" userIdentity.type="IAMUser" | event_type := "aws_console";
+        * | event_type := "other";
+      }
+    | source_ip := coalesce(sourceIPAddress, IPAddress, sourceIP, srcIP, source.ip, detail.service.action.networkConnectionAction.remoteIpDetails.ipAddressV4)
+    | dest_user := coalesce(userPrincipalName, UserName, userName, user.name, userIdentity.userName, TargetUserName)
+    | dest_host := coalesce(destinationHost, destination, ComputerName, ResourceDisplayName, resources{}.id)
+    | groupBy([source_ip, dest_user, dest_host], function=([
+        collect([@timestamp, event_type, eventName, responseElements.ConsoleLogin, detail.type]),
+        min(@timestamp, as=first_seen),
+        max(@timestamp, as=last_seen)
+      ]))
+    | sort(@timestamp)
+    | failures := array:filter(_collector, {event_type="failure"})
+    | successes := array:filter(_collector, {event_type="success"})
+    | guardduty_events := array:filter(_collector, {event_type="guardduty"})
+    | aws_console := array:filter(_collector, {event_type="aws_console" AND responseElements.ConsoleLogin="Success"})
+    | failure_count := length(failures)
+    | success_count := length(successes)
+    | guardduty_count := length(guardduty_events)
+    | aws_console_count := length(aws_console)
+    | time_window_3m := (last_seen - first_seen) <= 180000
+    | time_window_15m := (last_seen - first_seen) <= 900000
+    | (
+        (failure_count >= 10 AND success_count >= 1 AND time_window_15m)
+        OR
+        (guardduty_count >= 1 AND aws_console_count >= 1 AND time_window_15m)
+      )
+    | table([source_ip, dest_user, dest_host, failure_count, success_count, guardduty_count, aws_console_count, first_seen, last_seen])
+  xql: "dataset = cloud_audit_logs\n| filter cloud_provider in (\"AWS\", \"AZURE\", \"OFFICE_365\")\n| alter \n    is_auth_failure = if(\n   \
+    \     (cloud_provider = \"AZURE\" and event_type = \"SignInLogs\" and result_status = \"failure\") or\n        (cloud_provider = \"OFFICE_365\"\
+    \ and event_type = \"UserLoginFailed\") or\n        (cloud_provider = \"AWS\" and (finding_type in (\"Impact:EC2/WinRMBruteForce\", \"UnauthorizedAccess:EC2/RDPBruteForce\"\
+    , \"UnauthorizedAccess:EC2/SSHBruteForce\") or (event_type = \"AwsApiCall\" and event_id = \"ConsoleLogin\" and responseelements_consolelogin\
+    \ = \"Failure\"))), \n        1, 0),\n    is_auth_success = if(\n        (cloud_provider = \"AZURE\" and event_type = \"SignInLogs\" and result_status\
+    \ = \"success\") or\n        (cloud_provider = \"OFFICE_365\" and event_type = \"UserLoggedIn\") or\n        (cloud_provider = \"AWS\" and\
+    \ event_id = \"ConsoleLogin\" and useridentity_type = \"IAMUser\" and responseelements_consolelogin = \"Success\"),\n        1, 0),\n    is_guardduty_bruteforce\
+    \ = if(finding_type in (\"Impact:EC2/WinRMBruteForce\", \"UnauthorizedAccess:EC2/RDPBruteForce\", \"UnauthorizedAccess:EC2/SSHBruteForce\"\
+    ), 1, 0),\n    source_ip = coalesce(src_ip, source_ip, ipaddress),\n    dest_user = coalesce(username, user_name, target_username, identity_name)\n\
+    | bin _time span = 3m\n| comp \n    sum(is_auth_failure) as failure_count,\n    min(if(is_auth_failure = 1, _time, null)) as first_failure_time,\n\
+    \    max(if(is_auth_failure = 1, _time, null)) as last_failure_time,\n    sum(is_guardduty_bruteforce) as guardduty_count\n    by _time, source_ip,\
+    \ dest_user, cloud_provider\n| filter failure_count >= 10 or guardduty_count >= 1\n| join type = inner (\n    dataset = cloud_audit_logs\n\
+    \    | filter cloud_provider in (\"AWS\", \"AZURE\", \"OFFICE_365\")\n    | alter\n        is_success = if(\n            (cloud_provider =\
+    \ \"AZURE\" and event_type = \"SignInLogs\" and result_status = \"success\") or\n            (cloud_provider = \"OFFICE_365\" and event_type\
+    \ = \"UserLoggedIn\") or\n            (cloud_provider = \"AWS\" and event_id = \"ConsoleLogin\" and useridentity_type = \"IAMUser\" and responseelements_consolelogin\
+    \ = \"Success\"),\n            1, 0),\n        source_ip = coalesce(src_ip, source_ip, ipaddress),\n        dest_user = coalesce(username,\
+    \ user_name, target_username, identity_name)\n    | filter is_success = 1\n) as success_events\n    success_events.source_ip = source_ip and\
+    \ success_events.dest_user = dest_user\n| alter time_diff_minutes = timestamp_diff(success_events._time, last_failure_time, \"MINUTE\")\n\
+    | filter time_diff_minutes >= 0 and time_diff_minutes <= 15\n| fields _time, source_ip, dest_user, cloud_provider, failure_count, guardduty_count,\
+    \ success_events._time, time_diff_minutes\n"
+  lucene: |
+    (event.type:"GuardDuty" AND event.id:("Impact:EC2/WinRMBruteForce" OR "UnauthorizedAccess:EC2/RDPBruteForce" OR "UnauthorizedAccess:EC2/SSHBruteForce")) OR (event.provider:"cloudtrail.amazonaws.com" AND event.action:"ConsoleLogin" AND userIdentity.type:"IAMUser" AND responseElements.ConsoleLogin:"Success") OR (event.category:"authentication" AND event.outcome:"failure" AND (event.provider:("AzureActiveDirectory" OR "Office365" OR "VPN") OR source.geo.location_type:"external")) OR (event.category:"authentication" AND event.outcome:"success" AND (event.provider:("AzureActiveDirectory" OR "Office365" OR "VPN") OR source.geo.location_type:"external"))
+  sumo: "(_sourceCategory=*VPN* OR _sourceCategory=*Azure* OR _sourceCategory=*Office* OR _sourceCategory=*AWS* OR _sourceCategory=*GuardDuty*\
+    \ OR _sourceCategory=*CloudTrail*)\n| json field=_raw \"eventName\" as event_name\n| json field=_raw \"eventType\" as event_type\n| json field=_raw\
+    \ \"sourceIPAddress\" as src_ip\n| json field=_raw \"userIdentity.type\" as user_type\n| json field=_raw \"userIdentity.userName\" as user_name\n\
+    | json field=_raw \"responseElements.ConsoleLogin\" as console_login\n| json field=_raw \"UserPrincipalName\" as upn\n| json field=_raw \"\
+    UserId\" as user_id\n| json field=_raw \"ResultType\" as result_type\n| json field=_raw \"Operation\" as operation\n| json field=_raw \"Status\"\
+    \ as status\n| json field=_raw \"IPAddress\" as ip_address\n| where (event_type in (\"Impact:EC2/WinRMBruteForce\", \"UnauthorizedAccess:EC2/RDPBruteForce\"\
+    , \"UnauthorizedAccess:EC2/SSHBruteForce\")) \n   OR (result_type != \"0\" AND (operation matches \"*login*\" OR operation matches \"*auth*\"\
+    ))\n   OR (status matches \"*fail*\" AND (operation matches \"*login*\" OR operation matches \"*auth*\"))\n   OR (event_name = \"ConsoleLogin\"\
+    )\n| if(isNull(src_ip), ip_address, src_ip) as source_ip\n| if(isNull(user_name), if(isNull(upn), user_id, upn), user_name) as dest_user\n\
+    | where isValidIPv4(source_ip) or isValidIPv6(source_ip)\n| sort by _messageTime asc\n| timeslice 3m\n| if(event_type in (\"Impact:EC2/WinRMBruteForce\"\
+    , \"UnauthorizedAccess:EC2/RDPBruteForce\", \"UnauthorizedAccess:EC2/SSHBruteForce\"), \"guardduty_bruteforce\", \n     if(event_name = \"\
+    ConsoleLogin\" AND user_type = \"IAMUser\" AND console_login = \"Success\", \"aws_success\",\n        if(result_type != \"0\" OR status matches\
+    \ \"*fail*\", \"auth_failure\", \"auth_success\"))) as event_category\n| where event_category in (\"guardduty_bruteforce\", \"auth_failure\"\
+    , \"auth_success\", \"aws_success\")\n| count by _timeslice, source_ip, dest_user, event_category\n| transpose row _timeslice, source_ip,\
+    \ dest_user column event_category\n| where (auth_failure >= 10 AND (auth_success >= 1 OR aws_success >= 1)) OR (guardduty_bruteforce >= 1\
+    \ AND aws_success >= 1)\n| fields source_ip, dest_user, auth_failure, auth_success, aws_success, guardduty_bruteforce\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -115,7 +226,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "10 Remote Authentication Failure events\nFrom 1 external source to the same destination\nWith the same Source IP and Destination\
   \ Username\nWithin 3 minutes\n\nFollowed By\n\n1 Successful Remote Login Event\nWith the same Source IP and Destination Username from the previous\

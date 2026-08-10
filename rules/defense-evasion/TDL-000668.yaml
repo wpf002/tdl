@@ -19,68 +19,39 @@ risk_score: 75
 queries:
   spl: "index=aws sourcetype=aws:cloudwatchlogs:guardduty eventType=\"AttackSequence:IAM/CompromisedCredentials\" \n| table _time, accountId,\
     \ region, eventType, severity, title, description, resource.accessKeyDetails.userName, resource.accessKeyDetails.userType, service.action.actionType\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000668 {\n  meta:\n    author = \"TDL\"\n    description = \"Potential Credential Compromise - GuardDuty\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1586\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where Type in ("AttackSequence:IAM/CompromisedCredentials")
+    | project TimeGenerated, Type, Title, Severity, AccountId, Region, ResourceType, Description
+  aql: "SELECT eventtime, LOGSOURCENAME(logsourceid) AS log_source, sourceip, destinationip, username, qidname(qid) AS event_name, \"Finding Type\"\
+    \ AS finding_type\nFROM events\nWHERE LOGSOURCENAME(logsourceid) ILIKE '%guardduty%' \n  AND (\"Finding Type\" = 'AttackSequence:IAM/CompromisedCredentials'\
+    \ OR qidname(qid) ILIKE '%AttackSequence:IAM/CompromisedCredentials%')\nLAST 24 HOURS\n"
+  yara_l: "rule aws_guardduty_compromised_credentials {\n  meta:\n    author = \"TDL\"\n    description = \"Detects AWS GuardDuty finding for\
+    \ compromised credentials (T1586)\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1586\"\n    severity =\
+    \ \"HIGH\"\n    \n  events:\n    $e.metadata.product_name = \"Amazon Web Services\"\n    $e.metadata.vendor_name = \"Amazon\"\n    $e.metadata.product_event_type\
+    \ = \"AttackSequence:IAM/CompromisedCredentials\"\n    $e.principal.user.userid = $user\n    \n  match:\n    $user over 1h\n    \n  outcome:\n\
+    \    $risk_score = 85\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE @timestamp > NOW() - 24 hour AND event.type IN ("AttackSequence:IAM/CompromisedCredentials")
+    | KEEP @timestamp, cloud.account.id, cloud.region, event.type, event.id, event.severity, user.name, source.ip, aws.guardduty.finding.severity, aws.guardduty.finding.id
+  leql: |
+    where(source_json.type="AttackSequence:IAM/CompromisedCredentials")
+  crowdstrike: |
+    #type=guardduty event.type="AttackSequence:IAM/CompromisedCredentials"
+    | table([@timestamp, ComputerName, event.type, account.id, region, resource.accessKeyDetails.userName, resource.accessKeyDetails.accessKeyId, service.additionalInfo, severity, description])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and event_type in ("AttackSequence:IAM/CompromisedCredentials")
+    | fields _time, cloud_provider, event_type, actor_user, resource_sub_type, raw_log
+  lucene: |
+    eventName:"AttackSequence:IAM/CompromisedCredentials" OR (source:"guardduty" AND eventType:"AttackSequence:IAM/CompromisedCredentials") OR finding.type:"AttackSequence:IAM/CompromisedCredentials"
+  sumo: |
+    _sourceCategory=*GuardDuty* OR _sourceCategory=*guardduty* OR _sourceCategory=*AWS/GuardDuty*
+    | json field=_raw "type" as event_type
+    | where event_type = "AttackSequence:IAM/CompromisedCredentials"
+    | fields _messageTime, _sourceHost, event_type, _raw
 false_positives:
 - Security software
 - Authorized admin tools
@@ -90,7 +61,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"AttackSequence:IAM/CompromisedCredentials\"]"
 triage_steps:

@@ -19,71 +19,64 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudwatchlogs:guardduty type="Policy:Kubernetes/AdminAccessToDefaultServiceAccount"
-    | table _time, account_id, region, severity, type, resource.eksClusterDetails.name, service.action.kubernetesApiCallAction.verb, service.action.kubernetesApiCallAction.requestUri, title, description
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: 'index=aws sourcetype=aws:cloudwatchlogs:guardduty type="Policy:Kubernetes/AdminAccessToDefaultServiceAccount"
 
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+    | table _time, account_id, region, severity, type, resource.eksClusterDetails.name, service.action.kubernetesApiCallAction.verb, service.action.kubernetesApiCallAction.requestUri,
+    title, description
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000349 {\n  meta:\n    author = \"TDL\"\n    description = \"Admin Access Given to Default Service Account - GuardDuty\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where Title == "Policy:Kubernetes/AdminAccessToDefaultServiceAccount"
+    | project TimeGenerated, Title, Description, Severity, AccountId, Region, ResourceType, ResourceId = Resource_KubernetesDetails_KubernetesUserDetails_Username, ServiceName = Service_ServiceName, Action = Service_Action_ActionType
+  aql: |
+    SELECT eventtime, sourceip, destinationip, username, qidname(qid), LOGSOURCENAME(logsourceid), "Finding Type" AS finding_type, "Account ID", "Resource Type"
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%GuardDuty%'
+      AND "Finding Type" = 'Policy:Kubernetes/AdminAccessToDefaultServiceAccount'
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_k8s_admin_access_default_serviceaccount {
+      meta:
+        author = "TDL"
+        description = "Detects GuardDuty finding for admin access to default Kubernetes service account"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        platform = "AWS"
+        data_source = "AWS GuardDuty"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Amazon GuardDuty"
+        $e.metadata.product_event_type = "Policy:Kubernetes/AdminAccessToDefaultServiceAccount"
+        $e.principal.cloud.environment = $environment
 
-    | WHERE eventName LIKE "%GuardDuty%"
+      match:
+        $environment over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE @timestamp > NOW() - 24 hour AND event.type == "Policy:Kubernetes/AdminAccessToDefaultServiceAccount"
+    | KEEP @timestamp, cloud.account.id, cloud.region, event.id, event.severity, aws.guardduty.service.action.kubernetes_api_call_action.remote_ip_details.ip_address_v4, aws.guardduty.resource.kubernetes_details.kubernetes_workload_details.name, aws.guardduty.resource.kubernetes_details.kubernetes_workload_details.namespace
+  leql: |
+    where(source_json.type="Policy:Kubernetes/AdminAccessToDefaultServiceAccount")
+  crowdstrike: |
+    #repo=guardduty event_type="Policy:Kubernetes/AdminAccessToDefaultServiceAccount"
+    | table([@timestamp, account_id, region, severity, resource.eksClusterDetails.name, service.action.actionType, title, description])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and raw_log_source_type = "GuardDuty" and event_type in ["Policy:Kubernetes/AdminAccessToDefaultServiceAccount"]
+    | fields _time, cloud_provider, actor_effective_username, resource_name, resource_type, event_type, severity
+  lucene: |
+    event.type:"Policy:Kubernetes/AdminAccessToDefaultServiceAccount"
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty*
+    | json field=_raw "detail.type" as event_type
+    | where event_type = "Policy:Kubernetes/AdminAccessToDefaultServiceAccount"
+    | fields _messageTime, _sourceHost, event_type, detail
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -93,7 +86,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Policy:Kubernetes/AdminAccessToDefaultServiceAccount\"]"
 suppression:

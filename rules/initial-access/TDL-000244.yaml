@@ -20,77 +20,86 @@ queries:
     \ src_ip!=192.168.0.0/16) \n    (dest_ip=10.0.0.0/8 OR dest_ip=172.16.0.0/12 OR dest_ip=192.168.0.0/16)\n    (alert.action=allowed OR alert.action=alert\
     \ OR action=allowed OR action=alert)\n| lookup pci_hosts.csv ip as dest_ip OUTPUT is_pci\n| where is_pci=\"true\" OR is_pci=1\n| table _time,\
     \ src_ip, dest_ip, alert.signature, alert.category, alert.severity, action, dest_port\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceVendor in ("Palo Alto Networks", "Cisco", "Fortinet", "Check Point", "Snort", "Suricata") or DeviceProduct has_any ("IDS", "IPS", "Firewall", "NGFW")
+    | where DeviceEventClassID has_any ("exploit", "intrusion", "attack") or Activity has_any ("exploit", "intrusion", "attack") or DeviceEventCategory in ("exploit", "intrusion-detection", "intrusion-prevention")
+    | where DeviceAction in ("allow", "alert", "allowed", "detected")
+    | where CommunicationDirection == "Inbound" or (isnotempty(SourceIP) and isnotempty(DestinationIP) and not(ipv4_is_private(SourceIP)) and ipv4_is_private(DestinationIP))
+    | join kind=inner (
+        _GetWatchlist('PCI-Hosts')
+        | project PCIHost = SearchKey
+    ) on $left.DestinationIP == $right.PCIHost
+    | project TimeGenerated, DeviceVendor, DeviceProduct, DeviceEventClassID, Activity, DeviceAction, SourceIP, DestinationIP, SourcePort, DestinationPort, Protocol, Message
+  aql: |
+    SELECT sourceip, destinationip, qidname(qid), categoryname(category), logsourceid, LOGSOURCENAME(logsourceid), COUNT(*) AS event_count
+    FROM events
+    WHERE category IN (SELECT category FROM categories WHERE high_level_category_id = 5000)
+      AND (sourceip NOT IN (SELECT * FROM network WHERE netname = 'Internal_Networks'))
+      AND (destinationip IN (SELECT * FROM network WHERE netname = 'Internal_Networks'))
+      AND (destinationip IN (SELECT * FROM assetproperty('PCI_Host')))
+      AND (creeventlist ILIKE '%allow%' OR creeventlist ILIKE '%alert%')
+    GROUP BY sourceip, destinationip, qid, category, logsourceid
     LAST 1 HOURS
+  yara_l: |
+    rule exploit_attempt_inbound_pci_host {
+      meta:
+        author = "Detection Engineer"
+        description = "T1203 - Exploitation for Client Execution - Inbound exploit attempt on PCI host"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1203"
+        severity = "HIGH"
 
-    '
-  yara_l: "rule tdl_tdl_auth_000244 {\n  meta:\n    author = \"TDL\"\n    description = \"Allowed Exploit to PCI Host\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0001\"\n    technique = \"T1203\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.security_result.category_details = "exploit"
+        $e.network.direction = "INBOUND"
+        (
+          $e.security_result.action = "ALLOW" or
+          $e.security_result.action = "ALERT"
+        )
+        $e.target.ip = $dest_ip
+        $e.target.asset.asset_id in %pci_host_list
 
-    | WHERE @timestamp > NOW() - 1 hour
+      match:
+        $dest_ip over 5m
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network.ids*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND event.category == "intrusion_detection"
+      AND event.kind == "alert"
+      AND network.direction == "inbound"
+      AND (event.action == "allow" OR event.action == "alert")
+      AND NOT CIDR_MATCH(source.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+      AND CIDR_MATCH(destination.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    | ENRICH pci_hosts ON destination.ip
+    | WHERE pci_hosts.is_pci == true
+    | KEEP @timestamp, source.ip, destination.ip, event.action, event.category, rule.name, network.protocol, destination.port
+  leql: |
+    where(log_source_name ICONTAINS "ids" OR log_source_name ICONTAINS "ips" OR log_source_name ICONTAINS "intrusion") AND (source_json.action=allow OR source_json.action=alert OR action=allow OR action=alert) AND (direction=INBOUND OR source_json.direction=inbound OR traffic_direction=INBOUND) AND (destination_asset IN pci_hosts OR destination_address IN pci_hosts OR dest_asset IN pci_hosts)
+  crowdstrike: "#type=ids_ips event_simpleName=*Exploit* direction=inbound (action=allow OR action=alert) \n| match(file=\"pci_hosts.csv\", field=DestinationIP,\
+    \ include=[DestinationIP], strict=false)\n| table([@timestamp, SourceIP, DestinationIP, action, signature, ComputerName])\n"
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter threat_category = "vulnerability" and action in (ALLOW, ALERT) and direction = INBOUND and not incidr(src_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16") and incidr(dst_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    | alter is_pci_host = dst_ip in ("192.168.1.10", "10.20.30.40")
+    | filter is_pci_host = true
+    | fields _time, src_ip, dst_ip, threat_name, action, severity, direction
+  lucene: |
+    event.category:"intrusion_detection" AND (event.action:allow OR event.action:alert) AND source.ip:(NOT 10.0.0.0/8 AND NOT 172.16.0.0/12 AND NOT 192.168.0.0/16) AND destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND tags:pci_host AND (event.kind:alert OR signature_category:exploit OR attack_technique:*exploit*)
+  sumo: |
+    _sourceCategory=*IDS* OR _sourceCategory=*IPS*
+    | where (direction="inbound" OR src_ip_geo!="internal") AND (dest_ip_class="internal" OR is_internal_dest="true")
+    | where action="allow" OR action="alert"
+    | where event_type="exploit" OR signature_category="exploit" OR attack_type="exploit"
+    | lookup pci_hosts on dest_ip = ip_address OUTPUT is_pci
+    | where is_pci="true"
+    | fields _messageTime, src_ip, dest_ip, signature, action, event_type
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -100,7 +109,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 IDS/IPS Exploit Event
 

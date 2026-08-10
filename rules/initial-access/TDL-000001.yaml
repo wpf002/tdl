@@ -19,82 +19,131 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    (index=wineventlog sourcetype=WinEventLog:Security (EventCode=528 OR EventCode=540 OR EventCode=4624)) OR (index=linux sourcetype=linux_secure "Accepted")
+  spl: '(index=wineventlog sourcetype=WinEventLog:Security (EventCode=528 OR EventCode=540 OR EventCode=4624)) OR (index=linux sourcetype=linux_secure
+    "Accepted")
+
     | eval src_ip=coalesce(Source_Network_Address, src, client_ip)
+
     | eval dest_user=coalesce(TargetUserName, user, Account_Name)
+
     | eval src_host=coalesce(Workstation_Name, Source_Network_Address, host)
-    | search (src_ip="10.*" OR src_ip="172.16.*" OR src_ip="172.17.*" OR src_ip="172.18.*" OR src_ip="172.19.*" OR src_ip="172.20.*" OR src_ip="172.21.*" OR src_ip="172.22.*" OR src_ip="172.23.*" OR src_ip="172.24.*" OR src_ip="172.25.*" OR src_ip="172.26.*" OR src_ip="172.27.*" OR src_ip="172.28.*" OR src_ip="172.29.*" OR src_ip="172.30.*" OR src_ip="172.31.*" OR src_ip="192.168.*") OR (lower(dest_user)="guest" OR lower(dest_user)="administrator")
+
+    | search (src_ip="10.*" OR src_ip="172.16.*" OR src_ip="172.17.*" OR src_ip="172.18.*" OR src_ip="172.19.*" OR src_ip="172.20.*" OR src_ip="172.21.*"
+    OR src_ip="172.22.*" OR src_ip="172.23.*" OR src_ip="172.24.*" OR src_ip="172.25.*" OR src_ip="172.26.*" OR src_ip="172.27.*" OR src_ip="172.28.*"
+    OR src_ip="172.29.*" OR src_ip="172.30.*" OR src_ip="172.31.*" OR src_ip="192.168.*") OR (lower(dest_user)="guest" OR lower(dest_user)="administrator")
+
     | lookup domain_controllers.csv host as src_host OUTPUT is_dc
+
     | lookup mail_servers.csv host as src_host OUTPUT is_mail
+
     | lookup central_auth_servers.csv host as src_host OUTPUT is_auth
+
     | lookup default_accounts.csv username as dest_user OUTPUT is_default
+
     | where (isnull(is_dc) OR is_dc!=1) AND (isnull(is_mail) OR is_mail!=1) AND (isnull(is_auth) OR is_auth!=1)
+
     | table _time, src_host, src_ip, dest_user, EventCode, ComputerName
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4624")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4624')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000001 {\n  meta:\n    author = \"TDL\"\n    description = \"Default Account Logon\"\n    severity = \"LOW\"\n  \
-    \  tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(4624)/\n  \
-    \  $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
+  kql: "let DomainControllers = dynamic([]);\nlet MailServers = dynamic([]);\nlet CentralAuthServers = dynamic([]);\nlet DefaultAccounts = dynamic([]);\n\
+    let InternalIPRanges = dynamic([\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"]);\nunion\n(SecurityEvent\n| where TimeGenerated > ago(1h)\n\
+    | where EventID in (528, 540, 4624)\n| where (ipv4_is_in_any_range(IpAddress, InternalIPRanges) \n    or TargetUserName =~ \"Guest\" \n  \
+    \  or TargetUserName =~ \"Administrator\" \n    or TargetUserName in (DefaultAccounts))\n| where Computer !in (DomainControllers)\n| where\
+    \ Computer !in (MailServers)\n| where Computer !in (CentralAuthServers)\n| project TimeGenerated, Computer, TargetUserName, IpAddress, LogonType,\
+    \ EventID),\n(Syslog\n| where TimeGenerated > ago(1h)\n| where SyslogMessage has \"Accepted\" or SyslogMessage has \"session opened\"\n| extend\
+    \ SourceIP = extract(@\"from\\s+(\\S+)\", 1, SyslogMessage)\n| extend DestinationUser = extract(@\"for\\s+(\\S+)\", 1, SyslogMessage)\n| where\
+    \ (ipv4_is_in_any_range(SourceIP, InternalIPRanges)\n    or DestinationUser =~ \"Guest\"\n    or DestinationUser =~ \"Administrator\"\n  \
+    \  or DestinationUser in (DefaultAccounts))\n| where Computer !in (DomainControllers)\n| where Computer !in (MailServers)\n| where Computer\
+    \ !in (CentralAuthServers)\n| project TimeGenerated, Computer, DestinationUser, SourceIP)\n"
+  aql: "SELECT sourceip, username, LOGSOURCENAME(logsourceid) AS host, COUNT(*) AS auth_count\nFROM events\nWHERE (\"EventID\" IN ('528', '540',\
+    \ '4624') OR categoryname(category) ILIKE '%authentication%success%')\n  AND (sourceip IN (SELECT sourceip FROM events WHERE INOFFENSE('Internal\
+    \ IP Ranges')) \n       OR username ILIKE 'guest' \n       OR username ILIKE 'administrator'\n       OR username IN (SELECT username FROM\
+    \ events WHERE INOFFENSE('Customer Default Accounts')))\n  AND logsourceid NOT IN (SELECT logsourceid FROM events WHERE INOFFENSE('Domain\
+    \ Controllers'))\n  AND logsourceid NOT IN (SELECT logsourceid FROM events WHERE INOFFENSE('Mail Servers'))\n  AND logsourceid NOT IN (SELECT\
+    \ logsourceid FROM events WHERE INOFFENSE('Central Authentication Servers'))\nGROUP BY sourceip, username, logsourceid\nLAST 1 HOURS\n"
+  yara_l: |
+    rule valid_accounts_default_login {
+      meta:
+        author = "TDL"
+        description = "Detects successful authentication using default or privileged accounts from non-authorized sources"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 day
+      events:
+        $e.metadata.event_type = "USER_LOGIN"
+        $e.security_result.action = "ALLOW"
+        (
+          $e.metadata.product_event_type = "528" or
+          $e.metadata.product_event_type = "540" or
+          $e.metadata.product_event_type = "4624"
+        )
+        (
+          net.ip_in_range_cidr($e.principal.ip, "10.0.0.0/8") or
+          net.ip_in_range_cidr($e.principal.ip, "172.16.0.0/12") or
+          net.ip_in_range_cidr($e.principal.ip, "192.168.0.0/16") or
+          re.regex($e.target.user.userid, `(?i)^(guest|administrator)$`)
+        )
+        not (
+          $e.principal.hostname = /^DC-.*/ or
+          $e.principal.hostname = /^MAIL-.*/ or
+          $e.principal.hostname = /^AUTH-.*/ or
+          $e.principal.hostname = /^CAS-.*/ or
+          $e.principal.asset.hostname = /^DC-.*/ or
+          $e.principal.asset.hostname = /^MAIL-.*/ or
+          $e.principal.asset.hostname = /^AUTH-.*/ or
+          $e.principal.asset.hostname = /^CAS-.*/
+        )
+        $e.principal.hostname = $source
+        $e.target.user.userid = $user
 
-    | WHERE event.category == "authentication" AND event_id IN ("4624")
+      match:
+        $source, $user over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
+      outcome:
+        $risk_score = 50
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4624])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4624)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4624")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4624)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4624")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*, logs-windows.security*, winlogbeat-*
+    | WHERE event.code IN ("528", "540", "4624")
+      AND event.outcome == "success"
+      AND (
+        (source.ip IS NOT NULL AND NOT CIDR_MATCH(source.ip, "0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "255.255.255.255/32"))
+        OR TO_LOWER(user.name) IN ("guest", "administrator")
+      )
+      AND host.name NOT IN ("DC01", "DC02", "DC03")
+      AND source.ip NOT IN ("10.0.0.10", "10.0.0.11")
+      AND source.ip NOT IN ("10.0.0.20", "10.0.0.21")
+    | KEEP @timestamp, host.name, source.ip, user.name, event.code, winlog.computer_name, winlog.logon.type
+  leql: |
+    where((source_json.EventID IN [528, 540, 4624] OR result=SUCCESS) AND (source_address=private() OR destination_user ICONTAINS "guest" OR destination_user ICONTAINS "administrator")) groupby(destination_user, source_address, asset) calculate(count)
+  crowdstrike: "EventCode=4624 \n(IpAddress=/^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)/ OR lower(TargetUserName) in [\"guest\", \"\
+    administrator\"])\n| ComputerName!=*DC* \n| ComputerName!=*MAIL* \n| ComputerName!=*AUTH*\n| table([@timestamp, ComputerName, IpAddress, TargetUserName,\
+    \ LogonType, WorkstationName])\n"
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (528, 540, 4624)
+    | filter incidr(action_remote_ip, "10.0.0.0/8") or incidr(action_remote_ip, "172.16.0.0/12") or incidr(action_remote_ip, "192.168.0.0/16")
+       or lowercase(action_evtlog_event_data_TargetUserName) in ("guest", "administrator")
+    | filter agent_hostname not in ("DC01", "DC02", "MAIL01", "MAIL02", "AUTH01", "AUTH02")
+    | fields _time, agent_hostname, action_remote_ip, action_evtlog_event_data_TargetUserName, action_evtlog_event_id, action_evtlog_event_data_LogonType
+  lucene: |
+    (event.code:(528 OR 540 OR 4624) OR EventID:(528 OR 540 OR 4624)) AND (source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) OR user.name:/[Gg][Uu][Ee][Ss][Tt]/ OR user.name:/[Aa][Dd][Mm][Ii][Nn][Ii][Ss][Tt][Rr][Aa][Tt][Oo][Rr]/ OR TargetUserName:/[Gg][Uu][Ee][Ss][Tt]/ OR TargetUserName:/[Aa][Dd][Mm][Ii][Nn][Ii][Ss][Tt][Rr][Aa][Tt][Oo][Rr]/) AND NOT host.name:(domain_controller_* OR mail_server_* OR auth_server_*) AND NOT source.ip:(DC_IP_RANGE OR MAIL_IP_RANGE OR AUTH_IP_RANGE)
+  sumo: |
+    _sourceCategory=*Windows*Security* ("528" OR "540" OR "4624")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "IpAddress" as src_ip
+    | json field=_raw "TargetUserName" as dest_user
+    | json field=_raw "Computer" as source_host
+    | where event_id in ("528", "540", "4624")
+    | where (src_ip matches "10.*" OR src_ip matches "172.16.*" OR src_ip matches "172.17.*" OR src_ip matches "172.18.*" OR src_ip matches "172.19.*" OR src_ip matches "172.20.*" OR src_ip matches "172.21.*" OR src_ip matches "172.22.*" OR src_ip matches "172.23.*" OR src_ip matches "172.24.*" OR src_ip matches "172.25.*" OR src_ip matches "172.26.*" OR src_ip matches "172.27.*" OR src_ip matches "172.28.*" OR src_ip matches "172.29.*" OR src_ip matches "172.30.*" OR src_ip matches "172.31.*" OR src_ip matches "192.168.*" OR toLowerCase(dest_user) = "guest" OR toLowerCase(dest_user) = "administrator")
+    | where !(source_host matches "*DC*" OR source_host matches "*DomainController*")
+    | where !(source_host matches "*Mail*" OR source_host matches "*Exchange*")
+    | where !(source_host matches "*Auth*" OR source_host matches "*LDAP*" OR source_host matches "*SSO*")
+    | fields _messageTime, source_host, src_ip, dest_user, event_id
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -104,7 +153,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows Authentication Success Event\nWhere the Event ID is in [528, 540, 4624]\nFrom an internal Source IP \nOR\n\tWhere the\
   \ Destination Username is case insensitive \"Guest\" OR \"Administrator\"\n\t\t\t\n\tWhere the Destination Username is in Customer Default Account\

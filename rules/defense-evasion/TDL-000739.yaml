@@ -16,80 +16,104 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (Image="*\\wscript.exe" OR Image="*\\cscript.exe") (CommandLine="*PubPrn.vbs*" OR CommandLine="*SyncAppvPublishingServer.vbs*") (CommandLine="*http://*" OR CommandLine="*https://*" OR CommandLine="*\\\\*")
+  spl: 'index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (Image="*\\wscript.exe" OR Image="*\\cscript.exe")
+    (CommandLine="*PubPrn.vbs*" OR CommandLine="*SyncAppvPublishingServer.vbs*") (CommandLine="*http://*" OR CommandLine="*https://*" OR CommandLine="*\\\\*")
+
     | table _time, ComputerName, User, ParentImage, Image, CommandLine
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: |
+    Event
+    | where TimeGenerated > ago(1h)
+    | where Source == "Microsoft-Windows-Sysmon" and EventID == 1
+    | where EventData has_any ("PubPrn.vbs", "SyncAppvPublishingServer.vbs")
+    | extend CommandLine = tostring(EventData)
+    | where CommandLine has_any ("PubPrn.vbs", "SyncAppvPublishingServer.vbs")
+    | where CommandLine has_any ("http://", "https://", "\\\\", "script:")
+    | extend ProcessName = extract(@"<Data Name=\"Image\">([^<]+)</Data>", 1, EventData)
+    | extend ParentProcessName = extract(@"<Data Name=\"ParentImage\">([^<]+)</Data>", 1, EventData)
+    | extend User = extract(@"<Data Name=\"User\">([^<]+)</Data>", 1, EventData)
+    | extend ComputerName = Computer
+    | project TimeGenerated, ComputerName, User, ProcessName, ParentProcessName, CommandLine
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process CommandLine", "Parent Process Name", "Image"
+    FROM events
+    WHERE ("Process CommandLine" ILIKE '%PubPrn.vbs%' OR "Process CommandLine" ILIKE '%SyncAppvPublishingServer.vbs%')
+      AND ("Process CommandLine" ILIKE '%http:%' OR "Process CommandLine" ILIKE '%https:%' OR "Process CommandLine" ILIKE '%ftp:%' OR "Process CommandLine" ILIKE '%\\\\%')
+    LAST 24 HOURS
+  yara_l: |
+    rule signed_script_proxy_execution_t1216 {
+      meta:
+        author = "TDL"
+        description = "Detects signed script proxy execution (T1216) via PubPrn.vbs or SyncAppvPublishingServer.vbs with URL or unusual arguments"
+        mitre_attack_technique = "T1216"
+        mitre_attack_tactic = "Defense Evasion"
+        severity = "HIGH"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.metadata.product_name = "Microsoft Sysmon"
+        (
+          re.regex($e.principal.process.file.full_path, `(?i)\\cscript\.exe$`) or
+          re.regex($e.principal.process.file.full_path, `(?i)\\wscript\.exe$`)
+        )
+        (
+          re.regex($e.principal.process.command_line, `(?i)PubPrn\.vbs`) or
+          re.regex($e.principal.process.command_line, `(?i)SyncAppvPublishingServer\.vbs`)
+        )
+        (
+          re.regex($e.principal.process.command_line, `(?i)https?://`) or
+          re.regex($e.principal.process.command_line, `(?i)script:`) or
+          re.regex($e.principal.process.command_line, `(?i)\\\\`)
+        )
+        $e.principal.hostname = $host
 
-    WHERE "network.protocol" LIKE ''%tcp%''
+      match:
+        $host over 5m
 
-    GROUP BY sourceip, destinationip, destinationport
+      outcome:
+        $risk_score = 75
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_de_000739 {\n  meta:\n    author = \"TDL\"\n    description = \"Signed Script (PubPrn / SyncAppvPublishingServer) Used\
-    \ as Proxy\"\n    severity = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1216\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*
+    | WHERE winlog.event_id == 1
+      AND (
+        (process.command_line LIKE "*PubPrn.vbs*" AND process.command_line LIKE "*script:http*")
+        OR (process.command_line LIKE "*SyncAppvPublishingServer.vbs*" AND process.command_line LIKE "*http*")
+        OR (process.command_line LIKE "*PubPrn.vbs*" AND process.command_line LIKE "*/n:*")
+        OR (TO_LOWER(process.command_line) LIKE "*pubprn.vbs*" AND TO_LOWER(process.command_line) RLIKE ".*https?://.*")
+        OR (TO_LOWER(process.command_line) LIKE "*syncappvpublishingserver.vbs*" AND TO_LOWER(process.command_line) RLIKE ".*https?://.*")
+      )
+      AND (process.name == "wscript.exe" OR process.name == "cscript.exe")
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.executable
+  leql: |
+    where(process_name ICONTAINS "wscript.exe" OR process_name ICONTAINS "cscript.exe") AND (process_cmd_line ICONTAINS "PubPrn.vbs" OR process_cmd_line ICONTAINS "SyncAppvPublishingServer.vbs") AND (process_cmd_line ICONTAINS "http://" OR process_cmd_line ICONTAINS "https://" OR process_cmd_line ICONTAINS "script:")
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 (FileName=wscript.exe OR FileName=cscript.exe) (CommandLine=*PubPrn.vbs* OR CommandLine=*SyncAppvPublishingServer.vbs*) (CommandLine=*http* OR CommandLine=*\\\\*)
+    | table([@timestamp, ComputerName, UserName, ParentBaseFileName, CommandLine, FileName])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter actor_process_image_name ~= "(?i)(wscript\.exe|cscript\.exe)"
+    | filter action_process_image_command_line ~= "(?i)(PubPrn\.vbs|SyncAppvPublishingServer\.vbs)"
+    | filter action_process_image_command_line ~= "(?i)(http://|https://|\\\\)"
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_command_line, action_process_image_path
+  lucene: |
+    (process.command_line:*PubPrn.vbs* OR process.command_line:*SyncAppvPublishingServer.vbs*) AND (process.command_line:*http* OR process.command_line:*\\\\*)
+  sumo: |
+    _sourceCategory=*Sysmon* "1"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "Image" as image
+    | json field=_raw "ParentImage" as parent_image
+    | json field=_raw "Computer" as computer
+    | where event_id = "1"
+    | where (command_line matches "*PubPrn.vbs*" or command_line matches "*SyncAppvPublishingServer.vbs*")
+    | where (command_line matches "*http://*" or command_line matches "*https://*" or command_line matches "*\\\\*")
+    | fields _messageTime, computer, image, parent_image, command_line
 pseudo_logic: Microsoft-signed script (PubPrn.vbs, SyncAppvPublishingServer.vbs) invoked with a URL or unusual argument. Signed-script proxy execution.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -106,7 +130,7 @@ references:
 - https://attack.mitre.org/techniques/T1216/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

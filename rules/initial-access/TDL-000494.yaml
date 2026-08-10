@@ -15,83 +15,74 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=vpn OR index=remote_access sourcetype=vpn* OR sourcetype=remote* action=success OR EventCode=4624 Logon_Type=10
+  spl: 'index=vpn OR index=remote_access sourcetype=vpn* OR sourcetype=remote* action=success OR EventCode=4624 Logon_Type=10
+
     | search NOT src_ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+
     | lookup tor_exit_nodes.csv ip AS src_ip OUTPUT is_tor
+
     | where is_tor="true"
+
     | table _time, user, src_ip, dest, action, host
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tor"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tor%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000494 {\n  meta:\n    author = \"TDL\"\n    description = \"Remote Login from TOR Exit Node\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tor/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tor%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tor/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tor*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tor"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tor*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tor*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    let TorExitNodes = externaldata(TorIP: string)
+    [@"https://raw.githubusercontent.com/SecOps-Institute/Tor-IP-Addresses/master/tor-exit-nodes.lst"] with (format="txt", ignoreFirstRecord=false);
+    let TorIPs = TorExitNodes | where isnotempty(TorIP) | distinct TorIP;
+    SigninLogs
+    | where TimeGenerated > ago(1h)
+    | where ResultType == 0
+    | where NetworkLocationDetails has "external" or IPAddress !startswith "10." and IPAddress !startswith "172.16." and IPAddress !startswith "192.168."
+    | where IPAddress in (TorIPs)
+    | project TimeGenerated, UserPrincipalName, IPAddress, Location, DeviceDetail, AppDisplayName, ResultType, ResultDescription
+  aql: |
+    SELECT username, sourceip, destinationip, LOGSOURCENAME(logsourceid) AS host, eventtime, qidname(qid) AS event_name
+    FROM events
+    WHERE (qidname(qid) ILIKE '%VPN%logon%' OR qidname(qid) ILIKE '%VPN%login%' OR qidname(qid) ILIKE '%remote%logon%' OR qidname(qid) ILIKE '%remote%login%' OR categoryname(category) ILIKE '%VPN%' OR categoryname(category) ILIKE '%Remote Access%')
+      AND (qidname(qid) ILIKE '%success%' OR qidname(qid) ILIKE '%accept%')
+      AND sourceip IN (SELECT "IP Address" FROM reference_data WHERE reference_set_name = 'Tor_Exit_Nodes')
+    LAST 24 HOURS
+  yara_l: "rule tor_exit_node_remote_login {\n  meta:\n    author = \"TDL\"\n    description = \"Detects successful remote login from Tor exit\
+    \ node IP address\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"HIGH\"\n\n  events:\n\
+    \    $login.metadata.event_type = \"USER_LOGIN\"\n    $login.security_result.action = \"ALLOW\"\n    $login.principal.ip = $source_ip\n  \
+    \  $login.target.hostname = $host\n    \n    $tor.graph.metadata.entity_type = \"IP_ADDRESS\"\n    $tor.graph.metadata.threat.category_details\
+    \ = \"Tor exit node\"\n    $tor.graph.entity.ip = $source_ip\n\n  match:\n    $source_ip, $host over 5m\n\n  outcome:\n    $risk_score = 85\n\
+    \    $source_ip_match = $source_ip\n    $target_host = $host\n    $user = $login.target.user.userid\n\n  condition:\n    $login and $tor\n\
+    }\n"
+  esql: |
+    FROM logs-network.vpn*, logs-auth.vpn*, logs-remote_access*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.outcome == "success"
+      AND (event.action LIKE "*logon*" OR event.action LIKE "*login*" OR event.action LIKE "*authentication*")
+      AND NOT CIDR_MATCH(source.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    | ENRICH tor_exit_nodes ON source.ip
+    | WHERE tor_exit_node == true
+    | KEEP @timestamp, source.ip, user.name, host.name, event.action, event.outcome, source.geo.country_name
+  leql: |
+    where(result=SUCCESS AND source_address IN tor_exit_nodes)
+  crowdstrike: "event_simpleName=UserLogon LogonType_decimal IN [10, 3] \n| match(file=\"tor-exit-nodes.csv\", field=RemoteAddressIP4, include=[RemoteAddressIP4],\
+    \ ignoreCase=true, strict=false)\n| table([@timestamp, ComputerName, UserName, RemoteAddressIP4, LogonType_decimal, event_simpleName])\n"
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_NETWORK and event_sub_type = ENUM.EVENT_SUB_TYPE_VPN_LOGIN
+    | filter action_network_connection_status = "SUCCESS" or action_remote_ip != null
+    | alter is_tor_exit = if(action_remote_ip in ("185.220.101.1", "185.220.101.2", "185.220.101.3", "185.220.101.4", "185.220.101.5", "185.220.101.6", "185.220.101.7", "185.220.101.8", "185.220.101.9", "185.220.101.10", "185.220.101.11", "185.220.101.12", "185.220.101.13", "185.220.101.14", "185.220.101.15", "185.220.101.16", "185.220.101.17", "185.220.101.18", "185.220.101.19", "185.220.101.20", "185.220.102.1", "185.220.102.2", "185.220.102.3", "185.220.102.4", "185.220.102.5", "185.220.102.6", "185.220.102.7", "185.220.102.8", "185.100.84.82", "185.100.85.61", "185.100.85.101", "199.249.230.64", "199.249.230.65", "199.249.230.66", "199.249.230.67", "199.249.230.68", "199.249.230.69", "199.249.230.70", "199.249.230.71", "199.249.230.72", "199.249.230.73", "199.249.230.74", "199.249.230.75", "199.249.230.76", "199.249.230.77", "199.249.230.78", "199.249.230.79"), "true", "false")
+    | filter is_tor_exit = "true"
+    | fields _time, agent_hostname, actor_effective_username, action_remote_ip, action_remote_port
+  lucene: |
+    event.category:authentication AND event.outcome:success AND (event.type:start OR action:*logon* OR action:*login*) AND (source.ip:* AND NOT source.ip:10.0.0.0/8 AND NOT source.ip:172.16.0.0/12 AND NOT source.ip:192.168.0.0/16) AND threat.indicator.ip.tor_exit_node:true
+  sumo: |
+    _sourceCategory=*VPN* OR _sourceCategory=*Remote* OR _sourceCategory=*VDI*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "SourceIP" as source_ip
+    | json field=_raw "UserName" as user_name
+    | json field=_raw "Status" as status
+    | json field=_raw "LogonType" as logon_type
+    | where (event_id = "4624" AND (logon_type = "10" OR logon_type = "3")) OR status matches "*success*" OR status matches "*Success*"
+    | lookup type, actor, raw, threatlevel as threat_level from https://rules.emergingthreats.net/blockrules/emerging-tor.rules on threat_intel=source_ip
+    | where !isNull(threat_level) OR source_ip in ("TOR_EXIT_NODE_IPS")
+    | fields _messageTime, user_name, source_ip, _sourceHost, event_id, status
 false_positives:
 - Authorized pen testing
 - Security research
@@ -101,7 +92,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Successful Remote Login Event \nFrom an external source\nWhere the Source IP is on the Tor Exit Node IP List"
 triage_steps:

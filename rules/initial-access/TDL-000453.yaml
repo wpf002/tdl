@@ -15,85 +15,133 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (url="*search-ms://*" OR url="*webdav*" OR url="*.search-ms*" OR url="*\\\\*@*" OR url="*@*.dav*")
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (url="*search-ms://*" OR url="*webdav*" OR url="*.search-ms*" OR url="*\\\\*@*"
+    OR url="*@*.dav*")
+
     NOT [| inputlookup admin_allowlist.csv | fields src_ip]
-    | stats count sum(bytes_out) as total_bytes_out dc(dest_port) as port_count values(dest_port) as dest_ports values(url) as urls by src_ip, dest_ip
+
+    | stats count sum(bytes_out) as total_bytes_out dc(dest_port) as port_count values(dest_port) as dest_ports values(url) as urls by src_ip,
+    dest_ip
+
     | where count >= 1
+
     | sort - total_bytes_out
+
     | dedup src_ip, dest_ip
+
     | table src_ip, dest_ip, count, total_bytes_out, port_count, dest_ports, urls
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(90d)\n| where DeviceVendor has_any (\"Palo Alto\", \"Fortinet\", \"Cisco\", \"Zscaler\"\
+    , \"Squid\", \"Proxy\")\n| where ApplicationProtocol =~ \"tcp\" or Protocol =~ \"TCP\"\n| where RequestURL has_any (\"search-ms://\", \"webdav://\"\
+    , \"\\\\\\\\\", \"//\", \"@SSL\\\\DavWWWRoot\")\n    or RequestURL matches regex @\"search-ms:.*query=.*crumb=location:\"\n    or RequestURL\
+    \ matches regex @\"(http|https)://.*\\\\.library-ms$\"\n    or RequestURL matches regex @\"(http|https)://.*\\\\.searchConnector-ms$\"\n|\
+    \ where SourceIP !in (\"10.0.0.5\", \"10.0.0.10\", \"192.168.1.100\")\n| extend dest_ip = DestinationIP, dest_port = DestinationPort, src_ip\
+    \ = SourceIP\n| summarize connection_count = count(), \n            bytes_out = sum(SentBytes), \n            dest_ports = make_set(dest_port),\n\
+    \            URLs = make_set(RequestURL)\n    by src_ip, dest_ip\n| where connection_count >= 1\n| sort by bytes_out desc\n| project src_ip,\
+    \ dest_ip, connection_count, bytes_out, dest_ports, URLs\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(bytesout) AS total_bytes, COUNT(*) AS conn_count, URL
+    FROM events
+    WHERE (URL ILIKE '%search-ms://%' OR URL ILIKE '%\\\\%webdav%' OR URL ILIKE '%@ssl\\%' OR URL ILIKE '%@SSL\\DavWWWRoot%' OR URL ILIKE '%search-ms:displayname%')
+      AND PROTOCOLID = 6
+      AND sourceip NOT IN ('10.0.0.100', '10.0.0.101', '192.168.1.50')
+    GROUP BY sourceip, destinationip, destinationport, URL
+    HAVING conn_count >= 1
+    ORDER BY total_bytes DESC
+    LAST 7 DAYS
+  yara_l: |
+    rule mitre_t1584_searchms_webdav_initial_access {
+      meta:
+        author = "TDL"
+        description = "Detects search-ms or WebDAV URL patterns consistent with T1584 initial access campaigns via forward proxy logs"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1584"
+        severity = "HIGH"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.network.ip_protocol = "TCP"
+        (
+          re.regex($e.target.url, `(?i)search-ms://`) or
+          re.regex($e.target.url, `(?i)webdav`) or
+          re.regex($e.target.url, `(?i)\\\\[^\\]+@\d+\\`) or
+          re.regex($e.target.url, `(?i)@SSL@\d+`) or
+          re.regex($e.target.url, `(?i)\\.searchConnector-ms`) or
+          re.regex($e.target.url, `(?i)/davwwwroot/`) or
+          re.regex($e.target.url, `(?i)ms-search:`) or
+          re.regex($e.security_result.detection_fields.key, `(?i)webdav`)
+        )
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dest_ip
+        $e.target.port = $dest_port
+        $e.network.sent_bytes = $bytes_out
+        not (
+          $src_ip = "10.0.0.100" or
+          $src_ip = "10.0.0.101" or
+          $src_ip = "192.168.1.100" or
+          re.regex($e.principal.hostname, `(?i)scanner`) or
+          re.regex($e.principal.hostname, `(?i)monitor`) or
+          $e.security_result.summary = "authorized_scanner"
+        )
 
-    WHERE "network.protocol" LIKE ''%tcp%''
+      match:
+        $src_ip, $dest_ip over 24h
 
-    GROUP BY sourceip, destinationip, destinationport
+      outcome:
+        $risk_score = max(75)
+        $total_bytes_out = sum($bytes_out)
+        $dest_ports = array_distinct($dest_port)
+        $suspicious_urls = array_distinct($e.target.url)
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000453 {\n  meta:\n    author = \"TDL\"\n    description = \"Search-ms and WebDAV Suspicious Indicators in URL\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1584\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-network.firewall*, logs-network.ids*, logs-network.proxy*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND network.protocol == "tcp"
+      AND (url.full LIKE "*search-ms://*" OR url.full LIKE "*search-ms:*" OR http.request.body.content LIKE "*search-ms://*" OR url.full RLIKE ".*webdav.*" OR url.path RLIKE ".*/webdav/.*" OR url.full LIKE "*\\\\*@*.davfs*" OR url.full LIKE "*\\\\*\\DavWWWRoot\\*")
+      AND NOT (source.ip IN ("10.0.0.5", "10.0.0.10", "192.168.1.100") OR tags LIKE "*admin-allowlist*" OR tags LIKE "*authorized-scanner*")
+    | EVAL bytes_out = COALESCE(network.bytes, source.bytes, 0)
+    | STATS total_connections = COUNT(*), max_bytes = MAX(bytes_out), ports = VALUES(destination.port) BY source.ip, destination.ip
+    | WHERE total_connections >= 1
+    | SORT max_bytes DESC
+    | KEEP source.ip, destination.ip, total_connections, max_bytes, ports
+  leql: |
+    where(source_json.url ICONTAINS "search-ms://" OR source_json.url ICONTAINS "webdav" OR source_json.url=/.*search-ms:.*/ OR source_json.url=/.*\/.*(\.search-ms|\.searchConnector-ms).*/) AND source_json.protocol ICONTAINS "tcp" AND NOT(source_address IN [10.0.0.100, 192.168.1.50]) groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: "#type=firewall OR #type=ids protocol=tcp (url=*search-ms://* OR url=*WebDAV* OR url=*/webdav/* OR url=*@SSL@*) \n| groupBy([src_ip,\
+    \ dest_ip, dest_port], function=[count(as=conn_count), sum(bytes_out, as=total_bytes)])\n| conn_count >= 1\n| not(src_ip in [\"10.0.0.1\"\
+    , \"10.0.0.2\", \"192.168.1.100\"])\n| sort(total_bytes, order=desc, limit=10000)\n| groupBy([src_ip, dest_ip], function=selectLast([dest_port,\
+    \ total_bytes, conn_count]))\n| table([src_ip, dest_ip, dest_port, total_bytes, conn_count])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_networking_protocol = "tcp"
+    | filter url_category_list != null and (url_category_list contains "search-ms://" or url_category_list ~= "(?i)search-ms:" or referrer_url ~= "(?i)search-ms://" or http_url ~= "(?i)search-ms://" or http_url ~= "(?i).*webdav.*" or referrer_url ~= "(?i).*webdav.*" or url_category_list ~= "(?i).*webdav.*")
+    | alter src_ip = coalesce(action_local_ip, source_ip), dest_ip = coalesce(action_remote_ip, dest_ip), dest_port = coalesce(action_remote_port, dest_port), bytes_out = coalesce(action_upload_bytes, upload_bytes, 0)
+    | filter src_ip not in ("10.0.0.1", "10.0.0.2", "192.168.1.100")
+    | comp count() as connection_count, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | filter connection_count >= 1
+    | sort desc total_bytes_out
+    | dedup src_ip, dest_ip
+    | fields src_ip, dest_ip, dest_port, connection_count, total_bytes_out
+  lucene: |
+    network.protocol:tcp AND (url:*search-ms\:* OR url:*webdav* OR url:*\@ssl\\* OR url:*\\\\*) AND NOT source.ip:(scanner_ip_1 OR scanner_ip_2 OR monitoring_agent_ip)
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*network*
+    | json field=_raw "url" as url
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "bytes_out" as bytes_out
+    | json field=_raw "protocol" as protocol
+    | where protocol matches "*tcp*"
+    | where url matches "*search-ms://*" OR url matches "*webdav*" OR url matches "*.search-ms*"
+    | where !(src_ip in ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
+    | sum(bytes_out) as total_bytes by src_ip, dest_ip, dest_port
+    | sort by total_bytes desc
+    | dedup by src_ip, dest_ip
+    | fields src_ip, dest_ip, dest_port, total_bytes
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -103,7 +151,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

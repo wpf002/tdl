@@ -15,83 +15,86 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp category IN ("malicious", "malware", "phishing", "botnet", "command and control", "c2")
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp category IN ("malicious", "malware", "phishing", "botnet", "command
+    and control", "c2")
+
     | search NOT (src_ip IN ("10.0.0.100", "10.0.0.101", "172.16.1.50") OR src_host IN ("scanner*", "monitor*", "nessus*", "qualys*"))
+
     | stats count dc(dest_ip) as unique_dests sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+
     | where count >= 1
+
     | sort - total_bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(90d)\n| where DeviceVendor has \"firewall\" or DeviceEventClassID has \"ids\"\n| where\
+    \ Protocol =~ \"tcp\"\n| where DeviceCustomString1 has_any (\"malicious\", \"malware\", \"botnet\", \"command and control\", \"C2\", \"c&c\"\
+    ) \n    or DeviceCustomString2 has_any (\"malicious\", \"malware\", \"botnet\", \"command and control\", \"C2\", \"c&c\")\n    or DeviceCustomString3\
+    \ has_any (\"malicious\", \"malware\", \"botnet\", \"command and control\", \"C2\", \"c&c\")\n    or DeviceCustomString4 has_any (\"malicious\"\
+    , \"malware\", \"botnet\", \"command and control\", \"C2\", \"c&c\")\n    or DeviceCustomString5 has_any (\"malicious\", \"malware\", \"botnet\"\
+    , \"command and control\", \"C2\", \"c&c\")\n    or DeviceCustomString6 has_any (\"malicious\", \"malware\", \"botnet\", \"command and control\"\
+    , \"C2\", \"c&c\")\n    or AdditionalExtensions has_any (\"malicious\", \"malware\", \"botnet\", \"command and control\", \"C2\", \"c&c\"\
+    )\n    or RequestURL has_any (\"malicious\", \"malware\", \"botnet\")\n    or ThreatDescription has_any (\"malicious\", \"malware\", \"botnet\"\
+    , \"command and control\", \"C2\", \"c&c\")\n    or ThreatSeverity >= 7\n| where SourceIP !in (\"10.0.0.10\", \"10.0.0.11\", \"192.168.1.100\"\
+    )\n| summarize \n    count_ = count(),\n    unique_dests = dcount(DestinationIP),\n    bytes_out = sum(SentBytes)\n    by SourceIP, DestinationIP,\
+    \ DestinationPort\n| where count_ >= 1\n| sort by bytes_out desc\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_dests, SUM(destinationbytes) AS total_bytes_out
     FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+    WHERE protocol = 6
+      AND sourceip NOT IN ('10.0.0.5', '10.0.0.6', '10.0.0.7')
+      AND (categoryname(category) ILIKE '%malicious%' OR categoryname(category) ILIKE '%suspicious%' OR categoryname(category) ILIKE '%threat%')
     GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000498 {\n  meta:\n    author = \"TDL\"\n    description = \"Web Request to Maliciously Categorized Site\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    HAVING event_count >= 1
+    ORDER BY total_bytes_out DESC
+    LAST 24 HOURS
+  yara_l: "rule malicious_site_access_c2 {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects web requests to maliciously\
+    \ categorized sites - T1078 C2\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique = \"T1078\"\n    severity\
+    \ = \"HIGH\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.ip_protocol = \"TCP\"\n    (\n      $e.security_result.category_details\
+    \ = \"malicious\" or\n      $e.security_result.category_details = \"command and control\" or\n      $e.security_result.category_details =\
+    \ \"botnet\" or\n      $e.security_result.threat_name != \"\"\n    )\n    $e.principal.ip = $src_ip\n    $e.target.ip = $dest_ip\n    $e.target.port\
+    \ = $dest_port\n    \n    not (\n      $e.principal.hostname = /authorized_scanner/ or\n      $e.principal.hostname = /monitoring_agent/ or\n\
+    \      $e.principal.asset.hostname = /authorized_scanner/ or\n      $e.principal.asset.hostname = /monitoring_agent/\n    )\n\n  match:\n\
+    \    $src_ip, $dest_ip over 1h\n\n  outcome:\n    $risk_score = max(75)\n    $unique_dests = count_distinct($dest_ip)\n    $total_bytes_out\
+    \ = sum($e.network.sent_bytes)\n    $dest_ports = array_distinct($dest_port)\n\n  condition:\n    #e >= 1\n}\n"
+  esql: |
+    FROM logs-network.firewall*, logs-network.ids*
+    | WHERE network.transport == "tcp" AND @timestamp > NOW() - 24 hour
+    | WHERE NOT (source.ip IN ("10.0.0.1", "10.0.0.2") OR tags IN ("authorized_scanner", "monitoring_agent"))
+    | STATS count = COUNT(*), unique_dests = COUNT_DISTINCT(destination.ip), total_bytes_out = SUM(network.bytes) BY source.ip, destination.ip, destination.port
+    | WHERE count >= 1
+    | SORT total_bytes_out DESC
+    | KEEP source.ip, destination.ip, destination.port, count, unique_dests, total_bytes_out
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp" AND source_json.category IN ["malicious", "malware", "phishing", "command-and-control", "botnet"] AND NOT source_address IN [authorized_scanner_ips]) groupby(source_address, destination_address, destination_port) calculate(count, unique:destination_address, sum:bytes_out)
+  crowdstrike: "#type=firewall network.protocol=*tcp* \n| dest_category=malicious OR dest_category=suspicious OR threat_category=malicious OR\
+    \ url_category=malicious\n| !in(field=src_ip, values=[10.0.0.1, 192.168.1.100])\n| groupBy([src_ip, dest_ip, dest_port], function=[count(as=count),\
+    \ count(dest_ip, distinct=true, as=unique_dests), sum(bytes_out, as=total_bytes_out)])\n| count >= 1\n| sort(field=total_bytes_out, order=desc,\
+    \ limit=10000)\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter proto = "tcp" and url_category_list contains "malware" or url_category_list contains "command-and-control" or url_category_list contains "phishing" or url_category_list contains "malicious-sites"
+    | filter src_ip not in ("10.1.1.100", "10.1.1.101")
+    | comp count() as conn_count, count_distinct(dst_ip) as unique_dests, sum(bytes_sent) as total_bytes_out by src_ip, dst_ip, dst_port
+    | filter conn_count >= 1
+    | sort desc total_bytes_out
+  lucene: |
+    (sourcetype:firewall OR sourcetype:ids) AND network.protocol:*tcp* AND url_category:(*malicious* OR *malware* OR *phishing* OR *command* OR *botnet* OR *suspicious*) AND NOT src_ip:(10.100.50.* OR 10.100.51.* OR scanner.company.com)
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*ids*
+    | json field=_raw "protocol" as network_protocol
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "bytes_out" as bytes_out
+    | json field=_raw "category" as category
+    | where network_protocol matches "*tcp*"
+    | where category matches "*malicious*" OR category matches "*malware*" OR category matches "*threat*" OR category matches "*botnet*" OR category matches "*phishing*"
+    | where !(src_ip in ("10.0.0.100", "10.0.0.101"))
+    | count as cnt, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | where cnt >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, cnt, unique_dests, total_bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -101,7 +104,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

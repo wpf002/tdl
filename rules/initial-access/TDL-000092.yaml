@@ -16,71 +16,77 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=email_security (category="Malware" OR category="Phish") action="Allow" attachment_count>0
+  spl: 'index=email_security (category="Malware" OR category="Phish") action="Allow" attachment_count>0
+
     | table _time, recipient, sender, subject, category, action, attachment_name, attachment_count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000092 {\n  meta:\n    author = \"TDL\"\n    description = \"Email Delivered Containing Malicious Attachment\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1566\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    EmailEvents
+    | where TimeGenerated > ago(24h)
+    | where ThreatTypes has_any ("Malware", "Phish")
+    | where AttachmentCount > 0
+    | where DeliveryAction == "Delivered"
+    | project TimeGenerated, RecipientEmailAddress, SenderFromAddress, Subject, ThreatTypes, AttachmentCount, FileName = tostring(parse_json(AttachmentExtensions)), DeliveryAction, NetworkMessageId
+  aql: |
+    SELECT sourceip, destinationip, username, "Email Subject", "Attachment Name", "Email Action", "Email Label", eventtime, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE (categoryname(category) ILIKE '%email%' OR categoryname(category) ILIKE '%mail%')
+      AND ("Email Label" ILIKE '%Malware%' OR "Email Label" ILIKE '%Phish%')
+      AND "Attachment Name" IS NOT NULL
+      AND ("Email Action" ILIKE '%Allow%' OR "Email Action" ILIKE '%Delivered%')
+    LAST 24 HOURS
+  yara_l: |
+    rule phishing_or_malware_email_with_attachment_allowed {
+      meta:
+        author = "TDL"
+        description = "Detects emails labeled as malware or phish with attachments that were allowed through email security"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1566"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "EMAIL_TRANSACTION"
+        (
+          $e.security_result.summary = "Malware" or
+          $e.security_result.summary = "Phish"
+        )
+        $e.security_result.action = "ALLOW"
+        $e.network.email.num_attachments > 0
+        $e.principal.user.email_addresses = $recipient
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $recipient over 1h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-o365.audit*, logs-google_workspace.alert*, logs-email*\n| WHERE @timestamp > NOW() - 24 hours\n  AND (\n    (TO_LOWER(event.category)\
+    \ == \"email\" OR TO_LOWER(event.type) == \"delivery\")\n    AND (\n      TO_LOWER(email.direction) == \"inbound\" OR TO_LOWER(email.delivery_action)\
+    \ == \"allow\" OR TO_LOWER(event.action) == \"allow\"\n    )\n    AND (\n      TO_LOWER(threat.indicator.type) LIKE \"*malware*\" \n     \
+    \ OR TO_LOWER(threat.indicator.type) LIKE \"*phish*\"\n      OR TO_LOWER(email.subject) LIKE \"*malware*\"\n      OR TO_LOWER(email.subject)\
+    \ LIKE \"*phish*\"\n      OR TO_LOWER(rule.name) LIKE \"*malware*\"\n      OR TO_LOWER(rule.name) LIKE \"*phish*\"\n    )\n    AND email.attachments.file.name\
+    \ IS NOT NULL\n  )\n| KEEP @timestamp, host.name, user.name, email.from.address, email.to.address, email.subject, email.attachments.file.name,\
+    \ email.delivery_action, threat.indicator.type, rule.name\n"
+  leql: |
+    where(log_set="Email Security" AND (category="Malware" OR category="Phish") AND attachment_present=true AND action="Allow")
+  crowdstrike: |
+    #type=email_security (label=Malware OR label=Phish) attachment=* action=Allow
+    | table([@timestamp, recipient, sender, subject, label, attachment, action])
+  xql: |
+    dataset = email_security_events
+    | filter (email_classification = "Malware" or email_classification = "Phish")
+      and attachment_count > 0
+      and action = "Allow"
+    | fields _time, recipient_email, sender_email, subject, email_classification, attachment_names, attachment_count
+  lucene: |
+    event.category:email AND (email.threat.classification:(Malware OR Phish) OR email.label:(Malware OR Phish) OR threat.category:(malware OR phishing)) AND email.attachments.file.name:* AND (email.action:allow OR email.delivery.action:allow OR action:allow)
+  sumo: |
+    _sourceCategory=*Email* OR _sourceCategory=*Mail* OR _sourceCategory=*email*
+    | where (label matches "*Malware*" OR label matches "*Phish*" OR classification matches "*Malware*" OR classification matches "*Phish*" OR verdict matches "*Malware*" OR verdict matches "*Phish*")
+    | where (attachment_count > 0 OR has_attachment = "true" OR attachments matches "*")
+    | where (action = "Allow" OR action = "Delivered" OR action = "allow" OR action = "delivered")
+    | fields _messageTime, _sourceHost, recipient, sender, subject, attachment_count, attachments, label, classification, verdict, action
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -90,7 +96,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Email Security Event\nWhere the Email is labeled as \"Malware\" OR \"Phish\"\nWhere the email has an attachment \nWhere the Action\
   \ is Allow"

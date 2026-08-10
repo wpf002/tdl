@@ -31,77 +31,91 @@ queries:
     \ Destination_Network_Address)\n    | eval dest_port=coalesce(dest_port, DestinationPort, Destination_Port)\n    | where dest_port >= 1024\n\
     \    | stats earliest(_time) as tcp_time by src_ip, dest_ip, dest_port\n]\n| where tcp_time > udp_time AND tcp_time <= (udp_time + 120)\n\
     | table udp_time, tcp_time, src_ip, dest_ip, udp_count, dest_port\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_per_000715 {\n  meta:\n    author = \"TDL\"\n    description = \"Inbound Connection Following Unusual UDP Knock Sequence\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0003\"\n    technique = \"T1205\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: "let knockWindow = 5m;\nlet knockThreshold = 3;\nlet udpKnocks = materialize(\n    CommonSecurityLog\n    | where TimeGenerated > ago(10m)\n\
+    \    | where DeviceVendor has_any (\"Palo Alto\", \"Fortinet\", \"Check Point\", \"Cisco\") or DeviceProduct has_any (\"ASA\", \"Firewall\"\
+    )\n    | where Protocol == \"UDP\" and DeviceAction in (\"deny\", \"drop\", \"blocked\", \"reject\")\n    | where DestinationPort between\
+    \ (1 .. 65535)\n    | where ApplicationProtocol == \"\" or isempty(ApplicationProtocol)\n    | extend PacketSize = coalesce(SentBytes, ReceivedBytes,\
+    \ toint(0))\n    | where PacketSize <= 100\n    | summarize KnockTimes = make_list(TimeGenerated), KnockPorts = make_list(DestinationPort),\
+    \ KnockCount = count() \n        by SourceIP, DestinationIP, bin(TimeGenerated, knockWindow)\n    | where KnockCount >= knockThreshold\n \
+    \   | extend FirstKnock = KnockTimes[0], LastKnock = KnockTimes[array_length(KnockTimes)-1]\n);\nCommonSecurityLog\n| where TimeGenerated\
+    \ > ago(10m)\n| where Protocol == \"TCP\" and DeviceAction in (\"allow\", \"accept\", \"permitted\")\n| where DestinationPort >= 1024\n| extend\
+    \ ConnectionTime = TimeGenerated\n| join kind=inner (\n    udpKnocks\n) on SourceIP, DestinationIP\n| where ConnectionTime between (LastKnock\
+    \ .. (LastKnock + knockWindow))\n| project TimeGenerated = ConnectionTime, SourceIP, DestinationIP, DestinationPort, KnockCount, KnockPorts,\
+    \ \n    KnockSequenceStart = FirstKnock, KnockSequenceEnd = LastKnock, TimeBetweenKnockAndConnection = ConnectionTime - LastKnock,\n    DeviceVendor,\
+    \ DeviceProduct, DeviceName\n| sort by TimeGenerated desc\n"
+  aql: "SELECT sourceip, destinationip, MIN(starttime) AS first_udp_time, MAX(starttime) AS last_activity_time, COUNT(*) AS total_events\nFROM\
+    \ flows\nWHERE (protocol = '17' AND destinationport NOT IN (SELECT destinationport FROM flows WHERE protocol = '17' AND flowtype = 'accepted')\
+    \ AND bytes < 100)\n   OR (protocol = '6' AND destinationport > 1024)\nGROUP BY sourceip, destinationip\nHAVING COUNT(CASE WHEN protocol =\
+    \ '17' THEN 1 END) >= 3 \n   AND COUNT(CASE WHEN protocol = '6' THEN 1 END) >= 1\n   AND MAX(CASE WHEN protocol = '6' THEN starttime END)\
+    \ - MIN(CASE WHEN protocol = '17' THEN starttime END) BETWEEN 0 AND 300000\nLAST 1 HOURS\n"
+  yara_l: "rule port_knocking_sequence {\n  meta:\n    author = \"TDL\"\n    description = \"Detects port knocking sequence: UDP packets to closed\
+    \ ports followed by TCP connection to high port\"\n    mitre_attack_tactic = \"Persistence\"\n    mitre_attack_technique = \"T1205\"\n   \
+    \ severity = \"HIGH\"\n\n  events:\n    $udp.metadata.event_type = \"NETWORK_CONNECTION\"\n    $udp.network.ip_protocol = \"UDP\"\n    $udp.target.port\
+    \ < 1024\n    $udp.security_result.action = \"BLOCK\" or $udp.security_result.summary = \"closed\" or $udp.security_result.summary = \"denied\"\
+    \n    $udp.principal.ip = $src_ip\n    $udp.target.ip = $dst_ip\n\n    $tcp.metadata.event_type = \"NETWORK_CONNECTION\"\n    $tcp.network.ip_protocol\
+    \ = \"TCP\"\n    $tcp.target.port >= 1024\n    $tcp.security_result.action = \"ALLOW\" or $tcp.security_result.action != \"BLOCK\"\n    $tcp.principal.ip\
+    \ = $src_ip\n    $tcp.target.ip = $dst_ip\n    \n    $udp.metadata.event_timestamp.seconds <= $tcp.metadata.event_timestamp.seconds\n\n  match:\n\
+    \    $src_ip, $dst_ip over 2m\n\n  outcome:\n    $risk_score = max(75)\n    $udp_count = count_distinct($udp.target.port)\n    $tcp_port =\
+    \ $tcp.target.port\n    $source_ip = $src_ip\n    $destination_ip = $dst_ip\n\n  condition:\n    #udp >= 3 and #tcp >= 1 and $udp.metadata.event_timestamp.seconds\
+    \ + 60 >= $tcp.metadata.event_timestamp.seconds\n}\n"
+  esql: |
+    FROM logs-network.traffic*, packetbeat-*, logs-zeek.conn*
+    | WHERE @timestamp > NOW() - 5 minutes
+      AND network.transport == "udp"
+      AND destination.port < 1024
+      AND network.bytes < 100
+    | STATS udp_knocks = COUNT(*) BY source.ip, destination.ip, knock_window = BUCKET(@timestamp, 30 seconds)
+    | WHERE udp_knocks >= 3
+    | EVAL sequence_key = CONCAT(source.ip, "-", destination.ip, "-", TO_STRING(knock_window))
+    | JOIN (
+        FROM logs-network.traffic*, packetbeat-*, logs-zeek.conn*
+        | WHERE @timestamp > NOW() - 5 minutes
+          AND network.transport == "tcp"
+          AND destination.port >= 1024
+          AND event.action IN ("connection_attempted", "flow_started", "network_connection")
+        | EVAL sequence_key = CONCAT(source.ip, "-", destination.ip, "-", TO_STRING(BUCKET(@timestamp, 30 seconds)))
+      ) ON sequence_key
+    | KEEP @timestamp, source.ip, destination.ip, destination.port, udp_knocks
+  leql: |
+    where(protocol=UDP AND destination_port NOT IN [53, 123, 161, 514, 520, 1900] AND bytes < 100) groupby(source_address, destination_address) calculate(count)
+  crowdstrike: |
+    (event_simpleName=NetworkConnectIP4 OR event_simpleName=NetworkReceiveAcceptIP4)
+    | case {
+        Protocol=17 | ContextBaseFileName=*;
+        Protocol=6 | ContextBaseFileName=*;
+        * | ContextBaseFileName=*;
+      }
+    | selfJoinFilter([RemoteAddressIP4], where=[{Protocol=17}, {Protocol=6}], window=60s)
+    | groupBy([RemoteAddressIP4, ComputerName], function=[
+        count(Protocol, as=udp_count, where=Protocol=17),
+        count(Protocol, as=tcp_count, where=Protocol=6),
+        min(@timestamp, as=first_udp, where=Protocol=17),
+        min(@timestamp, as=first_tcp, where=Protocol=6)
+      ])
+    | udp_count >= 3 AND tcp_count >= 1
+    | first_tcp > first_udp
+    | table([@timestamp, RemoteAddressIP4, ComputerName, udp_count, tcp_count, first_udp, first_tcp])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter protocol = "udp" and action = "deny" and bytes_sent < 100
+    | bin _time span=60s
+    | comp count() as udp_knocks, collect_set(dest_port) as knock_ports by _time, source_ip, dest_ip
+    | filter udp_knocks >= 3
+    | join type=inner (dataset = panw_ngfw_traffic_raw | filter protocol = "tcp" and action = "allow" and dest_port > 1024 | alter tcp_time = _time | fields tcp_time, source_ip as tcp_src, dest_ip as tcp_dst, dest_port as tcp_port) as tcp_conn (source_ip = tcp_src and dest_ip = tcp_dst and tcp_time > _time and tcp_time <= to_epoch(_time, "millis") + 120000)
+    | fields _time, source_ip, dest_ip, udp_knocks, knock_ports, tcp_conn.tcp_time, tcp_conn.tcp_port
+  lucene: |
+    (event.type:connection AND network.transport:udp AND destination.port:(<1024 OR >49152) AND network.bytes:<100) OR (event.type:connection AND network.transport:tcp AND destination.port:[49152 TO 65535])
+  sumo: "_sourceCategory=*Firewall* OR _sourceCategory=*IDS* OR _sourceCategory=*Network*\n| parse regex \"(?<src_ip>\\d{1,3}\\.\\d{1,3}\\.\\\
+    d{1,3}\\.\\d{1,3}).*(?<dest_ip>\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}).*(?<dest_port>\\d+).*(?<protocol>\\w+)\" nodrop\n| parse regex \"\
+    (?i)port.*(?<port>\\d+)\" nodrop\n| parse regex \"(?i)udp|tcp\" as protocol nodrop\n| where (protocol matches \"*UDP*\" or protocol matches\
+    \ \"*TCP*\") and (dest_port != \"\" or port != \"\")\n| if(isBlank(dest_port), port, dest_port) as dst_port\n| where protocol matches \"*UDP*\"\
+    \ or protocol matches \"*TCP*\"\n| timeslice 60s\n| if(protocol matches \"*UDP*\", 1, 0) as is_udp\n| if(protocol matches \"*TCP*\", 1, 0)\
+    \ as is_tcp\n| where (is_udp = 1 and num(dst_port) < 1024) or (is_tcp = 1 and num(dst_port) > 1024)\n| sort by _messageTime asc\n| fields\
+    \ _messageTime, src_ip, dest_ip, dst_port, protocol\n| where [subquery: \n    _sourceCategory=*Firewall* OR _sourceCategory=*IDS* OR _sourceCategory=*Network*\n\
+    \    | parse regex \"(?<src_ip>\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}).*(?<protocol>\\w+)\"\n    | where protocol matches \"*UDP*\"\n \
+    \   | timeslice 10s\n    | count as udp_count by _timeslice, src_ip\n    | where udp_count >= 3\n  ]\n| transaction on src_ip with \"protocol\
+    \ matches '*UDP*' and num(dst_port) < 1024\" followed by \"protocol matches '*TCP*' and num(dst_port) > 1024\" within 60s\n| count by src_ip,\
+    \ dest_ip\n"
 pseudo_logic: Sequence of small UDP packets to closed ports immediately followed by a TCP connection from the same source to a high port. Classic
   port-knock backdoor activation.
 false_positives:
@@ -120,7 +134,7 @@ references:
 - https://attack.mitre.org/techniques/T1205/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'

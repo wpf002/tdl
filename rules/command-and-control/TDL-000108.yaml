@@ -16,71 +16,65 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=o365 sourcetype="o365:management:activity" Workload="SecurityComplianceCenter" Operation="AlertTriggered" Name="Activity from anonymous IP addresses"
+  spl: 'index=o365 sourcetype="o365:management:activity" Workload="SecurityComplianceCenter" Operation="AlertTriggered" Name="Activity from anonymous
+    IP addresses"
+
     | table _time, UserId, ClientIP, Operation, Name, Data
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "AlertTriggered"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%AlertTriggered%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000108 {\n  meta:\n    author = \"TDL\"\n    description = \"Activity From Anonymous Proxy IP Detected\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0011\"\n    technique = \"T1090\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /AlertTriggered/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    CloudAppEvents
+    | where TimeGenerated > ago(1h)
+    | where ActionType == "AlertTriggered"
+    | where RawEventData.Name =~ "Activity from anonymous IP addresses"
+    | project TimeGenerated, AccountObjectId, AccountDisplayName, Application, IPAddress, RawEventData
+  aql: |
+    SELECT eventtime, username, sourceip, destinationip, "Operation", "Alert Name", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "Operation" = 'AlertTriggered'
+      AND "Alert Name" = 'Activity from anonymous IP addresses'
+    LAST 24 HOURS
+  yara_l: |
+    rule o365_atp_anonymous_ip_activity {
+      meta:
+        author = "TDL"
+        description = "Detects Microsoft Cloud App Security alerts for activity from anonymous IP addresses - T1090"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1090"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Microsoft Cloud App Security"
+        $e.metadata.event_type = "GENERIC_EVENT"
+        $e.metadata.product_event_type = "AlertTriggered"
+        $e.security_result.summary = "Activity from anonymous IP addresses"
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%AlertTriggered%"
+      match:
+        $user over 1h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/AlertTriggered/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*AlertTriggered*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "AlertTriggered"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*AlertTriggered*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*AlertTriggered*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-o365*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.action == \"AlertTriggered\" \n  AND o365.audit.Name == \"Activity\
+    \ from anonymous IP addresses\"\n| KEEP @timestamp, user.name, source.ip, host.name, event.action, o365.audit.Name, o365.audit.AlertEntityId,\
+    \ o365.audit.AlertId\n"
+  leql: |
+    where(source_json.Operation="AlertTriggered" AND source_json.Name="Activity from anonymous IP addresses")
+  crowdstrike: |
+    #type=O365 Operation="AlertTriggered" Name="Activity from anonymous IP addresses"
+    | table([@timestamp, UserId, ClientIP, Operation, Name, AlertType, Severity])
+  xql: |
+    dataset = msft_cloud_app_security_raw
+    | filter operation = "AlertTriggered" and alert_name = "Activity from anonymous IP addresses"
+    | fields _time, user, operation, alert_name, alert_severity, ip_address, application
+  lucene: |
+    Operation:"AlertTriggered" AND alert_name:"Activity from anonymous IP addresses"
+  sumo: |
+    _sourceCategory=*O365* OR _sourceCategory=*CloudApp* OR _sourceCategory=*ATP*
+    | json field=_raw "Operation" as operation
+    | json field=_raw "AlertName" as alert_name, "Name" as name
+    | where operation = "AlertTriggered" and (alert_name = "Activity from anonymous IP addresses" or name = "Activity from anonymous IP addresses")
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -90,7 +84,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Microsoft Cloud App Security Event
 

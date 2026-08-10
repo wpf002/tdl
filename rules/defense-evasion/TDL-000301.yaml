@@ -17,71 +17,82 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=google_workspace sourcetype=gsuite:reports:admin events.name="CHANGE_APPLICATION_SETTING" events.parameters{}.oldValue="*allowed*false*" events.parameters{}.newValue="*allowed*true*"
+  spl: 'index=google_workspace sourcetype=gsuite:reports:admin events.name="CHANGE_APPLICATION_SETTING" events.parameters{}.oldValue="*allowed*false*"
+    events.parameters{}.newValue="*allowed*true*"
+
     | table _time, actor.email, events.name, events.parameters{}.oldValue, events.parameters{}.newValue, events.parameters{}.settingName
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000301 {\n  meta:\n    author = \"TDL\"\n    description = \"Google Workspace Application Removed from Blocklist\"\n\
-    \    severity = \"LOW\"\n    tactic = \"TA0005\"\n    technique = \"T1562\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    GWorkspaceActivityReports
+    | where TimeGenerated > ago(1h)
+    | where RecordType == "admin"
+    | where Operation == "CHANGE_APPLICATION_SETTING"
+    | extend OldValue = tostring(parse_json(tostring(AdditionalDetails)).OLD_VALUE)
+    | extend NewValue = tostring(parse_json(tostring(AdditionalDetails)).NEW_VALUE)
+    | where OldValue contains "allowed" and OldValue contains "false"
+    | where NewValue contains "allowed" and NewValue contains "true"
+    | project TimeGenerated, ActorIpAddress, UserId, Operation, OldValue, NewValue, RecordType
+  aql: |
+    SELECT eventtime, username, sourceip, "OLD_VALUE", "NEW_VALUE", "events.name", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "events.name" = 'CHANGE_APPLICATION_SETTING'
+      AND "OLD_VALUE" ILIKE '%allowed%' AND "OLD_VALUE" ILIKE '%false%'
+      AND "NEW_VALUE" ILIKE '%allowed%' AND "NEW_VALUE" ILIKE '%true%'
+    LAST 24 HOURS
+  yara_l: |
+    rule gworkspace_app_setting_allow_change {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects Google Workspace application setting changes from disallowed to allowed - T1562 Defense Evasion"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1562"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.vendor_name = "Google"
+        $e.metadata.product_name = "Google Workspace"
+        $e.metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT"
+        $e.metadata.product_event_type = "CHANGE_APPLICATION_SETTING"
+        re.regex($e.security_result.detection_fields["OLD_VALUE"], `(?i)allowed.*false`)
+        re.regex($e.security_result.detection_fields["NEW_VALUE"], `(?i)allowed.*true`)
+        $e.principal.user.userid = $user
+        $e.target.hostname = $org
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user, $org over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-google_workspace*
+    | WHERE event.action == "CHANGE_APPLICATION_SETTING"
+      AND TO_LOWER(google_workspace.admin.old_value) LIKE "*allowed*" AND TO_LOWER(google_workspace.admin.old_value) LIKE "*false*"
+      AND TO_LOWER(google_workspace.admin.new_value) LIKE "*allowed*" AND TO_LOWER(google_workspace.admin.new_value) LIKE "*true*"
+    | KEEP @timestamp, user.email, event.action, google_workspace.admin.setting.name, google_workspace.admin.old_value, google_workspace.admin.new_value, google_workspace.organization.domain
+  leql: |
+    where(source_json.events.name="CHANGE_APPLICATION_SETTING" AND source_json.OLD_VALUE ICONTAINS "allowed" AND source_json.OLD_VALUE ICONTAINS "false" AND source_json.NEW_VALUE ICONTAINS "allowed" AND source_json.NEW_VALUE ICONTAINS "true")
+  crowdstrike: |
+    #event_platform=GoogleWorkspace events.name="CHANGE_APPLICATION_SETTING" OLD_VALUE=*allowed* OLD_VALUE=*false* NEW_VALUE=*allowed* NEW_VALUE=*true*
+    | table([@timestamp, actor.email, events.name, OLD_VALUE, NEW_VALUE, ip_address])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Google" and event_type = "CHANGE_APPLICATION_SETTING"
+    | filter lowercase(OLD_VALUE) contains "allowed" and lowercase(OLD_VALUE) contains "false"
+    | filter lowercase(NEW_VALUE) contains "allowed" and lowercase(NEW_VALUE) contains "true"
+    | fields _time, actor_user, target_resource, OLD_VALUE, NEW_VALUE, event_type
+  lucene: |
+    events.name:"CHANGE_APPLICATION_SETTING" AND OLD_VALUE:(*allowed* AND *false*) AND NEW_VALUE:(*allowed* AND *true*)
+  sumo: |
+    _sourceCategory=*Google*Workspace* "CHANGE_APPLICATION_SETTING"
+    | json field=_raw "events[*].name" as event_name
+    | json field=_raw "events[*].parameters[*].name" as param_name
+    | json field=_raw "events[*].parameters[*].value" as param_value
+    | json field=_raw "events[*].parameters[*].multiValue" as multi_value
+    | where event_name = "CHANGE_APPLICATION_SETTING"
+    | where (param_name = "OLD_VALUE" and param_value matches "*allowed*" and param_value matches "*false*") or (param_name = "NEW_VALUE" and param_value matches "*allowed*" and param_value matches "*true*")
+    | fields _messageTime, _sourceHost, event_name, param_name, param_value
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +102,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Google Workspace Event
 

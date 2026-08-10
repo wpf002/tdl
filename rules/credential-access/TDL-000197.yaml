@@ -15,73 +15,66 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=okta eventType="application.lifecycle.delete"
+  spl: 'index=okta eventType="application.lifecycle.delete"
+
     | bin _time span=10m
+
     | stats dc(app) as unique_apps count by _time, src_ip, user
+
     | where unique_apps >= 5 AND count >= 5
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000197 {\n  meta:\n    author = \"TDL\"\n    description = \"Multiple Application Connections Deleted\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    OktaSSO
+    | where TimeGenerated > ago(10m)
+    | where eventType_s == "application.lifecycle.delete"
+    | summarize UniqueApps = dcount(target_s), AppList = make_set(target_s), EventCount = count() by bin(TimeGenerated, 10m), client_ipAddress_s, actor_alternateId_s
+    | where EventCount >= 5 and UniqueApps >= 5
+    | project TimeGenerated, SourceIP = client_ipAddress_s, SourceUser = actor_alternateId_s, EventCount, UniqueApplications = UniqueApps, Applications = AppList
+  aql: |
+    SELECT sourceip, username, UNIQUECOUNT("Application") AS unique_apps, COUNT(*) AS event_count
+    FROM events
+    WHERE "Event Type" = 'application.lifecycle.delete'
+    GROUP BY sourceip, username
+    HAVING event_count >= 5 AND unique_apps >= 5
+    LAST 10 MINUTES
+  yara_l: "rule okta_mass_app_deletion {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects mass deletion of Okta applications\
+    \ from same IP and user\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique = \"T1078\"\n    severity = \"HIGH\"\
+    \n    \n  events:\n    $e.metadata.vendor_name = \"OKTA\"\n    $e.metadata.product_event_type = \"application.lifecycle.delete\"\n    $e.principal.ip\
+    \ = $ip\n    $e.principal.user.userid = $user\n    $e.target.application = $app\n    \n  match:\n    $ip, $user over 10m\n    \n  outcome:\n\
+    \    $risk_score = 75\n    $unique_apps = count_distinct($app)\n    \n  condition:\n    #e >= 5 and $unique_apps >= 5\n}\n"
+  esql: |
+    FROM logs-okta.system*
+    | WHERE @timestamp > NOW() - 10 minutes AND event.action == "application.lifecycle.delete"
+    | STATS event_count = COUNT(*), unique_apps = COUNT_DISTINCT(okta.target.id) BY source.ip, okta.actor.id, window = BUCKET(@timestamp, 10 minutes)
+    | WHERE event_count >= 5 AND unique_apps >= 5
+    | KEEP window, source.ip, okta.actor.id, event_count, unique_apps
+  leql: |
+    where(source_json.eventType="application.lifecycle.delete") groupby(source_address, source_user) calculate(unique:source_json.target.displayName)
+  crowdstrike: |
+    #repo=okta eventType="application.lifecycle.delete"
+    | groupBy([client.ipAddress, actor.alternateId], function=[count(as=event_count), count(target.alternateId, distinct=true, as=unique_apps)], limit=max)
+    | event_count >= 5 AND unique_apps >= 5
+    | table([client.ipAddress, actor.alternateId, event_count, unique_apps])
+  xql: |
+    dataset = okta_raw
+    | filter outcome_result = "SUCCESS" and eventtype = "application.lifecycle.delete"
+    | bin _time span=10m
+    | comp count_distinct(target_0_alternateId) as unique_apps by _time, client_ipAddress, actor_alternateId
+    | filter unique_apps >= 5
+  lucene: |
+    eventType:"application.lifecycle.delete"
+  sumo: |
+    _sourceCategory=*Okta* "application.lifecycle.delete"
+    | json field=_raw "eventType" as event_type
+    | json field=_raw "client.ipAddress" as src_ip
+    | json field=_raw "actor.alternateId" as user
+    | json field=_raw "target[0].displayName" as application
+    | where event_type = "application.lifecycle.delete"
+    | timeslice 10m
+    | count_distinct(application) as unique_apps, count as event_count by _timeslice, src_ip, user
+    | where unique_apps >= 5 and event_count >= 5
+    | fields _timeslice, src_ip, user, unique_apps, event_count
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +84,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '5 Okta Event
 

@@ -16,84 +16,90 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (url="*/autodiscover/*" OR url="*/ews/*" OR url="*/ecp/*" OR url="*/owa/*" OR url="*/mapi/*") (url="*__VIEWSTATE*" OR url="*Email=autodiscover*" OR url="*@*" OR url="*X-Rps-CAT*" OR url="*X-BEResource*" OR url="*&Email=*" OR url="*?Email=*")
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (url="*/autodiscover/*" OR url="*/ews/*" OR url="*/ecp/*" OR url="*/owa/*"
+    OR url="*/mapi/*") (url="*__VIEWSTATE*" OR url="*Email=autodiscover*" OR url="*@*" OR url="*X-Rps-CAT*" OR url="*X-BEResource*" OR url="*&Email=*"
+    OR url="*?Email=*")
+
     | search NOT (src_ip IN ("10.0.0.100", "10.0.0.101", "172.16.0.50"))
+
     | stats count dc(dest_ip) as unique_dests sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
+
     | where count >= 1
+
     | sort - bytes_out
+
     | table src_ip, dest_ip, dest_port, count, unique_dests, bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(24h)\n| where DeviceVendor has_any (\"Firewall\", \"IDS\", \"Proxy\") or DeviceProduct\
+    \ has_any (\"Firewall\", \"IDS\", \"Proxy\")\n| where Protocol =~ \"TCP\"\n| where RequestURL has_any (\"autodiscover.json\", \"autodiscover/autodiscover.json\"\
+    , \"mapi/nspi\", \"EWS/Exchange.asmx\", \"ecp/DDI/DDIService.svc\", \"owa/auth/\") \n    or RequestURL matches regex @\"(?i).*autodiscover\\\
+    .json.*@.*Powershell.*\"\n    or RequestURL contains \"X-Rps-CAT\"\n    or RequestURL contains \"X-AnonResource-Backend\"\n    or RequestURL\
+    \ contains \"__RequestVerificationToken\"\n| where SourceIP !in (\"10.0.0.100\", \"10.0.0.101\", \"10.0.0.102\")\n| summarize \n    count_\
+    \ = count(),\n    unique_dests = dcount(DestinationIP),\n    bytes_out = sum(SentBytes)\n    by SourceIP, DestinationIP, DestinationPort\n\
+    | where count_ >= 1\n| sort by bytes_out desc\n| project TimeGenerated = now(), SourceIP, DestinationIP, DestinationPort, count_, unique_dests,\
+    \ bytes_out\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_dests, SUM(destinationbytes) AS bytes_out, LOGSOURCENAME(logsourceid) AS log_source
     FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+    WHERE (LOGSOURCENAME(logsourceid) ILIKE '%firewall%' OR LOGSOURCENAME(logsourceid) ILIKE '%ids%' OR categoryname(category) ILIKE '%firewall%' OR categoryname(category) ILIKE '%ids%')
+      AND protocolid = 6
+      AND (destinationport = 443 OR destinationport = 80)
+      AND (payload MATCHES '.*autodiscover.*|.*mapi.*|.*owa.*|.*ecp.*|.*PowerShell.*|.*X-Rps-CAT.*|.*X-CommonAccessToken.*|.*DelegatedFrom.*|.*proxyLogon.*|.*\/autodiscover\/autodiscover\.json.*|.*Email=autodiscover\/autodiscover\.json.*')
+      AND sourceip NOT IN ('10.0.0.10', '10.0.0.11', '192.168.1.100')
     GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000448 {\n  meta:\n    author = \"TDL\"\n    description = \"OWASSRF Exploitation Attempt Using Public POC - Proxy\"\
-    \n    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
+    HAVING event_count >= 1
+    ORDER BY bytes_out DESC
+    LAST 24 HOURS
+  yara_l: "rule exchange_owassrf_exploitation_attempt {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects OWASSRF\
+    \ exploitation attempts against Exchange infrastructure\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1190\"\
+    \n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.network.ip_protocol = \"TCP\"\n    re.regex($e.target.url,\
+    \ `(?i)/autodiscover/autodiscover\\.json.*\\@.*Powershell`) or\n    re.regex($e.target.url, `(?i)/autodiscover/autodiscover\\.json.*\\@.*Email=autodiscover`)\
+    \ or\n    re.regex($e.target.url, `(?i)/owa/auth/.*\\.js`) or\n    re.regex($e.target.url, `(?i)/ecp/.*DelegatedOrg=`) or\n    re.regex($e.target.url,\
+    \ `(?i)/ecp/.*msExchEcpCanary=`) or\n    re.regex($e.principal.url, `(?i)(/autodiscover/|/owa/|/ecp/).*(__.*ViewState|__VIEWSTATEGENERATOR)`)\
+    \ or\n    re.regex($e.network.http.user_agent, `(?i)(python-requests|curl|wget|ExchangeServicesClient)`)\n    $e.principal.ip = $src_ip\n\
+    \    $e.target.ip = $dest_ip\n    $e.target.port = $dest_port\n    not re.regex($e.principal.ip, `(?i)(10\\.50\\.1\\.100|10\\.50\\.1\\.101|192\\\
+    .168\\.10\\.50)`)\n    not re.regex($e.principal.hostname, `(?i)(scanner|nessus|qualys|rapid7|nexpose|monitoring)`)\n    \n  match:\n    $src_ip,\
+    \ $dest_ip, $dest_port over 1h\n    \n  outcome:\n    $risk_score = max(75)\n    $event_count = count_distinct($e.metadata.id)\n    $unique_dests\
+    \ = count_distinct($e.target.ip)\n    $bytes_out = sum($e.network.sent_bytes)\n    \n  condition:\n    #e >= 1\n}\n"
+  esql: "FROM logs-network.proxy*\n| WHERE @timestamp > NOW() - 24 hours \n  AND network.protocol == \"tcp\"\n  AND (http.request.uri LIKE \"\
+    *autodiscover*\" OR http.request.uri LIKE \"*ecp*\" OR http.request.uri LIKE \"*owa*\")\n  AND (http.request.uri LIKE \"*__VIEWSTATE*\" OR\
+    \ http.request.uri LIKE \"*__VIEWSTATEGENERATOR*\" OR http.request.uri LIKE \"*X-Rps-CAT*\" OR http.request.uri LIKE \"*Email=autodiscover/autodiscover.json*\"\
+    )\n  AND source.ip NOT IN (\"10.0.0.100\", \"10.0.0.101\")\n| STATS count = COUNT(*), unique_dests = COUNT_DISTINCT(destination.ip), bytes_out\
+    \ = SUM(source.bytes) BY source.ip, destination.ip, destination.port\n| WHERE count >= 1\n| SORT bytes_out DESC\n| KEEP source.ip, destination.ip,\
+    \ destination.port, count, unique_dests, bytes_out\n"
+  leql: |
+    where(destination_port=443 AND (url ICONTAINS "/autodiscover/autodiscover.json" OR url ICONTAINS "/ecp/" OR url ICONTAINS "/owa/" OR url ICONTAINS "/Microsoft-Server-ActiveSync" OR url ICONTAINS "/mapi/") AND (url ICONTAINS "X-AnonResource-Backend" OR url ICONTAINS "X-BEResource" OR url ICONTAINS "__RequestVerificationToken" OR url ICONTAINS "autodiscover.json?@" OR url ICONTAINS "powershell")) groupby(source_address, destination_address, destination_port) calculate(count, unique:destination_address)
+  crowdstrike: |
+    #type=firewall OR #type=ids protocol=tcp dest_port IN [443, 80] (url=*/autodiscover/* OR url=*/ecp/* OR url=*/ews/* OR url=*/mapi/* OR url=*/owa/* OR url=*/powershell/* OR url=*/rpc/* OR CommandLine=*autodiscover* OR CommandLine=*powershell* OR CommandLine=*/ews/* OR CommandLine=*/ecp/* OR CommandLine=*/owa/* OR CommandLine=*/mapi/* OR http_uri=*/autodiscover/* OR http_uri=*/ecp/* OR http_uri=*/ews/* OR http_uri=*/mapi/* OR http_uri=*/owa/* OR http_uri=*/powershell/* OR http_uri=*/rpc/*) (http_method=POST OR http_method=GET)
+    | NOT (src_ip IN [10.0.0.100, 10.0.0.101, 192.168.1.50])
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=count), count(dest_ip, distinct=true, as=unique_dests), sum(bytes_out, as=bytes_out)])
+    | count >= 1
+    | sort(bytes_out, order=desc)
+    | table([src_ip, dest_ip, dest_port, count, unique_dests, bytes_out])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_networking_protocol = tcp and (dst_action_url_path contains "/owa/" or dst_action_url_path contains "/autodiscover/" or dst_action_url_path contains "/ecp/") and (dst_action_url_path contains "X-Rps-CAT" or dst_action_url_path contains "X-BEResource" or dst_action_url_path contains "proxyLogon" or dst_action_url_query contains "Email=autodiscover")
+    | alter is_scanner = if(action_local_ip in ("10.0.0.50", "10.0.0.51", "192.168.1.100"), true, false)
+    | filter is_scanner = false
+    | comp count() as cnt, count_distinct(action_remote_ip) as unique_dests, sum(action_upload_bytes) as bytes_out by action_local_ip, action_remote_ip, action_remote_port
+    | filter cnt >= 1
     | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
+    | fields action_local_ip, action_remote_ip, action_remote_port, cnt, unique_dests, bytes_out
+  lucene: |
+    sourcetype:(firewall OR ids) AND network.protocol:tcp AND (url.path:(*autodiscover* OR *powershell* OR *mapi* OR *ews*) OR dest_port:(443 OR 80)) AND (url.query:(*Email=autodiscover* OR *X-Rps-CAT* OR *X-BEResource* OR *proxylogon*) OR http.request.body:(*<SerializedSecurityContext>* OR *<LogonUserSid>*)) AND NOT src_ip:(authorized_scanner_ip1 OR authorized_scanner_ip2 OR monitoring_agent_ip)
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*ids*
+    | where protocol="tcp" OR protocol="TCP" OR _raw matches "*tcp*"
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | parse regex "(?<dest_port>\d+)" nodrop
+    | where _raw matches "*autodiscover*" OR _raw matches "*owa*" OR _raw matches "*ecp*" OR _raw matches "*powershell*" OR _raw matches "*ssrf*" OR _raw matches "*proxyshell*" OR _raw matches "*proxylogon*" OR url matches "*autodiscover.json*" OR url matches "*X-Rps-CAT*" OR url matches "*Email=autodiscover*"
+    | where !(src_ip in ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
+    | count as event_count, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as bytes_out by src_ip, dest_ip, dest_port
+    | where event_count >= 1
     | sort by bytes_out desc
-
-    '
+    | fields src_ip, dest_ip, dest_port, event_count, unique_dests, bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -103,7 +109,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

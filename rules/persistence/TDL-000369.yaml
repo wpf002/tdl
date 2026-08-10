@@ -15,71 +15,88 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=azure sourcetype=azure:monitor:aad EventCategory=SignInLogs OperationName="Sign-in activity" AppId="1b730954-1685-4b74-9bfd-dac224a7b894" TokenIssuerType="AzureAD" ResultType=0
+  spl: 'index=azure sourcetype=azure:monitor:aad EventCategory=SignInLogs OperationName="Sign-in activity" AppId="1b730954-1685-4b74-9bfd-dac224a7b894"
+    TokenIssuerType="AzureAD" ResultType=0
+
     | table _time, UserPrincipalName, AppDisplayName, IPAddress, Location, DeviceDetail.operatingSystem, ResultDescription
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000369 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Successful Powershell Login\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0003\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    SigninLogs
+    | where TimeGenerated > ago(90d)
+    | where OperationName in ("Sign-in activity")
+    | where AppId == "1b730954-1685-4b74-9bfd-dac224a7b894"
+    | where TokenIssuerType == "AzureAD"
+    | where ResultType == 0
+    | project TimeGenerated, UserPrincipalName, AppDisplayName, AppId, IPAddress, Location, DeviceDetail, TokenIssuerType, ResultType, OperationName
+  aql: |
+    SELECT username, sourceip, destinationip, "Application ID", "Token Issuer Type", eventtime, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "OperationName" = 'Sign-in activity'
+      AND "Application ID" = '1b730954-1685-4b74-9bfd-dac224a7b894'
+      AND "Token Issuer Type" = 'AzureAD'
+      AND LOWER(UTF8(payload)) MATCHES '.*"status"[:\s]*\{[^}]*"errorCode"[:\s]*0.*'
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_azuread_portal_signin_persistence {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects successful sign-ins to Azure AD portal (T1098 - Account Manipulation)"
+        mitre_attack_technique = "T1098"
+        mitre_attack_tactic = "Persistence"
+        platform = "Azure"
+        data_source = "Azure SigninLogs"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $signin.metadata.vendor_name = "Microsoft"
+        $signin.metadata.product_name = "Azure"
+        $signin.metadata.log_type = "AZURE_SIGNIN_LOGS"
+        $signin.metadata.product_event_type = "Sign-in activity"
+        $signin.target.application = "1b730954-1685-4b74-9bfd-dac224a7b894"
+        $signin.security_result.action = "ALLOW"
+        $signin.additional.fields["tokenIssuerType"] = "AzureAD"
+        $signin.principal.user.userid = $user
+        $signin.target.application_object.application = $app
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $signin
+    }
+  esql: |
+    FROM logs-azure.signinlogs*
+    | WHERE azure.signinlogs.properties.status.error_code == "0"
+      AND azure.signinlogs.operation_name == "Sign-in activity"
+      AND azure.signinlogs.properties.app_id == "1b730954-1685-4b74-9bfd-dac224a7b894"
+      AND azure.signinlogs.properties.token_issuer_type == "AzureAD"
+    | KEEP @timestamp, azure.signinlogs.properties.user_principal_name, azure.signinlogs.properties.app_display_name, azure.signinlogs.properties.ip_address, azure.signinlogs.properties.location
+  leql: |
+    where(source_json.OperationName="Sign-in activity" AND source_json.AppId="1b730954-1685-4b74-9bfd-dac224a7b894" AND source_json.TokenIssuerType="AzureAD" AND source_json.ResultType="0")
+  crowdstrike: |
+    #repo=* event_platform=Azure event_simpleName=AzureActiveDirectorySignInLogs OperationName="Sign-in activity" AppId=1b730954-1685-4b74-9bfd-dac224a7b894 TokenIssuerType=AzureAD ResultType=0
+    | table([@timestamp, UserPrincipalName, AppDisplayName, IPAddress, UserAgent, Location])
+  xql: |
+    dataset = azure_raw_data
+    | filter cloud_provider = "azure" and event_type = "SigninLogs"
+    | filter action_operation_name = "Sign-in activity"
+    | filter action_app_id = "1b730954-1685-4b74-9bfd-dac224a7b894"
+    | filter action_result_status = "Success"
+    | filter action_token_issuer_type = "AzureAD"
+    | fields _time, action_country_or_region, actor_primary_user_upn, action_app_display_name, action_resource_display_name, action_client_app_used, action_ip_address, action_user_agent
+  lucene: |
+    OperationName:"Sign-in activity" AND AppId:"1b730954-1685-4b74-9bfd-dac224a7b894" AND TokenIssuerType:"AzureAD" AND ResultType:0
+  sumo: |
+    _sourceCategory=*Azure* "SignInLogs" "Sign-in activity"
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "properties.appId" as app_id
+    | json field=_raw "properties.tokenIssuerType" as token_issuer_type
+    | json field=_raw "properties.status.errorCode" as error_code
+    | where operation_name = "Sign-in activity"
+    | where app_id = "1b730954-1685-4b74-9bfd-dac224a7b894"
+    | where token_issuer_type = "AzureAD"
+    | where error_code = "0" or isNull(error_code)
+    | fields _messageTime, operation_name, app_id, token_issuer_type, error_code
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +106,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure SigninLogs Event
 

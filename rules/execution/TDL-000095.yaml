@@ -28,77 +28,124 @@ queries:
     firewall\" AND direction=\"inbound\" AND is_threat_src=1, 1, 0)\n| eval has_firewall_outbound=if(event_type=\"firewall\" AND direction=\"\
     outbound\" AND is_threat_dest=1, 1, 0)\n| where has_malware=1 AND (has_firewall_inbound=1 OR has_firewall_outbound=1)\n| table _time, src_ip,\
     \ dest_ip, direction, event_type, src_threat, dest_threat\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  kql: "let MalwareEvents = \n    CommonSecurityLog\n    | where TimeGenerated > ago(15m)\n    | where DeviceVendor has \"antivirus\" or DeviceProduct\
+    \ has \"antivirus\" or DeviceEventClassID has_any (\"malware\", \"virus\", \"threat\")\n    | where Activity has_any (\"detected\", \"blocked\"\
+    , \"quarantined\") or DeviceAction has_any (\"detected\", \"blocked\", \"quarantined\")\n    | extend SourceIP = coalesce(SourceIP, DeviceCustomIPv4Address1)\n\
+    \    | where isnotempty(SourceIP)\n    | project MalwareTime = TimeGenerated, MalwareSourceIP = SourceIP, DeviceVendor, DeviceProduct, Activity,\
+    \ DeviceAction;\nlet FirewallEvents = \n    CommonSecurityLog\n    | where TimeGenerated > ago(15m)\n    | where DeviceVendor has_any (\"\
+    firewall\", \"palo alto\", \"fortinet\", \"checkpoint\", \"cisco\") or DeviceProduct has_any (\"firewall\", \"asa\", \"fortigate\")\n    |\
+    \ extend SourceIP = coalesce(SourceIP, DeviceCustomIPv4Address1)\n    | extend DestinationIP = coalesce(DestinationIP, DeviceCustomIPv4Address2)\n\
+    \    | where isnotempty(SourceIP) and isnotempty(DestinationIP)\n    | project FirewallTime = TimeGenerated, FWSourceIP = SourceIP, FWDestinationIP\
+    \ = DestinationIP, DeviceAction;\nlet ThreatIntelIPs = \n    ThreatIntelligenceIndicator\n    | where TimeGenerated > ago(7d)\n    | where\
+    \ isnotempty(NetworkIP) or isnotempty(NetworkSourceIP) or isnotempty(NetworkDestinationIP)\n    | extend ThreatIP = coalesce(NetworkIP, NetworkSourceIP,\
+    \ NetworkDestinationIP)\n    | where isnotempty(ThreatIP)\n    | distinct ThreatIP;\nMalwareEvents\n| join kind=inner (\n    FirewallEvents\n\
+    \    | extend IsInbound = ipv4_is_private(FWDestinationIP) and not(ipv4_is_private(FWSourceIP))\n    | extend IsOutbound = ipv4_is_private(FWSourceIP)\
+    \ and not(ipv4_is_private(FWDestinationIP))\n    | where IsInbound or IsOutbound\n    | extend RelevantIP = iff(IsInbound, FWSourceIP, FWDestinationIP)\n\
+    \    | join kind=inner (ThreatIntelIPs) on $left.RelevantIP == $right.ThreatIP\n    | extend MatchType = iff(IsInbound, \"Inbound from Threat\
+    \ IP\", \"Outbound to Threat IP\")\n    | extend MatchIP = iff(IsInbound, FWDestinationIP, FWSourceIP)\n) on $left.MalwareSourceIP == $right.MatchIP\n\
+    | where FirewallTime >= MalwareTime and FirewallTime <= MalwareTime + 15m\n| project MalwareTime, FirewallTime, SourceIP = MalwareSourceIP,\
+    \ MatchType, ThreatIP = RelevantIP, FWSourceIP, FWDestinationIP, DeviceVendor, DeviceProduct, Activity, DeviceAction\n"
+  aql: "SELECT \n    av.eventtime AS malware_time,\n    av.sourceip AS infected_host,\n    av.qidname(av.qid) AS malware_detection,\n    fw.eventtime\
+    \ AS firewall_time,\n    fw.sourceip AS fw_sourceip,\n    fw.destinationip AS fw_destinationip,\n    fw.qidname(fw.qid) AS firewall_event,\n\
+    \    CASE \n        WHEN fw.sourceip != av.sourceip THEN 'Inbound from Threat IP'\n        WHEN fw.destinationip != av.sourceip THEN 'Outbound\
+    \ to Threat IP'\n    END AS direction\nFROM events av\nJOIN events fw ON (\n    (fw.sourceip != av.sourceip AND fw.destinationip = av.sourceip\
+    \ AND fw.sourceip IN (SELECT sourceip FROM events WHERE category IN (SELECT categoryid FROM categories WHERE low_level_category_id IN (1000,\
+    \ 1001, 1002, 1003, 1004, 1005))))\n    OR\n    (fw.sourceip = av.sourceip AND fw.destinationip != av.sourceip AND fw.destinationip IN (SELECT\
+    \ destinationip FROM events WHERE category IN (SELECT categoryid FROM categories WHERE low_level_category_id IN (1000, 1001, 1002, 1003, 1004,\
+    \ 1005))))\n)\nWHERE av.category = (SELECT categoryid FROM categories WHERE name ILIKE '%malware%' OR name ILIKE '%antivirus%')\n    AND fw.category\
+    \ IN (SELECT categoryid FROM categories WHERE name ILIKE '%firewall%')\n    AND fw.eventtime BETWEEN av.eventtime AND (av.eventtime + 900000)\n\
+    LAST 15 MINUTES\n"
+  yara_l: "rule malware_followed_by_threat_intel_firewall {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"T1204 - Malware\
+    \ detection followed by firewall activity involving threat intel IP\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique\
+    \ = \"T1204\"\n    \n  events:\n    $malware.metadata.event_type = \"SCAN_UNCATEGORIZED\"\n    $malware.security_result.detection_fields[\"\
+    malware_detected\"] != \"\"\n    $malware.principal.ip = $source_ip\n    \n    (\n      $firewall_inbound.metadata.event_type = \"NETWORK_CONNECTION\"\
+    \n      $firewall_inbound.network.direction = \"INBOUND\"\n      $firewall_inbound.principal.ip = $external_ip\n      net.is_external_ip($firewall_inbound.principal.ip)\n\
+    \      $firewall_inbound.target.ip = $source_ip\n      net.is_internal_ip($firewall_inbound.target.ip)\n      arrays.exists($firewall_inbound.principal.ip,\
+    \ $firewall_inbound.network.threat_intel_list)\n    )\n    or\n    (\n      $firewall_outbound.metadata.event_type = \"NETWORK_CONNECTION\"\
+    \n      $firewall_outbound.network.direction = \"OUTBOUND\"\n      $firewall_outbound.principal.ip = $source_ip\n      net.is_internal_ip($firewall_outbound.principal.ip)\n\
+    \      $firewall_outbound.target.ip = $external_ip_out\n      net.is_external_ip($firewall_outbound.target.ip)\n      arrays.exists($firewall_outbound.target.ip,\
+    \ $firewall_outbound.network.threat_intel_list)\n    )\n    \n    $malware.metadata.event_timestamp.seconds <= $firewall_inbound.metadata.event_timestamp.seconds\n\
+    \    $malware.metadata.event_timestamp.seconds <= $firewall_outbound.metadata.event_timestamp.seconds\n\n  match:\n    $source_ip over 15m\n\
+    \n  condition:\n    $malware and ($firewall_inbound or $firewall_outbound)\n}\n"
+  esql: "FROM logs-endpoint.alerts*, logs-network.firewall*\n| WHERE @timestamp > NOW() - 1 hour\n| EVAL event_type = CASE(\n    event.dataset\
+    \ LIKE \"*antivirus*\" OR event.dataset LIKE \"*alerts*\" OR event.category == \"malware\", \"malware\",\n    event.dataset LIKE \"*firewall*\"\
+    \ OR event.category == \"network\", \"firewall\",\n    \"other\"\n  )\n| WHERE event_type IN (\"malware\", \"firewall\")\n| EVAL is_malware\
+    \ = CASE(event_type == \"malware\", 1, 0)\n| EVAL is_firewall = CASE(event_type == \"firewall\", 1, 0)\n| EVAL is_inbound = CASE(network.direction\
+    \ == \"inbound\" OR (source.ip RLIKE \"^(?!10\\\\.|172\\\\.(1[6-9]|2[0-9]|3[01])\\\\.|192\\\\.168\\\\.).*\" AND destination.ip RLIKE \"^(10\\\
+    \\.|172\\\\.(1[6-9]|2[0-9]|3[01])\\\\.|192\\\\.168\\\\.).*\"), 1, 0)\n| EVAL is_outbound = CASE(network.direction == \"outbound\" OR (source.ip\
+    \ RLIKE \"^(10\\\\.|172\\\\.(1[6-9]|2[0-9]|3[01])\\\\.|192\\\\.168\\\\.).*\" AND destination.ip RLIKE \"^(?!10\\\\.|172\\\\.(1[6-9]|2[0-9]|3[01])\\\
+    \\.|192\\\\.168\\\\.).*\"), 1, 0)\n| EVAL threat_match = CASE(threat.indicator.ip IS NOT NULL OR event.risk_score > 70, 1, 0)\n| SORT @timestamp\
+    \ ASC\n| STATS \n    malware_time = MIN(CASE(is_malware == 1, @timestamp, NULL)),\n    malware_source_ip = VALUES(CASE(is_malware == 1, source.ip,\
+    \ NULL)),\n    firewall_time = MIN(CASE(is_firewall == 1, @timestamp, NULL)),\n    firewall_inbound = MAX(CASE(is_firewall == 1 AND is_inbound\
+    \ == 1 AND threat_match == 1, 1, 0)),\n    firewall_outbound = MAX(CASE(is_firewall == 1 AND is_outbound == 1 AND threat_match == 1, 1, 0)),\n\
+    \    firewall_source = VALUES(CASE(is_firewall == 1, source.ip, NULL)),\n    firewall_dest = VALUES(CASE(is_firewall == 1, destination.ip,\
+    \ NULL))\n  BY host.name, source.ip\n| WHERE malware_time IS NOT NULL AND firewall_time IS NOT NULL\n| EVAL time_diff_minutes = (firewall_time\
+    \ - malware_time) / 60000\n| WHERE time_diff_minutes >= 0 AND time_diff_minutes <= 15\n| WHERE (firewall_inbound == 1 OR firewall_outbound\
+    \ == 1)\n| KEEP @timestamp, host.name, source.ip, malware_time, firewall_time, time_diff_minutes, firewall_source, firewall_dest\n"
+  leql: |
+    where(source_json.event_type="Malware Detection")
+    groupby(source_address, timestamp)
+    calculate(count)
+    ```
 
-    | where TimeGenerated > ago(1d)
+    Note: InsightIDR LEQL does not natively support multi-stage "followed by" correlation with time windows in a single query. The malware-then-firewall correlation with 15-minute window and threat intel checks requires either:
+    1. Two separate queries with manual correlation
+    2. An InsightIDR Alert/Rule using the Detection Rules UI which supports chained event logic
+    3. Multiple log searches combined externally
 
-    | where network.protocol matches regex "tcp"
+    Single LEQL query for the initial malware detection event:
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exe_000095 {\n  meta:\n    author = \"TDL\"\n    description = \"Malware Detection Followed by Connection to Threat IP\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+    ```
+    where(source_json.event_type="Malware Detection" OR source_json.event_type ICONTAINS "malware")
+  crowdstrike: |
+    (#type=antivirus OR #type=firewall)
+    | case {
+        #type=antivirus | malware_detected=true | select([@timestamp, SourceIP, event_id, ComputerName]);
+        #type=firewall | direction=* | select([@timestamp, SourceIP, DestinationIP, direction, threat_intel_match, event_id]);
+        * | @timestamp := now();
+      }
+    | sort(@timestamp)
+    | selfJoin(field=[SourceIP], where=[{#type=antivirus}, {#type=firewall}], window=15m)
+    | case {
+        direction=inbound AND threat_intel_match=true AND DestinationIP=SourceIP | keep=true;
+        direction=outbound AND threat_intel_match=true | keep=true;
+        * | keep=false;
+      }
+    | keep=true
+    | table([@timestamp, SourceIP, DestinationIP, direction, ComputerName, event_id])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_MALWARE
+    | alter malware_time = _time, malware_src_ip = action_local_ip, malware_host = agent_hostname
+    | join type=inner (
+        dataset = panw_ngfw_traffic_raw
+        | filter action in ("allow", "deny", "drop", "reset")
+        | alter fw_time = _time, fw_src_ip = src_ip, fw_dst_ip = dst_ip
+        | alter is_inbound = if(not incidr(fw_src_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16") and incidr(fw_dst_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"), true, false)
+        | alter is_outbound = if(incidr(fw_src_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16") and not incidr(fw_dst_ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"), true, false)
+        | alter threat_ip = if(is_inbound = true, fw_src_ip, if(is_outbound = true, fw_dst_ip, null))
+        | filter threat_ip != null
+        | join type=inner (
+            dataset = threat_intel_feeds
+            | alter threat_ip = indicator_value
+            | fields threat_ip
+        ) threat_ip = threat_ip
+        | fields fw_time, fw_src_ip, fw_dst_ip, is_inbound, is_outbound, threat_ip
+    ) (malware_src_ip = fw_src_ip and is_inbound = true and fw_dst_ip = malware_src_ip) or (malware_src_ip = fw_src_ip and is_outbound = true)
+    | filter fw_time >= malware_time and fw_time <= malware_time + 900000
+    | fields malware_time, malware_host, malware_src_ip, fw_time, fw_src_ip, fw_dst_ip, threat_ip
+  lucene: |
+    (event_type:antivirus AND malware_detected:true) AND (event_type:firewall AND ((direction:inbound AND source_ip_threat_intel:true AND destination_ip:{{previous_source_ip}}) OR (direction:outbound AND destination_ip_threat_intel:true AND source_ip:{{previous_source_ip}})))
+  sumo: "_sourceCategory=*antivirus* OR _sourceCategory=*firewall*\n| json field=_raw \"event_type\" as event_type\n| json field=_raw \"source_ip\"\
+    \ as source_ip\n| json field=_raw \"dest_ip\" as dest_ip\n| json field=_raw \"direction\" as direction\n| json field=_raw \"threat_intel\"\
+    \ as threat_intel\n| json field=_raw \"severity\" as severity\n| where (event_type matches \"*malware*\" or event_type matches \"*virus*\"\
+    \ or event_type matches \"*threat*\") \n   or (event_type matches \"*firewall*\" or _sourceCategory matches \"*firewall*\")\n| sort by _messageTime\
+    \ asc\n| if(event_type matches \"*malware*\" or event_type matches \"*virus*\" or severity matches \"*malware*\", \"malware\", \"firewall\"\
+    ) as category\n| if(category = \"malware\", source_ip, null) as malware_ip\n| if(category = \"firewall\" and direction = \"inbound\" and threat_intel\
+    \ = \"true\" and dest_ip = malware_ip, 1, 0) as inbound_match\n| if(category = \"firewall\" and direction = \"outbound\" and threat_intel\
+    \ = \"true\" and source_ip = malware_ip, 1, 0) as outbound_match\n| timeslice 15m\n| where category = \"malware\" or inbound_match = 1 or\
+    \ outbound_match = 1\n| transaction on malware_ip, source_ip with window=15m\n| where count >= 2\n| fields _messageTime, source_ip, dest_ip,\
+    \ event_type, direction, threat_intel\n"
 false_positives:
 - Authorized pen testing
 - Security research
@@ -108,7 +155,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Malware Detection Event\n\nFollowed By\n\n1 Firewall Event\nOR\n          From an external source to an internal destination\
   \ (Inbound)\n          Where the Source IP is on a Threat Intelligence List\n          Where the Destination IP is the Source IP in the previous\

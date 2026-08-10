@@ -15,82 +15,95 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    (index=network sourcetype=firewall OR index=network sourcetype=ids) protocol=tcp direction=inbound signature="*Command Injection*" action=allowed NOT (src_ip IN ("10.0.0.100", "10.0.0.101", "192.168.1.50")) NOT (src_ip="*scanner*" OR src_ip="*monitor*")
+  spl: '(index=network sourcetype=firewall OR index=network sourcetype=ids) protocol=tcp direction=inbound signature="*Command Injection*" action=allowed
+    NOT (src_ip IN ("10.0.0.100", "10.0.0.101", "192.168.1.50")) NOT (src_ip="*scanner*" OR src_ip="*monitor*")
+
     | stats sum(bytes_out) as bytes_out, dc(dest_ip) as unique_dest_ips by src_ip, dest_ip, dest_port
+
     | sort - bytes_out
+
     | table src_ip, dest_ip, dest_port, bytes_out, unique_dest_ips
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(24h)\n| where DeviceVendor in (\"Palo Alto Networks\", \"Cisco\", \"Fortinet\", \"Check\
+    \ Point\", \"Snort\", \"Suricata\") or DeviceProduct has_any (\"Firewall\", \"IDS\", \"IPS\")\n| where Protocol =~ \"tcp\"\n| where CommunicationDirection\
+    \ =~ \"inbound\" or DeviceCustomString2 =~ \"inbound\" or AdditionalExtensions has \"direction=inbound\"\n| where Activity has_any (\"Command\
+    \ Injection\", \"command injection\", \"Command-Injection\") or DeviceEventCategory has_any (\"Command Injection\", \"command-injection\"\
+    ) or Message has_any (\"command injection\", \"command-injection\")\n| where DeviceAction in~ (\"allowed\", \"allow\", \"permitted\", \"permit\"\
+    )\n| where SourceIP !in (\"10.0.100.50\", \"10.0.100.51\", \"192.168.1.100\", \"172.16.50.10\")\n| where SourceUserName !has_any (\"scanner\"\
+    , \"monitor\", \"agent\", \"nessus\", \"qualys\")\n| extend bytes_out = coalesce(SentBytes, DeviceCustomNumber1, tolong(0))\n| summarize \n\
+    \    event_count = count(),\n    dest_ip_count = dcount(DestinationIP),\n    total_bytes_out = sum(bytes_out),\n    first_seen = min(TimeGenerated),\n\
+    \    last_seen = max(TimeGenerated)\n    by SourceIP, DestinationIP, DestinationPort\n| where event_count >= 1\n| sort by total_bytes_out\
+    \ desc\n| project SourceIP, DestinationIP, DestinationPort, event_count, dest_ip_count, total_bytes_out, first_seen, last_seen\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(bytesout) AS bytes_out, UNIQUECOUNT(destinationip) AS unique_dest_ips
+    FROM events
+    WHERE CATEGORYNAME(category) ILIKE '%Command Injection%'
+      AND CATEGORYNAME(category) ILIKE '%IDS%'
+      AND protocolname(protocolid) = 'TCP'
+      AND (QIDNAME(qid) ILIKE '%inbound%' OR QIDNAME(qid) ILIKE '%incoming%')
+      AND (QIDNAME(qid) ILIKE '%allow%' OR QIDNAME(qid) ILIKE '%permit%')
+      AND sourceip NOT IN ('10.0.0.100', '10.0.0.101', '192.168.1.50')
+      AND LOGSOURCENAME(logsourceid) NOT ILIKE '%scanner%'
+      AND LOGSOURCENAME(logsourceid) NOT ILIKE '%monitoring%'
     GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000469 {\n  meta:\n    author = \"TDL\"\n    description = \"Allowed Command Injection Signature Detection - Inbound\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0011\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
+    ORDER BY bytes_out DESC
+    LAST 24 HOURS
+  yara_l: "rule command_injection_allowed_inbound {\n  meta:\n    author = \"TDL\"\n    description = \"Detects allowed inbound Command Injection\
+    \ signature events from IDS/IPS, excluding authorized scanners\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique\
+    \ = \"T1078\"\n    severity = \"HIGH\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.metadata.product_log_id =\
+    \ \"IDS\" or $e.metadata.product_log_id = \"IPS\"\n    \n    $e.network.ip_protocol = \"TCP\"\n    $e.network.direction = \"INBOUND\"\n  \
+    \  \n    re.regex($e.security_result.summary, `(?i)command.injection`)\n    $e.security_result.action = \"ALLOW\"\n    \n    not (\n     \
+    \ $e.principal.ip = \"10.0.0.100\" or\n      $e.principal.ip = \"10.0.0.101\" or\n      $e.principal.ip = \"10.0.0.102\" or\n      re.regex($e.principal.asset.hostname,\
+    \ `(?i)scanner`) or\n      re.regex($e.principal.asset.hostname, `(?i)monitor`)\n    )\n    \n    $e.principal.ip = $src_ip\n    $e.target.ip\
+    \ = $dest_ip\n    $e.target.port = $dest_port\n    $e.network.sent_bytes = $bytes_out\n\n  match:\n    $src_ip, $dest_ip, $dest_port over\
+    \ 1h\n\n  outcome:\n    $risk_score = max(75)\n    $total_bytes_out = sum($bytes_out)\n    $unique_dest_ips = count_distinct($dest_ip)\n\n\
+    \  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-network.ids*, logs-network.firewall*
+    | WHERE network.protocol == "tcp"
+      AND network.direction == "inbound"
+      AND event.action == "allowed"
+      AND (threat.indicator.description LIKE "*Command Injection*" OR rule.name LIKE "*Command Injection*" OR threat.technique.name LIKE "*Command Injection*")
+      AND source.ip NOT IN ("10.0.0.100", "10.0.0.101", "192.168.1.50")
+    | STATS bytes_out = SUM(network.bytes), dc_dest_ip = COUNT_DISTINCT(destination.ip) BY source.ip, destination.ip, destination.port
     | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
+    | KEEP source.ip, destination.ip, destination.port, bytes_out, dc_dest_ip
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp" AND source_json.direction="inbound" AND source_json.signature ICONTAINS "Command Injection" AND source_json.action="allowed" AND source_json.src_ip NOT IN ["scanner_ip_1", "scanner_ip_2"] AND source_json.src_ip!="monitoring_agent_ip") groupby(source_json.src_ip, source_json.dest_ip, source_json.dest_port) calculate(sum:source_json.bytes_out)
+  crowdstrike: |
+    #type=network (sourcetype=firewall OR sourcetype=ids) network.protocol=*tcp* direction=inbound signature=*Command?Injection* action=allowed
+    | NOT (src_ip IN ["10.0.0.100", "10.0.0.101", "192.168.1.50"])
+    | groupBy([src_ip, dest_ip, dest_port], function=[sum(bytes_out, as=bytes_out), count(dest_ip, distinct=true, as=dc_dest_ip)])
+    | sort(bytes_out, order=desc, limit=10000)
+    | table([src_ip, dest_ip, dest_port, bytes_out, dc_dest_ip])
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter threat_name contains "Command Injection" and action_direction = "inbound" and action_verdict = "allow" and protocol = "tcp"
+    | filter src_ip not in ("10.0.0.50", "10.0.0.51", "192.168.1.100")
+    | comp sum(bytes_sent) as bytes_out, count_distinct(dest_ip) as dc_dest_ip by src_ip, dest_ip, dest_port
     | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
+    | fields src_ip, dest_ip, dest_port, bytes_out, dc_dest_ip
+  lucene: |
+    network.protocol:tcp AND traffic.direction:inbound AND signature.category:"Command Injection" AND action:allowed AND NOT (source.ip:(10.0.1.100 OR 10.0.1.101 OR 192.168.50.10) OR source.agent:"monitoring-agent")
+  sumo: |
+    _sourceCategory=*network* OR _sourceCategory=*firewall* OR _sourceCategory=*ids*
+    | json field=_raw "protocol" as protocol
+    | json field=_raw "direction" as direction
+    | json field=_raw "signature" as signature
+    | json field=_raw "action" as action
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "bytes_out" as bytes_out
+    | where protocol matches "*tcp*"
+    | where direction matches "*inbound*"
+    | where signature matches "*Command Injection*"
+    | where action matches "*allow*"
+    | where !(src_ip in ("10.0.0.100", "10.0.0.101", "192.168.1.50"))
+    | count_distinct(dest_ip) as dc_dest_ip by src_ip, dest_ip, dest_port, bytes_out
     | sort by bytes_out desc
-
-    '
+    | fields src_ip, dest_ip, dest_port, bytes_out, dc_dest_ip
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -100,7 +113,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

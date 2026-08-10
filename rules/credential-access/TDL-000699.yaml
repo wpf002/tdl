@@ -15,77 +15,94 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=endpoint sourcetype=Sysmon EventCode=1 process_name="*.+*"
+  spl: 'index=endpoint sourcetype=Sysmon EventCode=1 process_name="*.+*"
+
     | stats count dc(ComputerName) as host_count dc(User) as user_count by process_name, parent_process_name, command_line
+
     | where count >= 1
+
     | sort - count
+
     | table process_name, parent_process_name, command_line, count, host_count, user_count
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000699 {\n  meta:\n    author = \"TDL\"\n    description = \"Guest User Privilege Escalation\"\n    severity = \"HIGH\"\
-    \n    tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    Event
+    | where TimeGenerated > ago(90d)
+    | where Source == "Microsoft-Windows-Sysmon" and EventID == 1
+    | extend ProcessName = tostring(EventData.Image)
+    | extend ParentProcessName = tostring(EventData.ParentImage)
+    | extend CommandLine = tostring(EventData.CommandLine)
+    | where ProcessName matches regex @".*\+.*"
+    | summarize Count = count(), Hosts = dcount(Computer), Users = dcount(tostring(EventData.User)) by ProcessName, ParentProcessName, CommandLine
+    | where Count >= 1
+    | sort by Count desc
+    | project ProcessName, ParentProcessName, CommandLine, Count, Hosts, Users
+  aql: |
+    SELECT "Process Name" AS process_name, "Parent Process Name" AS parent_process_name, "Process CommandLine" AS command_line, LOGSOURCENAME(logsourceid) AS host, username, COUNT(*) AS occurrence_count
+    FROM events
+    WHERE "EventID" = '1' AND "Process Name" MATCHES '.*\\.\\+.*'
+    GROUP BY "Process Name", "Parent Process Name", "Process CommandLine", LOGSOURCENAME(logsourceid), username
+    HAVING occurrence_count >= 1
+    ORDER BY occurrence_count DESC
+    LAST 24 HOURS
+  yara_l: |
+    rule credential_access_account_privilege_change {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects Sysmon Process Creation events matching account privilege change pattern"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        $e.metadata.product_event_type = "1"
+        re.regex($e.target.process.file.full_path, `.+\..+`)
+        $e.target.process.file.full_path = $process_name
+        $e.principal.process.file.full_path = $parent_process_name
+        $e.target.process.command_line = $command_line
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $process_name, $parent_process_name, $command_line over 1h
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*
+    | WHERE winlog.event_id == 1 AND process.name LIKE "*.*"
+    | STATS count = COUNT(*), hosts = COUNT_DISTINCT(host.name), users = COUNT_DISTINCT(user.name) BY process.name, process.parent.name, process.command_line
+    | WHERE count >= 1
     | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+    | KEEP process.name, process.parent.name, process.command_line, count, hosts, users
+  leql: |
+    where(source_json.EventID=1 AND process_name=/.*\+.*/) groupby(process_name, parent_process_name, process_cmd_line) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 event_platform=Win FileName=*.+*
+    | groupBy([FileName, ParentBaseFileName, CommandLine], function=count(as=cnt))
+    | cnt >= 1
+    | sort(cnt, order=desc, limit=10000)
+    | table([FileName, ParentBaseFileName, CommandLine, cnt])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS and action_evtlog_event_id = 1 and action_process_image_name ~= ".*\+.*"
+    | comp count() as occurrence_count, count_distinct(agent_hostname) as unique_hosts, count_distinct(actor_effective_username) as unique_users by action_process_image_name, actor_process_image_name, action_process_image_command_line
+    | filter occurrence_count >= 1
+    | sort desc occurrence_count
+    | fields action_process_image_name, actor_process_image_name, action_process_image_command_line, occurrence_count, unique_hosts, unique_users
+  lucene: |
+    sourcetype:Sysmon AND EventCode:1 AND process_name:*\+*
+  sumo: |
+    _sourceCategory=*Sysmon* OR _sourceCategory=*Windows*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Image" as process_name
+    | json field=_raw "ParentImage" as parent_process_name
+    | json field=_raw "CommandLine" as command_line
+    | where event_id = "1" and process_name matches "*.+*"
+    | count as occurrence_count by process_name, parent_process_name, command_line
+    | where occurrence_count >= 1
+    | sort by occurrence_count desc
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -95,7 +112,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'

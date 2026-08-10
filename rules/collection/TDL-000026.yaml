@@ -18,69 +18,71 @@ risk_score: 55
 queries:
   spl: "index=o365 sourcetype=\"o365:management:activity\" Operation=\"SharingInvitationCreated\" Workload!=\"OneDrive\" \n| regex TargetUserOrGroupName!=\"\
     .*@(yourcompany\\.com|yourdomain\\.com)$\"\n| table _time, UserId, Operation, Workload, ObjectId, TargetUserOrGroupName, SiteUrl, SourceFileName\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    OfficeActivity
+    | where TimeGenerated > ago(24h)
+    | where Operation == "SharingInvitationCreated"
+    | where Workload != "OneDrive"
+    | extend TargetUserEmail = tostring(TargetUserOrGroupName)
+    | where TargetUserEmail !endswith "@yourdomain.com"
+    | project TimeGenerated, UserId, TargetUserEmail, OfficeObjectId, Site_Url, SourceFileName, Operation, Workload
+  aql: |
+    SELECT eventtime, username, "Operation", "Workload", "TargetUserOrGroupName", sourceip, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE "Operation" = 'SharingInvitationCreated'
+      AND "Workload" != 'OneDrive'
+      AND "TargetUserOrGroupName" NOT ILIKE '%@yourdomain.com'
+    LAST 24 HOURS
+  yara_l: |
+    rule sharepoint_external_sharing_invitation {
+      meta:
+        author = "TDL"
+        description = "Detects external sharing invitations in SharePoint excluding OneDrive"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1537"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.product_event_type = "SharingInvitationCreated"
+        $e.metadata.product_name = "Microsoft 365"
+        $e.target.application = $workload
+        $workload != "OneDrive"
+        $e.target.user.email_addresses = $target_email
+        not re.regex($target_email, `@(yourdomain\.com|yourcompany\.com)$`)
+        $e.principal.user.userid = $actor
 
-    | where eventName matches regex "SharingInvitationCreated"
+      match:
+        $actor over 1h
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%SharingInvitationCreated%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000026 {\n  meta:\n    author = \"TDL\"\n    description = \"SharePoint File Shared Outside Organization\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0009\"\n    technique = \"T1537\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /SharingInvitationCreated/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n\
-    }\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%SharingInvitationCreated%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/SharingInvitationCreated/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*SharingInvitationCreated*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "SharingInvitationCreated"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*SharingInvitationCreated*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*SharingInvitationCreated*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-o365.audit*\n| WHERE @timestamp > NOW() - 24 hours \n  AND event.action == \"SharingInvitationCreated\" \n  AND o365.audit.Workload\
+    \ != \"OneDrive\"\n  AND NOT o365.audit.TargetUserOrGroupName RLIKE \".*@(your-domain\\\\.com|your-org\\\\.com)$\"\n| KEEP @timestamp, user.name,\
+    \ host.name, o365.audit.Workload, o365.audit.TargetUserOrGroupName, o365.audit.ObjectId, source.ip\n"
+  leql: |
+    where(source_json.Operation="SharingInvitationCreated" AND source_json.Workload!="OneDrive" AND source_json.TargetUserOrGroupType="Guest")
+  crowdstrike: |
+    event_simpleName=SharePointFileOperation Operation=SharingInvitationCreated Workload!=OneDrive
+    | regex("@(?<domain>[^@]+)$", field=TargetUserPrincipalName)
+    | domain != /.*\.internal$|.*\.local$|.*\.onmicrosoft\.com$/
+    | table([@timestamp, ComputerName, UserId, TargetUserPrincipalName, domain, ObjectId, SiteUrl, SourceFileName])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Microsoft" and event_type = "SharingInvitationCreated" and raw_log_json.Workload != "OneDrive" and raw_log_json.TargetUserOrGroupType = "Guest"
+    | alter target_user = arrayindex(regextract(coalesce(raw_log_json.TargetUserOrGroupName, ""), "([^@]+@[^@]+)"), 0)
+    | alter target_domain = arrayindex(regextract(target_user, "@(.+)$"), 0)
+    | filter target_domain not in ("yourdomain.com", "yourorg.onmicrosoft.com")
+    | fields _time, actor_user, raw_log_json.ObjectId, target_user, target_domain, raw_log_json.Workload, raw_log_json.SiteUrl
+  lucene: |
+    Operation:"SharingInvitationCreated" AND NOT Workload:"OneDrive" AND NOT TargetUserOrGroupName:*@yourdomain.com
+  sumo: |
+    _sourceCategory=*Office365* OR _sourceCategory=*M365* OR _sourceCategory=*SharePoint*
+    | json field=_raw "Operation" as operation
+    | json field=_raw "Workload" as workload
+    | json field=_raw "TargetUserOrGroupName" as target_user
+    | where operation = "SharingInvitationCreated" and workload != "OneDrive" and !(target_user matches "*@yourorganization.com")
+    | fields _messageTime, _sourceHost, operation, workload, target_user
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +92,7 @@ tags:
 - collection
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: 1 event where the operation is "SharingInvitationCreated" and the workload is not "OneDrive" and the target user is not a domain
   owned by the organization

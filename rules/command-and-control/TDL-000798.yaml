@@ -16,84 +16,119 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 50
 queries:
-  spl: |
-    index=network_ids sourcetype=suricata (event_type=tls OR event_type=alert) dest_port=443 NOT src IN(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+  spl: 'index=network_ids sourcetype=suricata (event_type=tls OR event_type=alert) dest_port=443 NOT src IN(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+
     | eval ja3_hash=coalesce(tls.ja3.hash, ja3_hash), ja3s_hash=coalesce(tls.ja3s.hash, ja3s_hash), process=coalesce(process_name, app_proto)
+
     | where isnotnull(ja3_hash) AND isnotnull(process)
+
     | eventstats dc(_time) as first_seen earliest(_time) as earliest_time by ja3_hash, process
+
     | where first_seen=1 AND _time=earliest_time
+
     | table _time, src, dest, dest_port, process, ja3_hash, ja3s_hash, tls.sni
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tls"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: "let lookback = 14d;\nlet detection_window = 1h;\nlet historical_ja3 = \n    CommonSecurityLog\n    | where TimeGenerated between (ago(lookback)\
+    \ .. ago(detection_window))\n    | where DeviceEventClassID == \"NetworkConnection\" or DeviceAction in (\"allowed\", \"detected\")\n    |\
+    \ where DestinationPort in (443, 8443)\n    | where isnotempty(DeviceCustomString1) or isnotempty(DeviceCustomString2)\n    | extend JA3Hash\
+    \ = coalesce(DeviceCustomString1, extract(\"JA3=([a-f0-9]{32})\", 1, AdditionalExtensions))\n    | extend JA3SHash = coalesce(DeviceCustomString2,\
+    \ extract(\"JA3S=([a-f0-9]{32})\", 1, AdditionalExtensions))\n    | extend ProcessName = coalesce(DeviceCustomString3, FileName, ProcessName)\n\
+    \    | where isnotempty(JA3Hash) and isnotempty(ProcessName)\n    | summarize by JA3Hash, JA3SHash, ProcessName;\nCommonSecurityLog\n| where\
+    \ TimeGenerated > ago(detection_window)\n| where DeviceEventClassID == \"NetworkConnection\" or DeviceAction in (\"allowed\", \"detected\"\
+    )\n| where DestinationPort in (443, 8443)\n| where isnotempty(DeviceCustomString1) or isnotempty(DeviceCustomString2)\n| extend JA3Hash =\
+    \ coalesce(DeviceCustomString1, extract(\"JA3=([a-f0-9]{32})\", 1, AdditionalExtensions))\n| extend JA3SHash = coalesce(DeviceCustomString2,\
+    \ extract(\"JA3S=([a-f0-9]{32})\", 1, AdditionalExtensions))\n| extend ProcessName = coalesce(DeviceCustomString3, FileName, ProcessName)\n\
+    | where isnotempty(JA3Hash) and isnotempty(ProcessName)\n| join kind=leftanti historical_ja3 on JA3Hash, JA3SHash, ProcessName\n| project\
+    \ TimeGenerated, SourceIP, DestinationIP, DestinationPort, ProcessName, JA3Hash, JA3SHash, DeviceName = Computer, DeviceVendor, DeviceProduct\n"
+  aql: "SELECT sourceip, destinationip, destinationport, \"JA3 Hash\" AS ja3_hash, \"JA3S Hash\" AS ja3s_hash, \"Process Name\", COUNT(*) AS connection_count\n\
+    FROM events\nWHERE category IN (SELECT qid FROM categories WHERE low_level_category_id = 4) \n  AND destinationport IN (443, 8443) \n  AND\
+    \ \"JA3 Hash\" IS NOT NULL \n  AND \"JA3S Hash\" IS NOT NULL\n  AND \"Process Name\" IS NOT NULL\n  AND (\"JA3 Hash\", \"Process Name\") NOT\
+    \ IN (\n    SELECT \"JA3 Hash\", \"Process Name\" \n    FROM events \n    WHERE category IN (SELECT qid FROM categories WHERE low_level_category_id\
+    \ = 4) \n      AND destinationport IN (443, 8443)\n      AND \"JA3 Hash\" IS NOT NULL \n      AND \"Process Name\" IS NOT NULL\n    START\
+    \ 'EPOCH_TIME_7_DAYS_AGO' STOP 'EPOCH_TIME_24_HOURS_AGO'\n  )\nGROUP BY sourceip, destinationip, destinationport, \"JA3 Hash\", \"JA3S Hash\"\
+    , \"Process Name\"\nLAST 24 HOURS\n"
+  yara_l: |
+    rule custom_tls_stack_c2 {
+      meta:
+        author = "TDL"
+        description = "Detects outbound TLS connections with novel JA3/JA3S fingerprints for a process binary, indicating custom TLS stack C2"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1001"
+        severity = "HIGH"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.direction = "OUTBOUND"
+        $e.target.port = 443 or $e.network.application_protocol = "SSL" or $e.network.application_protocol = "TLS"
+        $e.principal.process.file.sha256 = $process_hash
+        $e.principal.hostname = $host
+        $e.network.tls.client.ja3 = $ja3
+        $e.network.tls.server.ja3s = $ja3s
 
-    WHERE "network.protocol" LIKE ''%tls%''
+      match:
+        $process_hash, $ja3, $ja3s over 24h
 
-    GROUP BY sourceip, destinationip, destinationport
+      outcome:
+        $risk_score = 75
+        $process_path = array_distinct($e.principal.process.file.full_path)
+        $target_ips = array_distinct($e.target.ip)
+        $first_seen = min($e.metadata.event_timestamp.seconds)
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000798 {\n  meta:\n    author = \"TDL\"\n    description = \"TLS JA3 Fingerprint Anomalous for Process\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1001\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tls/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tls%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tls/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tls*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tls"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tls*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tls*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e = 1
+    }
+  esql: "FROM logs-network*\n| WHERE @timestamp > NOW() - 24 hours \n  AND network.protocol == \"tls\" \n  AND network.direction == \"outbound\"\
+    \n  AND tls.client.ja3 IS NOT NULL\n  AND tls.server.ja3s IS NOT NULL\n  AND process.executable IS NOT NULL\n| STATS \n    first_seen = MIN(@timestamp),\n\
+    \    conn_count = COUNT(*),\n    unique_dests = COUNT_DISTINCT(destination.ip)\n  BY process.executable, tls.client.ja3, tls.server.ja3s\n\
+    | WHERE first_seen > NOW() - 1 hour\n| KEEP first_seen, process.executable, tls.client.ja3, tls.server.ja3s, conn_count, unique_dests\n"
+  leql: |
+    where(source_json.event_type="tls" AND direction="OUTBOUND") groupby(source_json.ja3, source_json.ja3s, source_json.process_name, source_address) calculate(count)
+  crowdstrike: |
+    #type=network event_simpleName=*TLS* OR event_simpleName=*SSL* OR event_simpleName=NetworkConnect*
+    | case {
+        event_simpleName=*TLS* | JA3Hash=* ;
+        event_simpleName=*SSL* | JA3Hash=* ;
+        * | drop();
+      }
+    | groupBy([SHA256HashData, JA3Hash, JA3SHash], function=count(as=occurrences), limit=max)
+    | occurrences = 1
+    | table([@timestamp, ComputerName, SHA256HashData, FileName, RemoteAddressIP4, RemotePort, JA3Hash, JA3SHash, occurrences])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter app = "ssl" and action = "allow" and direction = "outbound"
+    | alter process_binary = coalesce(app_name, src_user)
+    | filter process_binary != null
+    | alter ja3_hash = coalesce(ssl_ja3_hash, "")
+    | alter ja3s_hash = coalesce(ssl_ja3s_hash, "")
+    | filter ja3_hash != "" or ja3s_hash != ""
+    | comp count() as connection_count, min(_time) as first_seen by process_binary, ja3_hash, ja3s_hash, src_ip, dst_ip, dst_port
+    | comp count_distinct(process_binary) as process_count by ja3_hash, ja3s_hash
+    | filter process_count = 1 and connection_count <= 5
+    | fields first_seen, src_ip, dst_ip, dst_port, process_binary, ja3_hash, ja3s_hash, connection_count
+  lucene: |
+    event.category:network AND network.protocol:tls AND network.direction:outbound AND _exists_:tls.client.ja3 AND _exists_:process.executable
+  sumo: |
+    _sourceCategory=*Network* OR _sourceCategory=*IDS* OR _sourceCategory=*Zeek* OR _sourceCategory=*Suricata* (ssl OR tls OR ja3)
+    | json field=_raw "ja3" as ja3
+    | json field=_raw "ja3s" as ja3s
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "process" as process
+    | json field=_raw "source_process" as source_process
+    | parse regex field=_raw "\"ja3\":\"(?<ja3_hash>[^\"]+)\""
+    | parse regex field=_raw "\"ja3s\":\"(?<ja3s_hash>[^\"]+)\""
+    | where !isNull(ja3) OR !isNull(ja3_hash)
+    | where dest_port = "443" OR dest_port = "8443" OR dest_port = "4443"
+    | if(isNull(process), source_process, process) as process_name
+    | where !isEmpty(process_name)
+    | if(isEmpty(ja3), ja3_hash, ja3) as ja3_final
+    | if(isEmpty(ja3s), ja3s_hash, ja3s) as ja3s_final
+    | where !isEmpty(ja3_final)
+    | count_distinct(_messageTime) as first_seen by process_name, ja3_final, ja3s_final, src_ip
+    | where first_seen = 1
+    | fields src_ip, dest_ip, process_name, ja3_final, ja3s_final
 pseudo_logic: Outbound TLS connection with JA3 / JA3S not seen before for the originating process binary. Custom-stack C2.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -109,7 +144,7 @@ references:
 - https://attack.mitre.org/techniques/T1001/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

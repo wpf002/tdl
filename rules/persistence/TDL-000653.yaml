@@ -16,73 +16,55 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=azure sourcetype=azure:signinlogs OR sourcetype=azure:aad:audit operationName="Admin registered security info" OR properties.operationName="Admin registered security info" resultType=0 OR properties.resultDescription="success" OR status.errorCode=0
-    | eval action=coalesce('properties.result', result, if(resultType=0 OR 'status.errorCode'=0, "success", "failure"))
+  spl: 'index=azure sourcetype=azure:signinlogs OR sourcetype=azure:aad:audit operationName="Admin registered security info" OR properties.operationName="Admin
+    registered security info" resultType=0 OR properties.resultDescription="success" OR status.errorCode=0
+
+    | eval action=coalesce(''properties.result'', result, if(resultType=0 OR ''status.errorCode''=0, "success", "failure"))
+
     | where action="success"
+
     | table _time, user, userPrincipalName, ipAddress, properties.targetResources{}.userPrincipalName, operationName, action
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_000653 {\n  meta:\n    author = \"TDL\"\n    description = \"Suspicious Authentication Method Added to User Account\
-    \ - Azure\"\n    severity = \"LOW\"\n    tactic = \"TA0003\"\n    technique = \"T1098\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AuditLogs
+    | where TimeGenerated > ago(24h)
+    | where OperationName == "Admin registered security info"
+    | where Result == "success"
+    | project TimeGenerated, OperationName, Result, Identity, TargetResources, InitiatedBy, AADTenantId, CorrelationId
+  aql: |
+    SELECT username, sourceip, destinationip, eventtime, QIDNAME(qid), CATEGORYNAME(category), LOGSOURCENAME(logsourceid)
+    FROM events
+    WHERE QIDNAME(qid) ILIKE '%Admin registered security info%'
+      AND LOGSOURCENAME(logsourceid) ILIKE '%Azure%'
+    LAST 24 HOURS
+  yara_l: "rule azure_admin_registered_security_info {\n  meta:\n    author = \"TDL\"\n    description = \"Detects successful admin registration\
+    \ of security info in Azure (T1098 - Account Manipulation)\"\n    mitre_attack_tactic = \"Persistence\"\n    mitre_attack_technique = \"T1098\"\
+    \n    platform = \"Azure\"\n    data_source = \"Azure Sign-in\"\n  \n  events:\n    $e.metadata.product_name = \"Azure Active Directory\"\n\
+    \    $e.metadata.product_event_type = \"Admin registered security info\"\n    $e.security_result.action = \"ALLOW\"\n    $e.principal.user.userid\
+    \ = $user\n    $e.principal.hostname = $host\n  \n  match:\n    $user over 5m\n  \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-azure.signinlogs*\n| WHERE @timestamp > NOW() - 24 hours \n  AND azure.signinlogs.operation_name == \"Admin registered security\
+    \ info\"\n  AND event.outcome == \"success\"\n| KEEP @timestamp, user.name, azure.signinlogs.properties.user_principal_name, source.ip, azure.signinlogs.properties.app_display_name,\
+    \ host.name, azure.correlation_id\n"
+  leql: |
+    where(source_json.operationName="Admin registered security info" AND source_json.resultType="0")
+  crowdstrike: |
+    #repo=azure* OperationName="Admin registered security info" ResultType=0
+    | table([@timestamp, UserPrincipalName, IPAddress, Location, AppDisplayName, DeviceDetail.operatingSystem])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "Azure" and operation_name = "Admin registered security info" and outcome = "Success"
+    | fields _time, identity_name, actor_caller_ip_address, operation_name, outcome, resource_name, cloud_provider_project
+  lucene: |
+    event.name:"Admin registered security info" AND action:success
+  sumo: |
+    _sourceCategory=*Azure* "Admin registered security info"
+    | json field=_raw "properties.resultType" as result_type
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "properties.userPrincipalName" as user
+    | json field=_raw "properties.ipAddress" as ip_address
+    | where operation_name = "Admin registered security info" and result_type = "0"
+    | fields _messageTime, user, ip_address, operation_name, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -92,7 +74,7 @@ tags:
 - persistence
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure Sign-In Event
 

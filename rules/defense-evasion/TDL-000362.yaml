@@ -17,75 +17,59 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=windows sourcetype=WinEventLog:Security EventCode=4688 Parent_Process_Name="*\\conhost.exe" NOT (New_Process_Name="*\\splwow64.exe" OR New_Process_Name="*\\werfault.exe" OR New_Process_Name="*\\conhost.exe")
+  spl: 'index=windows sourcetype=WinEventLog:Security EventCode=4688 Parent_Process_Name="*\\conhost.exe" NOT (New_Process_Name="*\\splwow64.exe"
+    OR New_Process_Name="*\\werfault.exe" OR New_Process_Name="*\\conhost.exe")
+
     | table _time, ComputerName, Account_Name, Parent_Process_Name, New_Process_Name, Process_Command_Line
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("conhost.exe", "splwow64.exe", "werfault.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('conhost.exe', 'splwow64.exe', 'werfault.exe')\nLAST 24\
-    \ HOURS\n"
-  yara_l: "rule tdl_tdl_de_000362 {\n  meta:\n    author = \"TDL\"\n    description = \"Suspicious Conhost Child Process\"\n    severity = \"\
-    LOW\"\n    tactic = \"TA0005\"\n    technique = \"T1202\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(conhost.exe|splwow64.exe|werfault.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("conhost.exe", "splwow64.exe", "werfault.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [conhost.exe, splwow64.exe, werfault.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (conhost.exe, splwow64.exe, werfault.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("conhost.exe", "splwow64.exe", "werfault.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(conhost.exe OR splwow64.exe OR werfault.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("conhost.exe", "splwow64.exe", "werfault.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (592, 4688)
+    | where ParentProcessName endswith "\\conhost.exe"
+    | where Process !endswith "\\splwow64.exe" and Process !endswith "\\werfault.exe" and Process !endswith "\\conhost.exe"
+    | project TimeGenerated, Computer, Account, Process, ParentProcessName, CommandLine, NewProcessName, ProcessId
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Parent Process Name", "Process CommandLine"
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Parent Process Name" ILIKE '%conhost.exe%'
+      AND "Process Name" NOT ILIKE '%splwow64.exe%'
+      AND "Process Name" NOT ILIKE '%werfault.exe%'
+      AND "Process Name" NOT ILIKE '%conhost.exe%'
+    LAST 24 HOURS
+  yara_l: "rule conhost_indirect_command_execution {\n  meta:\n    author = \"TDL\"\n    description = \"Detects indirect command execution via\
+    \ conhost.exe - T1202\"\n    mitre_attack_technique = \"T1202\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    \n  events:\n    $e.metadata.event_type\
+    \ = \"PROCESS_LAUNCH\"\n    (\n      $e.metadata.product_event_type = \"592\" or\n      $e.metadata.product_event_type = \"4688\"\n    )\n\
+    \    re.regex($e.principal.process.file.full_path, `(?i)\\\\conhost\\.exe$`)\n    not re.regex($e.target.process.file.full_path, `(?i)\\\\\
+    (splwow64|werfault|conhost)\\.exe$`)\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-windows.security*, logs-system.security*, winlogbeat-*\n| WHERE event.code IN (\"592\", \"4688\") \n  AND TO_LOWER(process.parent.name)\
+    \ == \"conhost.exe\"\n  AND TO_LOWER(process.name) NOT IN (\"splwow64.exe\", \"werfault.exe\", \"conhost.exe\")\n| KEEP @timestamp, host.name,\
+    \ user.name, process.name, process.parent.name, process.command_line, process.executable\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND parent_process_name="conhost.exe" AND process_name NOT IN ["splwow64.exe", "werfault.exe", "conhost.exe"])
+  crowdstrike: |
+    EventCode=4688 ParentBaseFileName=conhost.exe
+    | FileName!=splwow64.exe AND FileName!=werfault.exe AND FileName!=conhost.exe
+    | table([@timestamp, ComputerName, UserName, ParentBaseFileName, FileName, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter lowercase(actor_process_image_name) contains "conhost.exe"
+    | filter not (lowercase(action_process_image_name) contains "splwow64.exe" or lowercase(action_process_image_name) contains "werfault.exe" or lowercase(action_process_image_name) contains "conhost.exe")
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:4688 AND process.parent.name:conhost.exe AND NOT process.name:(splwow64.exe OR werfault.exe OR conhost.exe)
+  sumo: |
+    _sourceCategory=*Windows* ("4688" OR "592")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ParentProcessName" as parent_process
+    | json field=_raw "NewProcessName" as process_name
+    | where event_id in ("4688", "592")
+    | where parent_process matches "*conhost.exe"
+    | where !(process_name matches "*splwow64.exe" OR process_name matches "*werfault.exe" OR process_name matches "*conhost.exe")
+    | fields _messageTime, _sourceHost, parent_process, process_name, event_id
 false_positives:
 - Security software
 - Authorized admin tools
@@ -95,7 +79,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Windows Process Creation Event
 

@@ -15,72 +15,63 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail eventName=RunInstances errorCode=null
+  spl: 'index=aws sourcetype=aws:cloudtrail eventName=RunInstances errorCode=null
+
     | search NOT [| inputlookup authorized_users.csv | fields userIdentity.userName | rename userIdentity.userName as userName]
+
     | table _time, userName, eventName, awsRegion, sourceIPAddress, userAgent, requestParameters.instanceType, responseElements.instancesSet.items{}.instanceId
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000194 {\n  meta:\n    author = \"TDL\"\n    description = \"EC2 Instance Created by Unauthorized User\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1578\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(1h)
+    | where EventName == "RunInstances"
+    | where ErrorCode == ""
+    | where SourceUserIdentity !in ("authorized-user1@example.com", "authorized-user2@example.com", "authorized-service-account")
+    | project TimeGenerated, EventName, SourceUserIdentity, SourceIPAddress, UserAgent, AWSRegion, RequestParameters, ResponseElements, ErrorCode, ErrorMessage
+  aql: |
+    SELECT sourceip, username, "eventName", "requestParameters", eventtime, LOGSOURCENAME(logsourceid) AS source
+    FROM events
+    WHERE "eventName" = 'RunInstances'
+      AND "errorCode" IS NULL
+      AND username NOT IN ('authorized_user1', 'authorized_user2', 'authorized_user3')
+      AND LOGSOURCENAME(logsourceid) ILIKE '%CloudTrail%'
+    LAST 24 HOURS
+  yara_l: "rule aws_unauthorized_ec2_instance_launch {\n  meta:\n    author = \"TDL\"\n    description = \"Detects unauthorized AWS EC2 instance\
+    \ launches via RunInstances API call\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1578\"\n    severity\
+    \ = \"Medium\"\n    \n  events:\n    $e.metadata.vendor_name = \"AMAZON\"\n    $e.metadata.product_name = \"AWS CloudTrail\"\n    $e.metadata.product_event_type\
+    \ = \"RunInstances\"\n    not $e.security_result.summary = /ErrorCode/\n    not $e.principal.user.userid in [\n      // Add authorized user\
+    \ IDs here\n      \"authorized_user_1\",\n      \"authorized_user_2\"\n    ]\n    $e.principal.user.userid = $user\n    \n  match:\n    $user\
+    \ over 5m\n    \n  outcome:\n    $risk_score = 65\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE event.action == "RunInstances" AND event.outcome == "success"
+    | WHERE user.name IS NOT NULL
+    | WHERE user.name NOT IN ("authorized-user-1", "authorized-user-2", "authorized-service-account")
+    | KEEP @timestamp, cloud.account.id, user.name, source.ip, user.target.name, event.action, aws.cloudtrail.user_identity.arn, aws.cloudtrail.request_parameters
+  leql: |
+    where(source_json.eventName=RunInstances AND source_json.errorCode=null AND NOT source_json.userIdentity.principalId IN [AUTHORIZED_PRINCIPAL_IDS])
+  crowdstrike: |
+    #repo=* event_simpleName=CloudTrailEvent eventName=RunInstances
+    | errorCode!="*"
+    | not (userIdentity.principalId IN ["AUTHORIZED_PRINCIPAL_ID_1", "AUTHORIZED_PRINCIPAL_ID_2"])
+    | table([@timestamp, userIdentity.principalId, userIdentity.arn, eventName, awsRegion, sourceIPAddress, requestParameters, responseElements])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and event_type = "RunInstances" and outcome = "success"
+    | filter actor_user not in ("authorized_user1", "authorized_user2", "authorized_user3")
+    | fields _time, actor_user, cloud_provider, event_type, target_resource, agent_id, action_country, action_region
+  lucene: |
+    eventName:RunInstances AND NOT userIdentity.principalId:(authorized_user_1 OR authorized_user_2 OR authorized_user_3) AND NOT _exists_:errorCode
+  sumo: |
+    _sourceCategory=*cloudtrail* RunInstances
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "userIdentity.principalId" as source_user
+    | json field=_raw "errorCode" as error_code
+    | where event_name = "RunInstances"
+    | where !(source_user in ("AuthorizedUser1", "AuthorizedUser2", "AuthorizedServiceRole"))
+    | where isNull(error_code)
+    | fields _messageTime, _sourceHost, event_name, source_user, error_code
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +81,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 AWS CloudTrail Event
 

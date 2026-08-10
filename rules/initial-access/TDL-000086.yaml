@@ -18,68 +18,61 @@ risk_score: 75
 queries:
   spl: "index=email_security action=\"url_click_permitted\" \n| lookup high_value_targets.csv user_email AS src_user OUTPUT is_hvt\n| where is_hvt=\"\
     true\"\n| table _time, src_user, url, subject, sender, recipient\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000086 {\n  meta:\n    author = \"TDL\"\n    description = \"HVT User Successful Click Permitted\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1566\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    EmailUrlInfo
+    | where TimeGenerated > ago(24h)
+    | where UrlClickAction == "Allowed" or UrlClickAction == "Permitted" or ActionType == "ClickAllowed"
+    | join kind=inner (
+        IdentityInfo
+        | where Tags has "HighValueTarget" or Tags has "HVT" or Tags has "HighValue"
+        | project AccountUpn
+    ) on $left.RecipientEmailAddress == $right.AccountUpn
+    | project TimeGenerated, RecipientEmailAddress, Url, UrlDomain, NetworkMessageId, SenderFromAddress, Subject, ThreatTypes, UrlClickAction
+  aql: |
+    SELECT sourceip, username, destinationip, URL, COUNT(*) AS click_count
+    FROM events
+    WHERE CATEGORYNAME(category) ILIKE '%email%'
+      AND (qidname(qid) ILIKE '%url%click%' OR qidname(qid) ILIKE '%link%click%' OR qidname(qid) ILIKE '%click%permitted%')
+      AND username IN (SELECT username FROM events WHERE categoryname(category) ILIKE '%high%value%' OR qidname(qid) ILIKE '%hvt%' OR qidname(qid) ILIKE '%high%value%target%' LAST 30 DAYS)
+    GROUP BY sourceip, username, destinationip, URL
+    LAST 24 HOURS
+  yara_l: "rule high_value_user_url_click {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects URL click permitted events\
+    \ from high value target users - T1566 Initial Access\"\n    mitre_attack_tactic = \"Initial Access\"\n    mitre_attack_technique = \"T1566\"\
+    \n    severity = \"HIGH\"\n  \n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.metadata.product_name = \"EMAIL_SECURITY\"\
+    \n    $e.security_result.action = \"ALLOW\"\n    $e.principal.user.userid = $user\n    \n    // High value target user list - adjust as needed\n\
+    \    (\n      $user = \"ceo@company.com\" or\n      $user = \"cfo@company.com\" or\n      $user = \"cio@company.com\" or\n      $user = \"\
+    cto@company.com\" or\n      re.regex($user, `(?i)(executive|c-level|vp|president|director)`)\n    )\n  \n  match:\n    $user over 5m\n  \n\
+    \  outcome:\n    $risk_score = 85\n    $user_clicked = $user\n    $clicked_url = $e.target.url\n    $source_ip = $e.principal.ip\n  \n  condition:\n\
+    \    $e\n}\n"
+  esql: "FROM logs-email.security*\n| WHERE @timestamp > NOW() - 24 hour \n  AND event.action == \"url_click_permitted\"\n  AND user.name IN (\"\
+    executive1\", \"executive2\", \"ceo\", \"cfo\", \"cto\", \"admin\", \"domain_admin\", \"enterprise_admin\")\n| KEEP @timestamp, user.name,\
+    \ host.name, source.ip, email.from.address, url.full, email.subject\n"
+  leql: |
+    where(log_source_type="Email Security" AND event_type="URL Click Permitted" AND source_user IN high_value_target_user_list)
+  crowdstrike: |
+    #type=email_security event_simpleName=UrlClickPermitted
+    | match(file="high_value_targets.csv", field=SourceUser, include=[SourceUser])
+    | table([@timestamp, SourceUser, ComputerName, URL, Subject, Sender])
+  xql: |
+    dataset = email_protection_data
+    | filter event_type = ENUM.EVENT_TYPE_URL_CLICK and action_name = "permitted"
+    | alter is_hvt = arrayfilter(xdr_lookups(actor_effective_username, "high_value_targets"), "@element" != null)
+    | filter is_hvt != null and array_length(is_hvt) > 0
+    | fields _time, actor_effective_username, action_url, action_subject, action_sender_email, agent_hostname
+  lucene: |
+    event.action:"url_click_permitted" AND user.tags:"high_value_target"
+  sumo: |
+    _sourceCategory=*Email* OR _sourceCategory=*email* OR _sourceCategory=*EmailSecurity*
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "action" as action
+    | json field=_raw "user" as user
+    | json field=_raw "source_user" as source_user
+    | json field=_raw "recipient" as recipient
+    | json field=_raw "url_click" as url_click
+    | json field=_raw "verdict" as verdict
+    | where (event_type matches "*click*" OR event_type matches "*url*" OR action matches "*click*" OR action matches "*permit*" OR verdict matches "*permit*" OR verdict matches "*allow*")
+    | where user in ("exec@company.com", "ceo@company.com", "cfo@company.com", "admin@company.com") OR source_user in ("exec@company.com", "ceo@company.com", "cfo@company.com", "admin@company.com") OR recipient in ("exec@company.com", "ceo@company.com", "cfo@company.com", "admin@company.com")
+    | fields _messageTime, user, source_user, recipient, event_type, action, verdict, url_click
 false_positives:
 - Authorized pen testing
 - Security research
@@ -89,7 +82,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 URL Click Permitted Event
 

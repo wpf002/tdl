@@ -20,71 +20,64 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=* sourcetype=aws:cloudwatchlogs:guardduty (type="UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS" OR type="UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS")
-    | table _time, type, severity, accountId, region, resource.instanceDetails.instanceId, service.action.awsApiCallAction.remoteIpDetails.ipAddressV4, resource.accessKeyDetails.userName
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: 'index=* sourcetype=aws:cloudwatchlogs:guardduty (type="UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS" OR type="UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS")
 
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+    | table _time, type, severity, accountId, region, resource.instanceDetails.instanceId, service.action.awsApiCallAction.remoteIpDetails.ipAddressV4,
+    resource.accessKeyDetails.userName
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000307 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Instance Credential Exfiltration - GuardDuty\"\n \
-    \   severity = \"MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1552\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where EventType in ("UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS", "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS")
+    | project TimeGenerated, EventType, AccountId, Region, ResourceType, Severity, Title, Description, UserName, IpAddress
+  aql: "SELECT sourceip, destinationip, username, qidname(qid), LOGSOURCENAME(logsourceid), eventtime, \"Event Type\"\nFROM events\nWHERE LOGSOURCENAME(logsourceid)\
+    \ ILIKE '%guardduty%'\n  AND (\"Event Type\" = 'UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS' \n       OR \"Event Type\"\
+    \ = 'UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS')\nLAST 24 HOURS\n"
+  yara_l: |
+    rule aws_guardduty_iam_credential_exfiltration {
+      meta:
+        author = "TDL"
+        description = "Detects AWS GuardDuty alerts for IAM instance credential exfiltration"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1552"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Amazon GuardDuty"
+        (
+          $e.metadata.product_event_type = "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS" or
+          $e.metadata.product_event_type = "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS"
+        )
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%GuardDuty%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS", "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS")
+    | KEEP @timestamp, cloud.account.id, cloud.region, user.name, source.ip, event.type, event.severity, event.id
+  leql: |
+    where(source_json.type IN ["UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS", "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS"])
+  crowdstrike: "#type=guardduty \n| \"finding.type\" in [\"UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS\", \"UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS\"\
+    ]\n| table([@timestamp, \"finding.type\", \"finding.severity\", \"resource.instanceDetails.instanceId\", \"service.action.awsApiCallAction.remoteIpDetails.ipAddressV4\"\
+    , \"resource.accessKeyDetails.userName\"])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and log_name = "GuardDuty"
+    | filter raw_log.type in ("UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS", "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS")
+    | fields _time, cloud_provider, project, resource_name, raw_log.type, raw_log.severity, raw_log.description, raw_log.region, raw_log.accountId
+  lucene: |
+    event.type:"guardduty" AND (aws.guardduty.finding.type:"UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS" OR aws.guardduty.finding.type:"UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS")
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS", "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS")
+    | fields _messageTime, _sourceHost, event_type
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -94,7 +87,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Guard Duty Event
 

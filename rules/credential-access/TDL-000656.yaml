@@ -15,71 +15,63 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=azure sourcetype=azure:signinlogs appId="1b730954-1685-4b74-9bfd-dac224a7b894" resultType=0 NOT (resourceId IN ("00000002-0000-0000-c000-000000000000", "00000003-0000-0000-c000-000000000000"))
+  spl: 'index=azure sourcetype=azure:signinlogs appId="1b730954-1685-4b74-9bfd-dac224a7b894" resultType=0 NOT (resourceId IN ("00000002-0000-0000-c000-000000000000",
+    "00000003-0000-0000-c000-000000000000"))
+
     | table _time, userPrincipalName, appDisplayName, resourceDisplayName, ipAddress, location, deviceDetail.operatingSystem, userAgent
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000656 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Powershell Accessing Non Azure AD Resources\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SigninLogs
+    | where TimeGenerated > ago(1h)
+    | where AppId == "1b730954-1685-4b74-9bfd-dac224a7b894"
+    | where ResultType == 0
+    | where ResourceIdentity !in ("00000002-0000-0000-c000-000000000000", "00000003-0000-0000-c000-000000000000")
+    | project TimeGenerated, UserPrincipalName, AppDisplayName, AppId, ResourceIdentity, ResourceDisplayName, IPAddress, Location, DeviceDetail
+  aql: |
+    SELECT username, sourceip, "Application ID", "Resource ID", "Failure Code", eventtime, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%Azure%'
+      AND (QIDNAME(qid) ILIKE '%sign%in%' OR categoryname(category) ILIKE '%authentication%')
+      AND "Application ID" = '1b730954-1685-4b74-9bfd-dac224a7b894'
+      AND "Failure Code" = '0'
+      AND "Resource ID" NOT IN ('00000002-0000-0000-c000-000000000000', '00000003-0000-0000-c000-000000000000')
+    LAST 24 HOURS
+  yara_l: "rule azure_valid_accounts_aad_ps_signin {\n  meta:\n    author = \"TDL\"\n    description = \"Detects Azure sign-ins using AAD PowerShell\
+    \ application with successful authentication\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique = \"T1078\"\n\
+    \    severity = \"Medium\"\n  \n  events:\n    $e.metadata.vendor_name = \"MICROSOFT\"\n    $e.metadata.product_name = \"AZURE\"\n    $e.metadata.event_type\
+    \ = \"USER_LOGIN\"\n    $e.principal.application = \"1b730954-1685-4b74-9bfd-dac224a7b894\"\n    $e.security_result.summary = \"0\"\n    $e.target.resource.id\
+    \ != \"00000002-0000-0000-c000-000000000000\"\n    $e.target.resource.id != \"00000003-0000-0000-c000-000000000000\"\n    $e.principal.user.userid\
+    \ = $user\n    $e.principal.ip = $ip\n  \n  match:\n    $user, $ip over 5m\n  \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-azure.signinlogs*
+    | WHERE azure.signinlogs.properties.app_id == "1b730954-1685-4b74-9bfd-dac224a7b894"
+      AND azure.signinlogs.properties.status.error_code == 0
+      AND azure.signinlogs.properties.resource_id NOT IN ("00000002-0000-0000-c000-000000000000", "00000003-0000-0000-c000-000000000000")
+    | KEEP @timestamp, azure.signinlogs.properties.user_principal_name, azure.signinlogs.properties.ip_address, azure.signinlogs.properties.app_display_name, azure.signinlogs.properties.resource_display_name, azure.signinlogs.properties.resource_id
+  leql: |
+    where(source_json.appId="1b730954-1685-4b74-9bfd-dac224a7b894" AND source_json.status.errorCode=0 AND source_json.resourceId!="00000002-0000-0000-c000-000000000000" AND source_json.resourceId!="00000003-0000-0000-c000-000000000000")
+  crowdstrike: "#event_type=AzureSignInLogs appId=\"1b730954-1685-4b74-9bfd-dac224a7b894\" resultType=0 \n| !in(field=resourceId, values=[\"00000002-0000-0000-c000-000000000000\"\
+    , \"00000003-0000-0000-c000-000000000000\"])\n| table([@timestamp, userPrincipalName, appDisplayName, resourceDisplayName, ipAddress, location,\
+    \ deviceDetail])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AZURE" and operation_name = "Sign-in activity"
+    | filter json_extract_scalar(raw_log, "$.properties.appId") = "1b730954-1685-4b74-9bfd-dac224a7b894"
+    | filter json_extract_scalar(raw_log, "$.properties.status.errorCode") = "0"
+    | filter json_extract_scalar(raw_log, "$.properties.resourceId") not in ("00000002-0000-0000-c000-000000000000", "00000003-0000-0000-c000-000000000000")
+    | fields _time, json_extract_scalar(raw_log, "$.properties.userPrincipalName") as user, json_extract_scalar(raw_log, "$.properties.ipAddress") as ip_address, json_extract_scalar(raw_log, "$.properties.appDisplayName") as app_name, json_extract_scalar(raw_log, "$.properties.resourceDisplayName") as resource_name
+  lucene: |
+    properties.appId:"1b730954-1685-4b74-9bfd-dac224a7b894" AND properties.status.errorCode:0 AND NOT properties.resourceId:("00000002-0000-0000-c000-000000000000" OR "00000003-0000-0000-c000-000000000000")
+  sumo: |
+    _sourceCategory=*Azure*SignIn* OR _sourceCategory=*Azure*Sign-in* OR _sourceCategory=*azure*signin*
+    | json field=_raw "appId" as app_id
+    | json field=_raw "status.errorCode" as error_code
+    | json field=_raw "resourceId" as resource_id
+    | where app_id = "1b730954-1685-4b74-9bfd-dac224a7b894"
+    | where error_code = "0" OR error_code = 0
+    | where !(resource_id in ("00000002-0000-0000-c000-000000000000", "00000003-0000-0000-c000-000000000000"))
+    | fields _messageTime, app_id, error_code, resource_id, _sourceHost
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +81,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Azure Sign-in Event\nWhere the application id is \"1b730954-1685-4b74-9bfd-dac224a7b894\"\nWhere the failure code is 0 \nWhere\
   \ the resourceid is not in (\"00000002-0000-0000-c000-000000000000\", \"00000003-0000-0000-c000-000000000000\")"

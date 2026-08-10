@@ -17,78 +17,100 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 95
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=4886 OR EventCode=4887) Request_Attributes="*upn:*"
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=4886 OR EventCode=4887) Request_Attributes="*upn:*"
+
     | rex field=Request_Attributes "upn:(?<san_upn>[^\r\n]+)"
+
     | eval san_upn=lower(trim(san_upn))
+
     | eval requester=lower(coalesce(Account_Name, SubjectUserName))
+
     | where isnotnull(san_upn) AND san_upn != requester
+
     | table _time, ComputerName, EventCode, requester, san_upn, Request_Attributes, Certificate_Template
-  kql: 'DeviceProcessEvents
 
-    | where TimeGenerated > ago(1d)
+    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID in (4886, 4887)
+    | extend RequestorAccount = tolower(coalesce(SubjectUserName, Account))
+    | extend RequestorDomain = tolower(coalesce(SubjectDomainName, ""))
+    | extend RequestorUPN = strcat(RequestorAccount, "@", RequestorDomain)
+    | extend Attributes = tostring(column_ifexists("Attributes", ""))
+    | where Attributes has "upn="
+    | extend ExtractedUPN = extract(@"(?i)upn=([^\s&]+)", 1, Attributes)
+    | where isnotempty(ExtractedUPN)
+    | extend ExtractedUPNLower = tolower(ExtractedUPN)
+    | where ExtractedUPNLower != RequestorUPN and ExtractedUPNLower != tolower(strcat(RequestorAccount, "@"))
+    | project TimeGenerated, Computer, EventID, RequestorAccount, RequestorDomain, RequestorUPN, ExtractedUPN, Attributes, TargetUserName, Activity
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, "EventID", username AS requesting_account, "Subject" AS certificate_subject, "Subject Alternative Name" AS subject_alt_name, "Certificate Template" AS cert_template, sourceip
+    FROM events
+    WHERE ("EventID" = '4886' OR "EventID" = '4887')
+      AND "Subject Alternative Name" IS NOT NULL
+      AND "Subject Alternative Name" != ''
+      AND LOWER("Subject Alternative Name") NOT ILIKE LOWER(CONCAT('%', username, '%'))
+    LAST 24 HOURS
+  yara_l: |
+    rule adcs_esc1_esc6_subject_altname_mismatch {
+      meta:
+        author = "TDL"
+        description = "Detects ADCS ESC1/ESC6 abuse via SubjectAltName mismatch (T1649)"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1649"
+        severity = "HIGH"
 
+      events:
+        ($e.metadata.event_type = "GENERIC_EVENT" or $e.metadata.event_type = "USER_RESOURCE_ACCESS")
+        ($e.metadata.product_event_type = "4886" or $e.metadata.product_event_type = "4887")
+        $e.principal.user.userid = $requesting_account
+        $e.target.user.userid = $san_upn
+        $requesting_account != $san_upn
+        $e.principal.hostname = $host
+
+      match:
+        $host, $requesting_account, $san_upn over 5m
+
+      outcome:
+        $risk_score = 85
+
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE winlog.event_id IN (4886, 4887)
+      AND winlog.event_data.Attributes LIKE "*SAN:*upn=*"
+      AND winlog.event_data.Attributes NOT LIKE CONCAT("*upn=", user.name, "@*")
+    | EVAL requested_upn = REPLACE(REPLACE(winlog.event_data.Attributes, ".*SAN:.*upn=([^&\\s]+).*", "$1"), winlog.event_data.Attributes, "extracted")
+    | KEEP @timestamp, host.name, user.name, winlog.event_id, winlog.event_data.Attributes, winlog.event_data.TemplateName, requested_upn
+  leql: |
+    where(source_json.EventID IN [4886, 4887] AND source_json.CertificateSubjectAlternativeName ICONTAINS "upn=" AND source_json.CertificateSubjectAlternativeName != source_json.SubjectUserName) groupby(asset, source_json.SubjectUserName, source_json.CertificateSubjectAlternativeName) calculate(count)
+  crowdstrike: |
+    (EventCode=4886 OR EventCode=4887) Attributes=*san:upn=*
+    | regex("san:upn=(?<san_upn>[^&\s]+)", field=Attributes)
+    | san_upn!=SubjectUserName
+    | table([@timestamp, ComputerName, SubjectUserName, san_upn, Attributes, RequestId])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (4886, 4887)
+    | alter subject_user = coalesce(action_evtlog_event_data_SubjectUserName, action_evtlog_event_data_RequesterName)
+    | alter san_upn = arrayindex(regextract(action_evtlog_message, "san:upn=([^,\s]+)"), 0)
+    | filter san_upn != null and san_upn != "" and lowercase(san_upn) != lowercase(subject_user)
+    | fields _time, agent_hostname, action_evtlog_event_id, subject_user, san_upn, action_evtlog_event_data_CertificateTemplate, action_evtlog_message
+  lucene: |
+    (event.code:(4886 OR 4887) OR winlog.event_id:(4886 OR 4887)) AND _exists_:winlog.event_data.Attributes AND winlog.event_data.Attributes:*san:upn* AND NOT (winlog.event_data.SubjectUserName:* AND winlog.event_data.Attributes:*san\:upn\=*winlog.event_data.SubjectUserName*)
+  sumo: |
+    _sourceCategory=*ADCS* OR _sourceCategory=*Windows* (4886 OR 4887)
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "SubjectUserName" as subject_user
+    | json field=_raw "Attributes" as attributes
     | where event_id in ("4886", "4887")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4886', '4887')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000752 {\n  meta:\n    author = \"TDL\"\n    description = \"ADCS Certificate Issued With SAN Override\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0006\"\n    technique = \"T1649\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id\
-    \ = /(4886|4887)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND event_id IN ("4886", "4887")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4886, 4887])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4886, 4887)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4886", "4887")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4886 OR 4887)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4886", "4887")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+    | where attributes matches "*san:upn=*"
+    | parse regex field=attributes "san:upn=(?<san_upn>[^&\s]+)"
+    | where san_upn != subject_user
+    | fields _messageTime, _sourceHost, event_id, subject_user, san_upn, attributes
 pseudo_logic: EID 4886/4887 with explicit SubjectAltName UPN that does not match the requesting account. ADCS ESC1/ESC6 abuse.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -106,7 +128,7 @@ references:
 - https://attack.mitre.org/techniques/T1649/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'

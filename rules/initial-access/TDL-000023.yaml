@@ -18,90 +18,151 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    (index=o365 sourcetype="o365:management:activity" Operation=UserLoggedIn Result=Success) OR (index=vpn sourcetype=vpn (action=success OR action=login)) OR (index=aws sourcetype="aws:cloudtrail" eventName=ConsoleLogin errorCode=success) OR (index=o365 sourcetype="o365:atp:alert" alert_name="Impossible travel activity") OR (index=aws sourcetype="aws:guardduty" type="UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B")
-    | eval user=coalesce(UserId, user, userName, userIdentity.userName, dest_user)
-    | eval src_ip=coalesce(ClientIP, src_ip, src, sourceIPAddress)
-    | eval event_type=case(
-        sourcetype="o365:atp:alert" AND alert_name="Impossible travel activity", "o365_atp_alert",
-        sourcetype="aws:guardduty" AND type="UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B", "guardduty_event",
-        (sourcetype="o365:management:activity" OR sourcetype="vpn" OR sourcetype="aws:cloudtrail"), "login_event",
-        1=1, "other"
+  spl: "(index=o365 sourcetype=\"o365:management:activity\" Operation=UserLoggedIn Result=Success) OR (index=vpn sourcetype=vpn (action=success\
+    \ OR action=login)) OR (index=aws sourcetype=\"aws:cloudtrail\" eventName=ConsoleLogin errorCode=success) OR (index=o365 sourcetype=\"o365:atp:alert\"\
+    \ alert_name=\"Impossible travel activity\") OR (index=aws sourcetype=\"aws:guardduty\" type=\"UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B\"\
+    )\n| eval user=coalesce(UserId, user, userName, userIdentity.userName, dest_user)\n| eval src_ip=coalesce(ClientIP, src_ip, src, sourceIPAddress)\n\
+    | eval event_type=case(\n    sourcetype=\"o365:atp:alert\" AND alert_name=\"Impossible travel activity\", \"o365_atp_alert\",\n    sourcetype=\"\
+    aws:guardduty\" AND type=\"UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B\", \"guardduty_event\",\n    (sourcetype=\"o365:management:activity\"\
+    \ OR sourcetype=\"vpn\" OR sourcetype=\"aws:cloudtrail\"), \"login_event\",\n    1=1, \"other\"\n)\n| iplocation src_ip\n| eval lat=coalesce(lat,\
+    \ 0), lon=coalesce(lon, 0)\n| sort 0 user _time\n| streamstats current=f last(lat) as prev_lat last(lon) as prev_lon last(_time) as prev_time\
+    \ by user\n| eval time_diff_hours=(_time - prev_time)/3600\n| eval distance_km=6371*acos(cos(radians(lat))*cos(radians(prev_lat))*cos(radians(prev_lon)-radians(lon))+sin(radians(lat))*sin(radians(prev_lat)))\n\
+    | eval speed_kph=distance_km/time_diff_hours\n| eval impossible_travel=if(speed_kph > 925 AND isnotnull(prev_lat), 1, 0)\n| where (event_type=\"\
+    login_event\" AND impossible_travel=1) OR event_type=\"o365_atp_alert\" OR event_type=\"guardduty_event\"\n| stats count(eval(event_type=\"\
+    login_event\" AND impossible_travel=1)) as login_events, count(eval(event_type=\"o365_atp_alert\")) as o365_alerts, count(eval(event_type=\"\
+    guardduty_event\")) as guardduty_events, values(_time) as event_times, values(src_ip) as src_ips, values(Country) as countries, max(speed_kph)\
+    \ as max_speed_kph by user\n| where (login_events >= 2) OR (o365_alerts >= 1) OR (guardduty_events >= 1)\n| table user, login_events, o365_alerts,\
+    \ guardduty_events, max_speed_kph, event_times, src_ips, countries\n"
+  kql: "let ImpossibleTravelThreshold = 925;\nlet TimeWindow = 24h;\nlet VPNLogins = \n    CommonSecurityLog\n    | where TimeGenerated > ago(TimeWindow)\n\
+    \    | where DeviceVendor has \"VPN\" or DeviceProduct has \"VPN\"\n    | where Activity has \"success\" or Activity has \"login\"\n    |\
+    \ extend DestinationUserName = coalesce(DestinationUserName, DstUserName, tostring(split(DestinationUserPrincipalName, \"@\")[0]))\n    |\
+    \ extend Latitude = toreal(DeviceCustomFloatingPoint1), Longitude = toreal(DeviceCustomFloatingPoint2)\n    | where isnotnull(Latitude) and\
+    \ isnotnull(Longitude)\n    | project TimeGenerated, DestinationUserName, Latitude, Longitude, SourceIP = SourceIP, Source = \"VPN\";\nlet\
+    \ O365Logins = \n    SigninLogs\n    | where TimeGenerated > ago(TimeWindow)\n    | where ResultType == 0\n    | extend DestinationUserName\
+    \ = UserPrincipalName\n    | extend Latitude = toreal(LocationDetails.geoCoordinates.latitude), Longitude = toreal(LocationDetails.geoCoordinates.longitude)\n\
+    \    | where isnotnull(Latitude) and isnotnull(Longitude)\n    | project TimeGenerated, DestinationUserName, Latitude, Longitude, SourceIP\
+    \ = IPAddress, Source = \"O365\";\nlet AWSLogins = \n    AWSCloudTrail\n    | where TimeGenerated > ago(TimeWindow)\n    | where EventName\
+    \ == \"ConsoleLogin\" and ErrorCode == \"\"\n    | extend DestinationUserName = coalesce(UserIdentityUserName, UserIdentityPrincipalid)\n\
+    \    | extend Latitude = toreal(LocationDetails.Latitude), Longitude = toreal(LocationDetails.Longitude)\n    | where isnotnull(Latitude)\
+    \ and isnotnull(Longitude)\n    | project TimeGenerated, DestinationUserName, Latitude, Longitude, SourceIP = SourceIpAddress, Source = \"\
+    AWS\";\nlet AllLogins = union VPNLogins, O365Logins, AWSLogins;\nlet ImpossibleTravelLogins = \n    AllLogins\n    | summarize LoginEvents\
+    \ = make_list(pack(\"Time\", TimeGenerated, \"Lat\", Latitude, \"Lon\", Longitude, \"IP\", SourceIP, \"Source\", Source)) by DestinationUserName\n\
+    \    | mv-expand LoginEvent1 = LoginEvents to typeof(dynamic)\n    | mv-expand LoginEvent2 = LoginEvents to typeof(dynamic)\n    | where LoginEvent1.Time\
+    \ < LoginEvent2.Time\n    | extend TimeDiffHours = datetime_diff('second', todatetime(LoginEvent2.Time), todatetime(LoginEvent1.Time)) / 3600.0\n\
+    \    | extend DistanceKm = 111.0 * sqrt(pow(toreal(LoginEvent1.Lat) - toreal(LoginEvent2.Lat), 2) + pow((toreal(LoginEvent1.Lon) - toreal(LoginEvent2.Lon))\
+    \ * cos((toreal(LoginEvent1.Lat) + toreal(LoginEvent2.Lat)) / 2 * pi() / 180), 2))\n    | extend SpeedKph = DistanceKm / TimeDiffHours\n \
+    \   | where SpeedKph > ImpossibleTravelThreshold\n    | summarize ImpossibleTravelCount = count() by DestinationUserName\n    | where ImpossibleTravelCount\
+    \ >= 1;\nlet O365ATPAlerts = \n    SecurityAlert\n    | where TimeGenerated > ago(TimeWindow)\n    | where ProviderName =~ \"Office 365 Advanced\
+    \ Threat Protection\" or ProductName has \"Office 365\"\n    | where AlertName has \"Impossible travel activity\"\n    | extend DestinationUserName\
+    \ = tostring(parse_json(Entities)[0].Name)\n    | summarize O365AlertCount = count() by DestinationUserName\n    | where O365AlertCount >=\
+    \ 1;\nlet GuardDutyAlerts = \n    AWSGuardDuty\n    | where TimeGenerated > ago(TimeWindow)\n    | where Type == \"UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B\"\
+    \n    | extend DestinationUserName = tostring(parse_json(Resource).AccessKeyDetails.UserName)\n    | summarize GuardDutyCount = count() by\
+    \ DestinationUserName\n    | where GuardDutyCount >= 1;\nImpossibleTravelLogins\n| join kind=inner O365ATPAlerts on DestinationUserName\n\
+    | join kind=inner GuardDutyAlerts on DestinationUserName\n| project DestinationUserName, ImpossibleTravelCount, O365AlertCount, GuardDutyCount\n"
+  aql: "SELECT username AS \"Destination Username\", \n       UNIQUECOUNT(sourceip) AS \"Unique Source IPs\", \n       COUNT(*) AS \"Total Logins\"\
+    ,\n       LOGSOURCENAME(logsourceid) AS \"Log Sources\"\nFROM events\nWHERE (categoryname(category) ILIKE '%authentication%' OR categoryname(category)\
+    \ ILIKE '%logon%')\n  AND username IS NOT NULL\n  AND sourceip IS NOT NULL\nGROUP BY username\nHAVING \"Unique Source IPs\" >= 2 AND \"Total\
+    \ Logins\" >= 2\nLAST 24 HOURS\n"
+  yara_l: "rule impossible_travel_multi_source {\n  meta:\n    author = \"TDL\"\n    description = \"Detects impossible travel from multiple sources:\
+    \ distance-based logins, O365 ATP alerts, GuardDuty console access\"\n    mitre_tactic = \"Initial Access\"\n    mitre_technique = \"T1078\"\
+    \n    severity = \"HIGH\"\n\n  events:\n    // Successful login events with distance calculation\n    $login.metadata.event_type = \"USER_LOGIN\"\
+    \n    $login.security_result.action = \"ALLOW\"\n    $login.target.user.userid = $user\n    $login.principal.location.country_or_region !=\
+    \ \"\"\n    $login.principal.ip != \"\"\n    \n    // O365 ATP impossible travel alert\n    $o365.metadata.product_name = \"Office 365\"\n\
+    \    $o365.metadata.event_type = \"USER_UNCATEGORIZED\"\n    $o365.security_result.summary = \"Impossible travel activity\"\n    $o365.target.user.userid\
+    \ = $user_o365\n    \n    // GuardDuty unauthorized console login\n    $gd.metadata.product_name = \"AWS GuardDuty\"\n    $gd.metadata.product_event_type\
+    \ = \"UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B\"\n    $gd.target.user.userid = $user_gd\n\n  match:\n    $user over 24h\n    $user_o365\
+    \ over 24h\n    $user_gd over 24h\n\n  outcome:\n    $risk_score = max(75)\n    $primary_user = array_distinct(coalesce($user, $user_o365,\
+    \ $user_gd))\n    $login_count = count_distinct($login.principal.ip)\n    $alert_sources = array_distinct(coalesce($o365.metadata.product_name,\
+    \ $gd.metadata.product_name))\n\n  condition:\n    (#login >= 2 and $login) or $o365 or $gd\n}\n"
+  esql: "FROM logs-o365.audit*, logs-aws.cloudtrail*, logs-vpn*, .alerts-security.alerts-*\n| WHERE @timestamp > NOW() - 24 hours\n| EVAL event_type\
+    \ = CASE(\n    event.dataset == \"o365.audit\" AND event.action == \"UserLoggedIn\" AND event.outcome == \"success\", \"o365_login\",\n  \
+    \  event.dataset LIKE \"aws.*\" AND event.action == \"ConsoleLogin\" AND event.outcome == \"success\", \"aws_login\",\n    event.dataset LIKE\
+    \ \"*vpn*\" AND event.action LIKE \"*login*\" AND event.outcome == \"success\", \"vpn_login\",\n    event.dataset == \"o365.audit\" AND event.kind\
+    \ == \"alert\" AND TO_LOWER(event.reason) LIKE \"*impossible travel*\", \"o365_alert\",\n    cloud.provider == \"aws\" AND event.dataset LIKE\
+    \ \"aws.guardduty*\" AND event.type == \"UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B\", \"guardduty_alert\",\n    \"other\"\n  )\n| WHERE\
+    \ event_type IN (\"o365_login\", \"aws_login\", \"vpn_login\", \"o365_alert\", \"guardduty_alert\")\n| STATS \n    login_count = COUNT(*)\
+    \ BY user.name, source.geo.location, destination.geo.location, event_type, bucket = BUCKET(@timestamp, 1 hour)\n| WHERE login_count >= 2\n\
+    | KEEP user.name, login_count, source.geo.location, destination.geo.location, event_type, bucket\n"
+  leql: |
+    where(((log_source_name="Authentication" AND result=SUCCESS) OR (log_source_name="Office 365" AND source_json.AlertName="Impossible travel activity") OR (log_source_name="AWS GuardDuty" AND source_json.type="UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B"))) groupby(user) calculate(count)
+  crowdstrike: |
+    (
+      (#type=vpn OR #type=o365 OR #type=guardduty)
+      AND (
+        (event_simpleName=UserLogon OR event_simpleName=OfficeActivity OR EventType="UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B")
+      )
     )
-    | iplocation src_ip
-    | eval lat=coalesce(lat, 0), lon=coalesce(lon, 0)
-    | sort 0 user _time
-    | streamstats current=f last(lat) as prev_lat last(lon) as prev_lon last(_time) as prev_time by user
-    | eval time_diff_hours=(_time - prev_time)/3600
-    | eval distance_km=6371*acos(cos(radians(lat))*cos(radians(prev_lat))*cos(radians(prev_lon)-radians(lon))+sin(radians(lat))*sin(radians(prev_lat)))
-    | eval speed_kph=distance_km/time_diff_hours
-    | eval impossible_travel=if(speed_kph > 925 AND isnotnull(prev_lat), 1, 0)
-    | where (event_type="login_event" AND impossible_travel=1) OR event_type="o365_atp_alert" OR event_type="guardduty_event"
-    | stats count(eval(event_type="login_event" AND impossible_travel=1)) as login_events, count(eval(event_type="o365_atp_alert")) as o365_alerts, count(eval(event_type="guardduty_event")) as guardduty_events, values(_time) as event_times, values(src_ip) as src_ips, values(Country) as countries, max(speed_kph) as max_speed_kph by user
-    | where (login_events >= 2) OR (o365_alerts >= 1) OR (guardduty_events >= 1)
-    | table user, login_events, o365_alerts, guardduty_events, max_speed_kph, event_times, src_ips, countries
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000023 {\n  meta:\n    author = \"TDL\"\n    description = \"Impossible Travel Login Detected\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    | case {
+        #type=o365 AND Operation="Impossible travel activity" | alert_type := "o365_atp";
+        #type=guardduty AND EventType="UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B" | alert_type := "guardduty";
+        * | alert_type := "login";
+      }
+    | case {
+        alert_type="login" AND LoginStatus=success | event_type := "successful_login";
+        alert_type="o365_atp" | event_type := "o365_alert";
+        alert_type="guardduty" | event_type := "guardduty_alert";
+        * | event_type := "other";
+      }
+    | event_type IN ["successful_login", "o365_alert", "guardduty_alert"]
+    | groupBy([UserName, SourceIP, SourceCity, SourceCountry, SourceLatitude, SourceLongitude], function=collect([alert_type, event_type, @timestamp]))
+    | selfJoin(field=[UserName], where=[{SourceLatitude != SourceLatitude}, {SourceLongitude != SourceLongitude}], as=travel)
+    | travel.SourceLatitude := travel.SourceLatitude
+    | travel.SourceLongitude := travel.SourceLongitude
+    | lat_diff := (SourceLatitude - travel.SourceLatitude)
+    | lon_diff := (SourceLongitude - travel.SourceLongitude)
+    | distance_km := sqrt((lat_diff * 111)^2 + (lon_diff * 111 * cos((SourceLatitude + travel.SourceLatitude) / 2 * 0.0174533))^2)
+    | time_diff_hours := (@timestamp - travel.@timestamp) / 3600000
+    | speed_kph := distance_km / time_diff_hours
+    | speed_kph > 925
+    | table([UserName, SourceIP, travel.SourceIP, SourceCity, travel.SourceCity, distance_km, time_diff_hours, speed_kph, @timestamp, travel.@timestamp])
+  xql: "dataset = cloud_audit_logs\n| filter (vendor = \"Microsoft\" and operation_name = \"UserLoggedIn\" and outcome = \"Success\") \n   or\
+    \ (vendor = \"Amazon AWS\" and event_type in (\"UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B\"))\n   or (vendor = \"Microsoft\" and alert_name\
+    \ = \"Impossible travel activity\")\n| alter username = coalesce(actor_effective_username, identity_name, user_name)\n| alter source_type\
+    \ = if(vendor = \"Amazon AWS\", \"AWS\", if(alert_name = \"Impossible travel activity\", \"O365_Alert\", \"O365\"))\n| alter lat = to_float(coalesce(src_location_latitude,\
+    \ source_location_latitude)), \n        lon = to_float(coalesce(src_location_longitude, source_location_longitude))\n| filter lat != null\
+    \ and lon != null and username != null\n| sort username, _time asc\n| fields _time, username, source_type, lat, lon, agent_ip_address, city,\
+    \ country\n| alter prev_time = arrayindex(arrayexpand(array_create(_time), -1), 0),\n        prev_lat = arrayindex(arrayexpand(array_create(lat),\
+    \ -1), 0),\n        prev_lon = arrayindex(arrayexpand(array_create(lon), -1), 0),\n        prev_source = arrayindex(arrayexpand(array_create(source_type),\
+    \ -1), 0)\n| filter prev_time != null and prev_lat != null and prev_lon != null and source_type != prev_source\n| alter time_diff_hours =\
+    \ to_float(timestamp_diff(_time, prev_time, \"HOUR\")),\n        distance_km = 6371 * acos(\n            cos(radians(prev_lat)) * cos(radians(lat))\
+    \ * cos(radians(lon) - radians(prev_lon)) + \n            sin(radians(prev_lat)) * sin(radians(lat))\n        )\n| alter speed_kph = if(time_diff_hours\
+    \ > 0, distance_km / time_diff_hours, 0)\n| filter speed_kph > 925\n| comp count() as login_events, values(source_type) as sources by username\n\
+    | filter login_events >= 2 and array_length(sources) >= 2\n"
+  lucene: |
+    (event.dataset:"o365.audit" AND event.outcome:success AND event.action:UserLoggedIn) OR (event.dataset:"microsoft_defender_cloud_apps" AND event.type:alert AND alert.name:"Impossible travel activity") OR (event.dataset:"aws.guardduty" AND event.type:"UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B")
+  sumo: |
+    (_sourceCategory=*VPN* OR _sourceCategory=*Office365* OR _sourceCategory=*O365* OR _sourceCategory=*AWS* OR _sourceCategory=*GuardDuty*)
+    | json field=_raw "username" as username nodrop
+    | json field=_raw "user" as user nodrop
+    | json field=_raw "UserPrincipalName" as upn nodrop
+    | json field=_raw "UserId" as userid nodrop
+    | json field=_raw "userIdentity.principalId" as aws_user nodrop
+    | json field=_raw "type" as event_type nodrop
+    | json field=_raw "AlertName" as alert_name nodrop
+    | json field=_raw "Operation" as operation nodrop
+    | json field=_raw "ClientIP" as client_ip nodrop
+    | json field=_raw "sourceIPAddress" as source_ip nodrop
+    | json field=_raw "Latitude" as lat nodrop
+    | json field=_raw "Longitude" as lon nodrop
+    | json field=_raw "latitude" as lat2 nodrop
+    | json field=_raw "longitude" as lon2 nodrop
+    | where (operation matches "*UserLoggedIn*" OR operation matches "*Login*" OR event_type="UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B" OR alert_name="Impossible travel activity")
+    | if(isNull(username), if(isNull(user), if(isNull(upn), if(isNull(userid), aws_user, userid), upn), user), username) as dest_user
+    | if(isNull(client_ip), source_ip, client_ip) as src_ip
+    | if(isNull(lat), lat2, lat) as latitude
+    | if(isNull(lon), lon2, lon) as longitude
+    | where !isNull(dest_user) AND !isNull(src_ip)
+    | geoip src_ip
+    | if(!isNull(latitude) AND !isNull(longitude), latitude, geoip_latitude) as final_lat
+    | if(!isNull(latitude) AND !isNull(longitude), longitude, geoip_longitude) as final_lon
+    | sort by dest_user, _messageTime asc
+    | first(_messageTime) as time1, first(final_lat) as lat1, first(final_lon) as lon1, first(src_ip) as ip1, last(_messageTime) as time2, last(final_lat) as lat2, last(final_lon) as lon2, last(src_ip) as ip2, count as event_count by dest_user
+    | where event_count >= 2 AND ip1 != ip2
+    | (6371 * acos(cos(lat1 * 3.14159/180) * cos(lat2 * 3.14159/180) * cos((lon2 - lon1) * 3.14159/180) + sin(lat1 * 3.14159/180) * sin(lat2 * 3.14159/180))) as distance_km
+    | (time2 - time1) / (1000 * 3600) as time_hours
+    | if(time_hours > 0, distance_km / time_hours, 0) as speed_kph
+    | where speed_kph > 925
+    | fields dest_user, ip1, ip2, lat1, lon1, lat2, lon2, distance_km, time_hours, speed_kph
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -111,7 +172,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "2 Successful Login Events\nFrom multiple sources\nWith the same Destination Username\nWhere the Distance Traveled speed required\
   \ is greater than 925 kph\n\n---------------------------------------------------------------------------------------------------------------\n\

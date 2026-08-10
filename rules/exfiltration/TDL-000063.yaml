@@ -16,84 +16,139 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=proxy (action=allowed OR status=200) direction=outbound http_method=POST
-    | search NOT dest IN ("*.internal.domain.com", "10.*", "192.168.*", "172.16.*", "172.17.*", "172.18.*", "172.19.*", "172.20.*", "172.21.*", "172.22.*", "172.23.*", "172.24.*", "172.25.*", "172.26.*", "172.27.*", "172.28.*", "172.29.*", "172.30.*", "172.31.*")
+  spl: 'index=proxy (action=allowed OR status=200) direction=outbound http_method=POST
+
+    | search NOT dest IN ("*.internal.domain.com", "10.*", "192.168.*", "172.16.*", "172.17.*", "172.18.*", "172.19.*", "172.20.*", "172.21.*",
+    "172.22.*", "172.23.*", "172.24.*", "172.25.*", "172.26.*", "172.27.*", "172.28.*", "172.29.*", "172.30.*", "172.31.*")
+
     | lookup paste_site_domains.csv domain as dest_domain OUTPUT is_paste_site
+
     | where is_paste_site="true"
-    | stats count earliest(_time) as first_seen latest(_time) as last_seen values(dest_domain) as destination_domains values(url) as urls by src, dest
+
+    | stats count earliest(_time) as first_seen latest(_time) as last_seen values(dest_domain) as destination_domains values(url) as urls by src,
+    dest
+
     | table first_seen last_seen src dest destination_domains urls count
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "http"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(1h)
+    | where DeviceVendor has "Proxy" or DeviceProduct has "Proxy" or DeviceEventClassID has "proxy"
+    | where DeviceDirection =~ "Outbound" or CommunicationDirection =~ "Outbound"
+    | where RequestMethod =~ "POST"
+    | where DestinationHostName has_any (
+        "pastebin.com", "paste.ee", "hastebin.com", "dpaste.com", "dpaste.org",
+        "pastelink.net", "paste2.org", "privatebin.net", "cl1p.net", "ivpaste.com",
+        "paste.ubuntu.com", "ghostbin.com", "paste.org.ru", "codeshare.io", "rentry.co",
+        "controlc.com", "justpaste.it", "jpst.it", "paste.centos.org", "termbin.com",
+        "everfall.com", "slexy.org", "friendpaste.com", "codepad.org", "ideone.com",
+        "paste.debian.net", "paste.opensuse.org", "paste.fedoraproject.org", "sprunge.us",
+        "ix.io", "0x0.st", "file.io", "transfer.sh", "temp.sh", "gist.github.com",
+        "defuse.ca", "bpa.st", "snippet.host", "quickleak.se", "throwbin.io"
+    )
+    | project TimeGenerated, SourceIP, DestinationHostName, DestinationIP, RequestURL, RequestMethod, SourceUserName, DeviceAction, SentBytes, ReceivedBytes
+  aql: "SELECT sourceip, destinationip, url, \"Request Method\", COUNT(*) AS post_count\nFROM events\nWHERE INOFFENSE('sourceip')='false'\n  AND\
+    \ INOFFENSE('destinationip')='false'\n  AND \"Request Method\" = 'POST'\n  AND (url ILIKE '%pastebin.com%' \n       OR url ILIKE '%paste.ee%'\n\
+    \       OR url ILIKE '%hastebin.com%'\n       OR url ILIKE '%dpaste.com%'\n       OR url ILIKE '%privatebin.net%'\n       OR url ILIKE '%ghostbin.com%'\n\
+    \       OR url ILIKE '%paste.org.ru%'\n       OR url ILIKE '%ideone.com%'\n       OR url ILIKE '%codepad.org%'\n       OR url ILIKE '%jsitor.com%'\n\
+    \       OR url ILIKE '%controlc.com%'\n       OR url ILIKE '%paste2.org%'\n       OR url ILIKE '%pastefs.com%'\n       OR url ILIKE '%justpaste.it%'\n\
+    \       OR url ILIKE '%cl1p.net%'\n       OR url ILIKE '%snipplr.com%'\n       OR url ILIKE '%textsnip.com%'\n       OR url ILIKE '%paste.centos.org%'\n\
+    \       OR url ILIKE '%paste.ubuntu.com%'\n       OR url ILIKE '%slexy.org%'\n       OR url ILIKE '%bpaste.net%'\n       OR url ILIKE '%paste.mozilla.org%'\n\
+    \       OR url ILIKE '%rentry.co%'\n       OR url ILIKE '%throwbin.io%')\nGROUP BY sourceip, destinationip, url, \"Request Method\"\nLAST\
+    \ 24 HOURS\n"
+  yara_l: |
+    rule exfiltration_to_paste_site {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects POST requests to known paste sites indicating potential exfiltration via T1567"
+        mitre_attack_tactic = "Exfiltration"
+        mitre_attack_technique = "T1567"
+        severity = "High"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.network.direction = "OUTBOUND"
+        $e.network.http.method = "POST"
+        (
+          re.regex($e.target.url, `(?i)pastebin\.com`) or
+          re.regex($e.target.url, `(?i)paste\.ee`) or
+          re.regex($e.target.url, `(?i)hastebin\.com`) or
+          re.regex($e.target.url, `(?i)ghostbin\.com`) or
+          re.regex($e.target.url, `(?i)dpaste\.com`) or
+          re.regex($e.target.url, `(?i)paste\.org\.ru`) or
+          re.regex($e.target.url, `(?i)textbin\.net`) or
+          re.regex($e.target.url, `(?i)slexy\.org`) or
+          re.regex($e.target.url, `(?i)0bin\.net`) or
+          re.regex($e.target.url, `(?i)paste2\.org`) or
+          re.regex($e.target.url, `(?i)gist\.github\.com`) or
+          re.regex($e.target.url, `(?i)snipplr\.com`) or
+          re.regex($e.target.url, `(?i)controlc\.com`) or
+          re.regex($e.target.url, `(?i)codepad\.org`) or
+          re.regex($e.target.url, `(?i)ideone\.com`) or
+          re.regex($e.target.url, `(?i)pastelink\.net`) or
+          re.regex($e.target.url, `(?i)paste\.centos\.org`) or
+          re.regex($e.target.url, `(?i)cl1p\.net`) or
+          re.regex($e.target.url, `(?i)pastie\.org`) or
+          re.regex($e.target.url, `(?i)termbin\.com`)
+        )
+        $e.principal.ip = $src_ip
+        $e.target.hostname = $dst_domain
 
-    WHERE "network.protocol" LIKE ''%http%''
+      match:
+        $src_ip, $dst_domain over 5m
 
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exf_000063 {\n  meta:\n    author = \"TDL\"\n    description = \"POST Data Exfiltration to Paste Site\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0010\"\n    technique = \"T1567\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /http/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%http%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/http/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*http*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "http"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*http*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*http*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-network.proxy*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND network.direction == "outbound"
+      AND http.request.method == "POST"
+      AND (
+        destination.domain LIKE "*pastebin.com" OR
+        destination.domain LIKE "*paste.ee" OR
+        destination.domain LIKE "*hastebin.com" OR
+        destination.domain LIKE "*ghostbin.com" OR
+        destination.domain LIKE "*snipplr.com" OR
+        destination.domain LIKE "*justpaste.it" OR
+        destination.domain LIKE "*dpaste.com" OR
+        destination.domain LIKE "*paste.org" OR
+        destination.domain LIKE "*paste2.org" OR
+        destination.domain LIKE "*pastelink.net" OR
+        destination.domain LIKE "*slexy.org" OR
+        destination.domain LIKE "*paste.debian.net" OR
+        destination.domain LIKE "*rentry.co" OR
+        destination.domain LIKE "*privatebin.net" OR
+        destination.domain LIKE "*controlc.com" OR
+        destination.domain LIKE "*codepad.org" OR
+        destination.domain LIKE "*ideone.com" OR
+        destination.domain LIKE "*defuse.ca" OR
+        destination.domain LIKE "*cl1p.net" OR
+        destination.domain LIKE "*everfall.com"
+      )
+    | KEEP @timestamp, source.ip, destination.ip, destination.domain, http.request.method, url.full, user.name, host.name
+  leql: |
+    where(direction=OUTBOUND AND destination_domain IN paste_sites AND http_method=POST) groupby(source_address, destination_domain) calculate(count)
+  crowdstrike: |
+    #type=proxy direction=outbound method=POST
+    | match(file="paste_site_domains.csv", field=dest_domain, include=[dest_domain])
+    | groupBy([src_ip, dest_domain], function=count(as=posts))
+    | posts >= 1
+    | table([src_ip, dest_domain, posts, @timestamp])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter traffic_direction = "outbound" and http_method = "POST" and dst_ip not in (private_ip_ranges) and dest_fqdn in ("pastebin.com","paste.ee","dpaste.com","dpaste.org","hastebin.com","ghostbin.com","gist.github.com","ideone.com","codepad.org","snipplr.com","controlc.com","paste.org.ru","paste2.org","paste.centos.org","paste.debian.net","paste.ubuntu.com","paste.opensuse.org","paste.fedoraproject.org","slexy.org","paste.kde.org","privatebin.net","0bin.net","cryptobin.co","cl1p.net","text.is","telegra.ph","rentry.co","defuse.ca","privatebin.info","0x0.st","ix.io","sprunge.us","termbin.com","vpaste.net","bpaste.net","fpaste.org","paste.dn42.us","p.ip.fi","paste.jp","paste.sh","clbin.com","wgetpaste.zlin.dk","pb.envs.net")
+    | fields _time, src_ip, src_user, dest_fqdn, http_method, bytes_sent, agent_hostname
+  lucene: |
+    (direction:outbound OR traffic_direction:outbound OR network.direction:outbound) AND (dest_domain:(pastebin.com OR paste.ee OR ghostbin.com OR justpaste.it OR controlc.com OR hastebin.com OR cl1p.net OR dpaste.com OR privatebin.net OR rentry.co OR defuse.ca OR0bin.net OR ideone.com OR paste.org.ru OR paste2.org OR slexy.org OR paste.debian.net OR codepad.org OR textsnip.com OR snipplr.com OR sprunge.us OR ix.io OR termbin.com OR paste.centos.org OR fpaste.org OR bpaste.net OR paste.ubuntu.com OR paste.fedoraproject.org OR paste.opensuse.org OR friendpaste.com OR everfall.com OR privnote.com OR gist.github.com OR gitlab.com) OR destination.domain:(pastebin.com OR paste.ee OR ghostbin.com OR justpaste.it OR controlc.com OR hastebin.com OR cl1p.net OR dpaste.com OR privatebin.net OR rentry.co OR defuse.ca OR0bin.net OR ideone.com OR paste.org.ru OR paste2.org OR slexy.org OR paste.debian.net OR codepad.org OR textsnip.com OR snipplr.com OR sprunge.us OR ix.io OR termbin.com OR paste.centos.org OR fpaste.org OR bpaste.net OR paste.ubuntu.com OR paste.fedoraproject.org OR paste.opensuse.org OR friendpaste.com OR everfall.com OR privnote.com OR gist.github.com OR gitlab.com) OR url.domain:(pastebin.com OR paste.ee OR ghostbin.com OR justpaste.it OR controlc.com OR hastebin.com OR cl1p.net OR dpaste.com OR privatebin.net OR rentry.co OR defuse.ca OR0bin.net OR ideone.com OR paste.org.ru OR paste2.org OR slexy.org OR paste.debian.net OR codepad.org OR textsnip.com OR snipplr.com OR sprunge.us OR ix.io OR termbin.com OR paste.centos.org OR fpaste.org OR bpaste.net OR paste.ubuntu.com OR paste.fedoraproject.org OR paste.opensuse.org OR friendpaste.com OR everfall.com OR privnote.com OR gist.github.com OR gitlab.com)) AND (http.request.method:POST OR request_method:POST OR method:POST)
+  sumo: |
+    _sourceCategory=*Proxy* OR _sourceCategory=*ForwardProxy* OR _sourceCategory=*Web*Proxy*
+    | where direction="outbound" OR action="allowed" OR (src_ip matches "10.*" OR src_ip matches "172.16.*" OR src_ip matches "172.17.*" OR src_ip matches "172.18.*" OR src_ip matches "172.19.*" OR src_ip matches "172.20.*" OR src_ip matches "172.21.*" OR src_ip matches "172.22.*" OR src_ip matches "172.23.*" OR src_ip matches "172.24.*" OR src_ip matches "172.25.*" OR src_ip matches "172.26.*" OR src_ip matches "172.27.*" OR src_ip matches "172.28.*" OR src_ip matches "172.29.*" OR src_ip matches "172.30.*" OR src_ip matches "172.31.*" OR src_ip matches "192.168.*")
+    | where method="POST" OR http_method="POST" OR request_method="POST"
+    | where dest_domain matches "*pastebin.com*" OR dest_domain matches "*paste.ee*" OR dest_domain matches "*hastebin.com*" OR dest_domain matches "*ghostbin.com*" OR dest_domain matches "*dpaste.com*" OR dest_domain matches "*paste.org*" OR dest_domain matches "*paste2.org*" OR dest_domain matches "*pastesite.com*" OR dest_domain matches "*justpaste.it*" OR dest_domain matches "*pastie.org*" OR dest_domain matches "*privatebin.net*" OR dest_domain matches "*controlc.com*" OR dest_domain matches "*snipplr.com*" OR dest_domain matches "*paste.ubuntu.com*" OR dest_domain matches "*ideone.com*" OR dest_domain matches "*codepad.org*" OR dest_domain matches "*jsbin.com*" OR dest_domain matches "*jsfiddle.net*" OR dest_domain matches "*codepen.io*" OR dest_domain matches "*gist.github.com*" OR url matches "*pastebin.com*" OR url matches "*paste.ee*" OR url matches "*hastebin.com*" OR url matches "*ghostbin.com*" OR url matches "*dpaste.com*" OR url matches "*paste.org*" OR url matches "*paste2.org*" OR url matches "*pastesite.com*" OR url matches "*justpaste.it*" OR url matches "*pastie.org*" OR url matches "*privatebin.net*" OR url matches "*controlc.com*" OR url matches "*snipplr.com*" OR url matches "*paste.ubuntu.com*" OR url matches "*ideone.com*" OR url matches "*codepad.org*" OR url matches "*jsbin.com*" OR url matches "*jsfiddle.net*" OR url matches "*codepen.io*" OR url matches "*gist.github.com*"
+    | fields _messageTime, src_ip, dest_domain, url, method, http_method, request_method, bytes_out, _sourceHost
 false_positives:
 - Whitelist login URLs
 tuning_guidance: 'Tune per environment baseline. Tuning period: 7 days.'
@@ -102,7 +157,7 @@ tags:
 - exfiltration
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Forward Proxy Event
 

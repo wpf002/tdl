@@ -19,84 +19,126 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    (index=ids OR index=ips OR index=guardduty)
-    | eval detection_type=case(
-        (sourcetype IN ("suricata","snort","ids","ips") AND match(signature, "(?i)\b(C2|c&c|command and control)") AND direction="outbound"), "ids_c2",
-        (sourcetype="aws:guardduty" AND 'detail.type' IN ("Backdoor:EC2/C&CActivity.B","Backdoor:EC2/C&CActivity.B!DNS","Backdoor:Lambda/C&CActivity.B","Backdoor:Runtime/C&CActivity.B","Backdoor:Runtime/C&CActivity.B!DNS") AND direction="outbound"), "guardduty_c2",
-        1=1, null()
-    )
-    | where isnotnull(detection_type)
-    | eval src_ip=coalesce(src, src_ip, 'detail.resource.instanceDetails.networkInterfaces{}.privateIpAddress', sourceIPAddress)
-    | eval dest_ip=coalesce(dest, dest_ip, dst, 'detail.service.action.networkConnectionAction.remoteIpDetails.ipAddressV4', destinationIPAddress)
+  spl: "(index=ids OR index=ips OR index=guardduty)\n| eval detection_type=case(\n    (sourcetype IN (\"suricata\",\"snort\",\"ids\",\"ips\")\
+    \ AND match(signature, \"(?i)\\b(C2|c&c|command and control)\") AND direction=\"outbound\"), \"ids_c2\",\n    (sourcetype=\"aws:guardduty\"\
+    \ AND 'detail.type' IN (\"Backdoor:EC2/C&CActivity.B\",\"Backdoor:EC2/C&CActivity.B!DNS\",\"Backdoor:Lambda/C&CActivity.B\",\"Backdoor:Runtime/C&CActivity.B\"\
+    ,\"Backdoor:Runtime/C&CActivity.B!DNS\") AND direction=\"outbound\"), \"guardduty_c2\",\n    1=1, null()\n)\n| where isnotnull(detection_type)\n\
+    | eval src_ip=coalesce(src, src_ip, 'detail.resource.instanceDetails.networkInterfaces{}.privateIpAddress', sourceIPAddress)\n| eval dest_ip=coalesce(dest,\
+    \ dest_ip, dst, 'detail.service.action.networkConnectionAction.remoteIpDetails.ipAddressV4', destinationIPAddress)\n| bin _time span=10m\n\
+    | eventstats dc(src_ip) as unique_src_count, dc(dest_ip) as unique_dest_count, dc(dest_ip) as dest_count_per_src by _time, detection_type,\
+    \ src_ip\n| eventstats dc(src_ip) as src_count_per_dest by _time, detection_type, dest_ip\n| where (detection_type=\"ids_c2\" AND src_count_per_dest\
+    \ >= 5 AND unique_src_count >= 5) OR (detection_type=\"guardduty_c2\" AND dest_count_per_src >= 5 AND unique_dest_count >= 5)\n| stats values(src_ip)\
+    \ as source_ips, values(dest_ip) as destination_ips, dc(src_ip) as unique_sources, dc(dest_ip) as unique_destinations, values(signature) as\
+    \ signatures, values(detail.type) as guardduty_types, count by _time, detection_type\n| table _time, detection_type, source_ips, destination_ips,\
+    \ unique_sources, unique_destinations, signatures, guardduty_types, count\n"
+  kql: "let TimeWindow = 10m;\nlet IDSEvents = \n    CommonSecurityLog\n    | where TimeGenerated > ago(TimeWindow)\n    | where DeviceVendor\
+    \ in (\"Palo Alto Networks\", \"Cisco\", \"Fortinet\", \"Check Point\", \"Snort\", \"Suricata\") or DeviceProduct has_any (\"IDS\", \"IPS\"\
+    , \"Intrusion\")\n    | where DeviceEventClassID has_any (\"exploit\", \"attack\") or Activity has \"exploit\"\n    | where DeviceAction !=\
+    \ \"blocked\" or isempty(DeviceAction)\n    | where DestinationIP !startswith \"10.\" and DestinationIP !startswith \"172.\" and DestinationIP\
+    \ !startswith \"192.168.\" and DestinationIP !startswith \"169.254.\"\n    | where SourceIP startswith \"10.\" or SourceIP startswith \"172.\"\
+    \ or SourceIP startswith \"192.168.\"\n    | where Message matches regex \"(?i)\\\\b(C2|c&c|command and control)\" or DeviceCustomString1\
+    \ matches regex \"(?i)\\\\b(C2|c&c|command and control)\" or DeviceCustomString2 matches regex \"(?i)\\\\b(C2|c&c|command and control)\"\n\
+    \    | summarize SourceIPs = dcount(SourceIP), SourceIPList = make_set(SourceIP), EventCount = count(), FirstSeen = min(TimeGenerated), LastSeen\
+    \ = max(TimeGenerated) by bin(TimeGenerated, TimeWindow), DestinationIP\n    | where SourceIPs >= 5;\nlet GuardDutyEvents = \n    AWSGuardDuty\n\
+    \    | where TimeGenerated > ago(TimeWindow)\n    | where Type in (\"Backdoor:EC2/C&CActivity.B\", \"Backdoor:EC2/C&CActivity.B!DNS\", \"\
+    Backdoor:Lambda/C&CActivity.B\", \"Backdoor:Runtime/C&CActivity.B\", \"Backdoor:Runtime/C&CActivity.B!DNS\")\n    | extend SourceIP = tostring(parse_json(Resource).InstanceDetails.NetworkInterfaces[0].PrivateIpAddress)\n\
+    \    | extend DestinationIP = tostring(parse_json(Service).Action.NetworkConnectionAction.RemoteIpDetails.IpAddressV4)\n    | where isnotempty(SourceIP)\
+    \ and isnotempty(DestinationIP)\n    | summarize DestIPs = dcount(DestinationIP), DestIPList = make_set(DestinationIP), EventCount = count(),\
+    \ FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by bin(TimeGenerated, TimeWindow), SourceIP, Type\n    | where DestIPs >=\
+    \ 5;\nunion \n    (IDSEvents | extend DetectionSource = \"IDS/IPS\", SourceIdentifier = \"Multiple\", TargetIdentifier = DestinationIP, UniqueCount\
+    \ = SourceIPs, IPList = SourceIPList),\n    (GuardDutyEvents | extend DetectionSource = \"GuardDuty\", SourceIdentifier = SourceIP, TargetIdentifier\
+    \ = \"Multiple\", UniqueCount = DestIPs, IPList = DestIPList, EventType = Type)\n| project TimeGenerated, DetectionSource, SourceIdentifier,\
+    \ TargetIdentifier, UniqueCount, IPList, EventCount, FirstSeen, LastSeen, EventType\n"
+  aql: "SELECT sourceip, destinationip, COUNT(*) AS event_count, UNIQUECOUNT(sourceip) AS unique_sources\nFROM events\nWHERE (categoryname(category)\
+    \ ILIKE '%IDS%' OR categoryname(category) ILIKE '%IPS%' OR categoryname(category) ILIKE '%Intrusion%')\n  AND qidname(qid) MATCHES '(?i)\\\
+    b(C2|c&c|command and control)'\n  AND destinationip NOT IN (SELECT sourceip FROM events WHERE category IN (SELECT category FROM categories\
+    \ WHERE high_level_category_id = 1) LAST 10 MINUTES)\nGROUP BY destinationip, sourceip\nHAVING unique_sources >= 5\nLAST 10 MINUTES\n\nUNION\n\
+    \nSELECT sourceip, destinationip, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_destinations\nFROM events\nWHERE (logsourcetypename(devicetype)\
+    \ ILIKE '%GuardDuty%' OR logsourcetypename(devicetype) ILIKE '%AWS%')\n  AND (qidname(qid) = 'Backdoor:EC2/C&CActivity.B' \n       OR qidname(qid)\
+    \ = 'Backdoor:EC2/C&CActivity.B!DNS'\n       OR qidname(qid) = 'Backdoor:Lambda/C&CActivity.B'\n       OR qidname(qid) = 'Backdoor:Runtime/C&CActivity.B'\n\
+    \       OR qidname(qid) = 'Backdoor:Runtime/C&CActivity.B!DNS')\nGROUP BY sourceip, destinationip\nHAVING unique_destinations >= 5\nLAST 10\
+    \ MINUTES\n"
+  yara_l: "rule c2_activity_correlation {\n  meta:\n    author = \"TDL\"\n    description = \"Detects C2 activity via IDS/IPS exploit events or\
+    \ GuardDuty backdoor findings\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique = \"T1071\"\n    \n  events:\n\
+    \    // IDS/IPS exploit events with C2 signatures\n    (\n      $ids.metadata.event_type = \"NETWORK_CONNECTION\"\n      $ids.security_result.category\
+    \ = \"EXPLOIT\"\n      re.regex($ids.security_result.summary, `(?i)\\b(C2|c&c|command and control)`)\n      $ids.network.direction = \"OUTBOUND\"\
+    \n      net.ip_in_range_cidr($ids.principal.ip, \"10.0.0.0/8\") or\n      net.ip_in_range_cidr($ids.principal.ip, \"172.16.0.0/12\") or\n\
+    \      net.ip_in_range_cidr($ids.principal.ip, \"192.168.0.0/16\")\n      not net.ip_in_range_cidr($ids.target.ip, \"10.0.0.0/8\")\n     \
+    \ not net.ip_in_range_cidr($ids.target.ip, \"172.16.0.0/12\")\n      not net.ip_in_range_cidr($ids.target.ip, \"192.168.0.0/16\")\n      $ids.target.ip\
+    \ = $ext_dest_ids\n      $ids.principal.ip = $src_ip_ids\n    )\n    or\n    // GuardDuty C2 backdoor events\n    (\n      $gd.metadata.vendor_name\
+    \ = \"Amazon AWS\"\n      $gd.metadata.product_name = \"GuardDuty\"\n      (\n        $gd.metadata.product_event_type = \"Backdoor:EC2/C&CActivity.B\"\
+    \ or\n        $gd.metadata.product_event_type = \"Backdoor:EC2/C&CActivity.B!DNS\" or\n        $gd.metadata.product_event_type = \"Backdoor:Lambda/C&CActivity.B\"\
+    \ or\n        $gd.metadata.product_event_type = \"Backdoor:Runtime/C&CActivity.B\" or\n        $gd.metadata.product_event_type = \"Backdoor:Runtime/C&CActivity.B!DNS\"\
+    \n      )\n      $gd.network.direction = \"OUTBOUND\"\n      net.ip_in_range_cidr($gd.principal.ip, \"10.0.0.0/8\") or\n      net.ip_in_range_cidr($gd.principal.ip,\
+    \ \"172.16.0.0/12\") or\n      net.ip_in_range_cidr($gd.principal.ip, \"192.168.0.0/16\")\n      not net.ip_in_range_cidr($gd.target.ip, \"\
+    10.0.0.0/8\")\n      not net.ip_in_range_cidr($gd.target.ip, \"172.16.0.0/12\")\n      not net.ip_in_range_cidr($gd.target.ip, \"192.168.0.0/16\"\
+    )\n      $gd.principal.ip = $src_ip_gd\n      $gd.target.ip = $dest_ip_gd\n    )\n\n  match:\n    $ext_dest_ids, $src_ip_gd over 10m\n\n \
+    \ condition:\n    (#ids >= 5 and #src_ip_ids >= 5) or (#gd >= 5 and #dest_ip_gd >= 5)\n}\n"
+  esql: |
+    FROM logs-aws.guardduty*, logs-network.ids*, logs-zeek.notice*, packetbeat-*
+    | WHERE @timestamp > NOW() - 10 minutes
+    | EVAL is_ids_exploit = CASE(
+        event.dataset IN ("zeek.notice", "suricata.alert", "snort.alert") AND event.kind == "alert" AND RLIKE(event.action, "(?i)\\b(C2|c&c|command and control)") AND NOT CIDR_MATCH(destination.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16") AND CIDR_MATCH(source.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"), 1,
+        0
+      ),
+      is_guardduty = CASE(
+        event.dataset == "aws.guardduty" AND event.action IN ("Backdoor:EC2/C&CActivity.B", "Backdoor:EC2/C&CActivity.B!DNS", "Backdoor:Lambda/C&CActivity.B", "Backdoor:Runtime/C&CActivity.B", "Backdoor:Runtime/C&CActivity.B!DNS") AND CIDR_MATCH(source.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16") AND NOT CIDR_MATCH(destination.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"), 1,
+        0
+      )
+    | WHERE is_ids_exploit == 1 OR is_guardduty == 1
+    | EVAL detection_key = CASE(
+        is_ids_exploit == 1, destination.ip,
+        is_guardduty == 1, source.ip,
+        NULL
+      )
+    | STATS unique_sources_ids = COUNT_DISTINCT(CASE(is_ids_exploit == 1, source.ip, NULL)),
+            unique_dests_gd = COUNT_DISTINCT(CASE(is_guardduty == 1, destination.ip, NULL)),
+            event_count = COUNT(*),
+            source_ips = VALUES(source.ip),
+            dest_ips = VALUES(destination.ip),
+            event_actions = VALUES(event.action)
+      BY detection_key, bucket = BUCKET(@timestamp, 10 minutes)
+    | WHERE (unique_sources_ids >= 5) OR (unique_dests_gd >= 5)
+    | KEEP bucket, detection_key, unique_sources_ids, unique_dests_gd, event_count, source_ips, dest_ips, event_actions
+  leql: |
+    where((log_source_name="IDS/IPS" AND direction=OUTBOUND AND source_json.signature=/(?i)\b(C2|c&c|command and control)/) OR (log_source_name="AWS GuardDuty" AND direction=OUTBOUND AND source_json.type IN ["Backdoor:EC2/C&CActivity.B", "Backdoor:EC2/C&CActivity.B!DNS", "Backdoor:Lambda/C&CActivity.B", "Backdoor:Runtime/C&CActivity.B", "Backdoor:Runtime/C&CActivity.B!DNS"])) groupby(destination_address, source_address) calculate(unique:source_address, unique:destination_address)
+  crowdstrike: "(#type=ids_ips OR #type=guardduty)\n| case {\n    #type=ids_ips AND direction=outbound AND signature=/(?i)\\b(C2|c&c|command and\
+    \ control)/ AND category=*exploit* \n      | groupBy([destination_ip], function=[count(source_ip, distinct=true, as=unique_sources), collect([source_ip,\
+    \ @timestamp])], limit=max)\n      | bucket := \"ids\"\n      | unique_sources >= 5\n      | rename(destination_ip, as=pivot_ip)\n      |\
+    \ timeDelta := max(@timestamp) - min(@timestamp)\n      | timeDelta <= 600000;\n    #type=guardduty AND direction=outbound AND event_type\
+    \ IN [\"Backdoor:EC2/C&CActivity.B\", \"Backdoor:EC2/C&CActivity.B!DNS\", \"Backdoor:Lambda/C&CActivity.B\", \"Backdoor:Runtime/C&CActivity.B\"\
+    , \"Backdoor:Runtime/C&CActivity.B!DNS\"]\n      | groupBy([source_ip], function=[count(destination_ip, distinct=true, as=unique_destinations),\
+    \ collect([destination_ip, @timestamp])], limit=max)\n      | bucket := \"guardduty\"\n      | unique_destinations >= 5\n      | rename(source_ip,\
+    \ as=pivot_ip)\n      | timeDelta := max(@timestamp) - min(@timestamp)\n      | timeDelta <= 600000;\n    * | drop(@timestamp);\n  }\n| table([bucket,\
+    \ pivot_ip, unique_sources, unique_destinations, timeDelta])\n"
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter action_external_hostname != null and action_local_ip != null and action_external_hostname != action_local_ip
+    | filter threat_name ~= "(?i)\b(C2|c&c|command and control)"
     | bin _time span=10m
-    | eventstats dc(src_ip) as unique_src_count, dc(dest_ip) as unique_dest_count, dc(dest_ip) as dest_count_per_src by _time, detection_type, src_ip
-    | eventstats dc(src_ip) as src_count_per_dest by _time, detection_type, dest_ip
-    | where (detection_type="ids_c2" AND src_count_per_dest >= 5 AND unique_src_count >= 5) OR (detection_type="guardduty_c2" AND dest_count_per_src >= 5 AND unique_dest_count >= 5)
-    | stats values(src_ip) as source_ips, values(dest_ip) as destination_ips, dc(src_ip) as unique_sources, dc(dest_ip) as unique_destinations, values(signature) as signatures, values(detail.type) as guardduty_types, count by _time, detection_type
-    | table _time, detection_type, source_ips, destination_ips, unique_sources, unique_destinations, signatures, guardduty_types, count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000241 {\n  meta:\n    author = \"TDL\"\n    description = \"C2 Callback - Multiple Internal Hosts\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0011\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+    | comp count_distinct(action_local_ip) as unique_sources, count() as event_count by _time, action_external_hostname
+    | filter unique_sources >= 5
+    | fields _time, action_external_hostname, unique_sources, event_count
+    | union (
+        dataset = cloud_audit_logs
+        | filter vendor = "AWS" and event_id in ("Backdoor:EC2/C&CActivity.B", "Backdoor:EC2/C&CActivity.B!DNS", "Backdoor:Lambda/C&CActivity.B", "Backdoor:Runtime/C&CActivity.B", "Backdoor:Runtime/C&CActivity.B!DNS")
+        | filter action_network_protocol != null
+        | bin _time span=10m
+        | comp count_distinct(action_external_hostname) as unique_destinations, count() as event_count by _time, action_local_ip
+        | filter unique_destinations >= 5
+        | fields _time, action_local_ip, unique_destinations, event_count
+    )
+  lucene: |
+    ((_exists_:ids.signature AND ids.signature:/(?i)\b(C2|c&c|command[\s-_]*and[\s-_]*control)\b/ AND network.direction:outbound AND NOT source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)) OR (event.dataset:aws.guardduty AND event.type:("Backdoor:EC2/C&CActivity.B" OR "Backdoor:EC2/C&CActivity.B!DNS" OR "Backdoor:Lambda/C&CActivity.B" OR "Backdoor:Runtime/C&CActivity.B" OR "Backdoor:Runtime/C&CActivity.B!DNS") AND network.direction:outbound))
+  sumo: "(_sourceCategory=*IDS* OR _sourceCategory=*IPS* OR _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty*)\n| json field=_raw \"\
+    signature\" as signature\n| json field=_raw \"src_ip\" as src_ip\n| json field=_raw \"dest_ip\" as dest_ip\n| json field=_raw \"direction\"\
+    \ as direction\n| json field=_raw \"event_type\" as event_type\n| json field=_raw \"severity.label\" as severity_label\n| where (signature\
+    \ matches /(?i)\\b(C2|c&c|command and control)/ AND direction=\"outbound\") \n   OR (event_type in (\"Backdoor:EC2/C&CActivity.B\", \"Backdoor:EC2/C&CActivity.B!DNS\"\
+    , \"Backdoor:Lambda/C&CActivity.B\", \"Backdoor:Runtime/C&CActivity.B\", \"Backdoor:Runtime/C&CActivity.B!DNS\"))\n| timeslice 10m\n| if(signature\
+    \ matches /(?i)\\b(C2|c&c|command and control)/, 1, 0) as is_ids\n| if(event_type in (\"Backdoor:EC2/C&CActivity.B\", \"Backdoor:EC2/C&CActivity.B!DNS\"\
+    , \"Backdoor:Lambda/C&CActivity.B\", \"Backdoor:Runtime/C&CActivity.B\", \"Backdoor:Runtime/C&CActivity.B!DNS\"), 1, 0) as is_guardduty\n\
+    | if(is_ids=1, count_distinct(src_ip) by _timeslice, dest_ip | where _count >= 5, count_distinct(dest_ip) by _timeslice, src_ip | where _count\
+    \ >= 5)\n| fields _timeslice, src_ip, dest_ip, signature, event_type\n"
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -106,7 +148,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "5 IDS/IPS Exploit Event\nFrom multiple internal sources to a single external destinations (Outbound)\nWhere the IDS/IPS Signature\
   \ matches the following regex \"(?i)\\b(C2|c&c|command and control)\"\nWith unique Source IPs\nWithin 10 minutes\n\n\n--------------------------------------------------------------------------------------\n\

@@ -16,71 +16,70 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=* sourcetype=*sharepoint* OR sourcetype=*o365* OR sourcetype=*microsoft365* Application="*SharePoint*" OR Workload="SharePoint" Operation="AnonymousLinkUsed" UserId="anonymous"
+  spl: 'index=* sourcetype=*sharepoint* OR sourcetype=*o365* OR sourcetype=*microsoft365* Application="*SharePoint*" OR Workload="SharePoint"
+    Operation="AnonymousLinkUsed" UserId="anonymous"
+
     | table _time, UserId, Operation, Application, Workload, ObjectId, ItemType, SiteUrl, SourceFileName, ClientIP
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "AnonymousLinkUsed"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%AnonymousLinkUsed%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000025 {\n  meta:\n    author = \"TDL\"\n    description = \"Anonymous User SharePoint Access\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1133\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /AnonymousLinkUsed/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    OfficeActivity
+    | where TimeGenerated > ago(24h)
+    | where OfficeWorkload == "SharePoint"
+    | where Operation == "AnonymousLinkUsed"
+    | where UserId == "anonymous"
+    | project TimeGenerated, UserId, Operation, OfficeWorkload, ClientIP, OfficeObjectId, Site_Url, SourceFileExtension, SourceFileName, UserAgent
+  aql: |
+    SELECT eventtime, sourceip, destinationip, "Operation", "UserId", "ObjectId", "ItemType", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%sharepoint%'
+      AND "Operation" = 'AnonymousLinkUsed'
+      AND "UserId" ILIKE '%anonymous%'
+    LAST 24 HOURS
+  yara_l: |
+    rule sharepoint_anonymous_link_used {
+      meta:
+        author = "TDL"
+        description = "Detects anonymous link usage in SharePoint (T1133 - External Remote Services)"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1133"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Microsoft 365"
+        $e.metadata.vendor_name = "Microsoft"
+        $e.target.application = "SharePoint"
+        $e.metadata.product_event_type = "AnonymousLinkUsed"
+        $e.principal.user.userid = "anonymous"
+        $e.principal.hostname = $host
 
-    | WHERE eventName LIKE "%AnonymousLinkUsed%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/AnonymousLinkUsed/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*AnonymousLinkUsed*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "AnonymousLinkUsed"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*AnonymousLinkUsed*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*AnonymousLinkUsed*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-o365.audit*\n| WHERE @timestamp > NOW() - 24 hour \n  AND event.dataset == \"o365.audit\" \n  AND o365.audit.Workload == \"\
+    SharePoint\"\n  AND o365.audit.Operation == \"AnonymousLinkUsed\"\n  AND TO_LOWER(user.id) == \"anonymous\"\n| KEEP @timestamp, host.name,\
+    \ user.id, o365.audit.Operation, o365.audit.ObjectId, source.ip, user_agent.original\n"
+  leql: |
+    where(source_json.Application=SharePoint AND source_json.Operation=AnonymousLinkUsed AND source_json.UserId=anonymous)
+  crowdstrike: |
+    #event_platform=Microsoft365 #repo=o365 Workload=SharePoint Operation=AnonymousLinkUsed UserId=anonymous
+    | table([@timestamp, ComputerName, UserId, Operation, Workload, ClientIP, ObjectId, SiteUrl])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Microsoft" and logon_type = "SHAREPOINT" and raw_log.Operation = "AnonymousLinkUsed" and raw_log.UserId = "anonymous"
+    | fields _time, raw_log.Workload, raw_log.Operation, raw_log.UserId, raw_log.ObjectId, raw_log.ClientIP, raw_log.UserAgent
+  lucene: |
+    application:Sharepoint AND Operation:AnonymousLinkUsed AND UserId:anonymous
+  sumo: |
+    _sourceCategory=*Sharepoint* OR _sourceCategory=*Microsoft365* OR _sourceCategory=*Office365*
+    | json field=_raw "Application" as application
+    | json field=_raw "Operation" as operation
+    | json field=_raw "UserId" as user_id
+    | where application = "SharePoint" and operation = "AnonymousLinkUsed" and user_id = "anonymous"
+    | fields _messageTime, _sourceHost, application, operation, user_id
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +89,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Sharepoint Event \nWhere the application is [Sharepoint]\nWhere the Operation is \"AnonymousLinkUsed\" \nWhere the UserId is\
   \ \"anonymous\""

@@ -19,74 +19,62 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=crowdstrike sourcetype=CrowdStrikeDetectionSummaryEvent SeverityName="Medium" Tactic!=Malware Tactic!="Machine Learning" Tactic!=Ransomware
+  spl: 'index=crowdstrike sourcetype=CrowdStrikeDetectionSummaryEvent SeverityName="Medium" Tactic!=Malware Tactic!="Machine Learning" Tactic!=Ransomware
+
     | table _time, host, SeverityName, Tactic, Technique, FileName, CommandLine, UserName
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000265 {\n  meta:\n    author = \"TDL\"\n    description = \"Endpoint Detection - Medium\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /.+/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    CommonSecurityLog
+    | where DeviceVendor == "CrowdStrike"
+    | where DeviceEventClassID == "DetectionSummaryEvent"
+    | where LogSeverity == "Medium"
+    | where AdditionalExtensions !has "Tactic=Malware"
+    | where AdditionalExtensions !has "Tactic=Machine Learning"
+    | where AdditionalExtensions !has "Tactic=Ransomware"
+    | project TimeGenerated, DeviceName, SourceUserName, DeviceEventClassID, LogSeverity, AdditionalExtensions, Message
+  aql: |
+    SELECT eventtime, "SeverityName", "Tactic", sourceip, destinationip, LOGSOURCENAME(logsourceid) AS log_source, categoryname(category) AS event_category, COUNT(*) AS event_count
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%CrowdStrike%'
+      AND (qidname(qid) ILIKE '%DetectionSummaryEvent%' OR categoryname(category) ILIKE '%DetectionSummary%')
+      AND "SeverityName" = 'Medium'
+      AND "Tactic" NOT IN ('Malware', 'Machine Learning', 'Ransomware')
+    GROUP BY eventtime, "SeverityName", "Tactic", sourceip, destinationip, logsourceid, category
+    LAST 1 HOURS
+  yara_l: "rule crowdstrike_medium_severity_non_malware_detection {\n  meta:\n    author = \"TDL\"\n    description = \"CrowdStrike medium severity\
+    \ detections excluding malware/ML/ransomware tactics\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1204\"\n\
+    \    severity = \"Medium\"\n    \n  events:\n    $e.metadata.vendor_name = \"CrowdStrike\"\n    $e.metadata.product_name = \"CrowdStrike\"\
+    \n    $e.metadata.product_event_type = \"DetectionSummaryEvent\"\n    $e.security_result.severity = \"MEDIUM\"\n    not re.regex($e.security_result.category_details,\
+    \ `(?i)malware`)\n    not re.regex($e.security_result.category_details, `(?i)machine.?learning`)\n    not re.regex($e.security_result.category_details,\
+    \ `(?i)ransomware`)\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n  outcome:\n    $risk_score = max(50)\n \
+    \   $event_count = count_distinct($e.metadata.id)\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-crowdstrike*
+    | WHERE event.type == "DetectionSummaryEvent" AND event.severity == "Medium" AND event.category NOT IN ("Malware", "Machine Learning", "Ransomware")
+    | KEEP @timestamp, host.name, user.name, event.action, event.reason, process.name, process.command_line, file.name, file.path
+  leql: |
+    where(source_json.SeverityName="Medium" AND source_json.Tactic!="Malware" AND source_json.Tactic!="Machine Learning" AND source_json.Tactic!="Ransomware")
+  crowdstrike: |
+    event_simpleName=DetectionSummaryEvent SeverityName=Medium
+    | Tactic!=Malware AND Tactic!="Machine Learning" AND Tactic!=Ransomware
+    | table([@timestamp, ComputerName, DetectName, Tactic, Technique, FileName, UserName, SHA256HashData])
+  xql: |
+    dataset = crowdstrike_falcon_detections_raw
+    | filter lowercase(severity) = "medium"
+      and lowercase(tactic) != "malware"
+      and lowercase(tactic) != "machine learning"
+      and lowercase(tactic) != "ransomware"
+    | fields _time, detection_id, tactic, technique, severity, device_id, user_name, file_name, command_line
+  lucene: |
+    event_simpleName:DetectionSummaryEvent AND SeverityName:Medium AND NOT Tactic:(Malware OR "Machine Learning" OR Ransomware)
+  sumo: |
+    _sourceCategory=*CrowdStrike* DetectionSummaryEvent
+    | json field=_raw "SeverityName" as severity_name
+    | json field=_raw "Tactic" as tactic
+    | where severity_name = "Medium"
+    | where !(tactic in ("Malware", "Machine Learning", "Ransomware"))
+    | fields _messageTime, _sourceHost, severity_name, tactic
 false_positives:
 - Security software
 - Authorized admin tools
@@ -96,7 +84,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 CrowdStrike DetectionSummaryEvent
 

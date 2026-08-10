@@ -15,74 +15,84 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail eventName=GetSecretValue
+  spl: 'index=aws sourcetype=aws:cloudtrail eventName=GetSecretValue
+
     | bin _time span=5m
-    | stats dc(requestParameters.secretId) as unique_secrets, count as api_calls, values(requestParameters.secretId) as secret_ids by _time, userIdentity.principalId, sourceIPAddress
+
+    | stats dc(requestParameters.secretId) as unique_secrets, count as api_calls, values(requestParameters.secretId) as secret_ids by _time, userIdentity.principalId,
+    sourceIPAddress
+
     | where api_calls >= 10 AND unique_secrets >= 10
+
     | table _time, userIdentity.principalId, sourceIPAddress, api_calls, unique_secrets, secret_ids
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000154 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Secret Retrieval\"\n    severity = \"LOW\"\n    tactic\
-    \ = \"TA0006\"\n    technique = \"T1552\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n   \
-    \ $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: "AWSCloudTrail\n| where TimeGenerated > ago(5m)\n| where EventName == \"GetSecretValue\"\n| extend SecretId = tostring(parse_json(RequestParameters).secretId)\n\
+    | where isnotempty(SecretId)\n| summarize \n    SecretCount = dcount(SecretId),\n    ApiCallCount = count(),\n    SecretsList = make_set(SecretId)\n\
+    \    by bin(TimeGenerated, 5m), UserIdentityPrincipalid, SourceIpAddress\n| where SecretCount >= 10 and ApiCallCount >= 10\n| project TimeGenerated,\
+    \ UserIdentityPrincipalid, SourceIpAddress, SecretCount, ApiCallCount, SecretsList\n"
+  aql: |
+    SELECT sourceip, username, UNIQUECOUNT("requestParameters") AS unique_secrets, COUNT(*) AS api_calls
+    FROM events
+    WHERE "eventName" = 'GetSecretValue'
+    GROUP BY sourceip, username
+    HAVING unique_secrets >= 10 AND api_calls >= 10
+    LAST 5 MINUTES
+  yara_l: |
+    rule aws_secrets_manager_enumeration {
+      meta:
+        author = "TDL"
+        description = "Detects enumeration of AWS Secrets Manager secrets via multiple GetSecretValue calls"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1552"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_event_type = "GetSecretValue"
+        $e.metadata.vendor_name = "AMAZON"
+        $e.metadata.product_name = "AWS CloudTrail"
+        $e.principal.user.userid = $user
+        $e.principal.ip = $source_ip
+        $e.target.resource.name = $secret_id
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user, $source_ip over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 10 and #secret_id >= 10
+    }
+  esql: "FROM logs-aws.cloudtrail*\n| WHERE @timestamp > NOW() - 5 minutes \n  AND event.action == \"GetSecretValue\"\n  AND event.category ==\
+    \ \"web\"\n| STATS \n    event_count = COUNT(*),\n    unique_secrets = COUNT_DISTINCT(aws.cloudtrail.request_parameters)\n  BY source.ip,\
+    \ user.name, window = BUCKET(@timestamp, 5 minutes)\n| WHERE event_count >= 10 AND unique_secrets >= 10\n| KEEP window, source.ip, user.name,\
+    \ event_count, unique_secrets\n"
+  leql: |
+    where(source_json.eventName="GetSecretValue") groupby(source_json.sourceIPAddress, source_json.userIdentity.principalId) calculate(unique:source_json.requestParameters.secretId)
+  crowdstrike: |
+    #repo=* #type=cloudtrail eventName=GetSecretValue
+    | bucket(span=5m, field=@timestamp, function=[count(as=eventCount), count(requestParameters.secretId, distinct=true, as=uniqueSecrets)], limit=max)
+    | groupBy([sourceIPAddress, userIdentity.principalId, _bucket], function=[sum(eventCount, as=totalEvents), sum(uniqueSecrets, as=totalUniqueSecrets)])
+    | totalEvents >= 10
+    | totalUniqueSecrets >= 10
+    | table([sourceIPAddress, userIdentity.principalId, _bucket, totalEvents, totalUniqueSecrets])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and operation_type = "APICall" and operation_name = "GetSecretValue"
+    | bin _time span=5m
+    | comp count_distinct(resource_id) as unique_secrets, count_distinct(operation_name) as api_calls by _time, source_ip, identity_name
+    | filter api_calls >= 10 and unique_secrets >= 10
+    | fields _time, source_ip, identity_name, api_calls, unique_secrets
+  lucene: |
+    eventName:GetSecretValue AND eventType:AwsApiCall
+  sumo: |
+    _sourceCategory=*cloudtrail* eventName=GetSecretValue
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "sourceIPAddress" as source_ip
+    | json field=_raw "userIdentity.principalId" as user_id
+    | json field=_raw "requestParameters.secretId" as secret_id
+    | where event_name = "GetSecretValue"
+    | timeslice 5m
+    | count_distinct(secret_id) as unique_secrets, count as api_calls by _timeslice, source_ip, user_id
+    | where unique_secrets >= 10 and api_calls >= 10
+    | fields _timeslice, source_ip, user_id, unique_secrets, api_calls
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -92,7 +102,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '10 unique AWS APICall Events
 

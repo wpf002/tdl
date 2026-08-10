@@ -18,82 +18,117 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=* sourcetype IN ("WinEventLog:Microsoft-Windows-Sysmon/Operational", "linux:auditd") (EventCode=11 OR type=PATH)
+  spl: 'index=* sourcetype IN ("WinEventLog:Microsoft-Windows-Sysmon/Operational", "linux:auditd") (EventCode=11 OR type=PATH)
+
     (TargetFilename IN ("*.exe", "*.lnk", "*.scr") OR name IN ("*.exe", "*.lnk", "*.scr"))
+
     (TargetFilename IN ("*\\Finance\\*", "*\\HR\\*", "*/Finance/*", "*/HR/*") OR name IN ("*\\Finance\\*", "*\\HR\\*", "*/Finance/*", "*/HR/*"))
+
     | eval file_path=coalesce(TargetFilename, name)
+
     | eval user=coalesce(User, auid)
+
     | eval host=coalesce(ComputerName, host)
+
     | search NOT user IN ("*admin*", "*Administrator*", "root", "*svc*", "*service*")
+
     | stats count earliest(_time) as first_seen latest(_time) as last_seen values(Image) as process values(file_path) as files by user, host
+
     | where count > 0
+
     | table first_seen, last_seen, user, host, process, files, count
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_lm_000781 {\n  meta:\n    author = \"TDL\"\n    description = \"Executable Written to Departmental Network Share\"\n \
-    \   severity = \"HIGH\"\n    tactic = \"TA0008\"\n    technique = \"T1080\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    Event
+    | where TimeGenerated > ago(1h)
+    | where Source == "Microsoft-Windows-Sysmon" and EventID == 11
+      or (Source == "Linux Auditd" and EventID == 1400)
+    | extend FileName = iff(Source == "Microsoft-Windows-Sysmon", tostring(EventData.TargetFilename), tostring(EventData.name))
+    | extend User = iff(Source == "Microsoft-Windows-Sysmon", tostring(EventData.User), tostring(EventData.auid))
+    | extend Computer = iff(Source == "Microsoft-Windows-Sysmon", Computer, tostring(EventData.hostname))
+    | where FileName matches regex @"(?i)\\\\[^\\]+\\(finance|hr|accounting|payroll|humanresources)[^\\]*\\.*\.(exe|lnk|scr)$"
+    | extend FileExtension = tolower(extract(@"\.([^\.]+)$", 1, FileName))
+    | where FileExtension in ("exe", "lnk", "scr")
+    | extend UserLower = tolower(User)
+    | where UserLower !has "admin" and UserLower !has "svc" and UserLower !has "system"
+    | summarize FileCount = dcount(FileName), Files = make_set(FileName), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by User, Computer, FileExtension
+    | where FileCount >= 3
+    | project FirstSeen, LastSeen, User, Computer, FileExtension, FileCount, Files
+  aql: "SELECT \n    username,\n    sourceip,\n    LOGSOURCENAME(logsourceid) AS host,\n    \"TargetFilename\" AS file_path,\n    COUNT(*) AS\
+    \ file_writes\nFROM events\nWHERE \n    (\"EventID\" = '11' OR \"EventID\" = 'FILE_WRITE')\n    AND (\n        \"TargetFilename\" ILIKE '%\\\
+    \\Finance\\\\%' \n        OR \"TargetFilename\" ILIKE '%\\\\HR\\\\%'\n        OR \"TargetFilename\" ILIKE '%/Finance/%'\n        OR \"TargetFilename\"\
+    \ ILIKE '%/HR/%'\n    )\n    AND (\n        \"TargetFilename\" ILIKE '%.exe' \n        OR \"TargetFilename\" ILIKE '%.lnk'\n        OR \"\
+    TargetFilename\" ILIKE '%.scr'\n    )\n    AND username NOT ILIKE '%admin%'\n    AND username NOT ILIKE '%svc%'\n    AND username NOT IN ('SYSTEM',\
+    \ 'LOCAL SERVICE', 'NETWORK SERVICE')\nGROUP BY username, sourceip, LOGSOURCENAME(logsourceid), \"TargetFilename\"\nLAST 1 HOURS\n"
+  yara_l: |
+    rule lateral_movement_taint_file_share {
+      meta:
+        author = "TDL"
+        description = "T1080 - New executable or shortcut written to departmental share by non-admin user"
+        mitre_attack_tactic = "Lateral Movement"
+        mitre_attack_technique = "T1080"
+        severity = "High"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "FILE_CREATION"
+        (
+          re.regex($e.target.file.full_path, `(?i)\\\\[^\\]+\\(Finance|HR|finance|hr)\\`) or
+          re.regex($e.target.file.full_path, `(?i)/(Finance|HR|finance|hr)/`)
+        )
+        (
+          re.regex($e.target.file.full_path, `(?i)\.(exe|lnk|scr)$`)
+        )
+        not re.regex($e.principal.user.userid, `(?i)(admin|Administrator|root|svc-)`)
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $user
+        $e.target.file.full_path = $file
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $host, $user over 10m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 75
+        $suspicious_file = array_distinct($file)
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-linux.auditd*
+    | WHERE winlog.event_id == 11 OR event.action == "created"
+    | WHERE (file.extension IN ("exe", "lnk", "scr") OR file.name LIKE "*.exe" OR file.name LIKE "*.lnk" OR file.name LIKE "*.scr")
+    | WHERE (file.path LIKE "*\\Finance\\*" OR file.path LIKE "*\\HR\\*" OR file.path LIKE "*/Finance/*" OR file.path LIKE "*/HR/*")
+    | WHERE NOT (user.name LIKE "*admin*" OR user.name LIKE "*svc*" OR user.name LIKE "*system*")
+    | STATS file_count = COUNT(*), distinct_hosts = COUNT_DISTINCT(host.name) BY user.name, file.extension, file.name
+    | WHERE file_count >= 1
+    | KEEP user.name, file.extension, file.name, file_count, distinct_hosts
+  leql: |
+    where(source_json.EventID IN [11, 23] AND (file_path ICONTAINS "\\Finance\\" OR file_path ICONTAINS "\\HR\\") AND (file_path ENDS-WITH ".exe" OR file_path ENDS-WITH ".lnk" OR file_path ENDS-WITH ".scr") AND user NOT ICONTAINS "admin") groupby(user, asset, file_path) calculate(count)
+  crowdstrike: |
+    (event_simpleName=FileWritten OR EventCode=11)
+    (FileName=*.exe OR FileName=*.lnk OR FileName=*.scr)
+    (FilePath=*\\Finance\\* OR FilePath=*\\HR\\* OR TargetFilename=*\\Finance\\* OR TargetFilename=*\\HR\\*)
+    | regex("(?i)(?<isAdmin>admin|administrator|system|service)", field=UserName, strict=false)
+    | !isAdmin=*
+    | groupBy([ComputerName, UserName, FileName], function=count(as=writeCount))
+    | table([@timestamp, ComputerName, UserName, FileName, FilePath, TargetFilename, writeCount])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_FILE and action_file_access_type = ENUM.FILE_ACCESS_TYPE_WRITE
+    | filter (lowercase(action_file_path) ~= ".*\\\\(finance|hr)\\\\.*" or lowercase(action_file_path) ~= ".*/finance/.*" or lowercase(action_file_path) ~= ".*/hr/.*")
+    | filter (lowercase(action_file_name) ~= ".*\.(exe|lnk|scr)$" or lowercase(action_file_path) ~= ".*\.(exe|lnk|scr)$")
+    | alter is_admin = if(lowercase(actor_effective_username) ~= ".*(admin|administrator|root|system).*", "true", "false")
+    | filter is_admin = "false"
+    | fields _time, agent_hostname, actor_effective_username, action_file_path, action_file_name, action_process_image_name
+  lucene: |
+    (file.path:(*\\Finance\\* OR *\\HR\\* OR */Finance/* OR */HR/*) OR destination.path:(*\\Finance\\* OR *\\HR\\* OR */Finance/* OR */HR/*)) AND (file.extension:(exe OR lnk OR scr) OR destination.extension:(exe OR lnk OR scr)) AND (event.code:(11 OR 23 OR 26) OR event.action:"created" OR event.type:"creation") AND NOT (user.name:(*admin* OR *svc* OR *service*) OR user.groups:(*admin* OR *Domain Admins* OR *Enterprise Admins*))
+  sumo: "_sourceCategory=*Sysmon* OR _sourceCategory=*Auditd*\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"TargetFilename\"\
+    \ as target_file\n| json field=_raw \"Image\" as process_image\n| json field=_raw \"User\" as user\n| where event_id = \"11\" OR event_id\
+    \ = \"1\" \n| where (target_file matches \"*\\\\Finance\\\\*\" OR target_file matches \"*\\\\HR\\\\*\" OR target_file matches \"*/Finance/*\"\
+    \ OR target_file matches \"*/HR/*\")\n| where (target_file matches \"*.exe\" OR target_file matches \"*.lnk\" OR target_file matches \"*.scr\"\
+    )\n| where !(user matches \"*admin*\" OR user matches \"*Administrator*\" OR user matches \"*root*\")\n| count by user, target_file, _sourceHost\n\
+    | fields user, target_file, _sourceHost\n"
 pseudo_logic: New .exe / .lnk / .scr written to a departmental file share (Finance, HR) by a non-admin user. Worm-like content tainting.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -110,7 +145,7 @@ references:
 - https://attack.mitre.org/techniques/T1080/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, target host, and the protocol / credential used.'

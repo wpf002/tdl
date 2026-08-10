@@ -16,84 +16,83 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp action=allowed OR action=permit OR action=accept
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp action=allowed OR action=permit OR action=accept
+
     | search NOT [| inputlookup benign_periodic_connections.csv | fields src_ip dest_ip]
+
     | stats count as connection_count, dc(dest_ip) as unique_dest_ips, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+
     | where connection_count >= 1
+
     | sort - total_bytes_out
+
     | table src_ip, dest_ip, dest_port, connection_count, unique_dest_ips, total_bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(24h)\n| where DeviceVendor in (\"Palo Alto Networks\", \"Fortinet\", \"Cisco\", \"Check\
+    \ Point\", \"Zscaler\", \"Barracuda\") or DeviceProduct has_any (\"Firewall\", \"IDS\", \"IPS\", \"Proxy\")\n| where Protocol =~ \"TCP\" or\
+    \ toupper(Protocol) == \"6\"\n| where isnotempty(SourceIP) and isnotempty(DestinationIP) and isnotempty(DestinationPort)\n| where SourceIP\
+    \ !in (\"10.0.0.1\", \"192.168.1.1\") and DestinationIP !in (\"8.8.8.8\", \"1.1.1.1\", \"time.windows.com\", \"time.apple.com\", \"ntp.ubuntu.com\"\
+    )\n| where DestinationPort !in (123, 53)\n| summarize \n    ConnectionCount = count(),\n    UniqueDestIPs = dcount(DestinationIP),\n    TotalBytesOut\
+    \ = sum(SentBytes),\n    FirstSeen = min(TimeGenerated),\n    LastSeen = max(TimeGenerated)\n    by SourceIP, DestinationIP, DestinationPort\n\
+    | where ConnectionCount >= 1\n| extend Duration = datetime_diff('second', LastSeen, FirstSeen)\n| extend AvgConnectionInterval = iff(ConnectionCount\
+    \ > 1, Duration / toreal(ConnectionCount - 1), 0)\n| where AvgConnectionInterval > 0 and AvgConnectionInterval < 3600\n| project SourceIP,\
+    \ DestinationIP, DestinationPort, ConnectionCount, UniqueDestIPs, TotalBytesOut, FirstSeen, LastSeen, AvgConnectionInterval\n| sort by TotalBytesOut\
+    \ desc\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS connection_count, UNIQUECOUNT(destinationip) AS unique_destinations, SUM(destinationbytes) AS bytes_out
     FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+    WHERE protocol = '6' AND destinationip NOT IN ('UPDATE_SERVER_IP_1', 'UPDATE_SERVER_IP_2', 'NTP_SERVER_IP', 'MONITORING_SERVER_IP') AND sourceip NOT IN ('BENIGN_CLIENT_IP_1', 'BENIGN_CLIENT_IP_2')
     GROUP BY sourceip, destinationip, destinationport
-
+    HAVING connection_count >= 1
+    ORDER BY bytes_out DESC
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_001 {\n  meta:\n    author = \"TDL\"\n    description = \"Beaconing Detected - Periodic Outbound Connection\"\n   \
-    \ severity = \"HIGH\"\n    tactic = \"TA0011\"\n    technique = \"T1071.001\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  yara_l: "rule c2_beaconing_periodic_tcp_connections {\n  meta:\n    author = \"TDL\"\n    description = \"Detects periodic outbound TCP connections\
+    \ indicative of C2 beaconing (MITRE T1071.001)\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique = \"T1071.001\"\
+    \n    severity = \"MEDIUM\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.ip_protocol = \"TCP\"\n\
+    \    $e.network.direction = \"OUTBOUND\"\n    $e.principal.ip = $src_ip\n    $e.target.ip = $dest_ip\n    $e.target.port = $dest_port\n  \
+    \  \n    not (\n      $e.principal.ip = \"10.0.0.100\" or\n      $e.principal.ip = \"10.0.0.101\" or\n      $e.target.ip = \"time.windows.com\"\
+    \ or\n      $e.target.ip = \"time.apple.com\" or\n      $e.target.ip = \"windowsupdate.microsoft.com\" or\n      $e.target.ip = \"swscan.apple.com\"\
+    \ or\n      re.regex($e.target.hostname, `(?i)(update|ntp|monitoring|antivirus)`)\n    )\n    \n  match:\n    $src_ip, $dest_ip, $dest_port\
+    \ over 1h\n    \n  outcome:\n    $risk_score = max(35)\n    $connection_count = count_distinct($e.metadata.id)\n    $unique_dest_ips = count_distinct($dest_ip)\n\
+    \    $total_bytes_out = sum($e.network.sent_bytes)\n    \n  condition:\n    #e >= 1\n}\n"
+  esql: "FROM logs-network*, logs-zeek*, logs-suricata*, filebeat-*\n| WHERE @timestamp > NOW() - 24 hour \n  AND network.protocol == \"tcp\"\
+    \ \n  AND network.direction == \"outbound\"\n  AND source.ip IS NOT NULL \n  AND destination.ip IS NOT NULL \n  AND destination.port IS NOT\
+    \ NULL\n  AND NOT (destination.ip IN (\"10.0.0.1\", \"192.168.1.1\", \"8.8.8.8\") OR source.ip IN (\"10.0.0.100\"))\n  AND NOT (destination.port\
+    \ IN (123, 53) OR destination.ip LIKE \"*.windowsupdate.com\" OR destination.ip LIKE \"*.apple.com\")\n| STATS \n    connection_count = COUNT(*),\
+    \ \n    unique_dest_ips = COUNT_DISTINCT(destination.ip),\n    bytes_out = SUM(network.bytes)\n  BY source.ip, destination.ip, destination.port\n\
+    | WHERE connection_count >= 1\n| SORT bytes_out DESC\n| KEEP source.ip, destination.ip, destination.port, connection_count, unique_dest_ips,\
+    \ bytes_out\n"
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp" AND source_address NOT IN ["<UPDATE_SERVER_IP>", "<NTP_SERVER_IP>", "<MONITORING_SERVER_IP>"] AND destination_address NOT IN ["<UPDATE_SERVER_IP>", "<NTP_SERVER_IP>", "<MONITORING_SERVER_IP>"]) groupby(source_address, destination_address, destination_port) calculate(count, unique:destination_address, sum:bytes_out)
+  crowdstrike: |
+    #type=firewall OR #type=ids network.protocol=*tcp*
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=connection_count), count(dest_ip, distinct=true, as=unique_dests), sum(bytes_out, as=total_bytes_out)])
+    | connection_count >= 1
+    | not (src_ip in [file="allowlist_beaconing.csv", column=src_ip] OR dest_ip in [file="allowlist_beaconing.csv", column=dest_ip])
+    | sort(field=total_bytes_out, order=desc, limit=1000)
+    | table([src_ip, dest_ip, dest_port, connection_count, unique_dests, total_bytes_out])
+  xql: "dataset = panw_ngfw_traffic_raw\n| filter uppercase(protocol) = \"TCP\" and action != \"deny\"\n| alter src_ip = coalesce(src_ip, source_ip),\
+    \ \n        dst_ip = coalesce(dest_ip, dst_ip, destination_ip),\n        dst_port = coalesce(dest_port, dst_port, destination_port),\n   \
+    \     bytes_sent = coalesce(bytes_sent, sent_bytes, 0)\n| filter src_ip not in (\"10.0.0.1\", \"10.0.0.2\")\n        and dst_ip not in (\"\
+    10.0.0.1\", \"10.0.0.2\")\n| comp count() as connection_count,\n        count_distinct(dst_ip) as unique_destinations,\n        sum(bytes_sent)\
+    \ as total_bytes_out\n        by src_ip, dst_ip, dst_port\n| filter connection_count >= 1\n| sort desc total_bytes_out\n| fields src_ip, dst_ip,\
+    \ dst_port, connection_count, unique_destinations, total_bytes_out\n"
+  lucene: |
+    network.protocol:tcp AND NOT (src_ip:(/* allow-list IPs */) OR dest_ip:(/* allow-list IPs */))
+  sumo: |
+    _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*network*
+    | parse regex "(?i)protocol[=:\s]+(?<protocol>\w+)" nodrop
+    | parse regex "(?i)src[_\s]?ip[=:\s]+(?<src_ip>[\d\.]+)" nodrop
+    | parse regex "(?i)dest[_\s]?ip[=:\s]+(?<dest_ip>[\d\.]+)" nodrop
+    | parse regex "(?i)dest[_\s]?port[=:\s]+(?<dest_port>\d+)" nodrop
+    | parse regex "(?i)bytes[_\s]?out[=:\s]+(?<bytes_out>\d+)" nodrop
+    | where protocol matches "*tcp*" or protocol matches "*TCP*"
+    | where !(src_ip matches "*update*" or dest_ip matches "*update*" or dest_ip matches "*ntp*" or dest_ip matches "*monitoring*")
+    | count as connection_count, count_distinct(dest_ip) as unique_dest_ips, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | where connection_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, connection_count, unique_dest_ips, total_bytes_out
 false_positives:
 - Software update clients
 - NTP clients
@@ -105,7 +104,7 @@ tags:
 author: TDL
 created: '2024-02-15'
 test_method: historical
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'
 - Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — verify beaconing characteristics (interval, jitter, request size,

@@ -19,77 +19,48 @@ risk_score: 55
 queries:
   spl: "index=dns query_type=\"AXFR\" \n| search NOT [| inputlookup dns_server_list.csv | fields src_ip | rename src_ip as src] \n| table _time,\
     \ src, dest, query, query_type, answer\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "dns"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%dns%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_dis_000190 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized DNS Zone Transfer\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0007\"\n    technique = \"T1082\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /dns/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%dns%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/dns/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*dns*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "dns"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*dns*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*dns*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    DnsEvents
+    | where TimeGenerated > ago(1h)
+    | where QueryType == "AXFR"
+    | where ClientIP !in ("10.0.0.10", "10.0.0.11")
+    | project TimeGenerated, ClientIP, Name, QueryType, Computer
+  aql: |
+    SELECT sourceip, destinationip, "Query", "Query Type", COUNT(*) AS axfr_attempts
+    FROM events
+    WHERE "Query Type" = 'AXFR'
+      AND sourceip NOT IN ('10.0.0.53', '10.0.1.53', '10.0.2.53')
+      AND category IN (SELECT category FROM categories WHERE category LIKE '%DNS%')
+    GROUP BY sourceip, destinationip, "Query", "Query Type"
+    LAST 24 HOURS
+  yara_l: "rule dns_zone_transfer_attempt {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects DNS zone transfer (AXFR)\
+    \ attempts from non-authorized DNS servers - T1082 Discovery\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1082\"\
+    \n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_DNS\"\n    $e.network.dns.questions.type = 252\n    $e.principal.ip\
+    \ = $source_ip\n    not (\n      net.ip_in_range_cidr($e.principal.ip, \"10.0.0.53/32\") or\n      net.ip_in_range_cidr($e.principal.ip, \"\
+    172.16.0.53/32\") or\n      net.ip_in_range_cidr($e.principal.ip, \"192.168.1.53/32\")\n    )\n    \n  match:\n    $source_ip over 5m\n  \
+    \  \n  outcome:\n    $risk_score = 50\n    $source_ip_out = array_distinct($e.principal.ip)\n    $queried_domain = array_distinct($e.network.dns.questions.name)\n\
+    \    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-network.dns*\n| WHERE @timestamp > NOW() - 24 hours \n  AND dns.question.type == \"AXFR\"\n  AND source.ip NOT IN (\"10.0.0.53\"\
+    , \"10.0.0.54\", \"192.168.1.53\")\n| KEEP @timestamp, source.ip, destination.ip, dns.question.name, dns.question.type, host.name\n"
+  leql: |
+    where(query_type=AXFR AND source_address NOT IN [dns_server_ip_1, dns_server_ip_2])
+  crowdstrike: "#type=dns QueryType=AXFR \n| SourceIP!=\"<DNS_SERVER_IP_1>\" AND SourceIP!=\"<DNS_SERVER_IP_2>\"\n| table([@timestamp, SourceIP,\
+    \ QueryName, QueryType, DestinationIP])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter app_category = "network-service" and app = "dns"
+    | filter dns_query_type = "AXFR"
+    | filter source_ip not in ("10.0.0.53", "10.0.1.53", "192.168.1.53")
+    | fields _time, source_ip, destination_ip, dns_query, dns_query_type, source_user
+  lucene: |
+    event.category:dns AND dns.question.type:AXFR AND NOT source.ip:(10.0.0.53 OR 10.0.1.53 OR 192.168.1.53)
+  sumo: |
+    _sourceCategory=*DNS* OR _sourceCategory=*dns* OR _sourceCategory=*Network*
+    | parse regex "(?<query_type>AXFR)" nodrop
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})" nodrop
+    | where query_type = "AXFR"
+    | where !(src_ip in ("10.0.0.53", "10.0.1.53", "192.168.1.10", "172.16.0.10"))
+    | fields _messageTime, src_ip, query_type, _sourceHost, _raw
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -99,7 +70,7 @@ tags:
 - discovery
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 DNS Request Event
 

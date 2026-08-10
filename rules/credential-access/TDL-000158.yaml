@@ -16,84 +16,76 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=proxy action=allowed direction=outbound method=POST
+  spl: 'index=proxy action=allowed direction=outbound method=POST
+
     | lookup threat_intel_domains domain as dest_domain OUTPUT threat_category
+
     | search threat_category=*
+
     | stats count by src_ip, dest_domain, method, threat_category, url, _time
+
     | where count >= 1
+
     | table _time, src_ip, dest_domain, method, url, threat_category
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(1h)
+    | where DeviceVendor has "Proxy" or DeviceProduct has "Proxy" or DeviceEventClassID has "Web"
+    | where DeviceDirection == "Outbound" or CommunicationDirection == "Outbound"
+    | where RequestMethod == "POST"
+    | where isnotempty(DestinationHostName)
+    | join kind=inner (
+        ThreatIntelligenceIndicator
+        | where TimeGenerated > ago(14d)
+        | where isnotempty(DomainName)
+        | distinct DomainName
+    ) on $left.DestinationHostName == $right.DomainName
+    | project TimeGenerated, SourceIP, SourceUserName, DestinationHostName, DestinationIP, RequestURL, RequestMethod, DeviceAction, BytesSent, BytesReceived
+  aql: |
+    SELECT sourceip, destinationip, url, "Request Method", COUNT(*) AS event_count
+    FROM events
+    WHERE category IN (SELECT category FROM categories WHERE high_level_category_id = 10000)
+      AND sourceip IN (SELECT sourceip FROM events WHERE INOFFENSE(sourceip))
+      AND destinationip NOT IN (SELECT sourceip FROM events WHERE INOFFENSE(sourceip))
+      AND url IN (SELECT domainname FROM referencetable WHERE name='Threat Intelligence List')
+      AND "Request Method" = 'POST'
+    GROUP BY sourceip, destinationip, url, "Request Method"
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_ca_000158 {\n  meta:\n    author = \"TDL\"\n    description = \"POST to Threat Domain\"\n    severity = \"MEDIUM\"\n \
-    \   tactic = \"TA0006\"\n    technique = \"T1567\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  yara_l: "rule credential_access_exfil_to_malicious_domain {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects POST\
+    \ requests to threat intel domains via forward proxy - T1567\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique\
+    \ = \"T1567\"\n    severity = \"HIGH\"\n    \n  events:\n    $e.metadata.event_type = \"NETWORK_HTTP\"\n    $e.network.direction = \"OUTBOUND\"\
+    \n    $e.network.http.method = \"POST\"\n    $e.target.url_hostname = $domain\n    $e.principal.ip = $src_ip\n    \n    // Threat intel enrichment\n\
+    \    $e.target.url_hostname in %threat_intel_domains\n    \n  match:\n    $src_ip, $domain over 5m\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-network.proxy*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND network.direction == "outbound"
+      AND http.request.method == "POST"
+      AND destination.domain IS NOT NULL
+    | ENRICH threat_indicator_domain ON destination.domain
+    | WHERE threat.indicator.type IS NOT NULL
+    | KEEP @timestamp, source.ip, destination.ip, destination.domain, http.request.method, url.full, user.name, host.name
+  leql: |
+    where(direction=OUTBOUND AND destination_domain IN THREATLIST AND request_method=POST) groupby(source_address, destination_domain) calculate(count)
+  crowdstrike: |
+    #type=proxy direction=outbound method=POST
+    | match(field=dest_domain, column=domain, file="threat_intel_domains.csv", include=[threat_list], strict=false)
+    | table([@timestamp, src_ip, dest_domain, dest_ip, method, bytes_out, threat_list])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_source_translated_ip != null and action_destination_translated_ip = null and threat_name != null and http_method = "POST"
+    | fields _time, action_source_ip, action_destination_ip, dest_host, threat_name, http_method, action_source_user
+  lucene: |
+    event.type:"proxy" AND network.direction:"outbound" AND threat.indicator.matched.atomic:* AND http.request.method:"POST"
+  sumo: |
+    _sourceCategory=*Proxy* OR _sourceCategory=*Forward*Proxy*
+    | where direction matches "*outbound*" OR direction matches "*external*" OR (isNull(direction) AND src_ip matches "10.*" OR src_ip matches "192.168.*" OR src_ip matches "172.16.*" OR src_ip matches "172.17.*" OR src_ip matches "172.18.*" OR src_ip matches "172.19.*" OR src_ip matches "172.20.*" OR src_ip matches "172.21.*" OR src_ip matches "172.22.*" OR src_ip matches "172.23.*" OR src_ip matches "172.24.*" OR src_ip matches "172.25.*" OR src_ip matches "172.26.*" OR src_ip matches "172.27.*" OR src_ip matches "172.28.*" OR src_ip matches "172.29.*" OR src_ip matches "172.30.*" OR src_ip matches "172.31.*")
+    | where method = "POST" OR http_method = "POST" OR request_method = "POST"
+    | lookup type, malicious_confidence, malicious_count from https://sumologic-public-threat-intel.s3.amazonaws.com/threatlookup.csv on domain=dest_domain OR domain=dest_host OR domain=url_domain
+    | where !isNull(malicious_confidence) OR !isNull(type)
+    | fields _messageTime, src_ip, dest_domain, dest_host, url, method, http_method, request_method, type, malicious_confidence
 false_positives:
 - Authorized pen testing
 - Security research
@@ -103,7 +95,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Forward Proxy Event
 

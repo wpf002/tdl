@@ -26,72 +26,94 @@ queries:
     \ EventCode=13 TargetObject=\"*\\\\HKCU\\\\Software\\\\Classes\\\\ms-settings\\\\Shell\\\\Open\\\\command*\" \n    | eval reg_set=1 \n   \
     \ | table _time ComputerName TargetObject Details reg_set]\n| where isnotnull(reg_set)\n| table _time, ComputerName, User, ParentImage, Image,\
     \ CommandLine, TargetObject, Details\n"
-  kql: 'DeviceProcessEvents
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 1 or EventID == 4688
+    | where Process has_any ("fodhelper.exe", "computerdefaults.exe") or NewProcessName has_any ("fodhelper.exe", "computerdefaults.exe")
+    | extend ProcessName = coalesce(Process, NewProcessName)
+    | extend ParentProcessName = coalesce(ParentImage, ParentProcessName)
+    | join kind=inner (
+        SecurityEvent
+        | where TimeGenerated > ago(24h)
+        | where EventID == 13
+        | where TargetObject has "HKCU\\Software\\Classes\\ms-settings\\Shell\\Open\\command"
+        | extend RegModTime = TimeGenerated
+        | project Computer, Account, RegModTime, TargetObject, Details
+    ) on Computer, Account
+    | where TimeGenerated >= RegModTime and TimeGenerated <= RegModTime + 5m
+    | project TimeGenerated, Computer, Account, ProcessName, ParentProcessName, CommandLine, TargetObject, Details
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Parent Process Name", "Process CommandLine"
+    FROM events
+    WHERE ("Process Name" ILIKE '%fodhelper.exe%' OR "Process Name" ILIKE '%computerdefaults.exe%')
+      AND ("EventID" = '1' OR "EventID" = '4688')
+    LAST 24 HOURS
+  yara_l: |
+    rule uac_bypass_fodhelper_computerdefaults {
+      meta:
+        author = "Chronicle Detection Engineering"
+        description = "Detects UAC bypass via fodhelper.exe or computerdefaults.exe with registry key precondition"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1548"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $reg.metadata.event_type = "REGISTRY_MODIFICATION"
+        re.regex($reg.target.registry.registry_key, `(?i)HKCU\\Software\\Classes\\ms-settings\\Shell\\Open\\command`)
+        $reg.principal.hostname = $host
+        $reg.principal.user.userid = $user
 
-    | where process_name in ("fodhelper.exe", "computerdefaults.exe")
+        $proc.metadata.event_type = "PROCESS_LAUNCH"
+        re.regex($proc.principal.process.file.full_path, `(?i)(fodhelper\.exe|computerdefaults\.exe)$`)
+        $proc.principal.hostname = $host
+        $proc.principal.user.userid = $user
 
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
+      match:
+        $host, $user over 5m
 
-    | order by Count desc
+      outcome:
+        $risk_score = 85
 
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('fodhelper.exe', 'computerdefaults.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000724 {\n  meta:\n    author = \"TDL\"\n    description = \"UAC Auto-Elevate Bypass via fodhelper / computerdefaults\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1548\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /(fodhelper.exe|computerdefaults.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n\
-    \    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
+      condition:
+        $reg and $proc
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.process*
     | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("fodhelper.exe", "computerdefaults.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [fodhelper.exe, computerdefaults.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (fodhelper.exe, computerdefaults.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("fodhelper.exe", "computerdefaults.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(fodhelper.exe OR computerdefaults.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("fodhelper.exe", "computerdefaults.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      AND process.parent.name IN ("fodhelper.exe", "computerdefaults.exe")
+      AND process.name != "fodhelper.exe"
+      AND process.name != "computerdefaults.exe"
+    | STATS spawns = COUNT(*) BY host.name, user.name, process.parent.name, process.name, process.command_line, process.executable
+    | KEEP host.name, user.name, process.parent.name, process.name, process.command_line, process.executable, spawns
+  leql: |
+    where(parent_process_name ICONTAINS "fodhelper.exe" OR parent_process_name ICONTAINS "computerdefaults.exe") groupby(asset, process_name, parent_process_name) calculate(count)
+  crowdstrike: |
+    event_simpleName=ProcessRollup2 (FileName=fodhelper.exe OR FileName=computerdefaults.exe)
+    | join({event_simpleName=AsepValueUpdate RegistryPath=*\Software\Classes\ms-settings\Shell\Open\command* | select([aid, TargetProcessId_decimal, @timestamp, RegistryPath, Value])}, field=[aid], key=[aid], include=[RegistryPath, Value])
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName, RegistryPath, Value])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter actor_process_image_name in ("fodhelper.exe", "computerdefaults.exe")
+    | alter parent_pid = action_process_os_pid
+    | join type=left (
+        dataset = xdr_data
+        | filter event_type = ENUM.EVENT_TYPE_REGISTRY
+        | filter action_registry_key_name ~= ".*\\Software\\Classes\\ms-settings\\Shell\\Open\\command.*"
+        | alter reg_pid = actor_process_os_pid
+        | fields reg_pid, action_registry_key_name, action_registry_value_name, action_registry_data
+      ) as reg on parent_pid = reg.reg_pid
+    | filter reg.action_registry_key_name != null
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_command_line, reg.action_registry_key_name, reg.action_registry_data
+  lucene: |
+    (process.parent.name:(fodhelper.exe OR computerdefaults.exe) OR winlog.event_data.ParentImage:(fodhelper.exe OR computerdefaults.exe)) AND (registry.path:*\\Software\\Classes\\ms-settings\\Shell\\Open\\command* OR winlog.event_data.TargetObject:*\\Software\\Classes\\ms-settings\\Shell\\Open\\command*)
+  sumo: "_sourceCategory=*Sysmon* OR _sourceCategory=*Windows*\n| json field=_raw \"EventID\" as event_id\n| json field=_raw \"Image\" as image\n\
+    | json field=_raw \"ParentImage\" as parent_image\n| json field=_raw \"CommandLine\" as command_line\n| json field=_raw \"TargetObject\" as\
+    \ target_object\n| where (event_id = \"1\" and (image matches \"*\\\\fodhelper.exe\" or image matches \"*\\\\computerdefaults.exe\")) \n \
+    \  or (event_id = \"13\" and target_object matches \"*\\\\Software\\\\Classes\\\\ms-settings\\\\Shell\\\\Open\\\\command*\")\n| timeslice\
+    \ 5m\n| count by _timeslice, _sourceHost, image, parent_image, command_line, target_object\n| where image matches \"*\\\\fodhelper.exe\" or\
+    \ image matches \"*\\\\computerdefaults.exe\"\n"
 pseudo_logic: fodhelper.exe or computerdefaults.exe spawned with HKCU\Software\Classes\ms-settings\Shell\Open\command precondition set. Classic
   auto-elevate UAC bypass.
 false_positives:
@@ -110,7 +132,7 @@ references:
 - https://attack.mitre.org/techniques/T1548/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

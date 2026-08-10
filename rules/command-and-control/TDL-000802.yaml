@@ -24,71 +24,115 @@ queries:
     Temp\\\\*\" OR CommandLine=\"*\\\\AppData\\\\*\" OR CommandLine=\"*%TEMP%*\" OR CommandLine=\"*%APPDATA%*\"))\nOR\n(index=linux sourcetype\
     \ IN (linux_secure, syslog) \n    (COMM IN (curl, wget) OR exe IN (*/curl, */wget))\n    (COMMAND=\"*/tmp/*\" OR cmdline=\"*/tmp/*\"))\n|\
     \ table _time, host, Image, CommandLine, User, ParentImage, process_name, exe, COMMAND\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("certutil.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('certutil.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000802 {\n  meta:\n    author = \"TDL\"\n    description = \"Living-Off-the-Land Binary Downloading From Internet\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0011\"\n    technique = \"T1105\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /(certutil.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("certutil.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [certutil.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (certutil.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("certutil.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(certutil.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("certutil.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    union
+    (SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where EventID == 1
+    | where (Process has_any ("certutil.exe", "bitsadmin.exe", "curl.exe", "wget.exe", "powershell.exe")
+        or CommandLine has_any ("certutil.exe", "bitsadmin.exe", "curl.exe", "wget.exe", "Invoke-WebRequest"))
+    | where CommandLine has_any ("-urlcache", "/transfer", "http://", "https://")
+    | where CommandLine has_any ("%TEMP%", "%APPDATA%", "\\Temp\\", "\\AppData\\", "/tmp/")
+    | extend ProcessName = tostring(split(Process, '\\')[-1])
+    | extend DestinationPath = extract(@"(?i)((?:[a-z]:\\|/)(?:.*?(?:temp|appdata)[^\\s]*))", 1, CommandLine)
+    | project TimeGenerated, Computer, Account, ProcessName, CommandLine, DestinationPath),
+    (Event
+    | where TimeGenerated > ago(24h)
+    | where Source == "Linux Audit" or EventID in (2003, 2004, 2005, 2006)
+    | where RenderedDescription has_any ("curl", "wget", "execve")
+    | extend CommandLine = tostring(ParameterXml)
+    | where CommandLine has_any ("curl", "wget")
+    | where CommandLine has_any ("http://", "https://")
+    | where CommandLine has_any ("/tmp/", "/var/tmp/", "/home/")
+    | extend ProcessName = extract(@"(?:curl|wget)", 0, CommandLine)
+    | extend DestinationPath = extract(@"(/tmp/[^\s]+|/var/tmp/[^\s]+|/home/[^\s]+)", 1, CommandLine)
+    | project TimeGenerated, Computer, Account, ProcessName, CommandLine, DestinationPath)
+    | where isnotempty(CommandLine)
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Parent Process Name"
+    FROM events
+    WHERE (
+      ("Process Name" ILIKE '%certutil.exe%' AND "Process CommandLine" ILIKE '%-urlcache%' AND "Process CommandLine" ILIKE '%-f%')
+      OR ("Process Name" ILIKE '%bitsadmin%' AND "Process CommandLine" ILIKE '%/transfer%')
+      OR ("Process Name" ILIKE '%curl%' OR "Process Name" ILIKE '%wget%')
+      OR ("Process Name" ILIKE '%powershell.exe%' AND "Process CommandLine" ILIKE '%Invoke-WebRequest%')
+    )
+    AND (
+      "Process CommandLine" ILIKE '%\\temp\\%'
+      OR "Process CommandLine" ILIKE '%\\appdata\\%'
+      OR "Process CommandLine" ILIKE '%/tmp/%'
+    )
+    LAST 1 HOURS
+  yara_l: "rule t1105_remote_file_download {\n  meta:\n    author = \"TDL\"\n    description = \"Detects download utilities fetching files from\
+    \ internet to temp directories - MITRE T1105\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique = \"T1105\"\n\
+    \    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    (\n      (\n        re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\certutil\\.exe$`) and\n        re.regex($e.principal.process.command_line, `(?i)-urlcache`) and\n        re.regex($e.principal.process.command_line,\
+    \ `(?i)-f`)\n      ) or\n      (\n        re.regex($e.principal.process.file.full_path, `(?i)\\\\bitsadmin\\.exe$`) and\n        re.regex($e.principal.process.command_line,\
+    \ `(?i)/transfer`)\n      ) or\n      (\n        re.regex($e.principal.process.file.full_path, `(?i)(\\\\curl\\.exe|/curl)$`) and\n      \
+    \  re.regex($e.principal.process.command_line, `(?i)http`)\n      ) or\n      (\n        re.regex($e.principal.process.file.full_path, `(?i)(\\\
+    \\wget\\.exe|/wget)$`) and\n        re.regex($e.principal.process.command_line, `(?i)http`)\n      ) or\n      (\n        re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\powershell\\.exe$`) and\n        re.regex($e.principal.process.command_line, `(?i)Invoke-WebRequest`)\n      )\n    )\n    (\n\
+    \      re.regex($e.principal.process.command_line, `(?i)(%TEMP%|\\\\Temp\\\\|\\\\AppData\\\\|%APPDATA%|/tmp/)`)\n    )\n    $e.principal.hostname\
+    \ = $host\n    \n  match:\n    $host over 5m\n    \n  outcome:\n    $risk_score = 65\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-endpoint.events.process*, logs-linux.auditd*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (process.name IN ("certutil.exe", "bitsadmin.exe") AND (process.command_line LIKE "*-urlcache*" OR process.command_line LIKE "*/transfer*"))
+        OR (process.name IN ("curl.exe", "wget.exe", "curl", "wget") AND process.command_line RLIKE ".*(http|https|ftp)://.*")
+        OR (process.name == "powershell.exe" AND process.command_line LIKE "*Invoke-WebRequest*")
+      )
+      AND (
+        process.command_line LIKE "*\\Temp\\*"
+        OR process.command_line LIKE "*\\AppData\\*"
+        OR process.command_line LIKE "*/tmp/*"
+        OR process.command_line LIKE "*%TEMP%*"
+        OR process.command_line LIKE "*%APPDATA%*"
+        OR process.command_line LIKE "*$TMPDIR*"
+      )
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.executable
+  leql: |
+    where((process_name ICONTAINS "certutil.exe" AND (process_cmd_line ICONTAINS "-urlcache" AND process_cmd_line ICONTAINS "-f")) OR (process_name ICONTAINS "bitsadmin.exe" AND process_cmd_line ICONTAINS "/transfer") OR (process_name ICONTAINS "curl" AND process_cmd_line ICONTAINS "http") OR (process_name ICONTAINS "wget" AND process_cmd_line ICONTAINS "http") OR (process_name ICONTAINS "powershell.exe" AND process_cmd_line ICONTAINS "Invoke-WebRequest")) AND (process_cmd_line ICONTAINS "\\temp\\" OR process_cmd_line ICONTAINS "\\appdata\\" OR process_cmd_line ICONTAINS "/tmp/" OR process_cmd_line ICONTAINS "%temp%" OR process_cmd_line ICONTAINS "%appdata%" OR process_cmd_line ICONTAINS "$env:temp" OR process_cmd_line ICONTAINS "$env:appdata")
+  crowdstrike: "(event_simpleName=ProcessRollup2 OR event_simpleName=ProcessRollup2V2 OR #type=sysmon EventCode=1 OR #type=auditd) \n(\n  (FileName=*certutil.exe\
+    \ (CommandLine=*-urlcache* AND CommandLine=*-f*)) OR\n  (FileName=*bitsadmin.exe (CommandLine=*/transfer*)) OR\n  (FileName=*curl.exe OR FileName=curl)\
+    \ OR\n  (FileName=*wget.exe OR FileName=wget) OR\n  (CommandLine=*Invoke-WebRequest*)\n)\n(CommandLine=*%TEMP%* OR CommandLine=*%APPDATA%*\
+    \ OR CommandLine=*/tmp/* OR CommandLine=*/var/tmp/* OR CommandLine=*\\\\Temp\\\\* OR CommandLine=*\\\\AppData\\\\*)\n| table([@timestamp,\
+    \ ComputerName, UserName, FileName, ParentBaseFileName, CommandLine])\n"
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_PROCESS
+    | filter (
+        (lowercase(action_process_image_name) contains "certutil.exe" and action_process_image_command_line ~= "(?i).*-urlcache.*-f.*")
+        or (lowercase(action_process_image_name) contains "bitsadmin" and action_process_image_command_line ~= "(?i).*/transfer.*")
+        or (lowercase(action_process_image_name) contains "curl" and action_process_image_command_line ~= "(?i).*(http|https|ftp)://.*")
+        or (lowercase(action_process_image_name) contains "wget" and action_process_image_command_line ~= "(?i).*(http|https|ftp)://.*")
+        or (lowercase(action_process_image_name) contains "powershell" and action_process_image_command_line ~= "(?i).*Invoke-WebRequest.*")
+    )
+    | filter action_process_image_command_line ~= "(?i).*(\\temp\\|\\appdata\\|/tmp/).*"
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line, actor_process_image_name
+  lucene: |
+    (process.name:(certutil.exe OR bitsadmin.exe OR curl.exe OR wget.exe OR powershell.exe OR pwsh.exe) AND (process.command_line:(*-urlcache* AND *-f*) OR process.command_line:(*\/transfer*) OR process.command_line:(*curl* AND (*http:* OR *https:*)) OR process.command_line:(*wget* AND (*http:* OR *https:*)) OR process.command_line:(*Invoke-WebRequest* OR *iwr* OR *wget*)) AND (process.command_line:(*%TEMP%* OR *%APPDATA%* OR *\/tmp\/* OR *C:\\Users\\*\\AppData\\* OR *C:\\Windows\\Temp\\*)))
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Linux* OR _sourceCategory=*Sysmon* OR _sourceCategory=*Auditd*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "Image" as image
+    | json field=_raw "NewProcessName" as new_process_name
+    | json field=_raw "ProcessCommandLine" as process_command_line
+    | json field=_raw "exe" as exe
+    | json field=_raw "a0" as arg0
+    | json field=_raw "SYSCALL" as syscall
+    | where (event_id in ("1", "4688") and (
+        (command_line matches "*certutil*" and command_line matches "*-urlcache*" and command_line matches "*-f*" and (command_line matches "*%TEMP%*" or command_line matches "*%APPDATA%*" or command_line matches "*\\Temp\\*" or command_line matches "*\\AppData\\*"))
+        or (command_line matches "*bitsadmin*" and command_line matches "*/transfer*" and (command_line matches "*%TEMP%*" or command_line matches "*%APPDATA%*" or command_line matches "*\\Temp\\*" or command_line matches "*\\AppData\\*"))
+        or (command_line matches "*curl*" and command_line matches "*http*" and (command_line matches "*%TEMP%*" or command_line matches "*%APPDATA%*" or command_line matches "*/tmp/*" or command_line matches "*\\Temp\\*" or command_line matches "*\\AppData\\*"))
+        or (command_line matches "*wget*" and command_line matches "*http*" and (command_line matches "*%TEMP%*" or command_line matches "*%APPDATA%*" or command_line matches "*/tmp/*" or command_line matches "*\\Temp\\*" or command_line matches "*\\AppData\\*"))
+        or (command_line matches "*Invoke-WebRequest*" and (command_line matches "*%TEMP%*" or command_line matches "*%APPDATA%*" or command_line matches "*\\Temp\\*" or command_line matches "*\\AppData\\*"))
+    )) or (syscall="execve" and (
+        (exe matches "*curl*" and arg0 matches "*http*" and (command_line matches "*/tmp/*" or process_command_line matches "*/tmp/*"))
+        or (exe matches "*wget*" and arg0 matches "*http*" and (command_line matches "*/tmp/*" or process_command_line matches "*/tmp/*"))
+    ))
+    | fields _messageTime, _sourceHost, event_id, command_line, image, new_process_name, exe, syscall
 pseudo_logic: certutil.exe -urlcache -f, bitsadmin /transfer, curl, wget, Invoke-WebRequest fetching from internet to %TEMP%/%APPDATA%.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -105,7 +149,7 @@ references:
 - https://attack.mitre.org/techniques/T1105/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

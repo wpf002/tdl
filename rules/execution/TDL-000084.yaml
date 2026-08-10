@@ -18,84 +18,71 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=* (sourcetype=firewall OR sourcetype=antivirus OR sourcetype=email* OR sourcetype=email_server)
+  spl: 'index=* (sourcetype=firewall OR sourcetype=antivirus OR sourcetype=email* OR sourcetype=email_server)
+
     | eval file_hash=coalesce(file_hash, hash, md5, sha1, sha256, file_md5, file_sha1, file_sha256, FileHash, Hash)
+
     | where isnotnull(file_hash)
+
     | lookup threat_intel_lookup hash as file_hash OUTPUT threat_score, threat_name, threat_category
+
     | where isnotnull(threat_score) OR isnotnull(threat_name) OR isnotnull(threat_category)
+
     | table _time, host, sourcetype, file_hash, file_name, src, dest, user, threat_score, threat_name, threat_category, action
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_exe_000084 {\n  meta:\n    author = \"TDL\"\n    description = \"Malicious File Hash Detected on Host\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1204\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: "let ThreatIntelHashes = \n    ThreatIntelligenceIndicator\n    | where TimeGenerated > ago(14d)\n    | where isnotempty(FileHashValue)\n\
+    \    | where Active == true\n    | extend FileHash = toupper(FileHashValue)\n    | project FileHash, Description, ThreatType, ConfidenceScore;\n\
+    union \n    (CommonSecurityLog\n    | where TimeGenerated > ago(1h)\n    | where isnotempty(FileHash)\n    | extend FileHash = toupper(FileHash)\n\
+    \    | join kind=inner ThreatIntelHashes on FileHash\n    | project TimeGenerated, DeviceVendor, DeviceProduct, SourceIP, DestinationIP, FileName,\
+    \ FileHash, Description, ThreatType, ConfidenceScore),\n    (EmailEvents\n    | where TimeGenerated > ago(1h)\n    | where isnotempty(SHA256)\n\
+    \    | extend FileHash = toupper(SHA256)\n    | join kind=inner ThreatIntelHashes on FileHash\n    | project TimeGenerated, SenderFromAddress,\
+    \ RecipientEmailAddress, Subject, FileName = AttachmentName, FileHash, Description, ThreatType, ConfidenceScore),\n    (DeviceFileEvents\n\
+    \    | where TimeGenerated > ago(1h)\n    | where isnotempty(SHA256)\n    | extend FileHash = toupper(SHA256)\n    | join kind=inner ThreatIntelHashes\
+    \ on FileHash\n    | project TimeGenerated, DeviceName, AccountName, FileName, FolderPath, FileHash, Description, ThreatType, ConfidenceScore)\n"
+  aql: |
+    SELECT sourceip, destinationip, username, qidname(qid) AS event_name, LOGSOURCENAME(logsourceid) AS log_source, "File Hash" AS file_hash, eventtime
+    FROM events
+    WHERE "File Hash" IN (SELECT value FROM reference_set WHERE name = 'ThreatIntelFileHashes')
+    LAST 24 HOURS
+  yara_l: "rule malicious_file_hash_ti_match {\n  meta:\n    author = \"TDL\"\n    description = \"Detects file hash matching threat intelligence\
+    \ indicators - MITRE T1204 Execution\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1204\"\n    severity = \"\
+    HIGH\"\n\n  events:\n    $e.metadata.event_type = \"FILE_CREATION\" or\n    $e.metadata.event_type = \"FILE_OPEN\" or\n    $e.metadata.event_type\
+    \ = \"FILE_MODIFICATION\" or\n    $e.metadata.event_type = \"NETWORK_HTTP\" or\n    $e.metadata.event_type = \"EMAIL_TRANSACTION\" or\n  \
+    \  $e.metadata.event_type = \"SCAN_UNCATEGORIZED\" or\n    $e.metadata.event_type = \"SCAN_FILE\" or\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\
+    \n    \n    $e.target.file.sha256 != \"\" or\n    $e.target.file.md5 != \"\" or\n    $e.target.file.sha1 != \"\" or\n    $e.principal.process.file.sha256\
+    \ != \"\" or\n    $e.principal.process.file.md5 != \"\" or\n    $e.principal.process.file.sha1 != \"\"\n    \n    (\n      $e.target.file.sha256\
+    \ in %ioc_sha256 or\n      $e.target.file.md5 in %ioc_md5 or\n      $e.target.file.sha1 in %ioc_sha1 or\n      $e.principal.process.file.sha256\
+    \ in %ioc_sha256 or\n      $e.principal.process.file.md5 in %ioc_md5 or\n      $e.principal.process.file.sha1 in %ioc_sha1\n    )\n    \n\
+    \    $e.principal.hostname = $host\n\n  match:\n    $host over 1h\n\n  outcome:\n    $risk_score = 85\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-ti_*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND threat.indicator.file.hash.sha256 IS NOT NULL
+    | ENRICH threat_indicator_file_hash ON file.hash.sha256 = threat.indicator.file.hash.sha256
+    | WHERE threat.indicator.file.hash.sha256 IS NOT NULL
+    | KEEP @timestamp, host.name, user.name, file.name, file.path, file.hash.sha256, threat.indicator.type, threat.indicator.description, source.ip, destination.ip
+  leql: |
+    where(threat_intel_indicator=FILE_HASH)
+  crowdstrike: |
+    #type=firewall OR #type=antivirus OR #type=email
+    | lookup(file="threat_intel_list.csv", field=SHA256HashData, include=[threat_level, threat_name])
+    | isNotNull(threat_level)
+    | table([@timestamp, ComputerName, UserName, FileName, SHA256HashData, threat_level, threat_name, event_simpleName])
+  xql: |
+    dataset = panw_ngfw_threat_raw
+    | filter threat_category = "malware" and action_file_sha256 != null
+    | join type=inner (dataset = threat_indicators | filter indicator_type = "Hash") as ti (action_file_sha256 = ti.indicator_value)
+    | fields _time, src_ip, dst_ip, app, action_file_sha256, threat_name, severity, action
+  lucene: |
+    file.hash.sha256:* AND threat.indicator.type:"file" AND threat.indicator.matched:true
+  sumo: |
+    _sourceCategory=*Firewall* OR _sourceCategory=*Antivirus* OR _sourceCategory=*Email*
+    | parse regex "(?<file_hash>[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})" nodrop
+    | where !isNull(file_hash)
+    | lookup malicious from shared/threat_intel on file_hash=hash_value
+    | where malicious = "true"
+    | fields _messageTime, _sourceCategory, _sourceHost, file_hash, malicious
 false_positives:
 - Authorized pen testing
 - Security research
@@ -105,7 +92,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Event
 

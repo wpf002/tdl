@@ -16,76 +16,121 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 55
 queries:
-  spl: |
-    index=* sourcetype=o365:management:activity Workload=SharePoint Operation=FileDownloaded
+  spl: 'index=* sourcetype=o365:management:activity Workload=SharePoint Operation=FileDownloaded
+
     | bin _time span=5m
+
     | lookup threat_intel_list SourceIP OUTPUT is_malicious
+
     | where is_malicious=1 OR is_malicious="true"
+
     | stats dc(FileName) as distinct_files values(FileName) as files values(SourceIP) as source_ips by _time, UserId
+
     | where distinct_files >= 10
+
     | table _time, UserId, source_ips, distinct_files, files
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "FileDownloaded"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%FileDownloaded%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000125 {\n  meta:\n    author = \"TDL\"\n    description = \"Mass File Download from Malicious IP\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0009\"\n    technique = \"T1213\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n   \
-    \ $e.eventName = /FileDownloaded/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    OfficeActivity
+    | where TimeGenerated > ago(5m)
+    | where Operation == "FileDownloaded"
+    | where OfficeWorkload == "SharePoint"
+    | join kind=inner (
+        ThreatIntelligenceIndicator
+        | where isnotempty(NetworkIP)
+        | project NetworkIP
+        | distinct NetworkIP
+    ) on $left.ClientIP == $right.NetworkIP
+    | summarize DistinctFiles = dcount(OfficeObjectId), FileList = make_set(OfficeObjectId) by UserId, ClientIP, bin(TimeGenerated, 5m)
+    | where DistinctFiles >= 10
+  aql: |
+    SELECT "Source Username", sourceip, UNIQUECOUNT("File Name") AS distinct_files, COUNT(*) AS download_count
+    FROM events
+    WHERE "Operation" = 'FileDownloaded'
+      AND "Workload" = 'Sharepoint'
+      AND sourceip IN (SELECT sourceip FROM events WHERE INOFFENSE('*') OR INCIDR('*', sourceip) IN (SELECT value FROM reference_data('ThreatIntelligence')))
+    GROUP BY "Source Username", sourceip
+    HAVING distinct_files >= 10
+    LAST 5 MINUTES
+  yara_l: |
+    rule sharepoint_file_download_from_threat_ip {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects 10+ distinct SharePoint file downloads from threat intel IP within 5 minutes - T1213 Collection"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1213"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Microsoft 365"
+        $e.metadata.product_event_type = "FileDownloaded"
+        $e.metadata.vendor_name = "Microsoft"
+        $e.target.application = "SharePoint"
+        $e.principal.ip in %threat_intel_list
+        $e.principal.user.userid = $user
+        $e.target.file.full_path = $file
+        $e.principal.ip = $source_ip
 
-    | WHERE eventName LIKE "%FileDownloaded%"
+      match:
+        $user, $source_ip over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 85
+        $distinct_files = count_distinct($file)
+        $downloaded_files = array_distinct($file)
+        $threat_ip = $source_ip
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/FileDownloaded/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*FileDownloaded*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "FileDownloaded"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*FileDownloaded*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*FileDownloaded*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #e >= 10 and $distinct_files >= 10
+    }
+  esql: |
+    FROM logs-o365.audit*
+    | WHERE @timestamp > NOW() - 5 minutes
+      AND event.action == "FileDownloaded"
+      AND o365.audit.Workload == "SharePoint"
+    | ENRICH threatintel_ip ON source.ip
+    | WHERE threatintel_ip.indicator.type IS NOT NULL
+    | STATS file_count = COUNT_DISTINCT(file.name) BY user.name, source.ip, bucket = BUCKET(@timestamp, 5 minutes)
+    | WHERE file_count >= 10
+    | KEEP bucket, user.name, source.ip, file_count
+  leql: |
+    where(source_json.Workload="SharePoint" AND source_json.Operation="FileDownloaded" AND threat_indicator=true) groupby(source_json.UserId, source_address) calculate(unique:source_json.ObjectId)
+  crowdstrike: |
+    #type=SharePoint Operation=FileDownloaded Workload=SharePoint
+    | ipReputation(field=ClientIP)
+    | Reputation="malicious"
+    | bucket(span=5m, field=@timestamp, as=time_bucket)
+    | groupBy([time_bucket, UserId, ClientIP], function=[count(ObjectId, distinct=true, as=distinct_files), count(as=total_events)])
+    | distinct_files >= 10
+    | table([time_bucket, UserId, ClientIP, distinct_files, total_events])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Microsoft" and logon_type = "SharePoint"
+    | filter action_type = "FileDownloaded"
+    | filter outcome = OUTCOME_SUCCESS
+    | alter threat_match = arrayindex(regextract(actor_ipv4, "(\d+\.\d+\.\d+\.\d+)"), 0)
+    | filter threat_match != null
+    | bin _time span = 5m
+    | comp count_distinct(object_name) as distinct_files, count() as total_events by _time, actor_effective_username, actor_ipv4
+    | filter distinct_files >= 10 and total_events >= 10
+    | fields _time, actor_effective_username, actor_ipv4, distinct_files, total_events
+  lucene: |
+    Workload:SharePoint AND Operation:FileDownloaded AND SourceIP:(* AND _exists_:ThreatIntelMatch)
+  sumo: |
+    _sourceCategory=*Sharepoint* OR _sourceCategory=*Microsoft365* OR _sourceCategory=*Office365*
+    | json field=_raw "Operation" as operation
+    | json field=_raw "Workload" as workload
+    | json field=_raw "ClientIP" as src_ip
+    | json field=_raw "UserId" as user
+    | json field=_raw "ObjectId" as file_name
+    | where operation = "FileDownloaded" and workload = "SharePoint"
+    | lookup type, actor, raw, threatlevel as malicious_confidence from sumo://threat/cs on threat=src_ip
+    | where type = "ip_address" and !isNull(malicious_confidence)
+    | timeslice 5m
+    | count_distinct(file_name) as distinct_files by _timeslice, user, src_ip
+    | where distinct_files >= 10
+    | fields _timeslice, user, src_ip, distinct_files
 false_positives:
 - Authorized pen testing
 - Security research
@@ -95,7 +140,7 @@ tags:
 - collection
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "10 Sharepoint Events\nWhere the Operation is \"FileDownloaded\"\nWhere the workload is \"Sharepoint\"\nWhere the Source IP is on\
   \ a Threat Intelligence List\nWith distinct File Names\nWith the same Source Username \nWithin 5 minutes"

@@ -23,77 +23,128 @@ queries:
     \ OR http_user_agent=\"*mining*\" OR http_user_agent=\"*miner*\" OR http_user_agent=\"*pool*\") \n| stats count sum(bytes_out) as bytes_out\
     \ values(http_user_agent) as user_agents by src_ip, dest_ip, dest_port \n| where count >= 1 \n| sort - bytes_out \n| table src_ip, dest_ip,\
     \ dest_port, count, bytes_out, user_agents\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000436 {\n  meta:\n    author = \"TDL\"\n    description = \"Crypto Miner User Agent\"\n    severity = \"MEDIUM\"\n\
-    \    tactic = \"TA0011\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceVendor has_any ("Proxy", "Firewall") or DeviceProduct has_any ("Proxy", "Firewall", "IDS", "IPS")
+    | where ApplicationProtocol =~ "tcp" or Protocol =~ "TCP"
+    | where RequestClientApplication has_any ("xmrig", "ccminer", "cpuminer", "ethminer", "claymore", "phoenixminer", "t-rex", "lolminer", "nanominer", "nbminer", "gminer", "bminer", "cryptonight", "nicehash", "stratum", "minergate")
+    | summarize bytes_out = sum(SentBytes), connection_count = count() by SourceIP, DestinationIP, DestinationPort, RequestClientApplication
+    | where connection_count >= 1
     | sort by bytes_out desc
+    | project TimeGenerated = now(), SourceIP, DestinationIP, DestinationPort, RequestClientApplication, bytes_out, connection_count
+  aql: |
+    SELECT sourceip, destinationip, destinationport, SUM(sourcebytes) AS bytes_out, COUNT(*) AS connections, LOGSOURCENAME(logsourceid) AS log_source
+    FROM flows
+    WHERE (LOGSOURCENAME(logsourceid) ILIKE '%firewall%' OR LOGSOURCENAME(logsourceid) ILIKE '%ids%' OR category IN (SELECT category FROM categories WHERE low_level_category_name ILIKE '%firewall%' OR low_level_category_name ILIKE '%ids%'))
+      AND protocolid = 6
+      AND (UTF8(payload) ILIKE '%stratum%' OR UTF8(payload) ILIKE '%xmrig%' OR UTF8(payload) ILIKE '%minergate%' OR UTF8(payload) ILIKE '%nicehash%' OR UTF8(payload) ILIKE '%claymore%' OR UTF8(payload) ILIKE '%cryptonight%' OR UTF8(payload) ILIKE '%ethminer%' OR UTF8(payload) ILIKE '%sgminer%')
+    GROUP BY sourceip, destinationip, destinationport
+    HAVING connections >= 1
+    ORDER BY bytes_out DESC
+    LAST 24 HOURS
+  yara_l: |
+    rule cryptominer_user_agent_c2 {
+      meta:
+        author = "TDL"
+        description = "Detects network traffic matching known cryptominer User-Agent patterns (T1071)"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1071"
+        severity = "MEDIUM"
 
-    '
+      events:
+        $e.metadata.event_type = "NETWORK_HTTP"
+        $e.network.ip_protocol = "TCP"
+        (
+          re.regex($e.network.http.user_agent, `(?i)xmrig`) or
+          re.regex($e.network.http.user_agent, `(?i)cpuminer`) or
+          re.regex($e.network.http.user_agent, `(?i)ccminer`) or
+          re.regex($e.network.http.user_agent, `(?i)ethminer`) or
+          re.regex($e.network.http.user_agent, `(?i)claymore`) or
+          re.regex($e.network.http.user_agent, `(?i)phoenixminer`) or
+          re.regex($e.network.http.user_agent, `(?i)nanominer`) or
+          re.regex($e.network.http.user_agent, `(?i)nbminer`) or
+          re.regex($e.network.http.user_agent, `(?i)t-rex`) or
+          re.regex($e.network.http.user_agent, `(?i)gminer`) or
+          re.regex($e.network.http.user_agent, `(?i)lolminer`) or
+          re.regex($e.network.http.user_agent, `(?i)teamredminer`) or
+          re.regex($e.network.http.user_agent, `(?i)bminer`) or
+          re.regex($e.network.http.user_agent, `(?i)kawpowminer`) or
+          re.regex($e.network.http.user_agent, `(?i)stratum`) or
+          re.regex($e.network.http.user_agent, `(?i)miner`)
+        )
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dest_ip
+        $e.target.port = $dest_port
+
+      match:
+        $src_ip, $dest_ip, $dest_port over 1h
+
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-network*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (event.dataset LIKE "*firewall*" OR event.dataset LIKE "*ids*")
+      AND network.protocol LIKE "*tcp*"
+      AND (
+        http.request.headers.user-agent LIKE "*xmrig*"
+        OR http.request.headers.user-agent LIKE "*minergate*"
+        OR http.request.headers.user-agent LIKE "*claymore*"
+        OR http.request.headers.user-agent LIKE "*ethminer*"
+        OR http.request.headers.user-agent LIKE "*ccminer*"
+        OR http.request.headers.user-agent LIKE "*sgminer*"
+        OR http.request.headers.user-agent LIKE "*cpuminer*"
+        OR http.request.headers.user-agent LIKE "*nheqminer*"
+        OR http.request.headers.user-agent LIKE "*phoenixminer*"
+        OR http.request.headers.user-agent LIKE "*lolminer*"
+        OR http.request.headers.user-agent LIKE "*t-rex*"
+        OR http.request.headers.user-agent LIKE "*nbminer*"
+        OR http.request.headers.user-agent LIKE "*bminer*"
+        OR http.request.headers.user-agent LIKE "*gminer*"
+        OR http.request.headers.user-agent LIKE "*nanominer*"
+        OR http.request.headers.user-agent LIKE "*srbminer*"
+        OR http.request.headers.user-agent LIKE "*teamredminer*"
+        OR http.request.headers.user-agent LIKE "*kawpowminer*"
+        OR http.request.headers.user-agent LIKE "*wildrig*"
+        OR http.request.headers.user-agent LIKE "*xmr-stak*"
+      )
+    | STATS connections = COUNT(*), total_bytes_out = SUM(source.bytes) BY source.ip, destination.ip, destination.port, user_agent = http.request.headers.user-agent
+    | WHERE connections >= 1
+    | SORT total_bytes_out DESC
+    | KEEP source.ip, destination.ip, destination.port, user_agent, connections, total_bytes_out
+  leql: |
+    where(source_json.http_user_agent=/.*([Mm]iner|[Xx][Mm][Rr]|stratum|nicehash|xmrig|ccminer|ethminer|claymore|phoenixminer|t-rex|nbminer|gminer|lolminer|nanominer|srbminer|teamredminer|wildrig|bminer|excavator|dstm|ewbf|funakoshi|optiminer|nheqminer|silentarmy|zcash|equihash|cryptonight|randomx|kawpow|ethash|progpow|zhash|beamhash|cuckatoo|cuckoo|eaglesong|handshake).*/i) groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    #type=network (sourcetype=firewall OR sourcetype=ids) network.protocol=*tcp* (user_agent=*stratum* OR user_agent=*xmrig* OR user_agent=*claymore* OR user_agent=*ethminer* OR user_agent=*cgminer* OR user_agent=*bfgminer* OR user_agent=*minergate* OR user_agent=*nicehash* OR user_agent=*phoenix* OR user_agent=*teamredminer* OR user_agent=*lolminer* OR user_agent=*nbminer* OR user_agent=*gminer*)
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=connections), sum(bytes_out, as=total_bytes_out)])
+    | connections >= 1
+    | sort(field=total_bytes_out, order=desc)
+    | table([src_ip, dest_ip, dest_port, connections, total_bytes_out, user_agent])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_source_translated_port != null and dest_port != null and to_string(http_user_agent) ~= "(?i)(xmrig|claymore|ethminer|ccminer|cgminer|bfgminer|cryptonight|monero|stratum)"
+    | comp sum(bytes_sent) as bytes_out, count() as conn_count by action_source_translated_ip, action_destination_translated_ip, dest_port
+    | filter conn_count >= 1
+    | sort desc bytes_out
+    | fields action_source_translated_ip, action_destination_translated_ip, dest_port, bytes_out, conn_count
+  lucene: |
+    (sourcetype:firewall OR sourcetype:ids) AND network.protocol:*tcp* AND http.request.headers.user_agent:(*stratum* OR *xmrig* OR *minergate* OR *claymore* OR *nicehash* OR *ethminer* OR *phoenixminer* OR *ccminer* OR *cgminer* OR *bfgminer* OR *sgminer* OR *t-rex* OR *nbminer* OR *gminer* OR *lolminer* OR *teamredminer* OR *srminer* OR *nanominer* OR *excavator* OR *bminer* OR *ewbf* OR *cryptonight* OR *monero* OR *xmr-stak* OR *supportxmr* OR *nanopool* OR *miningpoolhub* OR *minerproxy* OR *mining* OR *miner*)
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*network*
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "user_agent" as user_agent
+    | json field=_raw "bytes_out" as bytes_out
+    | json field=_raw "protocol" as protocol
+    | where protocol matches "*tcp*"
+    | where user_agent matches "*stratum*" OR user_agent matches "*xmrig*" OR user_agent matches "*claymore*" OR user_agent matches "*ccminer*" OR user_agent matches "*ethminer*" OR user_agent matches "*minergate*" OR user_agent matches "*nicehash*" OR user_agent matches "*phoenixminer*"
+    | count as connection_count by src_ip, dest_ip, dest_port, user_agent, bytes_out
+    | where connection_count >= 1
+    | sort by bytes_out desc
+    | fields src_ip, dest_ip, dest_port, user_agent, connection_count, bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -103,7 +154,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

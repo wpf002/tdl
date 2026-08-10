@@ -24,68 +24,73 @@ risk_score: 30
 queries:
   spl: "index=kubernetes sourcetype=kube:* resource=pods verb=create \n| spath path=requestObject.spec.hostPath \n| search requestObject.spec.hostPath=*\n\
     | table _time, user, namespace, resource, verb, requestObject.spec.hostPath\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    KubernetesEvents
+    | where TimeGenerated > ago(1h)
+    | where ObjectKind == "Pod"
+    | where Verb == "create"
+    | extend hostPathMount = parse_json(RequestObject).spec.volumes
+    | mv-expand hostPathMount
+    | where isnotnull(hostPathMount.hostPath)
+    | project TimeGenerated, Namespace, PodName = ObjectName, User, SourceIPs, Verb, hostPathMount = tostring(hostPathMount.hostPath.path), RequestObject
+  aql: |
+    SELECT username, sourceip, "requestObject.spec.hostPath" AS hostPath, "objectRef.name" AS podName, "objectRef.namespace" AS namespace, eventtime
+    FROM events
+    WHERE "requestObject.spec.hostPath" IS NOT NULL
+      AND "objectRef.resource" = 'pods'
+      AND "verb" = 'create'
+    LAST 24 HOURS
+  yara_l: |
+    rule kubernetes_hostpath_mount_privilege_escalation {
+      meta:
+        author = "TDL"
+        description = "Detects Kubernetes pod creation with hostPath mount - T1611 Escape to Host"
+        mitre_attack_tactic = "Privilege Escalation"
+        mitre_attack_technique = "T1611"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.event_type = "RESOURCE_CREATION"
+        $e.target.resource.type = "pods"
+        $e.security_result.action = "create"
+        not $e.target.resource.attribute.labels.key = "requestObject.spec.hostPath"
+        not $e.target.resource.attribute.labels.value = ""
+        $e.principal.hostname = $host
 
-    | where eventName matches regex ".+"
+      match:
+        $host over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+      outcome:
+        $risk_score = 75
 
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_pe_000582 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubernetes Pod Created with a hostPath Mount\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0004\"\n    technique = \"T1611\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-kubernetes.audit-*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND kubernetes.audit.objectRef.resource == "pods"
+      AND kubernetes.audit.verb == "create"
+      AND kubernetes.audit.requestObject.spec.hostPath IS NOT NULL
+    | KEEP @timestamp, kubernetes.audit.user.username, kubernetes.audit.objectRef.namespace, kubernetes.audit.objectRef.name, kubernetes.audit.requestObject.spec.hostPath, kubernetes.audit.sourceIPs
+  leql: |
+    where(source_json.objectRef.resource="pods" AND source_json.verb="create" AND source_json.requestObject.spec.hostPath!=null)
+  crowdstrike: |
+    #type=kubernetes event.verb=create event.objectRef.resource=pods requestObject.spec.hostPath=*
+    | table([@timestamp, event.user.username, event.objectRef.namespace, event.objectRef.name, requestObject.spec.hostPath])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter lowercase(resource_type) = "pods" and lowercase(verb) = "create" and requestObject.spec.hostPath != null
+    | fields _time, user, resource_type, verb, requestObject.spec.hostPath, source_ip, cluster_name
+  lucene: |
+    resource:"pods" AND verb:"create" AND _exists_:requestObject.spec.hostPath
+  sumo: |
+    _sourceCategory=*Kubernetes* "pods" "create"
+    | json field=_raw "verb" as verb
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "requestObject.spec.hostPath" as hostPath
+    | where resource = "pods" and verb = "create" and !isNull(hostPath)
+    | fields _messageTime, _sourceHost, verb, resource, hostPath
 false_positives:
 - Security software
 - Authorized admin tools
@@ -95,7 +100,7 @@ tags:
 - privilege-escalation
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere the Resource is \"pods\"\nWhere Verb is \"create\"\nWhere \"requestObject.spec.hostPath\" is NOT Null"
 triage_steps:

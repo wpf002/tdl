@@ -20,80 +20,144 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    (index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1 (Image="*\\sc.exe" CommandLine="*create*") OR (Image="*\\powershell.exe" CommandLine="*New-Service*")) OR (index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=13 TargetObject="*\\SYSTEM\\CurrentControlSet\\Services\\*\\ImagePath" (Details="*\\Temp\\*" OR Details="*\\AppData\\*")) OR (index=wineventlog sourcetype=WinEventLog:System EventCode=7045 (Service_File_Name="*\\Temp\\*" OR Service_File_Name="*\\AppData\\*"))
-    | eval detection_type=case(
-        EventCode=1 AND like(Image, "%\\sc.exe") AND like(CommandLine, "%create%"), "sc.exe_service_creation",
-        EventCode=1 AND like(Image, "%\\powershell.exe") AND like(CommandLine, "%New-Service%"), "PowerShell_New-Service",
-        EventCode=13 AND like(TargetObject, "%\\SYSTEM\\CurrentControlSet\\Services%") AND (like(Details, "%\\Temp\\%") OR like(Details, "%\\AppData\\%")), "Registry_ImagePath_Suspicious",
-        EventCode=7045 AND (like(Service_File_Name, "%\\Temp\\%") OR like(Service_File_Name, "%\\AppData\\%")), "Service_Installed_Suspicious_Path",
-        1=1, "Other")
-    | table _time, ComputerName, User, detection_type, EventCode, Image, CommandLine, TargetObject, Details, Service_Name, Service_File_Name
-  kql: 'DeviceRegistryEvents
+  spl: "(index=wineventlog sourcetype=\"WinEventLog:Microsoft-Windows-Sysmon/Operational\" EventCode=1 (Image=\"*\\\\sc.exe\" CommandLine=\"*create*\"\
+    ) OR (Image=\"*\\\\powershell.exe\" CommandLine=\"*New-Service*\")) OR (index=wineventlog sourcetype=\"WinEventLog:Microsoft-Windows-Sysmon/Operational\"\
+    \ EventCode=13 TargetObject=\"*\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\*\\\\ImagePath\" (Details=\"*\\\\Temp\\\\*\" OR Details=\"*\\\
+    \\AppData\\\\*\")) OR (index=wineventlog sourcetype=WinEventLog:System EventCode=7045 (Service_File_Name=\"*\\\\Temp\\\\*\" OR Service_File_Name=\"\
+    *\\\\AppData\\\\*\"))\n| eval detection_type=case(\n    EventCode=1 AND like(Image, \"%\\\\sc.exe\") AND like(CommandLine, \"%create%\"),\
+    \ \"sc.exe_service_creation\",\n    EventCode=1 AND like(Image, \"%\\\\powershell.exe\") AND like(CommandLine, \"%New-Service%\"), \"PowerShell_New-Service\"\
+    ,\n    EventCode=13 AND like(TargetObject, \"%\\\\SYSTEM\\\\CurrentControlSet\\\\Services%\") AND (like(Details, \"%\\\\Temp\\\\%\") OR like(Details,\
+    \ \"%\\\\AppData\\\\%\")), \"Registry_ImagePath_Suspicious\",\n    EventCode=7045 AND (like(Service_File_Name, \"%\\\\Temp\\\\%\") OR like(Service_File_Name,\
+    \ \"%\\\\AppData\\\\%\")), \"Service_Installed_Suspicious_Path\",\n    1=1, \"Other\")\n| table _time, ComputerName, User, detection_type,\
+    \ EventCode, Image, CommandLine, TargetObject, Details, Service_Name, Service_File_Name\n"
+  kql: |
+    union isfuzzy=true
+    (SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where (Process endswith "\\sc.exe" and CommandLine has "create")
+        or (Process endswith "\\powershell.exe" and CommandLine has "New-Service")
+    | where CommandLine has_any ("\\temp\\", "\\appdata\\", "%temp%", "%appdata%")
+    | extend ServiceCreationMethod = "CommandLine"
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ServiceCreationMethod),
+    (SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 13
+    | where RegistryKeyPath startswith "HKLM\\SYSTEM\\CurrentControlSet\\Services\\"
+    | where RegistryValueName =~ "ImagePath"
+    | where RegistryValueData has_any ("\\temp\\", "\\appdata\\", "%temp%", "%appdata%")
+    | extend ServiceCreationMethod = "Registry"
+    | project TimeGenerated, Computer, Account, RegistryKeyPath, RegistryValueData, ServiceCreationMethod),
+    (DeviceProcessEvents
+    | where TimeGenerated > ago(1h)
+    | where (FileName =~ "sc.exe" and ProcessCommandLine has "create")
+        or (FileName =~ "powershell.exe" and ProcessCommandLine has "New-Service")
+    | where ProcessCommandLine has_any ("\\temp\\", "\\appdata\\", "%temp%", "%appdata%")
+    | extend ServiceCreationMethod = "CommandLine"
+    | project TimeGenerated, DeviceName, AccountName, FileName, ProcessCommandLine, ServiceCreationMethod),
+    (DeviceRegistryEvents
+    | where TimeGenerated > ago(1h)
+    | where RegistryKey startswith "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\"
+    | where RegistryValueName =~ "ImagePath"
+    | where RegistryValueData has_any ("\\temp\\", "\\appdata\\", "%temp%", "%appdata%")
+    | extend ServiceCreationMethod = "Registry"
+    | project TimeGenerated, DeviceName, AccountName, RegistryKey, RegistryValueData, ServiceCreationMethod)
+  aql: |
+    SELECT eventtime, username, sourceip, LOGSOURCENAME(logsourceid) AS host, "Process Name", "Process CommandLine", "Service Name", "Service File Name", "Image Path"
+    FROM events
+    WHERE (
+      ("EventID" = '7045' AND ("Service File Name" ILIKE '%\Temp\%' OR "Service File Name" ILIKE '%\AppData\%'))
+      OR
+      ("EventID" = '1' AND "Process Name" ILIKE '%sc.exe%' AND "Process CommandLine" ILIKE '%create%' AND ("Process CommandLine" ILIKE '%\Temp\%' OR "Process CommandLine" ILIKE '%\AppData\%'))
+      OR
+      ("EventID" = '1' AND "Process Name" ILIKE '%powershell.exe%' AND "Process CommandLine" ILIKE '%New-Service%' AND ("Process CommandLine" ILIKE '%\Temp\%' OR "Process CommandLine" ILIKE '%\AppData\%'))
+      OR
+      ("EventID" = '13' AND "Target Object" ILIKE '%\SYSTEM\CurrentControlSet\Services\%\ImagePath%' AND ("Details" ILIKE '%\Temp\%' OR "Details" ILIKE '%\AppData\%'))
+    )
+    LAST 1 HOURS
+  yara_l: |
+    rule suspicious_service_creation_temp_appdata {
+      meta:
+        author = "TDL"
+        description = "Detects service creation with executable in TEMP or APPDATA directories - T1543 Privilege Escalation"
+        severity = "HIGH"
+        mitre_attack_technique = "T1543"
+        mitre_attack_tactic = "Privilege Escalation"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        (
+          $e.metadata.event_type = "PROCESS_LAUNCH" and
+          (
+            re.regex($e.principal.process.command_line, `(?i)sc\.exe.*create`) or
+            re.regex($e.principal.process.command_line, `(?i)New-Service`) or
+            re.regex($e.principal.process.file.full_path, `(?i)\\sc\.exe$`)
+          ) and
+          (
+            re.regex($e.principal.process.command_line, `(?i)\\temp\\`) or
+            re.regex($e.principal.process.command_line, `(?i)\\appdata\\`) or
+            re.regex($e.principal.process.command_line, `(?i)%temp%`) or
+            re.regex($e.principal.process.command_line, `(?i)%appdata%`)
+          )
+        ) or
+        (
+          $e.metadata.event_type = "REGISTRY_MODIFICATION" and
+          re.regex($e.target.registry.registry_key, `(?i)HKLM\\SYSTEM\\CurrentControlSet\\Services\\[^\\]+\\ImagePath`) and
+          (
+            re.regex($e.target.registry.registry_value_data, `(?i)\\temp\\`) or
+            re.regex($e.target.registry.registry_value_data, `(?i)\\appdata\\`)
+          )
+        )
 
-    | where registry_key matches regex ".+"
+        $e.principal.hostname = $host
 
-    | summarize Count=count() by DeviceName, InitiatingProcessFileName, RegistryKey, RegistryValueName, RegistryValueData
+      match:
+        $host over 5m
 
-    | order by Count desc
+      outcome:
+        $risk_score = 75
 
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Registry Key\", \"Registry Value Name\", \"Registry Value Data\", \"Process Name\"\nFROM events\nWHERE\
-    \ LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Sysmon'\n  AND \"EventID\" IN ('12','13','14')\n  AND \"registry_key\" LIKE '%.+%'\n\
-    LAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_pe_000719 {\n  meta:\n    author = \"TDL\"\n    description = \"New Windows Service Created With Binary in User Path\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0004\"\n    technique = \"T1543\"\n  events:\n    $e.metadata.event_type = \"REGISTRY_MODIFICATION\"\
-    \n    $e.registry_key = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "registry" AND registry_key LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, registry.path, registry.value, process.name
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND log_type = "registry" AND registry_key=/.+/)
-
-    groupby(asset, registry_key, registry_value)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (RegSystemConfigValueUpdate, RegGenericValueUpdate) AND registry_key=*.+*
-
-    | stats count as changes by ComputerName, UserName, RegObjectName, RegStringValue
-
-    | sort -changes
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.REGISTRY AND registry_key ~= ".+"
-
-    | comp count() as changes by agent_hostname, actor_effective_username, action_registry_key_name, action_registry_value_name
-
-    | sort desc changes
-
-    '
-  lucene: 'event.category:"registry" AND registry_key:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id IN ("12","13","14") AND registry_key matches "*.+*"
-
-    | count by host, user, registry_key, registry_value, image
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-endpoint.events.process*, logs-windows.sysmon_operational*, logs-system.system*
+    | WHERE (
+        (process.name IN ("sc.exe", "powershell.exe") AND (
+          (process.command_line LIKE "*sc*create*" AND (process.command_line LIKE "*%TEMP%*" OR process.command_line LIKE "*%APPDATA%*" OR process.command_line LIKE "*\\Temp\\*" OR process.command_line LIKE "*\\AppData\\*"))
+          OR (process.command_line LIKE "*New-Service*" AND (process.command_line LIKE "*%TEMP%*" OR process.command_line LIKE "*%APPDATA%*" OR process.command_line LIKE "*\\Temp\\*" OR process.command_line LIKE "*\\AppData\\*"))
+        ))
+        OR (winlog.event_id == 13 AND winlog.event_data.TargetObject LIKE "*\\SYSTEM\\CurrentControlSet\\Services\\*" AND winlog.event_data.TargetObject LIKE "*\\ImagePath" AND (winlog.event_data.Details LIKE "*\\Temp\\*" OR winlog.event_data.Details LIKE "*\\AppData\\*"))
+        OR (event.code == "7045" AND (winlog.event_data.ImagePath LIKE "*\\Temp\\*" OR winlog.event_data.ImagePath LIKE "*\\AppData\\*"))
+      )
+    | KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, winlog.event_id, winlog.event_data.TargetObject, winlog.event_data.Details, winlog.event_data.ServiceName, winlog.event_data.ImagePath, event.code
+  leql: |
+    where((process_name ICONTAINS "sc.exe" AND process_cmd_line ICONTAINS "create" AND (process_cmd_line ICONTAINS "%TEMP%" OR process_cmd_line ICONTAINS "%APPDATA%" OR process_cmd_line ICONTAINS "\AppData\" OR process_cmd_line ICONTAINS "\Temp\")) OR (process_name ICONTAINS "powershell" AND process_cmd_line ICONTAINS "New-Service" AND (process_cmd_line ICONTAINS "%TEMP%" OR process_cmd_line ICONTAINS "%APPDATA%" OR process_cmd_line ICONTAINS "\AppData\" OR process_cmd_line ICONTAINS "\Temp\")) OR (source_json.EventID=13 AND source_json.TargetObject ICONTAINS "\SYSTEM\CurrentControlSet\Services\" AND source_json.TargetObject ICONTAINS "\ImagePath" AND (source_json.Details ICONTAINS "\AppData\" OR source_json.Details ICONTAINS "\Temp\")))
+  crowdstrike: |
+    (event_simpleName=ProcessRollup2 (FileName=sc.exe CommandLine=*create*) OR (FileName=powershell.exe CommandLine=*New-Service*) OR (event_simpleName=ProcessRollup2 CommandLine=*reg* CommandLine=*add* CommandLine=*HKLM\\SYSTEM\\CurrentControlSet\\Services*) OR (EventCode=7045))
+    (CommandLine=*\\AppData\\* OR CommandLine=*\\Temp\\* OR CommandLine=*%TEMP%* OR CommandLine=*%APPDATA%* OR ImagePath=*\\AppData\\* OR ImagePath=*\\Temp\\*)
+    | table([@timestamp, ComputerName, UserName, event_simpleName, FileName, CommandLine, ImagePath, ServiceName, ParentBaseFileName])
+  xql: |
+    dataset = xdr_data
+    | filter (event_type = ENUM.EVENT_TYPE_PROCESS and (actor_process_image_name contains "sc.exe" and action_process_image_command_line ~= "(?i)sc\s+(\.exe\s+)?create" and (action_process_image_command_line ~= "(?i)binPath.*\\\\(temp|appdata)" or action_process_image_command_line ~= "(?i)binPath.*%(temp|appdata)%")) or (actor_process_image_name contains "powershell" and action_process_image_command_line ~= "(?i)New-Service" and (action_process_image_command_line ~= "(?i)-BinaryPathName.*\\\\(temp|appdata)" or action_process_image_command_line ~= "(?i)-BinaryPathName.*%(temp|appdata)%")))
+       or (event_type = ENUM.EVENT_TYPE_REGISTRY and action_registry_key_name ~= "(?i)HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\[^\\\\]+$" and action_registry_value_name = "ImagePath" and (action_registry_data ~= "(?i)\\\\(temp|appdata)\\\\" or action_registry_data ~= "(?i)%(temp|appdata)%"))
+    | fields _time, agent_hostname, actor_effective_username, event_type, actor_process_image_name, action_process_image_command_line, action_registry_key_name, action_registry_value_name, action_registry_data
+  lucene: |
+    (event.code:(7045 OR 4697) OR (process.name:(sc.exe OR powershell.exe) AND process.command_line:(*create* OR *New-Service*)) OR (winlog.event_data.TargetObject:*\\SYSTEM\\CurrentControlSet\\Services\\* AND winlog.event_data.TargetObject:*\\ImagePath)) AND (winlog.event_data.ImagePath:(*\\Temp\\* OR *\\AppData\\*) OR process.command_line:(*\\Temp\\* OR *\\AppData\\*) OR winlog.event_data.Details:(*\\Temp\\* OR *\\AppData\\*))
+  sumo: |
+    _sourceCategory=*Windows* OR _sourceCategory=*Sysmon* OR _sourceCategory=*EDR*
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "Image" as image
+    | json field=_raw "TargetObject" as target_object
+    | json field=_raw "Details" as details
+    | json field=_raw "ProcessName" as process_name
+    | json field=_raw "NewProcessName" as new_process_name
+    | where (
+        (command_line matches "*sc*create*" OR command_line matches "*New-Service*") AND (command_line matches "*%TEMP%*" OR command_line matches "*%APPDATA%*" OR command_line matches "*\\Temp\\*" OR command_line matches "*\\AppData\\*")
+      ) OR (
+        event_id = "13" AND target_object matches "*\\SYSTEM\\CurrentControlSet\\Services\\*\\ImagePath" AND (details matches "*%TEMP%*" OR details matches "*%APPDATA%*" OR details matches "*\\Temp\\*" OR details matches "*\\AppData\\*")
+      )
+    | fields _messageTime, _sourceHost, event_id, command_line, target_object, details, image, process_name, new_process_name
 pseudo_logic: sc create / New-Service / direct registry create under HKLM\SYSTEM\CurrentControlSet\Services with ImagePath in %TEMP%/%APPDATA%.
   Service runs as SYSTEM at next start.
 false_positives:
@@ -112,7 +176,7 @@ references:
 - https://attack.mitre.org/techniques/T1543/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, source user, and (if visible) the resulting privileged context.'

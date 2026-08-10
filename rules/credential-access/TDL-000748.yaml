@@ -19,84 +19,121 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 95
 queries:
-  spl: |
-    (index=azure OR index=aws OR index=cloud OR index=adfs) (sourcetype=azure:aad:audit OR sourcetype=aws:cloudtrail OR sourcetype=ADFS:Admin OR sourcetype=ADFS:Security OR sourcetype=WinEventLog:AD* OR source="*adfs*")
+  spl: '(index=azure OR index=aws OR index=cloud OR index=adfs) (sourcetype=azure:aad:audit OR sourcetype=aws:cloudtrail OR sourcetype=ADFS:Admin
+    OR sourcetype=ADFS:Security OR sourcetype=WinEventLog:AD* OR source="*adfs*")
+
     ("NotOnOrAfter" OR "saml" OR "token" OR "SignatureCertificate" OR "assertion")
-    | rex field=_raw "NotOnOrAfter[\"\':\s=]+(?<NotOnOrAfter_raw>[^\",\s\}]+)"
-    | rex field=_raw "(?i)SignatureCertificate[\"\':\s=]+(?<cert_fingerprint>[0-9A-Fa-f:]+)"
-    | rex field=_raw "(?i)thumbprint[\"\':\s=]+(?<thumbprint>[0-9A-Fa-f:]+)"
+
+    | rex field=_raw "NotOnOrAfter[\"\'':\s=]+(?<NotOnOrAfter_raw>[^\",\s\}]+)"
+
+    | rex field=_raw "(?i)SignatureCertificate[\"\'':\s=]+(?<cert_fingerprint>[0-9A-Fa-f:]+)"
+
+    | rex field=_raw "(?i)thumbprint[\"\'':\s=]+(?<thumbprint>[0-9A-Fa-f:]+)"
+
     | eval cert_id=coalesce(cert_fingerprint, thumbprint)
+
     | eval NotOnOrAfter_epoch=strptime(NotOnOrAfter_raw, "%Y-%m-%dT%H:%M:%S")
+
     | eval token_lifetime_hours=round((NotOnOrAfter_epoch - _time)/3600, 2)
+
     | eval suspicious_lifetime=if(token_lifetime_hours > 24, 1, 0)
+
     | lookup adfs_known_certs.csv fingerprint AS cert_id OUTPUT is_known
+
     | eval suspicious_cert=if(isnull(is_known) AND isnotnull(cert_id), 1, 0)
+
     | where suspicious_lifetime=1 OR suspicious_cert=1
-    | eval alert_reason=case(suspicious_lifetime=1 AND suspicious_cert=1, "Token lifetime exceeds 24h AND unknown certificate", suspicious_lifetime=1, "Token lifetime exceeds 24h", suspicious_cert=1, "Unknown SignatureCertificate fingerprint", 1=1, "Unknown")
-    | stats values(alert_reason) as reasons values(token_lifetime_hours) as token_lifetime_hours values(cert_id) as certificate_fingerprint values(NotOnOrAfter_raw) as NotOnOrAfter by _time, host, user, source, sourcetype
+
+    | eval alert_reason=case(suspicious_lifetime=1 AND suspicious_cert=1, "Token lifetime exceeds 24h AND unknown certificate", suspicious_lifetime=1,
+    "Token lifetime exceeds 24h", suspicious_cert=1, "Unknown SignatureCertificate fingerprint", 1=1, "Unknown")
+
+    | stats values(alert_reason) as reasons values(token_lifetime_hours) as token_lifetime_hours values(cert_id) as certificate_fingerprint values(NotOnOrAfter_raw)
+    as NotOnOrAfter by _time, host, user, source, sourcetype
+
     | table _time, host, user, reasons, token_lifetime_hours, certificate_fingerprint, NotOnOrAfter, source, sourcetype
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000748 {\n  meta:\n    author = \"TDL\"\n    description = \"SAML Token Issued With Impossible Lifetime\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0006\"\n    technique = \"T1606\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n \
-    \   $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "union \n(AuditLogs\n| where TimeGenerated > ago(7d)\n| where OperationName == \"Issue token\"\n| extend TokenClaims = parse_json(TargetResources[0].modifiedProperties)\n\
+    | mv-expand TokenClaims\n| where TokenClaims.displayName in (\"NotOnOrAfter\", \"SignatureCertificate\")\n| extend ClaimName = tostring(TokenClaims.displayName)\n\
+    | extend ClaimValue = tostring(TokenClaims.newValue)\n| summarize Claims = make_bag(pack(ClaimName, ClaimValue)) by TimeGenerated, OperationName,\
+    \ Identity, IPAddress = tostring(InitiatedBy.user.ipAddress), CorrelationId\n| extend NotOnOrAfter = todatetime(tostring(Claims.NotOnOrAfter))\n\
+    | extend SignatureCertFingerprint = tostring(Claims.SignatureCertificate)\n| extend TokenLifetimeHours = datetime_diff('hour', NotOnOrAfter,\
+    \ TimeGenerated)\n| where TokenLifetimeHours > 24 or (isnotempty(SignatureCertFingerprint) and SignatureCertFingerprint !in (\"KNOWN_CERT_FP1\"\
+    , \"KNOWN_CERT_FP2\"))\n| project TimeGenerated, OperationName, Identity, IPAddress, NotOnOrAfter, TokenLifetimeHours, SignatureCertFingerprint,\
+    \ CorrelationId),\n(AzureActivity\n| where TimeGenerated > ago(7d)\n| where OperationNameValue has \"Microsoft.Aadiam\"\n| where ActivityStatusValue\
+    \ == \"Success\"\n| extend Properties = parse_json(Properties)\n| extend NotOnOrAfter = todatetime(Properties.NotOnOrAfter)\n| extend SignatureCertFingerprint\
+    \ = tostring(Properties.SignatureCertificate)\n| extend TokenLifetimeHours = datetime_diff('hour', NotOnOrAfter, TimeGenerated)\n| where TokenLifetimeHours\
+    \ > 24 or (isnotempty(SignatureCertFingerprint) and SignatureCertFingerprint !in (\"KNOWN_CERT_FP1\", \"KNOWN_CERT_FP2\"))\n| project TimeGenerated,\
+    \ OperationNameValue, Caller, CallerIpAddress, NotOnOrAfter, TokenLifetimeHours, SignatureCertFingerprint, CorrelationId),\n(Event\n| where\
+    \ TimeGenerated > ago(7d)\n| where Source == \"AD FS Auditing\"\n| where EventID in (1200, 1202, 342, 299)\n| extend EventData = parse_xml(EventData)\n\
+    | extend NotOnOrAfter = todatetime(tostring(EventData.DataItem.EventData.Data[8]))\n| extend SignatureCertFingerprint = tostring(EventData.DataItem.EventData.Data[12])\n\
+    | extend TokenLifetimeHours = datetime_diff('hour', NotOnOrAfter, TimeGenerated)\n| where TokenLifetimeHours > 24 or (isnotempty(SignatureCertFingerprint)\
+    \ and SignatureCertFingerprint !in (\"KNOWN_CERT_FP1\", \"KNOWN_CERT_FP2\"))\n| project TimeGenerated, EventID, Computer, NotOnOrAfter, TokenLifetimeHours,\
+    \ SignatureCertFingerprint)\n"
+  aql: |
+    SELECT eventtime, sourceip, username, "TokenIssuer", "NotOnOrAfter", "SignatureCertificateFingerprint", "TokenSubject", LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE (LOGSOURCENAME(logsourceid) ILIKE '%ADFS%' OR LOGSOURCENAME(logsourceid) ILIKE '%Azure%' OR categoryname(category) ILIKE '%Authentication%')
+      AND (
+        ("NotOnOrAfter" IS NOT NULL AND CAST("NotOnOrAfter" AS LONG) - eventtime > 86400000)
+        OR ("SignatureCertificateFingerprint" IS NOT NULL AND "SignatureCertificateFingerprint" NOT IN (SELECT DISTINCT "PublishedCertificateFingerprint" FROM events WHERE "PublishedCertificateFingerprint" IS NOT NULL LAST 7 DAYS))
+      )
+    LAST 24 HOURS
+  yara_l: "rule golden_saml_token_forgery {\n  meta:\n    author = \"TDL\"\n    description = \"Detects potential Golden SAML token forgery via\
+    \ extended NotOnOrAfter or unknown certificate fingerprint\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique\
+    \ = \"T1606\"\n    severity = \"HIGH\"\n\n  events:\n    $e.metadata.product_log_id = \"ADFS\" or\n    $e.metadata.product_name = \"Azure\
+    \ Active Directory\" or\n    $e.metadata.product_name = \"Azure\"\n    \n    $e.metadata.event_type = \"USER_LOGIN\" or\n    $e.metadata.event_type\
+    \ = \"USER_RESOURCE_ACCESS\"\n    \n    $e.target.resource.attribute.labels.key = \"NotOnOrAfter\" or\n    $e.target.resource.attribute.labels.key\
+    \ = \"SignatureCertificate\" or\n    $e.target.resource.attribute.labels.key = \"TokenLifetime\" or\n    $e.security_result.summary =~ \"\
+    SAML\" or\n    $e.security_result.summary =~ \"token\"\n    \n    $e.principal.user.userid = $user\n    $e.principal.hostname = $host\n\n\
+    \  match:\n    $user over 1h\n\n  condition:\n    $e\n}\n"
+  esql: "FROM logs-azure.auditlogs*, logs-aws.cloudtrail*, logs-windows.adfs*\n| WHERE @timestamp > NOW() - 1 hour\n  AND (\n    (event.action\
+    \ LIKE \"*token*\" OR event.action LIKE \"*SAML*\" OR event.action LIKE \"*federation*\")\n    OR (event.provider == \"ADFS\" AND event.category\
+    \ == \"authentication\")\n    OR (azure.auditlogs.operation_name LIKE \"*token*\" OR azure.auditlogs.operation_name LIKE \"*SAML*\")\n   \
+    \ OR (aws.cloudtrail.event_name LIKE \"*AssumeRole*\" OR aws.cloudtrail.event_name LIKE \"*SAML*\")\n  )\n| EVAL token_lifetime_hours = CASE(\n\
+    \    event.duration IS NOT NULL, event.duration / 3600000000000,\n    azure.auditlogs.properties.tokenLifetimeMinutes IS NOT NULL, azure.auditlogs.properties.tokenLifetimeMinutes\
+    \ / 60,\n    0\n  )\n| EVAL cert_fingerprint = COALESCE(\n    azure.signinlogs.properties.certificateFingerprint,\n    tls.server.hash.sha256,\n\
+    \    event.hash.sha256,\n    \"unknown\"\n  )\n| WHERE token_lifetime_hours > 24\n  OR (cert_fingerprint != \"unknown\" \n      AND cert_fingerprint\
+    \ NOT IN (\n        \"known_valid_fingerprint_1\",\n        \"known_valid_fingerprint_2\",\n        \"known_valid_fingerprint_3\"\n      ))\n\
+    | KEEP @timestamp, host.name, user.name, source.ip, event.action, event.provider, azure.auditlogs.operation_name, aws.cloudtrail.event_name,\
+    \ token_lifetime_hours, cert_fingerprint, event.outcome\n| SORT @timestamp DESC\n| LIMIT 1000\n"
+  leql: |
+    where((source_json.NotOnOrAfter > 86400000 OR (source_json.SignatureCertificate EXISTS AND source_json.SignatureCertificate NOT IN [/* known_cert_fingerprints */])) AND (log_source_name ICONTAINS "adfs" OR log_source_name ICONTAINS "azure" OR source_json.EventID IN [1200, 1202, 4624] OR source_json.Category="AuditLogs")) groupby(user, source_json.SignatureCertificate, asset) calculate(count)
+  crowdstrike: "(#type=adfs OR #type=azure_ad OR event_simpleName=*SAML* OR event_simpleName=*ADFS*)\n(NotOnOrAfter=* OR SignatureCertificate=*\
+    \ OR CertificateThumbprint=*)\n| case {\n    NotOnOrAfter=* | parseTimestamp(field=NotOnOrAfter, as=notOnOrAfterTime, format=iso) \n     \
+    \              | validityHours := (notOnOrAfterTime - @timestamp) / 3600000 \n                   | validityHours > 24 \n                 \
+    \  | anomaly := \"Excessive token validity\";\n    SignatureCertificate=* | regex(\"(?<certFingerprint>[A-Fa-f0-9:]{47,})\", field=SignatureCertificate,\
+    \ strict=false)\n                           | in(field=certFingerprint, values=[knownCert1, knownCert2], negate=true)\n                  \
+    \         | anomaly := \"Unknown certificate fingerprint\";\n    CertificateThumbprint=* | in(field=CertificateThumbprint, values=[knownThumbprint1,\
+    \ knownThumbprint2], negate=true)\n                            | anomaly := \"Unknown certificate thumbprint\";\n    * | anomaly := \"Other\"\
+    ;\n  }\n| anomaly != \"Other\"\n| table([@timestamp, ComputerName, UserName, anomaly, NotOnOrAfter, validityHours, certFingerprint, CertificateThumbprint,\
+    \ SignatureCertificate])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider in ("AZURE", "AWS") and (action_resource_name contains "SAML" or action_resource_name contains "adfs" or json_extract_scalar(action_audit_raw_data, "$.samlResponse") != null or json_extract_scalar(action_audit_raw_data, "$.notOnOrAfter") != null or json_extract_scalar(action_audit_raw_data, "$.signatureCertificate") != null)
+    | alter token_not_on_or_after = to_epoch(coalesce(json_extract_scalar(action_audit_raw_data, "$.notOnOrAfter"), json_extract_scalar(action_audit_raw_data, "$.NotOnOrAfter"), json_extract_scalar(action_audit_raw_data, "$.saml_token_not_on_or_after")), "MILLIS")
+    | alter token_issued_at = to_epoch(coalesce(json_extract_scalar(action_audit_raw_data, "$.issuedAt"), json_extract_scalar(action_audit_raw_data, "$.IssueInstant"), _time), "MILLIS")
+    | alter signature_cert_fingerprint = coalesce(json_extract_scalar(action_audit_raw_data, "$.signatureCertificate"), json_extract_scalar(action_audit_raw_data, "$.SignatureCertificate"), json_extract_scalar(action_audit_raw_data, "$.x509_thumbprint"))
+    | alter token_lifetime_hours = divide(subtract(token_not_on_or_after, token_issued_at), 3600000)
+    | filter token_lifetime_hours > 24 or (signature_cert_fingerprint != null and signature_cert_fingerprint not in ("known_valid_cert_fingerprint_1", "known_valid_cert_fingerprint_2"))
+    | fields _time, cloud_provider, action_resource_name, actor_user, signature_cert_fingerprint, token_lifetime_hours, action_audit_raw_data
+  lucene: |
+    (event.dataset:(azure.auditlogs OR adfs* OR o365.audit) OR source:adfs OR application:adfs OR log_source:adfs) AND (saml* OR token* OR assertion* OR NotOnOrAfter OR SignatureCertificate OR certificate_fingerprint OR cert_thumbprint) AND (NotOnOrAfter:* OR SignatureCertificate:* OR certificate_fingerprint:* OR cert_thumbprint:* OR saml_assertion:*) AND NOT (certificate_fingerprint:(known_cert_fingerprint_1 OR known_cert_fingerprint_2 OR known_cert_fingerprint_3) OR cert_thumbprint:(known_cert_thumbprint_1 OR known_cert_thumbprint_2 OR known_cert_thumbprint_3))
+  sumo: |
+    _sourceCategory=*ADFS* OR _sourceCategory=*Azure* OR _sourceCategory=*AzureAD*
+    | json field=_raw "NotOnOrAfter" as not_on_or_after nodrop
+    | json field=_raw "NotBefore" as not_before nodrop
+    | json field=_raw "SignatureCertificate" as signature_cert nodrop
+    | json field=_raw "CertificateFingerprint" as cert_fingerprint nodrop
+    | json field=_raw "IssueInstant" as issue_instant nodrop
+    | where !isNull(not_on_or_after) OR !isNull(signature_cert) OR !isNull(cert_fingerprint)
+    | toLong(parseDateToEpochMillis(not_on_or_after)) as not_on_or_after_ms
+    | toLong(parseDateToEpochMillis(not_before)) as not_before_ms
+    | toLong(parseDateToEpochMillis(issue_instant)) as issue_instant_ms
+    | if(isNull(issue_instant_ms), toLong(_messageTime), issue_instant_ms) as token_time
+    | (not_on_or_after_ms - token_time) / 3600000 as lifetime_hours
+    | where lifetime_hours > 24 OR (!(cert_fingerprint matches "*known_cert_fp_1*") AND !(cert_fingerprint matches "*known_cert_fp_2*") AND !isNull(cert_fingerprint))
+    | fields _messageTime, _sourceHost, _sourceCategory, not_on_or_after, not_before, lifetime_hours, cert_fingerprint, signature_cert
 pseudo_logic: ADFS / Azure AD token with NotOnOrAfter > 24h, or SignatureCertificate fingerprint not in the published cert set. Golden-SAML forging
   signal.
 false_positives:
@@ -115,7 +152,7 @@ references:
 - https://attack.mitre.org/techniques/T1606/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'

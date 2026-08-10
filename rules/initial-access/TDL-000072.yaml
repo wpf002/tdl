@@ -15,81 +15,72 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=firewall (direction=outbound OR dest_port=3389) (app=rdp OR app=RDP OR app=Rdp OR Application=rdp OR Application=RDP OR Application=Rdp)
+  spl: 'index=firewall (direction=outbound OR dest_port=3389) (app=rdp OR app=RDP OR app=Rdp OR Application=rdp OR Application=RDP OR Application=Rdp)
+
     | where (match(direction, "(?i)outbound") OR dest_port=3389) AND (match(app, "(?i)rdp") OR match(Application, "(?i)rdp"))
+
     | table _time, src_ip, dest_ip, dest_port, app, Application, direction, action
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where destination_port in ("3389")
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "destination_port" IN (''3389'')
-
-    GROUP BY sourceip, destinationip, destinationport
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(1h)
+    | where DeviceDirection == "Outbound"
+    | where (DestinationPort == 3389 or ApplicationProtocol =~ "RDP")
+    | where ipv4_is_private(SourceIP) and not(ipv4_is_private(DestinationIP))
+    | project TimeGenerated, DeviceVendor, DeviceProduct, SourceIP, DestinationIP, DestinationPort, ApplicationProtocol, DeviceAction, Message
+  aql: |
+    SELECT sourceip, destinationip, destinationport, QIDNAME(qid) AS event_name, LOGSOURCENAME(logsourceid) AS firewall, COUNT(*) AS event_count
+    FROM events
+    WHERE (destinationport = 3389 OR QIDNAME(qid) ILIKE '%RDP%')
+      AND sourceip IN (SELECT sourceip FROM events WHERE INOFFENSE(sourceip) = FALSE AND INLOCALNET(sourceip) = TRUE LAST 1 HOURS)
+      AND destinationip IN (SELECT destinationip FROM events WHERE INLOCALNET(destinationip) = FALSE LAST 1 HOURS)
+    GROUP BY sourceip, destinationip, destinationport, qid, logsourceid
     LAST 1 HOURS
+  yara_l: |
+    rule t1021_rdp_outbound_connection {
+      meta:
+        author = "TDL"
+        description = "Detects outbound RDP connections from internal to external destinations"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1021"
+        severity = "Medium"
 
-    '
-  yara_l: "rule tdl_tdl_auth_000072 {\n  meta:\n    author = \"TDL\"\n    description = \"Successful RDP Connection - Outbound\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1021\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.destination_port\
-    \ = /(3389)/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.metadata.product_name = /firewall/i
+        $e.network.direction = "OUTBOUND"
+        (
+          $e.target.port = 3389 or
+          re.regex($e.network.application_protocol, `(?i)rdp`)
+        )
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dst_ip
 
-    | WHERE @timestamp > NOW() - 1 hour
+      match:
+        $src_ip, $dst_ip over 5m
 
-    | WHERE event.category == "network" AND destination_port IN ("3389")
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND destination_port IN [3389])
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND destination_port IN (3389)
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND destination_port in ("3389")
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND destination_port:(3389)
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where destination_port IN ("3389")
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-network.firewall*\n| WHERE network.direction == \"outbound\" \n  AND (destination.port == 3389 OR TO_LOWER(network.application)\
+    \ == \"rdp\")\n  AND source.ip NOT LIKE \"0.0.0.0/0\"\n  AND NOT CIDR_MATCH(destination.ip, \"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"\
+    , \"127.0.0.0/8\")\n| KEEP @timestamp, source.ip, destination.ip, destination.port, network.application, network.direction\n"
+  leql: |
+    where(destination_address NOT LIKE "10.*" AND destination_address NOT LIKE "192.168.*" AND destination_address NOT LIKE "172.16.*" AND destination_address NOT LIKE "172.17.*" AND destination_address NOT LIKE "172.18.*" AND destination_address NOT LIKE "172.19.*" AND destination_address NOT LIKE "172.20.*" AND destination_address NOT LIKE "172.21.*" AND destination_address NOT LIKE "172.22.*" AND destination_address NOT LIKE "172.23.*" AND destination_address NOT LIKE "172.24.*" AND destination_address NOT LIKE "172.25.*" AND destination_address NOT LIKE "172.26.*" AND destination_address NOT LIKE "172.27.*" AND destination_address NOT LIKE "172.28.*" AND destination_address NOT LIKE "172.29.*" AND destination_address NOT LIKE "172.30.*" AND destination_address NOT LIKE "172.31.*" AND (destination_port=3389 OR application ICONTAINS "RDP"))
+  crowdstrike: "#type=firewall (direction=outbound OR direction=Outbound) \n(DestinationPort=3389 OR Application=/rdp/i)\n| table([@timestamp,\
+    \ SourceIP, DestinationIP, DestinationPort, Application, direction])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter direction_of_attack = "client to server" and (dest_port = 3389 or lowercase(app) = "rdp")
+    | fields _time, src_ip, dest_ip, dest_port, app, action, bytes_sent, bytes_received, source_zone, dest_zone
+  lucene: |
+    (destination.port:3389 OR application:/(?i)rdp/) AND (direction:outbound OR (NOT source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16) AND (destination.ip:(0.0.0.0/0) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16))))
+  sumo: |
+    _sourceCategory=*Firewall* OR _sourceCategory=*firewall*
+    | where (dest_port = "3389" OR dest_port = 3389) OR (application matches /(?i)rdp/)
+    | where direction matches /(?i)outbound/ OR (isPrivateIP(src_ip) AND NOT isPrivateIP(dest_ip))
+    | fields _messageTime, src_ip, dest_ip, dest_port, application, direction
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -99,7 +90,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Firewall Event\nFrom one internal source to one external destination (Outbound)\nOR\n\tWhere the Destination Port is 3389\n\t\
   \n\tWhere the Application is case insensitive \"RDP\""

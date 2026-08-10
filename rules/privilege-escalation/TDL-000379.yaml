@@ -16,71 +16,54 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=azure (sourcetype=azure:aad:audit OperationName="Assigns the caller to user access admin") OR (sourcetype=azure:activity OperationName="MICROSOFT.AUTHORIZATION/ELEVATEACCESS/ACTION")
+  spl: 'index=azure (sourcetype=azure:aad:audit OperationName="Assigns the caller to user access admin") OR (sourcetype=azure:activity OperationName="MICROSOFT.AUTHORIZATION/ELEVATEACCESS/ACTION")
+
     | table _time, user, OperationName, ResultStatus, SourceIPAddress, UserAgent
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_pe_000379 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure Subscription Permission Elevation\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0004\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "union \n(AuditLogs\n| where TimeGenerated > ago(24h)\n| where OperationName has \"Assigns the caller to user access admin\"\n| extend\
+    \ Actor = tostring(InitiatedBy.user.userPrincipalName)\n| extend ActorIP = tostring(InitiatedBy.user.ipAddress)\n| project TimeGenerated,\
+    \ OperationName, Actor, ActorIP, Result, TargetResources, CorrelationId, Category),\n(AzureActivity\n| where TimeGenerated > ago(24h)\n| where\
+    \ OperationNameValue =~ \"MICROSOFT.AUTHORIZATION/ELEVATEACCESS/ACTION\"\n| extend Actor = Caller\n| extend ActorIP = CallerIpAddress\n| project\
+    \ TimeGenerated, OperationNameValue, Actor, ActorIP, ActivityStatusValue, ResourceGroup, SubscriptionId, CorrelationId, CategoryValue)\n|\
+    \ project TimeGenerated, EventName = coalesce(OperationName, OperationNameValue), Actor, ActorIP\n"
+  aql: |
+    SELECT eventtime, username, sourceip, qidname(qid), CATEGORYNAME(category), "Event Name", LOGSOURCENAME(logsourceid)
+    FROM events
+    WHERE ("Event Name" = 'Assigns the caller to user access admin' OR "Event Name" = 'MICROSOFT.AUTHORIZATION/ELEVATEACCESS/ACTION')
+      AND (LOGSOURCENAME(logsourceid) ILIKE '%Azure%' OR CATEGORYNAME(category) ILIKE '%Azure%')
+    LAST 24 HOURS
+  yara_l: "rule azure_privilege_escalation_elevation {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects Azure AD privilege\
+    \ escalation via user access admin assignment or elevation action\"\n    mitre_attack_tactic = \"Privilege Escalation\"\n    mitre_attack_technique\
+    \ = \"T1078\"\n    severity = \"HIGH\"\n    \n  events:\n    (\n      $e.metadata.product_name = \"Azure Active Directory\"\n      (\n   \
+    \     $e.metadata.product_event_type = \"Assigns the caller to user access admin\"\n      )\n    ) or (\n      $e.metadata.product_name =\
+    \ \"Azure\"\n      (\n        strings.to_upper($e.metadata.product_event_type) = \"MICROSOFT.AUTHORIZATION/ELEVATEACCESS/ACTION\"\n      )\n\
+    \    )\n    $e.principal.user.userid = $user\n    $e.target.resource.name = $resource\n    \n  match:\n    $user over 5m\n    \n  outcome:\n\
+    \    $risk_score = 85\n    \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-azure.activitylogs*, logs-azure.auditlogs*
+    | WHERE (event.action == "Assigns the caller to user access admin" OR event.action == "MICROSOFT.AUTHORIZATION/ELEVATEACCESS/ACTION")
+    | KEEP @timestamp, host.name, user.name, event.action, event.outcome, azure.activitylogs.operation_name, azure.auditlogs.operation_name, source.ip, user.id
+  leql: |
+    where(source_json.operationName IN ["Assigns the caller to user access admin", "MICROSOFT.AUTHORIZATION/ELEVATEACCESS/ACTION"])
+  crowdstrike: |
+    (#repo=azure* OR #type=azure* OR event_simpleName=*Azure*)
+    (EventName="Assigns the caller to user access admin" OR EventName="MICROSOFT.AUTHORIZATION/ELEVATEACCESS/ACTION" OR operationName="Assigns the caller to user access admin" OR operationName="MICROSOFT.AUTHORIZATION/ELEVATEACCESS/ACTION")
+    | table([@timestamp, ComputerName, UserName, EventName, operationName, callerIpAddress, userId, userPrincipalName])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "Azure" and (operation in ("Assigns the caller to user access admin", "MICROSOFT.AUTHORIZATION/ELEVATEACCESS/ACTION") or lowercase(operation) in ("microsoft.authorization/elevateaccess/action"))
+    | fields _time, actor_user, operation, cloud_provider, resource_name, raw_log
+  lucene: |
+    (event.action:"Assigns the caller to user access admin" OR event.action:"MICROSOFT.AUTHORIZATION/ELEVATEACCESS/ACTION")
+  sumo: |
+    _sourceCategory=*Azure* (("Assigns the caller to user access admin") OR ("MICROSOFT.AUTHORIZATION/ELEVATEACCESS/ACTION"))
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "properties.message" as message
+    | json field=_raw "caller" as caller
+    | json field=_raw "callerIpAddress" as caller_ip
+    | where operation_name matches "*ELEVATEACCESS/ACTION*" OR message matches "*user access admin*"
+    | fields _messageTime, _sourceHost, operation_name, message, caller, caller_ip
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +73,7 @@ tags:
 - privilege-escalation
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure AD Event
 

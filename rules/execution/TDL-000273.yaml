@@ -17,74 +17,84 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=windows EventCode IN (592, 4688) Process_Name="*\\cmd.exe" (CommandLine="*invoke-userhunter*" OR CommandLine="*invoke-sharefinder*" OR CommandLine="*invoke-kerberoast*" OR CommandLine="*invoke-smbautobrute*" OR CommandLine="*invoke-nightmare*" OR CommandLine="*zerologon*" OR CommandLine="*av_query*")
+  spl: 'index=windows EventCode IN (592, 4688) Process_Name="*\\cmd.exe" (CommandLine="*invoke-userhunter*" OR CommandLine="*invoke-sharefinder*"
+    OR CommandLine="*invoke-kerberoast*" OR CommandLine="*invoke-smbautobrute*" OR CommandLine="*invoke-nightmare*" OR CommandLine="*zerologon*"
+    OR CommandLine="*av_query*")
+
     | table _time, ComputerName, User, Process_Name, CommandLine, Parent_Process_Name
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("cmd.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('cmd.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000273 {\n  meta:\n    author = \"TDL\"\n    description = \"Cobalt Strike Module Commands Entered in CMD\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0002\"\n    technique = \"T1059\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(cmd.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4688
+    | where Process endswith "\\cmd.exe"
+    | where CommandLine has_any ("invoke-userhunter","invoke-sharefinder","invoke-kerberoast","invoke-smbautobrute","invoke-nightmare","zerologon","av_query")
+    | project TimeGenerated, Computer, Account, Process, CommandLine, ParentProcessName
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", sourceip
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Process Name" ILIKE '%cmd.exe%'
+      AND ("Process CommandLine" ILIKE '%invoke-userhunter%'
+           OR "Process CommandLine" ILIKE '%invoke-sharefinder%'
+           OR "Process CommandLine" ILIKE '%invoke-kerberoast%'
+           OR "Process CommandLine" ILIKE '%invoke-smbautobrute%'
+           OR "Process CommandLine" ILIKE '%invoke-nightmare%'
+           OR "Process CommandLine" ILIKE '%zerologon%'
+           OR "Process CommandLine" ILIKE '%av_query%')
+    LAST 24 HOURS
+  yara_l: |
+    rule malicious_cmd_powershell_techniques {
+      meta:
+        author = "TDL"
+        description = "Detects execution of malicious PowerShell-style commands via cmd.exe - T1059"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1059"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        ($e.metadata.product_event_type = "592" or $e.metadata.product_event_type = "4688")
+        re.regex($e.target.process.file.full_path, `(?i)\\cmd\.exe$`)
+        re.regex($e.target.process.command_line, `(?i)(invoke-userhunter|invoke-sharefinder|invoke-kerberoast|invoke-smbautobrute|invoke-nightmare|zerologon|av_query)`)
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name IN ("cmd.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
+      outcome:
+        $risk_score = 85
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [cmd.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (cmd.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("cmd.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(cmd.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("cmd.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-windows.sysmon_operational*, logs-system.security*, winlogbeat-*\n| WHERE event.code IN (\"592\", \"4688\") \n  AND TO_LOWER(process.name)\
+    \ == \"cmd.exe\"\n  AND (TO_LOWER(process.command_line) LIKE \"*invoke-userhunter*\"\n    OR TO_LOWER(process.command_line) LIKE \"*invoke-sharefinder*\"\
+    \n    OR TO_LOWER(process.command_line) LIKE \"*invoke-kerberoast*\"\n    OR TO_LOWER(process.command_line) LIKE \"*invoke-smbautobrute*\"\
+    \n    OR TO_LOWER(process.command_line) LIKE \"*invoke-nightmare*\"\n    OR TO_LOWER(process.command_line) LIKE \"*zerologon*\"\n    OR TO_LOWER(process.command_line)\
+    \ LIKE \"*av_query*\")\n| KEEP @timestamp, host.name, user.name, process.name, process.command_line, process.parent.name, process.executable\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND process_name="cmd.exe" AND (process_cmd_line ICONTAINS "invoke-userhunter" OR process_cmd_line ICONTAINS "invoke-sharefinder" OR process_cmd_line ICONTAINS "invoke-kerberoast" OR process_cmd_line ICONTAINS "invoke-smbautobrute" OR process_cmd_line ICONTAINS "invoke-nightmare" OR process_cmd_line ICONTAINS "zerologon" OR process_cmd_line ICONTAINS "av_query"))
+  crowdstrike: |
+    EventCode=4688 FileName=cmd.exe (CommandLine=*invoke-userhunter* OR CommandLine=*invoke-sharefinder* OR CommandLine=*invoke-kerberoast* OR CommandLine=*invoke-smbautobrute* OR CommandLine=*invoke-nightmare* OR CommandLine=*zerologon* OR CommandLine=*av_query*)
+    | table([@timestamp, ComputerName, UserName, CommandLine, ParentBaseFileName])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (592, 4688)
+    | filter lowercase(action_process_image_name) contains "cmd.exe"
+    | filter lowercase(action_process_image_command_line) ~= "invoke-userhunter|invoke-sharefinder|invoke-kerberoast|invoke-smbautobrute|invoke-nightmare|zerologon|av_query"
+    | fields _time, agent_hostname, actor_effective_username, action_process_image_name, action_process_image_command_line
+  lucene: |
+    event.code:4688 AND process.name:"cmd.exe" AND process.command_line:(/.*invoke-userhunter.*/i OR /.*invoke-sharefinder.*/i OR /.*invoke-kerberoast.*/i OR /.*invoke-smbautobrute.*/i OR /.*invoke-nightmare.*/i OR /.*zerologon.*/i OR /.*av_query.*/i)
+  sumo: |
+    _sourceCategory=*Windows* ("4688" OR "592")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | where event_id in ("4688", "592")
+    | where process_name matches "*cmd.exe"
+    | where command_line matches "*invoke-userhunter*" or command_line matches "*invoke-sharefinder*" or command_line matches "*invoke-kerberoast*" or command_line matches "*invoke-smbautobrute*" or command_line matches "*invoke-nightmare*" or command_line matches "*zerologon*" or command_line matches "*av_query*"
+    | fields _messageTime, _sourceHost, event_id, process_name, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -94,7 +104,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Windows Process Creation Event
 

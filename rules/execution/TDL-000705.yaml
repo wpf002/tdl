@@ -17,74 +17,56 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 50
 queries:
-  spl: |
-    index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=7 (ImageLoaded="*\\Temp\\*" OR ImageLoaded="*\\AppData\\*" OR ImageLoaded="*\\Users\\*\\Downloads\\*" OR ImageLoaded="*\\ProgramData\\*")
+  spl: 'index=wineventlog sourcetype="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=7 (ImageLoaded="*\\Temp\\*" OR ImageLoaded="*\\AppData\\*"
+    OR ImageLoaded="*\\Users\\*\\Downloads\\*" OR ImageLoaded="*\\ProgramData\\*")
+
     | table _time, ComputerName, User, Image, ImageLoaded, Signed, SignatureStatus
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000705 {\n  meta:\n    author = \"TDL\"\n    description = \"DLL Loaded from User-Writable Path\"\n    severity =\
-    \ \"MEDIUM\"\n    tactic = \"TA0002\"\n    technique = \"T1129\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceImageLoadEvents
+    | where TimeGenerated > ago(1h)
+    | where FolderPath has_any ("\\temp\\", "\\appdata\\", "\\programdata\\", "\\users\\public\\")
+    | where InitiatingProcessFileName !in~ ("explorer.exe", "svchost.exe", "msiexec.exe", "setup.exe", "installer.exe")
+    | project TimeGenerated, DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, FolderPath, SHA256
+  aql: "SELECT \"Process Name\", \"Image Loaded\", sourceip, LOGSOURCENAME(logsourceid) AS host, COUNT(*) AS load_count\nFROM events\nWHERE \"\
+    EventID\" = '7'\n  AND (\"Image Loaded\" ILIKE '%\\\\Temp\\\\%' \n       OR \"Image Loaded\" ILIKE '%\\\\AppData\\\\%'\n       OR \"Image\
+    \ Loaded\" ILIKE '%\\\\Users\\\\Public\\\\%'\n       OR \"Image Loaded\" ILIKE '%\\\\ProgramData\\\\%')\nGROUP BY \"Process Name\", \"Image\
+    \ Loaded\", sourceip, LOGSOURCENAME(logsourceid)\nLAST 1 HOURS\n"
+  yara_l: "rule dll_load_from_user_writable_directory {\n  meta:\n    author = \"TDL\"\n    description = \"Detects DLL loading from user-writable\
+    \ directories (T1129 - Shared Module Execution)\"\n    mitre_attack_tactic = \"Execution\"\n    mitre_attack_technique = \"T1129\"\n    severity\
+    \ = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"PROCESS_MODULE_LOAD\"\n    re.regex($e.target.file.full_path, `(?i)\\\\(temp|appdata|programdata|public|users\\\
+    \\[^\\\\]+\\\\downloads|users\\\\[^\\\\]+\\\\documents)\\\\`) nocase\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n\
+    \    \n  outcome:\n    $risk_score = 50\n    \n  condition:\n    $e\n}\n"
+  esql: "FROM logs-windows.sysmon_operational*, logs-endpoint.events.library*\n| WHERE @timestamp > NOW() - 1 hour \n  AND (winlog.event_id ==\
+    \ 7 OR event.category == \"library\")\n  AND (\n    TO_LOWER(dll.path) LIKE \"*\\\\temp\\\\*\" \n    OR TO_LOWER(dll.path) LIKE \"*\\\\appdata\\\
+    \\*\"\n    OR TO_LOWER(dll.path) LIKE \"*\\\\programdata\\\\*\"\n    OR TO_LOWER(dll.path) LIKE \"*\\\\users\\\\public\\\\*\"\n    OR TO_LOWER(winlog.event_data.ImageLoaded)\
+    \ LIKE \"*\\\\temp\\\\*\"\n    OR TO_LOWER(winlog.event_data.ImageLoaded) LIKE \"*\\\\appdata\\\\*\"\n    OR TO_LOWER(winlog.event_data.ImageLoaded)\
+    \ LIKE \"*\\\\programdata\\\\*\"\n    OR TO_LOWER(winlog.event_data.ImageLoaded) LIKE \"*\\\\users\\\\public\\\\*\"\n  )\n| EVAL loaded_dll\
+    \ = COALESCE(dll.path, winlog.event_data.ImageLoaded)\n| EVAL loading_process = COALESCE(process.name, winlog.event_data.Image)\n| KEEP @timestamp,\
+    \ host.name, user.name, loading_process, loaded_dll\n"
+  leql: |
+    where(source_json.EventID=7 AND (source_json.ImageLoaded ICONTAINS "\temp\" OR source_json.ImageLoaded ICONTAINS "\appdata\" OR source_json.ImageLoaded ICONTAINS "\users\public\" OR source_json.ImageLoaded ICONTAINS "\programdata\")) groupby(asset, source_json.Image, source_json.ImageLoaded) calculate(count)
+  crowdstrike: |
+    (event_simpleName=ProcessRollup2 OR EventCode=7)
+    (ImageLoaded=*\\Temp\\* OR ImageLoaded=*\\AppData\\* OR ImageLoaded=*\\Users\\*\\Downloads\\* OR ImageLoaded=*\\ProgramData\\*)
+    ImageLoaded=*.dll
+    | table([@timestamp, ComputerName, UserName, Image, ImageLoaded, CommandLine])
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_LOAD_IMAGE
+    | filter action_module_path ~= ".*\\\\(Temp|AppData|Users\\\\[^\\\\]+\\\\(Downloads|Documents|Desktop))\\\\.*\\.dll$"
+    | fields _time, agent_hostname, actor_process_image_name, action_module_path, actor_effective_username
+  lucene: |
+    event.code:7 AND winlog.event_data.ImageLoaded:(*\\Temp\\* OR *\\AppData\\Local\\* OR *\\AppData\\Roaming\\* OR *\\Users\\Public\\* OR *\\ProgramData\\*)
+  sumo: |
+    _sourceCategory=*Sysmon* "7"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Image" as process_image
+    | json field=_raw "ImageLoaded" as dll_path
+    | where event_id = "7"
+    | where dll_path matches "*\\Temp\\*" or dll_path matches "*\\AppData\\*" or dll_path matches "*\\Users\\*\\Downloads\\*" or dll_path matches "*\\ProgramData\\*"
+    | fields _messageTime, _sourceHost, process_image, dll_path
 pseudo_logic: Process loads a DLL from %TEMP%, %APPDATA% or other user-writable directory. Adversaries side-load malicious DLLs from those paths.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -102,7 +84,7 @@ references:
 - https://attack.mitre.org/techniques/T1129/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the executing process.'

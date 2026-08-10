@@ -16,82 +16,129 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) network.protocol="tcp" (signature_name="*Remote Code Execution*" OR signature_name="*Remote Code Injection*" OR signature="*RCE*" OR signature="*Remote Code*") action=allowed NOT [| inputlookup authorized_scanners.csv | fields src_ip]
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) network.protocol="tcp" (signature_name="*Remote Code Execution*" OR signature_name="*Remote
+    Code Injection*" OR signature="*RCE*" OR signature="*Remote Code*") action=allowed NOT [| inputlookup authorized_scanners.csv | fields src_ip]
+
     | stats count values(dest_ip) as unique_dests sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+
     | where count >= 1
+
     | sort - total_bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
+  kql: "let authorizedScanners = dynamic([\"10.0.0.100\", \"10.0.0.101\", \"192.168.1.50\"]);\nunion \n    (CommonSecurityLog \n    | where DeviceVendor\
+    \ has_any (\"Palo Alto\", \"Fortinet\", \"Cisco\", \"Check Point\", \"Barracuda\", \"F5\", \"Imperva\") \n    | where DeviceEventClassID has_any\
+    \ (\"RCE\", \"Remote Code Execution\", \"Code Injection\", \"Remote Code Injection\", \"Command Injection\")\n    | where DeviceAction in~\
+    \ (\"allowed\", \"permit\", \"accept\")\n    | where Protocol =~ \"tcp\"\n    | extend src_ip = SourceIP, dest_ip = DestinationIP, dest_port\
+    \ = DestinationPort, bytes_out = SentBytes),\n    (CommonSecurityLog\n    | where DeviceProduct has_any (\"IDS\", \"IPS\", \"Intrusion\",\
+    \ \"Snort\", \"Suricata\", \"TippingPoint\")\n    | where Activity has_any (\"RCE\", \"Remote Code Execution\", \"Code Injection\", \"Remote\
+    \ Code Injection\", \"Command Injection\", \"exploit\")\n    | where DeviceAction in~ (\"allowed\", \"permit\", \"accept\")\n    | where Protocol\
+    \ =~ \"tcp\"\n    | extend src_ip = SourceIP, dest_ip = DestinationIP, dest_port = DestinationPort, bytes_out = SentBytes)\n| where src_ip\
+    \ !in (authorizedScanners)\n| summarize count_ = count(), unique_dests = dcount(dest_ip), total_bytes_out = sum(bytes_out), earliest = min(TimeGenerated),\
+    \ latest = max(TimeGenerated) by src_ip, dest_ip, dest_port\n| where count_ >= 1\n| sort by total_bytes_out desc\n| project earliest, latest,\
+    \ src_ip, dest_ip, dest_port, count_, unique_dests, total_bytes_out\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS event_count, UNIQUECOUNT(destinationip) AS unique_dests, SUM(bytesout) AS total_bytes_out, CATEGORYNAME(category) AS signature_name, qidname(qid) AS event_name
+    FROM events
+    WHERE (LOGSOURCETYPENAME(devicetype) ILIKE '%IDS%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%IPS%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%Firewall%' OR LOGSOURCETYPENAME(devicetype) ILIKE '%WAF%')
+      AND (CATEGORYNAME(category) ILIKE '%Remote Code Execution%' OR CATEGORYNAME(category) ILIKE '%Remote Code Injection%' OR qidname(qid) ILIKE '%Remote Code Execution%' OR qidname(qid) ILIKE '%Remote Code Injection%' OR qidname(qid) ILIKE '%RCE%')
+      AND protocolid = 6
+      AND sourceip NOT IN ('10.0.0.100', '192.168.1.50')
+    GROUP BY sourceip, destinationip, destinationport, CATEGORYNAME(category), qidname(qid)
+    HAVING event_count >= 1
+    ORDER BY total_bytes_out DESC
+    LAST 24 HOURS
+  yara_l: |
+    rule mitre_t1190_exploit_public_facing_application {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects exploitation attempts via RCE/RCI signatures from IDS/IPS/WAF"
+        mitre_attack_technique = "T1190"
+        mitre_attack_tactic = "Initial Access"
+        severity = "HIGH"
 
-    FROM flows
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        (
+          $e.metadata.vendor_name = "Palo Alto Networks" or
+          $e.metadata.vendor_name = "Snort" or
+          $e.metadata.vendor_name = "Suricata" or
+          $e.metadata.vendor_name = "Cisco" or
+          $e.metadata.product_name = "IDS" or
+          $e.metadata.product_name = "IPS" or
+          $e.metadata.product_name = "WAF"
+        )
+        $e.network.ip_protocol = "TCP"
+        (
+          re.regex($e.security_result.summary, `(?i)(remote code execution|RCE|remote code injection|RCI)`) or
+          re.regex($e.security_result.category_details, `(?i)(remote code execution|RCE|remote code injection|RCI)`) or
+          re.regex($e.security_result.description, `(?i)(remote code execution|RCE|remote code injection|RCI)`)
+        )
+        $e.security_result.action = "ALLOW"
+        $e.network.direction = "INBOUND"
+        not re.regex($e.principal.ip, `^(10\.0\.1\.50|192\.168\.100\.20|172\.16\.5\.10)$`)
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dest_ip
+        $e.target.port = $dest_port
 
-    WHERE "network.protocol" LIKE ''%tcp%''
+      match:
+        $src_ip, $dest_ip, $dest_port over 24h
 
-    GROUP BY sourceip, destinationip, destinationport
+      outcome:
+        $risk_score = 85
+        $total_events = count_distinct($e.metadata.id)
+        $bytes_out = sum($e.network.sent_bytes)
 
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_auth_000553 {\n  meta:\n    author = \"TDL\"\n    description = \"Allowed Remote Code Execution Attempt\"\n    severity\
-    \ = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1190\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-network.ids*, logs-network.firewall*, logs-network.waf*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND network.protocol == "tcp"
+      AND (event.category == "intrusion_detection" OR event.category == "network" OR log.level IN ("alert", "warning"))
+      AND (event.action LIKE "*Remote Code Execution*" OR event.action LIKE "*Remote Code Injection*" OR event.action LIKE "*RCE*" OR event.action LIKE "*RCI*" OR rule.name LIKE "*Remote Code Execution*" OR rule.name LIKE "*Remote Code Injection*" OR rule.name LIKE "*RCE*" OR rule.name LIKE "*RCI*")
+      AND event.outcome IN ("success", "allowed", "alert")
+      AND source.ip NOT IN ("10.0.0.100", "10.0.0.101", "192.168.1.250")
+    | STATS event_count = COUNT(*), unique_dests = COUNT_DISTINCT(destination.ip), total_bytes_out = SUM(source.bytes) BY source.ip, destination.ip, destination.port
+    | WHERE event_count >= 1
+    | SORT total_bytes_out DESC
+    | KEEP source.ip, destination.ip, destination.port, event_count, unique_dests, total_bytes_out
+  leql: |
+    where(log_source_type IN [firewall, ids] AND network.protocol ICONTAINS "tcp" AND (signature ICONTAINS "remote code execution" OR signature ICONTAINS "remote code injection" OR signature ICONTAINS "rce" OR alert_name ICONTAINS "remote code execution" OR alert_name ICONTAINS "remote code injection")) groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    (#type=firewall OR #type=ids) network.protocol=*tcp* (signature=*"Remote Code Execution"* OR signature=*"Remote Code Injection"* OR signature=*RCE* OR signature=*RCI* OR event_simpleName=*RCE* OR event_simpleName=*RCI* OR alert=*"Remote Code Execution"* OR alert=*"Remote Code Injection"*)
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=event_count), count(dest_ip, distinct=true, as=unique_dests), sum(bytes_out, as=total_bytes_out)])
+    | event_count >= 1
+    | src_ip != /^(10\.1\.1\.100|192\.168\.1\.50|scanner\.company\.com)$/
+    | sort(field=total_bytes_out, order=desc, limit=1000)
+    | table([src_ip, dest_ip, dest_port, event_count, unique_dests, total_bytes_out])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action_source = "IDS" or action_source = "WAF" or action_source = "THREAT"
+    | filter action_network_protocol = "tcp"
+    | filter threat_name ~= "(?i)(remote.*code.*(execution|injection)|RCE|RCI)" and action_firewall_action != "deny" and action_firewall_action != "block" and action_firewall_action != "drop"
+    | alter bytes_out = coalesce(action_total_upload, 0)
+    | comp count() as event_count, count_distinct(action_destination_ip) as unique_dests, sum(bytes_out) as total_bytes_out by action_source_ip, action_destination_ip, action_destination_port
+    | filter event_count >= 1
+    | filter action_source_ip not in ("10.0.0.100", "10.0.0.101", "192.168.1.50")
+    | sort desc total_bytes_out
+    | fields action_source_ip, action_destination_ip, action_destination_port, event_count, unique_dests, total_bytes_out
+  lucene: |
+    (sourcetype:(firewall OR ids) AND network.protocol:*tcp*) AND (signature:*"Remote Code Execution"* OR signature:*"Remote Code Injection"* OR event.action:*RCE* OR event.action:*RCI* OR alert.signature:*"Remote Code Execution"* OR alert.signature:*"Remote Code Injection"*) AND NOT src_ip:(10.0.0.100 OR 10.0.0.101 OR 192.168.1.50)
+  sumo: |
+    _sourceCategory=*network* OR _sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*waf*
+    | where !isEmpty(src_ip) and !isEmpty(dest_ip)
+    | parse regex "(?i)remote.?code.?(execution|injection)" nodrop
+    | parse regex "(?i)(rce|remote code)" nodrop
+    | where _raw matches "*remote*code*" or _raw matches "*RCE*" or _raw matches "*injection*"
+    | where protocol matches "*tcp*" or _raw matches "*tcp*"
+    | where action matches "*allow*" or action matches "*permit*" or verdict matches "*allow*" or _raw matches "*allowed*" or _raw matches "*permitted*"
+    | where !(src_ip in ("10.0.0.1", "192.168.1.100"))
+    | count as event_count, count_distinct(dest_ip) as unique_dests, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | where event_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, event_count, unique_dests, total_bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -101,7 +148,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host/identity, source (IP, sender, URL), and the matched IOC.'

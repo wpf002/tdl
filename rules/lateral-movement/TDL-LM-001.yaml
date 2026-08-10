@@ -13,75 +13,77 @@ fidelity: Medium
 lifecycle: Deployed
 risk_score: 85
 queries:
-  spl: |
-    index=windows sourcetype="WinEventLog:Security" EventCode=4624 LogonType=3
+  spl: 'index=windows sourcetype="WinEventLog:Security" EventCode=4624 LogonType=3
+
     | stats count values(ComputerName) as ComputerName by user, IpAddress, LogonType
+
     | sort -count
+
     | where count >= 1
-  kql: 'SecurityEvent
-
-    | where TimeGenerated > ago(1d)
-
-    | where event_id in ("4624")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('4624')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_lm_001 {\n  meta:\n    author = \"TDL\"\n    description = \"Pass-the-Hash NTLM Lateral Movement\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0008\"\n    technique = \"T1550.002\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id =\
-    \ /(4624)/\n    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("4624")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
+  kql: |
+    SecurityEvent
+    | where EventID == 4624
+    | where LogonType == 3
+    | extend LogonProcessName = tostring(LogonProcessName)
+    | where LogonProcessName =~ "NtLmSsp" and AuthenticationPackageName =~ "NTLM"
+    | where KeyLength == 0
+    | summarize HostCount = dcount(Computer), Hosts = make_set(Computer), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), EventCount = count() by Account, IpAddress, LogonType
+    | project Account, IpAddress, LogonType, EventCount, HostCount, Hosts, FirstSeen, LastSeen
+    | sort by EventCount desc
+  aql: |
+    SELECT username, sourceip, "Logon Type", LOGSOURCENAME(logsourceid) AS host, COUNT(*) AS logon_count
+    FROM events
+    WHERE "EventID" = '4624' AND "Logon Type" IN ('3', '9')
+    GROUP BY username, sourceip, "Logon Type", LOGSOURCENAME(logsourceid)
+    ORDER BY logon_count DESC
+    LAST 24 HOURS
+  yara_l: "rule ntlm_pass_the_hash_logon {\n  meta:\n    author = \"Detection Engineer\"\n    description = \"Detects potential NTLM pass-the-hash\
+    \ lateral movement via logon type 3 or 9 with event 4624\"\n    mitre_attack_tactic = \"Lateral Movement\"\n    mitre_attack_technique = \"\
+    T1550.002\"\n    severity = \"High\"\n    \n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.metadata.product_event_type = \"\
+    4624\"\n    $e.security_result.action = \"ALLOW\"\n    (\n      $e.target.user.attribute.labels.key = \"LogonType\" and\n      $e.target.user.attribute.labels.value\
+    \ = \"3\"\n    ) or (\n      $e.target.user.attribute.labels.key = \"LogonType\" and\n      $e.target.user.attribute.labels.value = \"9\"\n\
+    \    )\n    $e.target.user.userid = $user\n    $e.principal.ip = $ip\n    $e.target.hostname = $host\n    \n  match:\n    $user, $ip over\
+    \ 24h\n    \n  outcome:\n    $risk_score = 75\n    $hosts = array_distinct($host)\n    $logon_count = count_distinct($e.metadata.id)\n   \
+    \ \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-system.security*, winlogbeat-*
+    | WHERE event.code == "4624"
+    | EVAL LogonType = winlog.event_data.LogonType
+    | STATS count = COUNT(*), hosts = COUNT_DISTINCT(host.name) BY user.name, source.ip, LogonType
     | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [4624])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (4624)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("4624")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(4624)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("4624")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+    | KEEP user.name, source.ip, LogonType, count, hosts
+  leql: |
+    where(source_json.EventID=4624 AND source_json.LogonType IN [3, 9]) groupby(source_json.TargetUserName, source_json.IpAddress, source_json.LogonType) calculate(count)
+  crowdstrike: |
+    EventCode=4624 LogonType=3
+    | groupBy([TargetUserName, IpAddress, LogonType], function=count(as=occurrences))
+    | occurrences >= 1
+    | sort(occurrences, order=desc)
+    | table([TargetUserName, IpAddress, LogonType, occurrences])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 4624
+    | alter LogonType = json_extract_scalar(action_evtlog_data, "$.EventData.LogonType")
+    | filter LogonType in ("3", "9")
+    | fields _time, agent_hostname, action_evtlog_event_data_TargetUserName, action_evtlog_event_data_IpAddress, LogonType, action_evtlog_event_id
+    | comp count() as event_count, count_distinct(agent_hostname) as host_count by action_evtlog_event_data_TargetUserName, action_evtlog_event_data_IpAddress, LogonType
+    | sort desc event_count
+  lucene: |
+    event.code:4624 AND winlog.event_data.LogonType:3 AND winlog.event_data.AuthenticationPackageName:NTLM AND winlog.event_data.LogonProcessName:NtLmSsp
+  sumo: |
+    _sourceCategory=*Windows*Security* "4624"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "LogonType" as logon_type
+    | json field=_raw "TargetUserName" as user
+    | json field=_raw "IpAddress" as ip_address
+    | json field=_raw "Computer" as host
+    | where event_id = "4624" and logon_type = "3"
+    | dedup user, ip_address, logon_type, host
+    | count as occurrences by user, ip_address, logon_type
+    | sort by occurrences desc
+    | where occurrences >= 1
 false_positives:
 - Legitimate admin accounts managing multiple systems
 tags:
@@ -91,7 +93,7 @@ tags:
 author: TDL
 created: '2024-02-10'
 test_method: purple_team
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, target host, and the protocol / credential used.'
 - Inspect the destination domain/IP, ASN, port, and TLS / HTTP fingerprints — confirm the cross-host action (SMB write, WinRM exec, RDP session,

@@ -26,77 +26,131 @@ queries:
     \ pipe=\"\\\\PIPE\\\\samr\" OR pipe=\"\\\\PIPE\\\\netlogon\")\n| bin _time span=5m\n| stats dc(dest_ip) as unique_targets values(dest_ip)\
     \ as targets values(pipe) as pipes earliest(_time) as first_seen latest(_time) as last_seen by _time, src_ip\n| where unique_targets >= 3\n\
     | eval timespan=last_seen - first_seen\n| table _time, src_ip, unique_targets, targets, pipes, first_seen, last_seen, timespan\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
+  kql: |
+    let suspectPipes = dynamic(["srvsvc", "samr", "netlogon"]);
+    let adminLogons = SecurityEvent
+        | where TimeGenerated > ago(10m)
+        | where EventID in (4624, 4648)
+        | where LogonType in (2, 3, 10)
+        | where AccountName !endswith "$"
+        | summarize by Computer, Account, bin(TimeGenerated, 5m);
+    SecurityEvent
+    | where TimeGenerated > ago(5m)
+    | where EventID == 5145
+    | where ShareName == "\\*\\IPC$" or RelativeTargetName has_any (suspectPipes)
+    | extend PipeName = extract(@"\\\\([^\\]+)\\\\.*", 1, ObjectName)
+    | where PipeName in (suspectPipes) or RelativeTargetName has_any (suspectPipes)
+    | extend SourceIP = IpAddress, TargetHost = Computer
+    | summarize DistinctTargets = dcount(TargetHost), Targets = make_set(TargetHost), AccessCount = count() by bin(TimeGenerated, 5m), SourceIP, Account
+    | where DistinctTargets >= 3
+    | join kind=leftanti (adminLogons) on $left.Account == $right.Account
+    | project TimeGenerated, SourceIP, Account, DistinctTargets, Targets, AccessCount
+  aql: |
+    SELECT sourceip, UNIQUECOUNT(destinationip) AS target_count, COUNT(*) AS connections, QIDNAME(qid) AS event_name
+    FROM events
+    WHERE (LOGSOURCENAME(logsourceid) ILIKE '%IDS%' OR category IN (18000, 19000))
+      AND (qidname(qid) ILIKE '%smb%' OR qidname(qid) ILIKE '%445%' OR qidname(qid) ILIKE '%DCE/RPC%')
+      AND (qidname(qid) ILIKE '%srvsvc%' OR qidname(qid) ILIKE '%samr%' OR qidname(qid) ILIKE '%netlogon%')
+    GROUP BY sourceip
+    HAVING target_count >= 3
+    LAST 5 MINUTES
+  yara_l: |
+    rule lateral_movement_smb_pipe_enumeration {
+      meta:
+        author = "TDL"
+        description = "Detects SMB named pipe enumeration across multiple hosts indicative of EternalBlue/Zerologon reconnaissance"
+        mitre_attack_tactic = "Lateral Movement"
+        mitre_attack_technique = "T1210"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $pipe.metadata.event_type = "NETWORK_CONNECTION"
+        $pipe.target.port = 445
+        $pipe.network.application_protocol = "SMB"
+        (
+          re.regex($pipe.target.resource.name, `(?i)\\\\PIPE\\\\srvsvc`) or
+          re.regex($pipe.target.resource.name, `(?i)\\\\PIPE\\\\samr`) or
+          re.regex($pipe.target.resource.name, `(?i)\\\\PIPE\\\\netlogon`)
+        )
+        $pipe.principal.hostname = $source
+        $pipe.target.hostname = $dest
 
-    | where network.protocol matches regex "smb"
+        $auth.metadata.event_type = "USER_LOGIN"
+        $auth.security_result.action = "ALLOW"
+        $auth.principal.hostname = $source
+        $auth.target.hostname = $dest
+        (
+          re.regex($auth.target.user.userid, `(?i).*admin.*`) or
+          $auth.security_result.summary = "Administrative logon"
+        )
 
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
+      match:
+        $source over 5m
 
-    | order by Bytes desc
+      outcome:
+        $risk_score = max(85)
+        $targeted_hosts = count_distinct($dest)
+        $source_host = $source
 
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%smb%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_lm_000775 {\n  meta:\n    author = \"TDL\"\n    description = \"Anomalous SMB Pipe Opens to Remote Hosts\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0008\"\n    technique = \"T1210\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n   \
-    \ $e.network.protocol = /smb/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%smb%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/smb/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*smb*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "smb"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*smb*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*smb*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        $pipe and not $auth and #dest >= 3
+    }
+  esql: |
+    FROM logs-network*, logs-windows.sysmon_operational*, logs-endpoint.events.network*
+    | WHERE @timestamp > NOW() - 5 minute
+      AND (
+        (event.category == "network" AND network.protocol == "smb" AND (destination.port == 445 OR destination.port == 139))
+        OR (winlog.event_id == 5145)
+      )
+      AND (
+        TO_LOWER(file.path) LIKE "*\\pipe\\srvsvc*"
+        OR TO_LOWER(file.path) LIKE "*\\pipe\\samr*"
+        OR TO_LOWER(file.path) LIKE "*\\pipe\\netlogon*"
+        OR TO_LOWER(winlog.event_data.ShareName) LIKE "*\\\\*\\pipe\\srvsvc*"
+        OR TO_LOWER(winlog.event_data.ShareName) LIKE "*\\\\*\\pipe\\samr*"
+        OR TO_LOWER(winlog.event_data.ShareName) LIKE "*\\\\*\\pipe\\netlogon*"
+        OR TO_LOWER(winlog.event_data.RelativeTargetName) LIKE "*srvsvc*"
+        OR TO_LOWER(winlog.event_data.RelativeTargetName) LIKE "*samr*"
+        OR TO_LOWER(winlog.event_data.RelativeTargetName) LIKE "*netlogon*"
+      )
+    | EVAL src = COALESCE(source.ip, host.ip, winlog.event_data.IpAddress)
+    | EVAL dst = COALESCE(destination.ip, winlog.event_data.IpAddress, server.ip)
+    | WHERE src IS NOT NULL AND dst IS NOT NULL AND src != dst
+    | STATS distinct_targets = COUNT_DISTINCT(dst), target_list = VALUES(dst) BY src, window = BUCKET(@timestamp, 5 minute)
+    | WHERE distinct_targets >= 3
+    | KEEP src, distinct_targets, target_list, window
+  leql: |
+    where(source_json.PipeName IN ["\PIPE\srvsvc", "\PIPE\samr", "\PIPE\netlogon"]) groupby(source_address) calculate(unique:destination_address)
+  crowdstrike: |
+    event_simpleName=NetworkConnectIP4 (RemotePort=445 OR RemotePort=139)
+    | groupBy([ComputerName, LocalAddressIP4], function=collect([RemoteAddressIP4, @timestamp]))
+    | test(count(RemoteAddressIP4, distinct=true) >= 3)
+    | timeChart(span=5m, function=count(RemoteAddressIP4, distinct=true, as=targets))
+    | targets >= 3
+  xql: "dataset = xdr_data\n| filter event_type = ENUM.EVENT_TYPE_NETWORK\n  and (action_network_connection_direction = \"OUTBOUND\" or action_network_connection_direction\
+    \ = \"OUTGOING\")\n  and (action_network_creation_name contains \"\\\\PIPE\\\\srvsvc\" \n       or action_network_creation_name contains \"\
+    \\\\PIPE\\\\samr\" \n       or action_network_creation_name contains \"\\\\PIPE\\\\netlogon\")\n| bin _time span=5m\n| comp count_distinct(action_remote_ip)\
+    \ as distinct_targets by _time, agent_hostname, actor_effective_username, actor_process_image_name\n| filter distinct_targets >= 3\n| fields\
+    \ _time, agent_hostname, actor_effective_username, actor_process_image_name, distinct_targets\n"
+  lucene: |
+    (pipe_name:("\\PIPE\\srvsvc" OR "\\PIPE\\samr" OR "\\PIPE\\netlogon") OR named_pipe:("\\PIPE\\srvsvc" OR "\\PIPE\\samr" OR "\\PIPE\\netlogon") OR file_name:("\\PIPE\\srvsvc" OR "\\PIPE\\samr" OR "\\PIPE\\netlogon") OR event.code:(5145 OR 5140) OR winlog.event_id:(5145 OR 5140)) AND NOT (event.code:(4624 OR 4672) OR winlog.event_id:(4624 OR 4672) OR logon_type:(3 OR 10))
+  sumo: |
+    _sourceCategory=*Network* OR _sourceCategory=*Windows*
+    | json field=_raw "event_type" as event_type
+    | json field=_raw "pipe_name" as pipe_name
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "SourceAddress" as source_address
+    | json field=_raw "DestinationAddress" as destination_address
+    | json field=_raw "EventID" as event_id
+    | where (pipe_name matches "*\\PIPE\\srvsvc*" or pipe_name matches "*\\PIPE\\samr*" or pipe_name matches "*\\PIPE\\netlogon*") or (event_type matches "*smb*" and (_raw matches "*\\PIPE\\srvsvc*" or _raw matches "*\\PIPE\\samr*" or _raw matches "*\\PIPE\\netlogon*"))
+    | if(isNull(src_ip), source_address, src_ip) as source
+    | if(isNull(dest_ip), destination_address, dest_ip) as destination
+    | where !isNull(source) and !isNull(destination)
+    | timeslice 5m
+    | count_distinct(destination) as target_count by _timeslice, source
+    | where target_count >= 3
+    | fields _timeslice, source, target_count
 pseudo_logic: Single source opens \PIPE\srvsvc, \PIPE\samr, \PIPE\netlogon to ≥3 distinct remote hosts within 5m without preceding admin auth.
   EternalBlue / Zerologon-style probing.
 false_positives:
@@ -115,7 +169,7 @@ references:
 - https://attack.mitre.org/techniques/T1210/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, target host, and the protocol / credential used.'

@@ -18,68 +18,69 @@ queries:
   spl: "index=aws sourcetype=aws:cloudtrail eventName=RestoreDBInstanceFromDBSnapshot \n| spath path=requestParameters.publiclyAccessible output=publicly_accessible\n\
     | search publicly_accessible=false\n| table _time, userIdentity.principalId, userIdentity.arn, sourceIPAddress, awsRegion, requestParameters.dBInstanceIdentifier,\
     \ requestParameters.dBSnapshotIdentifier, publicly_accessible\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(90d)
+    | where EventName == "RestoreDBInstanceFromDBSnapshot"
+    | extend PubliclyAccessible = tostring(parse_json(RequestParameters).publiclyAccessible)
+    | where PubliclyAccessible == "false"
+    | project TimeGenerated, EventName, UserIdentityArn, SourceIpAddress, RequestParameters, ResponseElements, AwsRegion, RecipientAccountId
+  aql: |
+    SELECT eventtime, username, sourceip, "AWS Account ID", "Resource ID", "Request Parameters"
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%AWS%CloudTrail%'
+      AND "Event Name" = 'RestoreDBInstanceFromDBSnapshot'
+      AND "Request Parameters" ILIKE '%publiclyAccessible%false%'
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_restore_db_non_public {
+      meta:
+        author = "TDL"
+        description = "Detects AWS RDS database restoration with PubliclyAccessible set to False - T1578 Defense Evasion"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1578"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.vendor_name = "AMAZON"
+        $e.metadata.product_name = "AWS CloudTrail"
+        $e.metadata.event_type = "GENERIC_EVENT"
+        $e.target.resource.attribute.labels["eventName"] = "RestoreDBInstanceFromDBSnapshot"
+        $e.target.resource.attribute.labels["requestParameters.publiclyAccessible"] = "false"
+        $e.principal.user.userid = $user
+        $e.target.resource.attribute.labels["awsRegion"] = $region
 
-    | where eventName matches regex ".+"
+      match:
+        $user, $region over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000150 {\n  meta:\n    author = \"TDL\"\n    description = \"Public AWS RDS Instance Restored\"\n    severity = \"\
-    MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1578\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE event.action == "RestoreDBInstanceFromDBSnapshot"
+      AND event.outcome == "success"
+      AND aws.cloudtrail.request_parameters LIKE "*publiclyAccessible*false*"
+    | KEEP @timestamp, cloud.account.id, cloud.region, user_identity.arn, aws.cloudtrail.request_parameters, event.action
+  leql: |
+    where(source_json.eventName=RestoreDBInstanceFromDBSnapshot AND source_json.requestParameters.publiclyAccessible=false)
+  crowdstrike: |
+    #repo=aws_cloudtrail eventName=RestoreDBInstanceFromDBSnapshot
+    | publiclyAccessible=*false*
+    | table([@timestamp, userIdentity.arn, sourceIPAddress, eventName, requestParameters.publiclyAccessible, requestParameters.dBInstanceIdentifier, awsRegion])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and operation = "RestoreDBInstanceFromDBSnapshot"
+    | filter json_extract_scalar(resource_json_properties, "$.publiclyAccessible") = "false" or json_extract_scalar(resource_json_properties, "$.requestParameters.publiclyAccessible") = "false"
+    | fields _time, actor_user, operation, cloud_provider_account, cloud_region, resource_json_properties
+  lucene: |
+    eventName:RestoreDBInstanceFromDBSnapshot AND requestParameters.publiclyAccessible:false
+  sumo: |
+    _sourceCategory=*CloudTrail* "RestoreDBInstanceFromDBSnapshot"
+    | json field=_raw "eventName" as event_name
+    | json field=_raw "requestParameters.publiclyAccessible" as publicly_accessible
+    | where event_name = "RestoreDBInstanceFromDBSnapshot" and publicly_accessible = "false"
+    | fields _messageTime, _sourceHost, event_name, publicly_accessible
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +90,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 AWS APICall Event
 

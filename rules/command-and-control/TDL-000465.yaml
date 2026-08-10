@@ -15,82 +15,112 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (url="*webdav*" OR uri="*webdav*" OR http_method IN ("PROPFIND","PROPPATCH","MKCOL","COPY","MOVE","LOCK","UNLOCK") OR dest_port=5985 OR dest_port=5986)
+  spl: 'index=network (sourcetype=firewall OR sourcetype=ids) protocol=tcp (url="*webdav*" OR uri="*webdav*" OR http_method IN ("PROPFIND","PROPPATCH","MKCOL","COPY","MOVE","LOCK","UNLOCK")
+    OR dest_port=5985 OR dest_port=5986)
+
     | stats count as connection_count, dc(dest_ip) as unique_dest_ips, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+
     | where connection_count >= 1
+
     | sort - total_bytes_out
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tcp"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
 
     '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: |
+    CommonSecurityLog
+    | where TimeGenerated > ago(90d)
+    | where DeviceVendor has_any ("Firewall", "IDS", "Proxy") or DeviceProduct has_any ("Firewall", "IDS", "Proxy")
+    | where Protocol =~ "tcp"
+    | where RequestURL has_any ("PROPFIND", "PROPPATCH") or RequestMethod in~ ("PROPFIND", "PROPPATCH") or ApplicationProtocol =~ "webdav" or DestinationPort in (80, 443, 8080) and (RequestURL contains ".davstore" or RequestURL contains "/_vti_bin" or RequestURL contains "/webdav" or Message has "webdav" or AdditionalExtensions has "webdav")
+    | summarize connection_count = count(), unique_dest_ips = dcount(DestinationIP), total_bytes_out = sum(SentBytes) by SourceIP, DestinationIP, DestinationPort
+    | where connection_count >= 1
+    | sort by total_bytes_out desc
+    | project TimeGenerated = now(), SourceIP, DestinationIP, DestinationPort, connection_count, unique_dest_ips, total_bytes_out
+  aql: |
+    SELECT sourceip, destinationip, destinationport, COUNT(*) AS connection_count, UNIQUECOUNT(destinationip) AS unique_destinations, SUM(bytesout) AS total_bytes_out
     FROM flows
-
-    WHERE "network.protocol" LIKE ''%tcp%''
-
+    WHERE protocolid = '6'
     GROUP BY sourceip, destinationip, destinationport
+    HAVING connection_count >= 1
+    ORDER BY total_bytes_out DESC
+    LAST 24 HOURS
+  yara_l: |
+    rule webdav_download_cradle_t1071 {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects WebDAV download cradle activity indicative of C2 communication"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1071"
+        severity = "High"
 
-    LAST 1 HOURS
+      events:
+        $e.metadata.event_type = "NETWORK_CONNECTION"
+        $e.network.ip_protocol = "TCP"
+        (
+          re.regex($e.network.http.user_agent, `(?i)Microsoft-WebDAV`) or
+          re.regex($e.network.http.method, `(?i)(PROPFIND|PROPPATCH|MKCOL|COPY|MOVE|LOCK|UNLOCK)`) or
+          $e.target.port = 80 and re.regex($e.principal.process.command_line, `(?i)\\\\[^\\]+@\d+`) or
+          $e.target.port = 443 and re.regex($e.principal.process.command_line, `(?i)\\\\[^\\]+@SSL@\d+`)
+        )
+        $e.principal.ip = $src_ip
+        $e.target.ip = $dest_ip
+        $e.target.port = $dest_port
 
-    '
-  yara_l: "rule tdl_tdl_c2_000465 {\n  meta:\n    author = \"TDL\"\n    description = \"Windows WebDAV User Agent\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0011\"\n    technique = \"T1071\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.protocol\
-    \ = /tcp/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
+      match:
+        $src_ip, $dest_ip, $dest_port over 24h
 
-    | WHERE @timestamp > NOW() - 1 hour
+      outcome:
+        $risk_score = 75
+        $total_connections = count_distinct($e.metadata.id)
+        $unique_dest_ips = count_distinct($e.target.ip)
+        $bytes_out = sum($e.network.sent_bytes)
 
-    | WHERE event.category == "network" AND network.protocol LIKE "%tcp%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tcp/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tcp*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tcp"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tcp*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tcp*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-network.firewall*, logs-network.ids*
+    | WHERE network.protocol == "tcp" AND network.transport == "tcp"
+    | EVAL webdav_pattern = CASE(
+        destination.port == 80 AND (http.request.method == "PROPFIND" OR http.request.method == "OPTIONS" OR http.request.method == "GET"), 1,
+        destination.port == 443 AND (http.request.method == "PROPFIND" OR http.request.method == "OPTIONS" OR http.request.method == "GET"), 1,
+        TO_LOWER(http.request.headers.user_agent) LIKE "*microsoft*webdav*", 1,
+        TO_LOWER(http.request.headers.user_agent) LIKE "*webdav*", 1,
+        url.path LIKE "*/.*/", 1,
+        0
+      )
+    | WHERE webdav_pattern == 1
+    | STATS connection_count = COUNT(*), unique_dest_ips = COUNT_DISTINCT(destination.ip), total_bytes_out = SUM(source.bytes) BY source.ip, destination.ip, destination.port
+    | WHERE connection_count >= 1
+    | SORT total_bytes_out DESC
+    | KEEP source.ip, destination.ip, destination.port, connection_count, unique_dest_ips, total_bytes_out
+  leql: |
+    where(source_json.protocol ICONTAINS "tcp") groupby(source_address, destination_address, destination_port) calculate(count)
+  crowdstrike: |
+    (#type=firewall OR #type=ids) network.protocol=*tcp* (url=*\/webdav* OR url=*\/*\.webdav* OR http.method=PROPFIND OR http.method=PROPPATCH OR http.method=MKCOL OR http.method=COPY OR http.method=MOVE OR http.method=LOCK OR http.method=UNLOCK OR url=*davclnt* OR user_agent=*WebDAV* OR user_agent=*Microsoft-WebDAV*)
+    | groupBy([src_ip, dest_ip, dest_port], function=[count(as=connection_count), count(dest_ip, distinct=true, as=unique_dest_ips), sum(bytes_out, as=total_bytes_out)])
+    | connection_count >= 1
+    | sort(field=total_bytes_out, order=desc, limit=10000)
+    | table([src_ip, dest_ip, dest_port, connection_count, unique_dest_ips, total_bytes_out])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter proto = "tcp"
+    | alter webdav_indicator = arrayindex(regextract(http_method, "^(PROPFIND|OPTIONS|MKCOL|PROPPATCH|COPY|MOVE|LOCK|UNLOCK)$"), 0)
+    | filter webdav_indicator != null or http_headers contains "translate: f" or http_headers contains "Translate:" or url_path ~= ".*\\.aspx/[A-Za-z0-9+/=]+$" or url_path contains "/_vti_bin/"
+    | comp count() as connection_count, count_distinct(dstip) as unique_dest_ips, sum(bytes_sent) as total_bytes_out by srcip, dstip, dstport
+    | filter connection_count >= 1
+    | sort desc total_bytes_out
+    | fields srcip, dstip, dstport, connection_count, unique_dest_ips, total_bytes_out
+  lucene: |
+    network.protocol:tcp AND (http.request.method:OPTIONS OR http.request.method:PROPFIND OR http.request.method:PROPPATCH OR http.request.method:MKCOL OR http.request.method:COPY OR http.request.method:MOVE OR http.request.method:LOCK OR http.request.method:UNLOCK OR http.request.method:PUT) AND (http.response.status_code:[200 TO 299] OR http.response.status_code:404 OR http.response.status_code:207)
+  sumo: |
+    _sourceCategory=*proxy* OR _sourceCategory=*firewall* OR _sourceCategory=*ids*
+    | where protocol="tcp" OR protocol="TCP" OR protocol matches "*tcp*"
+    | parse regex "(?i)webdav|PROPFIND|PROPPATCH|MKCOL|COPY|MOVE|LOCK|UNLOCK" as webdav_indicator
+    | where !isNull(webdav_indicator)
+    | count as connection_count, count_distinct(dest_ip) as unique_dest_ips, sum(bytes_out) as total_bytes_out by src_ip, dest_ip, dest_port
+    | where connection_count >= 1
+    | sort by total_bytes_out desc
+    | fields src_ip, dest_ip, dest_port, connection_count, unique_dest_ips, total_bytes_out
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -100,7 +130,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

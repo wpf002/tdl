@@ -29,77 +29,101 @@ queries:
     \ as subjects values(tls.issuer) as issuers by src_ip, dest_ip, dest_port\n| where session_count >= 3\n| eval duration=(last_seen - first_seen)\n\
     | eval avg_interval=duration/(session_count - 1)\n| where avg_interval >= 30 AND avg_interval <= 120\n| table src_ip, dest_ip, dest_port,\
     \ subjects, issuers, session_count, avg_interval, first_seen, last_seen\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where network.protocol matches regex "tls"
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
-    FROM flows
-
-    WHERE "network.protocol" LIKE ''%tls%''
-
-    GROUP BY sourceip, destinationip, destinationport
-
-    LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000799 {\n  meta:\n    author = \"TDL\"\n    description = \"Self-Signed TLS Certificate on Outbound Beacon\"\n   \
-    \ severity = \"MEDIUM\"\n    tactic = \"TA0011\"\n    technique = \"T1573\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\
-    \n    $e.network.protocol = /tls/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND network.protocol LIKE "%tls%"
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND network.protocol=/tls/)
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND network.protocol=*tls*
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND network.protocol ~= "tls"
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND network.protocol:*tls*
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where network.protocol matches "*tls*"
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  kql: |
+    NetworkIDS_CL
+    | where TimeGenerated > ago(1h)
+    | where Direction =~ "Outbound" or Direction =~ "egress"
+    | where Protocol =~ "TLS" or Protocol =~ "SSL" or DestinationPort in (443, 8443)
+    | where isnotempty(TLSCertificateIssuer) and isnotempty(TLSCertificateSubject)
+    | where TLSCertificateIssuer == TLSCertificateSubject
+    | where TLSCertificateSubject !has "cloudflare" and TLSCertificateSubject !has "akamai" and TLSCertificateSubject !has "fastly" and TLSCertificateSubject !has "cloudfront"
+    | where TLSCertificateSubject has_any ("localhost", "test", "default", "example", "temp", "admin") or TLSCertificateSubject matches regex @"^CN=[0-9\.]+" or TLSCertificateSubject matches regex @"^[A-Z]{2,6}$"
+    | extend DestIP = coalesce(DestinationIP, DstIpAddr, destination_ip)
+    | where DestIP !startswith "13." and DestIP !startswith "18." and DestIP !startswith "52." and DestIP !startswith "54." and DestIP !startswith "104." and DestIP !startswith "151.101."
+    | summarize sessions = count(), timestamps = make_list(TimeGenerated), MinTime = min(TimeGenerated), MaxTime = max(TimeGenerated) by SourceIP, DestIP, TLSCertificateSubject, bin(TimeGenerated, 5m)
+    | where sessions >= 2
+    | extend TimeSpan = datetime_diff('second', MaxTime, MinTime)
+    | extend AvgInterval = TimeSpan / (sessions - 1)
+    | where AvgInterval >= 30 and AvgInterval <= 120
+    | project TimeGenerated, SourceIP, DestIP, TLSCertificateSubject, sessions, AvgInterval, MinTime, MaxTime
+  aql: "SELECT sourceip, destinationip, destinationport, \n       UNIQUECOUNT(starttime) AS session_count,\n       MIN(starttime) AS first_seen,\n\
+    \       MAX(starttime) AS last_seen\nFROM flows\nWHERE destinationport IN (443, 8443)\n  AND \"TLS Certificate Issuer\" = \"TLS Certificate\
+    \ Subject\"\n  AND \"TLS Certificate Subject\" NOT ILIKE '%cloudfront%'\n  AND \"TLS Certificate Subject\" NOT ILIKE '%akamai%'\n  AND \"\
+    TLS Certificate Subject\" NOT ILIKE '%fastly%'\n  AND \"TLS Certificate Subject\" NOT ILIKE '%cloudflare%'\n  AND \"TLS Certificate Subject\"\
+    \ NOT ILIKE '%amazonaws%'\n  AND \"TLS Certificate Subject\" NOT ILIKE '%azure%'\n  AND \"TLS Certificate Subject\" NOT ILIKE '%gcp%'\n  AND\
+    \ destinationip NOT IN (CIDR_RANGES('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))\nGROUP BY sourceip, destinationip, destinationport\n\
+    HAVING session_count >= 10\nLAST 30 MINUTES\n"
+  yara_l: "rule c2_encrypted_beaconing_self_signed {\n  meta:\n    author = \"TDL\"\n    description = \"T1573 - Encrypted Channel: Detects periodic\
+    \ beaconing over TLS to non-CDN IPs with self-signed certificates and unusual subjects\"\n    mitre_attack_tactic = \"Command and Control\"\
+    \n    mitre_attack_technique = \"T1573\"\n    severity = \"HIGH\"\n\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.network.direction\
+    \ = \"OUTBOUND\"\n    $e.network.application_protocol = \"TLS\" or $e.target.port = 443\n    $e.security_result.summary = \"SELF_SIGNED_CERTIFICATE\"\
+    \ or \n      re.regex($e.security_result.summary, `(?i)(self.?signed|untrusted|invalid.?cert)`)\n    not re.regex($e.target.hostname, `(?i)(cloudfront|fastly|akamai|cloudflare|cdn)`)\n\
+    \    not net.ip_in_range_cidr($e.target.ip, \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($e.target.ip, \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($e.target.ip,\
+    \ \"192.168.0.0/16\")\n    $e.principal.hostname = $host\n    $e.target.ip = $ip\n\n  match:\n    $host, $ip over 10m\n\n  outcome:\n    $risk_score\
+    \ = 85\n    $session_count = count_distinct($e.network.session_id)\n    $connection_count = count($e.metadata.id)\n\n  condition:\n    #e\
+    \ >= 4 and $connection_count >= 4\n}\n"
+  esql: "FROM logs-network* \n| WHERE @timestamp > NOW() - 1 hour \n  AND network.direction == \"outbound\" \n  AND network.protocol == \"tls\"\
+    \ \n  AND tls.server.x509.issuer.common_name == tls.server.x509.subject.common_name\n  AND destination.ip NOT RLIKE \"^(104\\\\.16\\\\.|104\\\
+    \\.17\\\\.|172\\\\.(1[6-9]|2[0-9]|3[01])\\\\.|10\\\\.|192\\\\.168\\\\.)\"\n  AND NOT (tls.server.x509.subject.common_name LIKE \"*cloudflare*\"\
+    \ OR tls.server.x509.subject.common_name LIKE \"*akamai*\" OR tls.server.x509.subject.common_name LIKE \"*fastly*\" OR tls.server.x509.subject.common_name\
+    \ LIKE \"*amazonaws*\" OR tls.server.x509.subject.common_name LIKE \"*azure*\" OR tls.server.x509.subject.common_name LIKE \"*google*\")\n\
+    | EVAL beacon_window = BUCKET(@timestamp, 30 seconds)\n| STATS session_count = COUNT(*), unique_windows = COUNT_DISTINCT(beacon_window), earliest\
+    \ = MIN(@timestamp), latest = MAX(@timestamp) BY source.ip, destination.ip, destination.port, tls.server.x509.subject.common_name\n| EVAL\
+    \ duration_seconds = (latest - earliest) / 1000\n| WHERE session_count >= 4 \n  AND duration_seconds >= 90 \n  AND duration_seconds <= 3600\n\
+    \  AND (session_count / (duration_seconds / 60)) >= 0.5\n| KEEP source.ip, destination.ip, destination.port, tls.server.x509.subject.common_name,\
+    \ session_count, duration_seconds, earliest, latest\n"
+  leql: |
+    where(source_json.event_type="tls" AND source_json.tls.validation_status ICONTAINS "self signed" AND destination_address NOT ICONTAINS "cdn" AND source_json.tls.subject NOT IN ["Common Name", "localhost", "example.com"]) groupby(source_address, destination_address, source_json.tls.subject) calculate(count)
+  crowdstrike: |
+    #type=network event_simpleName=*TLS* OR event_simpleName=*SSL* OR event_simpleName=*Certificate*
+    NOT (RemoteAddressIP4=*cloudflare* OR RemoteAddressIP4=*akamai* OR RemoteAddressIP4=*fastly* OR RemoteAddressIP4=*amazonaws* OR RemoteAddressIP4=*azure* OR RemoteAddressIP4=*googleusercontent*)
+    (CertificateSelfSigned=true OR SelfSigned=true OR IsSelfSigned=true)
+    (CertificateSubject!=*cloudflare* AND CertificateSubject!=*letsencrypt* AND CertificateSubject!=*digicert* AND CertificateSubject!=*sectigo* AND CertificateSubject!=*globalsign*)
+    | groupBy([ComputerName, RemoteAddressIP4, CertificateSubject], function=count(as=sessions))
+    | sessions >= 2
+    | groupBy([ComputerName, RemoteAddressIP4, CertificateSubject], function=selectFromMax(field=@timestamp, include=[sessions]))
+    | table([ComputerName, RemoteAddressIP4, CertificateSubject, sessions, @timestamp])
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter action = "allow" and direction = "outbound" and app = "ssl"
+    | filter certificate_validation_status contains "self-signed" or certificate_validation_status contains "untrusted"
+    | filter not (dest_ip in ("", "0.0.0.0") or incidr(dest_ip, "10.0.0.0/8") or incidr(dest_ip, "172.16.0.0/12") or incidr(dest_ip, "192.168.0.0/16"))
+    | filter not (dest_hostname contains "cloudfront" or dest_hostname contains "akamai" or dest_hostname contains "fastly" or dest_hostname contains "cdn" or dest_hostname contains "cloudflare")
+    | bin _time span=30s
+    | comp count() as session_count, min(_time) as first_seen, max(_time) as last_seen by src_ip, dest_ip, dest_port, certificate_subject
+    | alter time_diff_sec = to_epoch(last_seen, "MILLIS") - to_epoch(first_seen, "MILLIS") / 1000
+    | filter session_count >= 3
+    | alter avg_interval = time_diff_sec / session_count
+    | filter avg_interval >= 30 and avg_interval <= 120
+    | filter certificate_subject ~= ".*[^a-zA-Z0-9\.\-\s].*" or certificate_subject ~= "^(localhost|test|example|server|device).*"
+    | fields src_ip, dest_ip, dest_port, certificate_subject, session_count, avg_interval, first_seen, last_seen
+  lucene: |
+    event.type:tls AND network.direction:outbound AND tls.server.x509.issuer.common_name:tls.server.x509.subject.common_name AND NOT destination.ip:(cloudflare.com OR akamai.net OR cloudfront.net OR fastly.com OR cdn77.com) AND (tls.server.x509.subject.organization_name:(*test* OR *self* OR *localhost* OR *example*) OR NOT _exists_:tls.server.x509.subject.organization_name)
+  sumo: |
+    _sourceCategory=*Network* OR _sourceCategory=*IDS* OR _sourceCategory=*Sumo* (tls OR ssl OR certificate OR cert)
+    | json field=_raw "dest_ip" as dest_ip
+    | json field=_raw "dest_port" as dest_port
+    | json field=_raw "src_ip" as src_ip
+    | json field=_raw "certificate.issuer" as issuer
+    | json field=_raw "certificate.subject" as subject
+    | json field=_raw "certificate.self_signed" as self_signed
+    | json field=_raw "tls.subject" as tls_subject
+    | json field=_raw "tls.issuer" as tls_issuer
+    | json field=_raw "ssl.issuer" as ssl_issuer
+    | json field=_raw "ssl.subject" as ssl_subject
+    | where (self_signed = "true" OR self_signed = true OR issuer = subject OR tls_issuer = tls_subject OR ssl_issuer = ssl_subject)
+    | where !(dest_ip matches "*.cloudfront.net*" OR dest_ip matches "*akamai*" OR dest_ip matches "*fastly*" OR dest_ip matches "*cdn*")
+    | where (subject matches "*localhost*" OR subject matches "*test*" OR subject matches "*admin*" OR subject matches "*temp*" OR tls_subject matches "*localhost*" OR tls_subject matches "*test*" OR tls_subject matches "*admin*" OR tls_subject matches "*temp*" OR ssl_subject matches "*localhost*" OR ssl_subject matches "*test*" OR ssl_subject matches "*admin*" OR ssl_subject matches "*temp*")
+    | sort by _messageTime asc
+    | timeslice 1s
+    | first(_messageTime) as session_time by src_ip, dest_ip, _timeslice
+    | sort by src_ip, dest_ip, session_time asc
+    | sessionize session_time, src_ip, dest_ip as session_id by src_ip, dest_ip with interval 150s
+    | session_time - lag(session_time, 1) by src_ip, dest_ip as interval_seconds
+    | where interval_seconds >= 30 AND interval_seconds <= 120
+    | count as beacon_count by src_ip, dest_ip
+    | where beacon_count >= 3
+    | fields src_ip, dest_ip, beacon_count
 pseudo_logic: Outbound TLS to non-cdn IP with self-signed cert and unusual subject, repeated session every 30–120s.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -116,7 +140,7 @@ references:
 - https://attack.mitre.org/techniques/T1573/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

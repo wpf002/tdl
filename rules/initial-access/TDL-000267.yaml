@@ -15,71 +15,65 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=azure sourcetype="azure:security:center" event_name="Access from an unusual location to a storage blob container"
+  spl: 'index=azure sourcetype="azure:security:center" event_name="Access from an unusual location to a storage blob container"
+
     | table _time, user, src, dest, storage_account, container_name, location, severity
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000267 {\n  meta:\n    author = \"TDL\"\n    description = \"Access from an unusual location to a storage blob container\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    SecurityAlert
+    | where TimeGenerated > ago(24h)
+    | where ProviderName == "Azure Security Center"
+    | where DisplayName == "Access from an unusual location to a storage blob container"
+    | project TimeGenerated, DisplayName, Description, Severity, CompromisedEntity, RemediationSteps, Entities, ExtendedProperties
+  aql: |
+    SELECT eventtime, username, sourceip, destinationip, QIDNAME(qid), CATEGORYNAME(category), LOGSOURCENAME(logsourceid)
+    FROM events
+    WHERE QIDNAME(qid) ILIKE '%Access from an unusual location to a storage blob container%'
+      AND LOGSOURCENAME(logsourceid) ILIKE '%Azure%'
+    LAST 24 HOURS
+  yara_l: |
+    rule azure_unusual_location_blob_access {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects access from an unusual location to Azure storage blob container - T1078 Initial Access"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Azure Security Center"
+        $e.metadata.product_event_type = "Access from an unusual location to a storage blob container"
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $resource
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user, $resource over 1h
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-azure.activitylogs*, logs-azure.signinlogs*, logs-azure.auditlogs*
+    | WHERE @timestamp > NOW() - 24 hour AND event.action == "Access from an unusual location to a storage blob container"
+    | KEEP @timestamp, cloud.account.id, cloud.provider, user.name, source.ip, source.geo.country_name, azure.resource.name, event.outcome, event.action
+  leql: |
+    where(source_json.EventName="Access from an unusual location to a storage blob container")
+  crowdstrike: |
+    #type=azure-security-event EventName="Access from an unusual location to a storage blob container"
+    | table([@timestamp, ComputerName, UserName, EventName, SourceIPAddress, ResourceId, Properties])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Microsoft" and cloud_provider = "Azure"
+    | filter operation_name = "Access from an unusual location to a storage blob container"
+    | fields _time, cloud_provider, vendor, operation_name, identity_name, resource_type, resource_sub_type, raw_log
+  lucene: |
+    event.name:"Access from an unusual location to a storage blob container"
+  sumo: |
+    _sourceCategory=*Azure*Security* "Access from an unusual location to a storage blob container"
+    | json field=_raw "EventName" as event_name
+    | where event_name = "Access from an unusual location to a storage blob container"
+    | fields _messageTime, _sourceHost, event_name
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +83,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Azure Security Event
 

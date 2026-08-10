@@ -15,71 +15,82 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=kubernetes sourcetype=kube:events object.kind="Event" objectRef.resource="serviceaccounts" objectRef.subResource="token" verb IN ("get", "list")
+  spl: 'index=kubernetes sourcetype=kube:events object.kind="Event" objectRef.resource="serviceaccounts" objectRef.subResource="token" verb IN
+    ("get", "list")
+
     | table _time, user.username, objectRef.namespace, objectRef.name, verb, sourceIPs{}, userAgent
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000577 {\n  meta:\n    author = \"TDL\"\n    description = \"Kubernetes Service Account Token File Accessed\"\n   \
-    \ severity = \"MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1528\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    KubernetesEvents
+    | where TimeGenerated > ago(1h)
+    | where ObjectKind =~ "serviceaccounts"
+    | where ObjectSubresource =~ "token"
+    | where Verb in~ ("get", "list")
+    | project TimeGenerated, Namespace, ObjectName, ObjectKind, ObjectSubresource, Verb, User, SourceIPs, UserAgent, ResponseStatus
+  aql: |
+    SELECT eventtime, username, sourceip, "Resource", "Subresource", "Verb", LOGSOURCENAME(logsourceid) AS source
+    FROM events
+    WHERE "Resource" = 'serviceaccounts'
+      AND "Subresource" = 'token'
+      AND "Verb" IN ('get', 'list')
+    LAST 24 HOURS
+  yara_l: |
+    rule kubernetes_serviceaccount_token_access {
+      meta:
+        author = "Detection Engineering"
+        description = "Detects access to Kubernetes service account tokens via API (T1528)"
+        mitre_attack_tactic = "Credential Access"
+        mitre_attack_technique = "T1528"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Kubernetes"
+        $e.metadata.event_type = "RESOURCE_READ"
+        $e.target.resource.name = "serviceaccounts"
+        $e.target.resource.attribute.labels.value = "token"
+        (
+          $e.security_result.action = "get" or
+          $e.security_result.action = "list"
+        )
+        $e.principal.user.userid = $user
+        $e.target.resource.name = $resource
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-kubernetes.audit*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND kubernetes.audit.objectRef.resource == "serviceaccounts"
+      AND kubernetes.audit.objectRef.subresource == "token"
+      AND kubernetes.audit.verb IN ("get", "list")
+    | KEEP @timestamp, kubernetes.audit.user.username, kubernetes.audit.verb, kubernetes.audit.objectRef.namespace, kubernetes.audit.objectRef.name, kubernetes.audit.sourceIPs, kubernetes.audit.userAgent
+  leql: |
+    where(source_json.objectRef.resource="serviceaccounts" AND source_json.objectRef.subresource="token" AND source_json.verb IN ["get", "list"])
+  crowdstrike: |
+    #type=kubernetes event.resource="serviceaccounts" event.subresource="token" (event.verb="get" OR event.verb="list")
+    | table([@timestamp, event.verb, event.resource, event.subresource, event.user.username, event.sourceIPs, event.objectRef.name, event.objectRef.namespace])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter json_extract_scalar(resource, "$.type") = "serviceaccounts"
+      and json_extract_scalar(request, "$.subresource") = "token"
+      and json_extract_scalar(request, "$.verb") in ("get", "list")
+    | fields _time, actor_user, resource, request
+  lucene: |
+    resource:"serviceaccounts" AND subresource:"token" AND verb:("get" OR "list")
+  sumo: |
+    _sourceCategory=*Kubernetes* OR _sourceCategory=*k8s*
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "objectRef.subresource" as subresource
+    | json field=_raw "verb" as verb
+    | where resource = "serviceaccounts"
+    | where subresource = "token"
+    | where verb in ("get", "list")
+    | fields _messageTime, _sourceHost, resource, subresource, verb
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +100,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere Resource is \"serviceaccounts\"\nWhere Subresource is \"token\"\nWhere Verb is IN (\"get\", \"list\"\
   )"

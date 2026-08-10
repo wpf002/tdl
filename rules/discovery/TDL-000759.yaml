@@ -26,71 +26,67 @@ queries:
     , \"*\\\\gdb\", \"*\\\\lldb\", \"*\\\\radare2\"))\n| stats count values(api_call) as apis values(function_name) as functions values(call_name)\
     \ as calls by _time, host, ComputerName, process_name, Image, process_path, user, User\n| eval final_host=coalesce(host, ComputerName), final_process=coalesce(process_name,\
     \ Image), final_user=coalesce(user, User)\n| table _time, final_host, final_process, process_path, final_user, apis, functions, calls, count\n"
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_dis_000759 {\n  meta:\n    author = \"TDL\"\n    description = \"Process Calls IsDebuggerPresent / CheckRemoteDebuggerPresent\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0007\"\n    technique = \"T1622\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n\
-    \    $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    DeviceEvents
+    | where TimeGenerated > ago(24h)
+    | where ActionType in ("IsDebuggerPresent", "CheckRemoteDebuggerPresent", "NtQueryInformationProcess")
+    | where InitiatingProcessFileName !in~ ("devenv.exe", "msbuild.exe", "vsjitdebugger.exe", "windbg.exe", "x64dbg.exe", "x32dbg.exe", "ollydbg.exe", "ida.exe", "ida64.exe", "idag.exe", "idag64.exe", "cdb.exe", "ntsd.exe", "kd.exe", "gdb", "lldb", "python.exe", "python3.exe", "java.exe", "javaw.exe")
+    | extend DebugCheckDetails = parse_json(AdditionalFields)
+    | where DebugCheckDetails.InformationClass == "ProcessDebugPort" or ActionType in ("IsDebuggerPresent", "CheckRemoteDebuggerPresent")
+    | project TimeGenerated, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName, ActionType, DebugCheckDetails
+  aql: |
+    SELECT sourceip, "Process Name", "Process CommandLine", "Function Name", COUNT(*) AS call_count
+    FROM events
+    WHERE ("Function Name" = 'IsDebuggerPresent' OR "Function Name" = 'CheckRemoteDebuggerPresent' OR ("Function Name" = 'NtQueryInformationProcess' AND "Function Parameters" ILIKE '%ProcessDebugPort%'))
+      AND "Process Name" NOT ILIKE '%debugger%'
+      AND "Process Name" NOT ILIKE '%windbg%'
+      AND "Process Name" NOT ILIKE '%devenv%'
+      AND "Process Name" NOT ILIKE '%visual studio%'
+    GROUP BY sourceip, "Process Name", "Process CommandLine", "Function Name"
+    LAST 1 HOURS
+  yara_l: "rule debugger_detection_t1622 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects non-debugger process invoking anti-debugging\
+    \ APIs (T1622)\"\n    mitre_attack_tactic = \"Discovery\"\n    mitre_attack_technique = \"T1622\"\n    severity = \"Medium\"\n\n  events:\n\
+    \    $e.metadata.event_type = \"PROCESS_OPEN\" or\n    $e.metadata.event_type = \"PROCESS_LAUNCH\" or\n    $e.metadata.event_type = \"SYSTEM_AUDIT_LOG_UNCATEGORIZED\"\
+    \n    \n    (\n      re.regex($e.principal.process.command_line, `(?i)IsDebuggerPresent`) or\n      re.regex($e.target.process.command_line,\
+    \ `(?i)IsDebuggerPresent`) or\n      re.regex($e.principal.process.command_line, `(?i)CheckRemoteDebuggerPresent`) or\n      re.regex($e.target.process.command_line,\
+    \ `(?i)CheckRemoteDebuggerPresent`) or\n      re.regex($e.principal.process.command_line, `(?i)NtQueryInformationProcess.*ProcessDebugPort`)\
+    \ or\n      re.regex($e.target.process.command_line, `(?i)NtQueryInformationProcess.*ProcessDebugPort`)\n    )\n    \n    not re.regex($e.principal.process.file.full_path,\
+    \ `(?i)(\\\\|/)?(windbg|x64dbg|ollydbg|ida|gdb|lldb|devenv|vsjitdebugger)\\.exe$`)\n    \n    $e.principal.hostname = $host\n\n  match:\n\
+    \    $host over 5m\n\n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-endpoint.events.api*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND event.category == "api"
+      AND (
+        api.name IN ("IsDebuggerPresent", "CheckRemoteDebuggerPresent", "NtQueryInformationProcess")
+        OR (api.name == "NtQueryInformationProcess" AND api.parameters LIKE "*ProcessDebugPort*")
+      )
+      AND NOT process.name IN ("devenv.exe", "msbuild.exe", "vsjitdebugger.exe", "WinDbg.exe", "x64dbg.exe", "x32dbg.exe", "ida.exe", "ida64.exe", "ollydbg.exe", "gdb", "lldb", "windbg.exe")
+    | STATS call_count = COUNT(*) BY process.name, process.executable, host.name, user.name, api.name
+    | WHERE call_count > 0
+    | KEEP @timestamp, host.name, user.name, process.name, process.executable, api.name, call_count
+  leql: |
+    where(source_json.EventID=10 AND (source_json.CallTrace ICONTAINS "IsDebuggerPresent" OR source_json.CallTrace ICONTAINS "CheckRemoteDebuggerPresent" OR source_json.CallTrace ICONTAINS "NtQueryInformationProcess") AND source_json.SourceImage NOT ICONTAINS "debugger" AND source_json.SourceImage NOT ICONTAINS "devenv.exe" AND source_json.SourceImage NOT ICONTAINS "windbg.exe") groupby(source_json.SourceImage, asset) calculate(count)
+  crowdstrike: "event_simpleName=ImageHash \n(FunctionName=IsDebuggerPresent OR FunctionName=CheckRemoteDebuggerPresent OR FunctionName=NtQueryInformationProcess)\n\
+    NOT (FileName=*debugger* OR FileName=*dbg* OR ParentBaseFileName=*debugger* OR ParentBaseFileName=*dbg*)\n| table([@timestamp, ComputerName,\
+    \ UserName, FileName, ParentBaseFileName, FunctionName, CommandLine])\n"
+  xql: |
+    dataset = xdr_data
+    | filter event_type = ENUM.EVENT_TYPE_API_CALL
+    | filter action_module_process_os_pid != null
+    | filter (action_api_name in ("IsDebuggerPresent", "CheckRemoteDebuggerPresent", "NtQueryInformationProcess"))
+    | filter not (lowercase(actor_process_image_name) ~= ".*(\\\\|/)?(windbg|x64dbg|x32dbg|ollydbg|ida64|ida|gdb|lldb|devenv|msbuild|vsjitdebugger)\\.exe$")
+    | fields _time, agent_hostname, actor_process_image_name, action_api_name, actor_effective_username, action_process_image_command_line
+  lucene: |
+    (event.action:"process_api_call" OR event.category:"process" OR event.type:"info") AND (api.name:("IsDebuggerPresent" OR "CheckRemoteDebuggerPresent" OR "NtQueryInformationProcess") OR process.command_line:(*IsDebuggerPresent* OR *CheckRemoteDebuggerPresent* OR *NtQueryInformationProcess*) OR winlog.event_data.CallTrace:(*IsDebuggerPresent* OR *CheckRemoteDebuggerPresent* OR *NtQueryInformationProcess*)) AND NOT (process.name:(*debugger* OR *dbg* OR *windbg.exe* OR *x64dbg.exe* OR *x32dbg.exe* OR *ollydbg.exe* OR *immunity*.exe OR *ida*.exe OR *ghidra* OR devenv.exe OR msbuild.exe OR vsjitdebugger.exe) OR process.executable:(*debugger* OR *"Visual Studio"* OR *"\Microsoft Visual Studio\"* OR *"\JetBrains\"*))
+  sumo: |
+    _sourceCategory=*EDR* (IsDebuggerPresent OR CheckRemoteDebuggerPresent OR NtQueryInformationProcess OR ProcessDebugPort)
+    | json field=_raw "process_name" as process_name
+    | json field=_raw "api_call" as api_call
+    | json field=_raw "process_path" as process_path
+    | where (api_call matches "*IsDebuggerPresent*" OR api_call matches "*CheckRemoteDebuggerPresent*" OR (api_call matches "*NtQueryInformationProcess*" AND api_call matches "*ProcessDebugPort*"))
+    | where !(process_name matches "*debugger*" OR process_name matches "*visual studio*" OR process_name matches "*devenv*" OR process_name matches "*windbg*" OR process_name matches "*ollydbg*" OR process_name matches "*x64dbg*" OR process_name matches "*ida*" OR process_name matches "*gdb*")
+    | fields _messageTime, _sourceHost, process_name, process_path, api_call
 pseudo_logic: Non-debugger process invokes IsDebuggerPresent, CheckRemoteDebuggerPresent or NtQueryInformationProcess (ProcessDebugPort).
 false_positives:
 - Sanctioned admin or engineering activity
@@ -106,7 +102,7 @@ references:
 - https://attack.mitre.org/techniques/T1622/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the enumeration command(s) observed.'

@@ -18,68 +18,66 @@ risk_score: 55
 queries:
   spl: "index=salesforce EventType=\"PermissionSet*Add\" \n| search NOT [| inputlookup salesforce_admins.csv | fields SourceUsername] \n| table\
     \ _time, SourceUsername, EventType, TargetUsername, PermissionSetName\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    SalesforceServiceCloud
+    | where TimeGenerated > ago(24h)
+    | where EventType startswith "PermissionSet" and EventType endswith "Add"
+    | where UserId !in (
+        SalesforceServiceCloud
+        | where TimeGenerated > ago(7d)
+        | where Profile == "System Administrator" or UserRole contains "Admin"
+        | distinct UserId
+    )
+    | project TimeGenerated, UserId, Username, EventType, SourceIp, SessionKey, ClientVersion
+  aql: |
+    SELECT username AS "Source Username", QIDNAME(qid) AS "Event Type", LOGSOURCENAME(logsourceid) AS "Log Source", eventtime, sourceip
+    FROM events
+    WHERE QIDNAME(qid) ILIKE '%PermissionSet%Add%'
+      AND username NOT IN ('salesforce_admin1@example.com', 'salesforce_admin2@example.com', 'salesforce_admin3@example.com')
+    LAST 24 HOURS
+  yara_l: |
+    rule salesforce_permission_set_add_by_non_admin {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects PermissionSet add events in Salesforce by non-admin users - T1078 Initial Access"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.product_name = "Salesforce"
+        re.regex($e.metadata.product_event_type, `PermissionSet.*Add`)
+        $e.principal.user.userid = $user
+        not re.regex($e.principal.user.userid, `(?i)(admin|service_account|integration_user)`)
 
-    | where eventName matches regex ".+"
+      match:
+        $user over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000419 {\n  meta:\n    author = \"TDL\"\n    description = \"Unauthorized Permission Set Addition - Salesforce\"\n\
-    \    severity = \"MEDIUM\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-salesforce.login*, logs-salesforce.events*
+    | WHERE @timestamp > NOW() - 24 hour
+      AND event.action LIKE "PermissionSet*Add"
+      AND NOT user.name IN ("salesforce_admin1", "salesforce_admin2", "salesforce_admin3")
+    | KEEP @timestamp, user.name, event.action, source.ip, host.name
+  leql: |
+    where(source_json.event_type=/PermissionSet.*Add/) AND NOT(source_user IN ["salesforce_admin1", "salesforce_admin2", "salesforce_admin3"])
+  crowdstrike: |
+    #type=salesforce EventType=PermissionSet*Add
+    | NOT (SourceUsername IN ["admin1@example.com", "admin2@example.com", "sfadmin@example.com"])
+    | table([@timestamp, SourceUsername, EventType, TargetUsername, PermissionSetName])
+  xql: |
+    dataset = salesforce_audit_logs
+    | filter action_type ~= "PermissionSet.*Add"
+    | filter actor_user not in ("admin@salesforce.com", "salesforce_admin@company.com")
+    | fields _time, actor_user, action_type, action_target_user, agent_ip_address, action_result
+  lucene: |
+    event.type:PermissionSet.*Add AND NOT source.user.name:(admin1 OR admin2 OR admin3)
+  sumo: "_sourceCategory=*Salesforce* \n| json field=_raw \"EVENT_TYPE\" as event_type\n| json field=_raw \"USER_NAME\" as source_username\n|\
+    \ where event_type matches \"PermissionSet*Add\"\n| where !(source_username in (\"admin1@example.com\", \"admin2@example.com\", \"sfadmin@example.com\"\
+    ))\n| fields _messageTime, source_username, event_type, _sourceHost\n"
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -89,7 +87,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Salseforce Event  \nWhere the Event Type is 'PermissionSet.*Add'\nWhere the Source Username is NOT on the Salesforce Admins List"
 suppression:

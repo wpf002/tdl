@@ -17,74 +17,111 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 75
 queries:
-  spl: |
-    index=saas_audit (sourcetype=o365:management:activity OR sourcetype=gsuite:gmail:audit) (Operation="New-InboxRule" OR event.name="CREATE_RULE")
-    | eval forward_address=coalesce('Parameters{}.Value', forward_to, redirect_to)
-    | where isnotnull(forward_address) AND (match(forward_address, ".*@(?!.*(?:companyA\.com|companyB\.onmicrosoft\.com)).*") OR NOT match(forward_address, ".*@(companyA\.com|companyB\.onmicrosoft\.com)"))
+  spl: 'index=saas_audit (sourcetype=o365:management:activity OR sourcetype=gsuite:gmail:audit) (Operation="New-InboxRule" OR event.name="CREATE_RULE")
+
+    | eval forward_address=coalesce(''Parameters{}.Value'', forward_to, redirect_to)
+
+    | where isnotnull(forward_address) AND (match(forward_address, ".*@(?!.*(?:companyA\.com|companyB\.onmicrosoft\.com)).*") OR NOT match(forward_address,
+    ".*@(companyA\.com|companyB\.onmicrosoft\.com)"))
+
     | stats count values(forward_address) as forwarding_addresses values(Operation) as rule_operation by _time, user, UserId, ClientIP
+
     | table _time, user, UserId, ClientIP, forwarding_addresses, rule_operation, count
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000791 {\n  meta:\n    author = \"TDL\"\n    description = \"Mailbox Auto-Forward Rule Created to External Domain\"\
-    \n    severity = \"HIGH\"\n    tactic = \"TA0009\"\n    technique = \"T1114\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    OfficeActivity
+    | where TimeGenerated > ago(1h)
+    | where Operation in ("New-InboxRule", "Set-InboxRule")
+    | where Parameters has_any ("ForwardTo", "RedirectTo")
+    | extend ForwardingAddress = extract(@"ForwardTo["":\s]+([^"";\s]+)", 1, Parameters)
+    | extend RedirectAddress = extract(@"RedirectTo["":\s]+([^"";\s]+)", 1, Parameters)
+    | extend DestinationAddress = coalesce(ForwardingAddress, RedirectAddress)
+    | where isnotempty(DestinationAddress)
+    | extend DestinationDomain = tolower(extract(@"@([^"";\s>]+)", 1, DestinationAddress))
+    | extend UserDomain = tolower(extract(@"@(.+)$", 1, UserId))
+    | where DestinationDomain != UserDomain
+    | project TimeGenerated, UserId, Operation, DestinationAddress, DestinationDomain, ClientIP, Parameters
+  aql: |
+    SELECT username, "Operation", "Parameters", "ClientIPAddress", LOGSOURCENAME(logsourceid) AS source
+    FROM events
+    WHERE (categoryname(category) ILIKE '%Office 365%' OR categoryname(category) ILIKE '%Google Workspace%' OR categoryname(category) ILIKE '%Email%' OR categoryname(category) ILIKE '%SaaS%')
+      AND ("Operation" ILIKE '%New-InboxRule%' OR "Operation" ILIKE '%Set-InboxRule%' OR "Operation" ILIKE '%message-rule%' OR "Operation" ILIKE '%CreateRule%' OR "Operation" ILIKE '%inbox.rule%')
+      AND ("Parameters" ILIKE '%ForwardTo%' OR "Parameters" ILIKE '%RedirectTo%' OR "Parameters" ILIKE '%ForwardAsAttachmentTo%')
+      AND "Parameters" NOT ILIKE '%@yourcompany.com%'
+    LAST 24 HOURS
+  yara_l: |
+    rule email_forwarding_rule_external_domain {
+      meta:
+        author = "TDL"
+        description = "Detects creation of inbox rules that forward or redirect emails to external domains"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1114"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_event_type = /New-InboxRule|message-rule/
+        $e.metadata.vendor_name = /Microsoft|Google/
+        (
+          $e.security_result.summary = /ForwardTo/ or
+          $e.security_result.summary = /RedirectTo/ or
+          $e.target.resource.attribute.labels.value = /ForwardTo/ or
+          $e.target.resource.attribute.labels.value = /RedirectTo/
+        )
+        not re.regex($e.security_result.summary, `@(.*\.)?(company\.com|corp\.com|organization\.com)`)
+        not re.regex($e.target.resource.attribute.labels.value, `@(.*\.)?(company\.com|corp\.com|organization\.com)`)
+        $e.principal.user.userid = $user
+        $e.principal.hostname = $host
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
+      outcome:
+        $risk_score = 85
 
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-o365.audit*, logs-google_workspace.admin*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND (
+        (event.action IN ("New-InboxRule", "Set-InboxRule") AND (o365.audit.Parameters LIKE "*ForwardTo*" OR o365.audit.Parameters LIKE "*RedirectTo*"))
+        OR (event.action == "CREATE_MAIL_FILTER" AND google_workspace.admin.email.setting_name IN ("FORWARD_TO", "REDIRECT_TO"))
+      )
+    | EVAL forward_address = COALESCE(o365.audit.ForwardTo, o365.audit.RedirectTo, google_workspace.admin.new_value)
+    | WHERE forward_address IS NOT NULL
+      AND NOT forward_address LIKE "*@company.com"
+      AND NOT forward_address LIKE "*@corp.company.com"
+    | KEEP @timestamp, event.action, user.name, user.email, forward_address, host.name, source.ip
+  leql: |
+    where(source_json.Operation IN ["New-InboxRule", "Set-InboxRule"] AND (source_json.Parameters ICONTAINS "ForwardTo" OR source_json.Parameters ICONTAINS "RedirectTo") AND (source_json.Parameters NOT ICONTAINS "@yourdomain.com")) groupby(user, source_json.Parameters) calculate(count)
+  crowdstrike: |
+    (#type=saas_audit OR event_simpleName=SaasAuditEvent) (Operation=*InboxRule* OR operation=*message-rule* OR eventName=*InboxRule* OR eventName=*message-rule* OR ActivityDisplayName=*inbox*rule*)
+    | regex("(?<ForwardTo>ForwardTo|RedirectTo|forwardTo|redirectTo)", field=Parameters)
+    | regex("(?<EmailDomain>@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", field=Parameters)
+    | not (EmailDomain=*@company.com OR EmailDomain=*@corp.com OR EmailDomain=*@internal.com)
+    | table([@timestamp, UserId, UserKey, user, Operation, operation, ActivityDisplayName, ClientIP, Parameters, EmailDomain])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = ENUM.CLOUD_PROVIDER_OFFICE_365 or cloud_provider = ENUM.CLOUD_PROVIDER_GOOGLE_WORKSPACE
+    | filter (operation_name contains "New-InboxRule" or operation_name contains "MessageRule" or operation_name = "CREATE_MAIL_FILTER")
+    | filter (raw_log contains "ForwardTo" or raw_log contains "RedirectTo" or raw_log contains "forward" or raw_log contains "redirect")
+    | filter raw_log ~= "@(?!.*@(company\.com|corp\.com|internal\.local))"
+    | fields _time, cloud_provider, operation_name, actor_user, target_user, raw_log
+  lucene: |
+    (event.action:("New-InboxRule" OR "message-rule-create" OR "create-inbox-rule") OR event.category:"email-settings") AND (forwarding_address:* OR redirect_address:* OR forward_to:* OR redirect_to:* OR parameters.ForwardTo:* OR parameters.RedirectTo:* OR rule.actions.forward:* OR rule.actions.redirect:*) AND NOT (forwarding_address:*@*corporate.com OR redirect_address:*@*corporate.com OR forward_to:*@*corporate.com OR redirect_to:*@*corporate.com OR parameters.ForwardTo:*@*corporate.com OR parameters.RedirectTo:*@*corporate.com)
+  sumo: |
+    _sourceCategory=*Office365* OR _sourceCategory=*Google*Workspace* OR _sourceCategory=*M365* OR _sourceCategory=*GSuite*
+    | json field=_raw "Operation" as operation
+    | json field=_raw "Parameters" as parameters
+    | json field=_raw "UserId" as user_id
+    | json field=_raw "ClientIP" as client_ip
+    | json field=_raw "Workload" as workload
+    | where operation matches "*New-InboxRule*" OR operation matches "*message-rule*" OR operation matches "*ForwardingSmtpAddress*" OR operation = "New-InboxRule" OR operation = "Set-InboxRule" OR operation = "CreateRule" OR operation = "UpdateRule"
+    | where parameters matches "*ForwardTo*" OR parameters matches "*RedirectTo*" OR parameters matches "*ForwardingSmtpAddress*" OR parameters matches "*forwardTo*" OR parameters matches "*redirectTo*"
+    | where !(parameters matches "*@yourdomain.com*" OR parameters matches "*@yourcompany.com*" OR parameters matches "*@corp.com*")
+    | fields _messageTime, user_id, operation, parameters, client_ip, workload, _sourceHost
 pseudo_logic: New-InboxRule / message-rule creation with ForwardTo / RedirectTo to a non-corporate domain. Classic mailbox theft pattern.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -101,7 +138,7 @@ references:
 - https://attack.mitre.org/techniques/T1114/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the data being read (paths, mailbox, share, repository).'

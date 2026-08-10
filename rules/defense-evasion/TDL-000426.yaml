@@ -16,71 +16,67 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=aws sourcetype=aws:cloudtrail eventSource="guardduty.amazonaws.com" eventName="CreateIPSet"
+  spl: 'index=aws sourcetype=aws:cloudtrail eventSource="guardduty.amazonaws.com" eventName="CreateIPSet"
+
     | table _time, userIdentity.principalId, userIdentity.arn, sourceIPAddress, requestParameters.*, responseElements.*
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000426 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS GuardDuty Trusted IP Set Created\"\n    severity =\
-    \ \"MEDIUM\"\n    tactic = \"TA0005\"\n    technique = \"T1562\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSCloudTrail
+    | where TimeGenerated > ago(90d)
+    | where EventSource == "guardduty.amazonaws.com"
+    | where EventName == "CreateIPSet"
+    | project TimeGenerated, EventName, EventSource, UserIdentityArn, SourceIpAddress, UserAgent, RequestParameters, ResponseElements, AwsRegion, RecipientAccountId
+  aql: |
+    SELECT sourceip, username, QIDNAME(qid) AS event_name, eventtime, LOGSOURCENAME(logsourceid) AS log_source
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%cloudtrail%'
+      AND (qidname(qid) ILIKE '%CreateIPSet%' OR "eventName" = 'CreateIPSet')
+      AND (QIDNAME(qid) ILIKE '%guardduty%' OR "eventSource" = 'guardduty.amazonaws.com')
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_create_ipset {
+      meta:
+        author = "TDL"
+        description = "Detects creation of GuardDuty IP sets which can be used for defense evasion"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1562"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "AWS CloudTrail"
+        $e.metadata.vendor_name = "AMAZON"
+        $e.target.application = "guardduty.amazonaws.com"
+        $e.metadata.product_event_type = "CreateIPSet"
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%GuardDuty%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.cloudtrail*
+    | WHERE event.provider == "guardduty.amazonaws.com" AND event.action == "CreateIPSet"
+    | KEEP @timestamp, cloud.account.id, cloud.region, user.name, user.id, source.ip, event.action, event.outcome
+  leql: |
+    where(source_json.eventSource="guardduty.amazonaws.com" AND source_json.eventName="CreateIPSet")
+  crowdstrike: |
+    #type=cloudtrail eventSource=guardduty.amazonaws.com eventName=CreateIPSet
+    | table([@timestamp, userIdentity.principalId, userIdentity.arn, awsRegion, sourceIPAddress, requestParameters, responseElements])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "AWS" and event_type = "CreateIPSet" and action_app_id_name = "guardduty.amazonaws.com"
+    | fields _time, actor_user, action_app_id_name, event_type, action_resource_name, action_result
+  lucene: |
+    eventSource:guardduty.amazonaws.com AND eventName:CreateIPSet
+  sumo: |
+    _sourceCategory=*cloudtrail* guardduty.amazonaws.com CreateIPSet
+    | json field=_raw "eventSource" as event_source
+    | json field=_raw "eventName" as event_name
+    | where event_source = "guardduty.amazonaws.com" and event_name = "CreateIPSet"
+    | fields _messageTime, event_source, event_name, _sourceHost
 false_positives:
 - 'https://docs.aws.amazon.com/guardduty/latest/APIReference/API_CreateIPSet.html
 
@@ -91,7 +87,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 AWS CloudTrail Event
 

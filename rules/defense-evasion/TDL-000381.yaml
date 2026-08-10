@@ -16,74 +16,60 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 75
 queries:
-  spl: |
-    index=windows EventCode=4688 (Process_Name="*\\appcmd.exe" OR NewProcessName="*\\appcmd.exe") CommandLine="*set*" CommandLine="*config*" CommandLine="*section:httplogging*" CommandLine="*dontlog:true*"
+  spl: 'index=windows EventCode=4688 (Process_Name="*\\appcmd.exe" OR NewProcessName="*\\appcmd.exe") CommandLine="*set*" CommandLine="*config*"
+    CommandLine="*section:httplogging*" CommandLine="*dontlog:true*"
+
     | table _time, ComputerName, User, Process_Name, NewProcessName, CommandLine, ParentProcessName
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("appcmd.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('appcmd.exe')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000381 {\n  meta:\n    author = \"TDL\"\n    description = \"Disable Windows IIS HTTP Logging\"\n    severity = \"\
-    HIGH\"\n    tactic = \"TA0005\"\n    technique = \"T1562\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name\
-    \ = /(appcmd.exe)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name IN ("appcmd.exe")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [appcmd.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (appcmd.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("appcmd.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(appcmd.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("appcmd.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (592, 4688)
+    | where Process endswith @"\appcmd.exe"
+    | where CommandLine has_all ("set","config","section:httplogging","dontlog:true")
+    | project TimeGenerated, Computer, Account, Process, CommandLine, EventID
+  aql: |
+    SELECT eventtime, sourceip, username, "Process Name", "Process CommandLine", LOGSOURCENAME(logsourceid) AS host
+    FROM events
+    WHERE "EventID" IN ('592', '4688')
+      AND "Process Name" ILIKE '%\\appcmd.exe'
+      AND "Process CommandLine" ILIKE '%set%'
+      AND "Process CommandLine" ILIKE '%config%'
+      AND "Process CommandLine" ILIKE '%section:httplogging%'
+      AND "Process CommandLine" ILIKE '%dontlog:true%'
+    LAST 24 HOURS
+  yara_l: "rule appcmd_disable_http_logging {\n  meta:\n    author = \"TDL\"\n    description = \"Detects disabling of IIS HTTP logging via appcmd.exe\
+    \ - T1562 Defense Evasion\"\n    mitre_attack_tactic = \"Defense Evasion\"\n    mitre_attack_technique = \"T1562\"\n    severity = \"HIGH\"\
+    \n    \n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.metadata.product_event_type = \"4688\"\n    re.regex($e.principal.process.file.full_path,\
+    \ `(?i)\\\\appcmd\\.exe$`)\n    re.regex($e.principal.process.command_line, `(?i)set`)\n    re.regex($e.principal.process.command_line, `(?i)config`)\n\
+    \    re.regex($e.principal.process.command_line, `(?i)section:httplogging`)\n    re.regex($e.principal.process.command_line, `(?i)dontlog:true`)\n\
+    \    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n    \n  outcome:\n    $risk_score = 75\n    \n  condition:\n    $e\n\
+    }\n"
+  esql: "FROM logs-windows.security*, logs-system.security*, winlogbeat-*\n| WHERE winlog.event_id IN (592, 4688) \n  AND process.name LIKE \"\
+    *\\\\appcmd.exe\"\n  AND process.command_line LIKE \"*set*\"\n  AND process.command_line LIKE \"*config*\"\n  AND process.command_line LIKE\
+    \ \"*section:httplogging*\"\n  AND process.command_line LIKE \"*dontlog:true*\"\n| KEEP @timestamp, host.name, user.name, process.name, process.command_line,\
+    \ process.parent.name\n"
+  leql: |
+    where(source_json.EventID IN [592, 4688] AND process_name ENDS-WITH "\appcmd.exe" AND process_cmd_line ICONTAINS "set" AND process_cmd_line ICONTAINS "config" AND process_cmd_line ICONTAINS "section:httplogging" AND process_cmd_line ICONTAINS "dontlog:true")
+  crowdstrike: |
+    EventCode=4688 FileName=*\appcmd.exe CommandLine=*set* CommandLine=*config* CommandLine=*section:httplogging* CommandLine=*dontlog:true*
+    | table([@timestamp, ComputerName, UserName, FileName, CommandLine, ParentBaseFileName])
+  xql: "dataset = xdr_data\n| filter action_evtlog_event_id in (592, 4688)\n| filter action_process_image_name ~= \".*\\\\appcmd\\.exe$\"\n| filter\
+    \ action_process_image_command_line contains \"set\" \n  and action_process_image_command_line contains \"config\" \n  and action_process_image_command_line\
+    \ contains \"section:httplogging\" \n  and action_process_image_command_line contains \"dontlog:true\"\n| fields _time, agent_hostname, actor_effective_username,\
+    \ action_process_image_name, action_process_image_command_line\n"
+  lucene: |
+    event.code:4688 AND process.name:*\\appcmd.exe AND process.command_line:(*set* AND *config* AND *section\:httplogging* AND *dontlog\:true*)
+  sumo: |
+    _sourceCategory=*Windows* "4688"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "CommandLine" as command_line
+    | where event_id in ("592", "4688")
+    | where process_name matches "*\\appcmd.exe"
+    | where command_line matches "*set*" and command_line matches "*config*" and command_line matches "*section:httplogging*" and command_line matches "*dontlog:true*"
+    | fields _messageTime, _sourceHost, process_name, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -93,7 +79,7 @@ tags:
 - defense-evasion
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Windows Process Creation Event\nWhere the Event ID is in [592, 4688]\nWhere\n\tProcess Name ends with [\"\\appcmd.exe\"]\n\t\
   AND Command Line contains all [\"set\",\"config\",\"section:httplogging\",\"dontlog:true\"]"

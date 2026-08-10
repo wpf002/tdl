@@ -15,71 +15,69 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=guardduty sourcetype=aws:cloudwatchlogs:guardduty (type="Trojan:EC2/DGADomainRequest.B" OR type="Trojan:EC2/DGADomainRequest.C!DNS" OR type="Trojan:Runtime/DGADomainRequest.C!DNS")
+  spl: 'index=guardduty sourcetype=aws:cloudwatchlogs:guardduty (type="Trojan:EC2/DGADomainRequest.B" OR type="Trojan:EC2/DGADomainRequest.C!DNS"
+    OR type="Trojan:Runtime/DGADomainRequest.C!DNS")
+
     | table _time, accountId, region, type, resource.instanceDetails.instanceId, severity, title, description
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex "GuardDuty"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_c2_000339 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS DNS Request to DGA Domain - GuardDuty\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0011\"\n    technique = \"T1568\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where Title in ("Trojan:EC2/DGADomainRequest.B", "Trojan:EC2/DGADomainRequest.C!DNS", "Trojan:Runtime/DGADomainRequest.C!DNS")
+    | project TimeGenerated, Title, Description, Severity, AccountId, Region, ResourceType, InstanceId = tostring(parse_json(Resource).InstanceDetails.InstanceId), InstanceType = tostring(parse_json(Resource).InstanceDetails.InstanceType)
+  aql: |
+    SELECT QIDNAME(qid) AS event_name, sourceip, destinationip, username, LOGSOURCENAME(logsourceid) AS log_source, "findingType" AS finding_type, "instanceId" AS instance_id, "resourceType" AS resource_type, COUNT(*) AS event_count
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%guardduty%'
+      AND ("findingType" IN ('Trojan:EC2/DGADomainRequest.B', 'Trojan:EC2/DGADomainRequest.C!DNS', 'Trojan:Runtime/DGADomainRequest.C!DNS')
+           OR "findingType" ILIKE '%DGADomainRequest%')
+    GROUP BY QIDNAME(qid), sourceip, destinationip, username, LOGSOURCENAME(logsourceid), "findingType", "instanceId", "resourceType"
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_dga_domain_requests {
+      meta:
+        author = "TDL"
+        description = "Detects DGA domain requests via AWS GuardDuty findings - T1568"
+        mitre_attack_tactic = "Command and Control"
+        mitre_attack_technique = "T1568"
+        severity = "HIGH"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Amazon GuardDuty"
+        (
+          $e.metadata.product_event_type = "Trojan:EC2/DGADomainRequest.B" or
+          $e.metadata.product_event_type = "Trojan:EC2/DGADomainRequest.C!DNS" or
+          $e.metadata.product_event_type = "Trojan:Runtime/DGADomainRequest.C!DNS"
+        )
+        $e.principal.hostname = $host
 
-    | WHERE eventName LIKE "%GuardDuty%"
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-aws.guardduty*\n| WHERE @timestamp > NOW() - 24 hour \n  AND event.type IN (\"Trojan:EC2/DGADomainRequest.B\", \"Trojan:EC2/DGADomainRequest.C!DNS\"\
+    , \"Trojan:Runtime/DGADomainRequest.C!DNS\")\n| KEEP @timestamp, cloud.account.id, cloud.instance.id, event.type, event.severity, source.ip,\
+    \ destination.domain, event.id\n"
+  leql: |
+    where(source_json.type IN ["Trojan:EC2/DGADomainRequest.B", "Trojan:EC2/DGADomainRequest.C!DNS", "Trojan:Runtime/DGADomainRequest.C!DNS"])
+  crowdstrike: "#repo=* #type=guardduty event_simpleName=GuardDutyFinding \n(detail.type=\"Trojan:EC2/DGADomainRequest.B\" OR detail.type=\"Trojan:EC2/DGADomainRequest.C!DNS\"\
+    \ OR detail.type=\"Trojan:Runtime/DGADomainRequest.C!DNS\")\n| table([@timestamp, detail.type, detail.resource.instanceDetails.instanceId,\
+    \ detail.severity, detail.title, detail.description])\n"
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and vendor_name = "Amazon" and event_source = "guardduty.amazonaws.com"
+    | filter json_extract_scalar(raw_log, "$.type") in ("Trojan:EC2/DGADomainRequest.B", "Trojan:EC2/DGADomainRequest.C!DNS", "Trojan:Runtime/DGADomainRequest.C!DNS")
+    | fields _time, cloud_provider, resource_name, resource_type, json_extract_scalar(raw_log, "$.type") as finding_type, json_extract_scalar(raw_log, "$.severity") as severity, json_extract_scalar(raw_log, "$.title") as title, json_extract_scalar(raw_log, "$.description") as description
+  lucene: |
+    event.type:"guardduty" AND (finding.type:"Trojan:EC2/DGADomainRequest.B" OR finding.type:"Trojan:EC2/DGADomainRequest.C!DNS" OR finding.type:"Trojan:Runtime/DGADomainRequest.C!DNS")
+  sumo: |
+    _sourceCategory=*guardduty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("Trojan:EC2/DGADomainRequest.B", "Trojan:EC2/DGADomainRequest.C!DNS", "Trojan:Runtime/DGADomainRequest.C!DNS")
+    | fields _messageTime, event_type, _sourceHost
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -89,7 +87,7 @@ tags:
 - command-and-control
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"Trojan:EC2/DGADomainRequest.B\", \"Trojan:EC2/DGADomainRequest.C!DNS\", Trojan:Runtime/DGADomainRequest.C!DNS]"
 suppression:

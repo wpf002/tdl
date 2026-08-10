@@ -18,74 +18,88 @@ fidelity: Low
 lifecycle: Proposed
 risk_score: 30
 queries:
-  spl: |
-    index=windows (EventCode=592 OR EventCode=4688 OR (ParentImage="*\\wmiprvse.exe" AND Image="*\\wsmprovhost.exe")) NOT (Image="*\\DismHost.exe" CommandLine="C:\\Windows\\Temp\\*") | table _time, ComputerName, EventCode, ParentImage, Image, CommandLine, User
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name in ("wmiprvse.exe", "wsmprovhost.exe", "DismHost.exe")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
+  spl: 'index=windows (EventCode=592 OR EventCode=4688 OR (ParentImage="*\\wmiprvse.exe" AND Image="*\\wsmprovhost.exe")) NOT (Image="*\\DismHost.exe"
+    CommandLine="C:\\Windows\\Temp\\*") | table _time, ComputerName, EventCode, ParentImage, Image, CommandLine, User
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" IN ('wmiprvse.exe', 'wsmprovhost.exe', 'DismHost.exe')\nLAST\
-    \ 24 HOURS\n"
-  yara_l: "rule tdl_tdl_exe_000246 {\n  meta:\n    author = \"TDL\"\n    description = \"PowerShell Remote Execution\"\n    severity = \"LOW\"\
-    \n    tactic = \"TA0002\"\n    technique = \"T1047\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.process_name = /(wmiprvse.exe|wsmprovhost.exe|DismHost.exe)/\n\
-    \    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(24h)
+    | where (EventID in (592, 4688))
+        or (ParentProcessName has "wmiprvse.exe" and NewProcessName has "wsmprovhost.exe")
+    | where not (NewProcessName has "DismHost.exe" and NewProcessName startswith "C:\\Windows\\Temp\\")
+    | project TimeGenerated, Computer, Account, EventID, Process, NewProcessName, ParentProcessName, CommandLine, ProcessId
+  aql: |
+    SELECT eventtime, sourceip, LOGSOURCENAME(logsourceid) AS host, username, "Process Name", "Process CommandLine", "Parent Process Name", "Process Path"
+    FROM events
+    WHERE (("EventID" IN ('592', '4688')) OR ("Parent Process Name" ILIKE '%wmiprvse.exe%' AND "Process Name" ILIKE '%wsmprovhost.exe%'))
+      AND NOT ("Process Name" ILIKE '%DismHost.exe%' AND "Process Path" ILIKE 'C:\Windows\Temp\%')
+    LAST 1 HOURS
+  yara_l: |
+    rule mitre_t1047_wmi_execution {
+      meta:
+        author = "TDL"
+        description = "Detects WMI execution via wmiprvse.exe spawning wsmprovhost.exe or process execution events 4688/592"
+        mitre_attack_tactic = "Execution"
+        mitre_attack_technique = "T1047"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.event_type = "PROCESS_LAUNCH"
+        (
+          $e.metadata.product_event_type = "4688" or
+          $e.metadata.product_event_type = "592" or
+          (
+            re.regex($e.principal.process.file.full_path, `(?i)\\wmiprvse\.exe$`) and
+            re.regex($e.target.process.file.full_path, `(?i)\\wsmprovhost\.exe$`)
+          )
+        )
+        not (
+          re.regex($e.target.process.file.full_path, `(?i)\\DismHost\.exe$`) and
+          re.regex($e.target.process.file.full_path, `(?i)^C:\\Windows\\Temp\\`)
+        )
+        $e.principal.hostname = $host
 
-    | WHERE event.category == "process" AND process_name IN ("wmiprvse.exe", "wsmprovhost.exe", "DismHost.exe")
+      match:
+        $host over 5m
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name IN [wmiprvse.exe, wsmprovhost.exe, DismHost.exe])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name IN (wmiprvse.exe, wsmprovhost.exe, DismHost.exe)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name in ("wmiprvse.exe", "wsmprovhost.exe", "DismHost.exe")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:(wmiprvse.exe OR wsmprovhost.exe OR DismHost.exe)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name IN ("wmiprvse.exe", "wsmprovhost.exe", "DismHost.exe")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-windows.sysmon_operational*, logs-system.security*, logs-endpoint.events.process*, winlogbeat-*
+    | WHERE (@timestamp > NOW() - 24 hours)
+      AND (
+        (event.code IN ("592", "4688"))
+        OR (process.parent.name == "wmiprvse.exe" AND process.name == "wsmprovhost.exe")
+      )
+      AND NOT (process.name == "DismHost.exe" AND STARTS_WITH(process.executable, "C:\\Windows\\Temp\\"))
+    | KEEP @timestamp, host.name, user.name, process.name, process.parent.name, process.command_line, process.executable, event.code
+  leql: |
+    where((source_json.EventID IN [592, 4688] AND parent_process_name=wmiprvse.exe AND process_name=wsmprovhost.exe) AND NOT (process_name=DismHost.exe AND process_path STARTS-WITH "C:\Windows\Temp\"))
+  crowdstrike: |
+    (EventCode=4688 OR EventCode=592 OR (ParentBaseFileName=wmiprvse.exe AND FileName=wsmprovhost.exe))
+    NOT (FileName=DismHost.exe AND ImageFileName=C:\\Windows\\Temp\\*)
+    | table([@timestamp, ComputerName, UserName, ParentBaseFileName, FileName, CommandLine, ImageFileName])
+  xql: |
+    dataset = xdr_data
+    | filter (action_evtlog_event_id in (592, 4688) or (actor_process_image_name ~= ".*wmiprvse\.exe$" and action_process_image_name ~= ".*wsmprovhost\.exe$"))
+    | filter not (action_process_image_name ~= ".*DismHost\.exe$" and action_process_image_path ~= "^C:\\Windows\\Temp\\.*")
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_name, action_process_image_path, action_process_image_command_line, action_evtlog_event_id
+  lucene: |
+    (event.code:(592 OR 4688) OR (process.parent.name:wmiprvse.exe AND process.name:wsmprovhost.exe)) AND NOT (process.name:DismHost.exe AND process.executable:C\:\\Windows\\Temp\\*)
+  sumo: |
+    _sourceCategory=*Windows* (("592" OR "4688") OR ("wmiprvse.exe" AND "wsmprovhost.exe"))
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "ParentProcessName" as parent_process_name
+    | json field=_raw "NewProcessName" as process_name
+    | json field=_raw "ProcessName" as process_name_alt
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "ParentImage" as parent_image
+    | json field=_raw "Image" as image
+    | where (event_id = "592" OR event_id = "4688") OR (parent_process_name matches "*wmiprvse.exe*" OR parent_image matches "*wmiprvse.exe*") AND (process_name matches "*wsmprovhost.exe*" OR process_name_alt matches "*wsmprovhost.exe*" OR image matches "*wsmprovhost.exe*")
+    | where !(process_name matches "*DismHost.exe*" AND (process_name matches "C:\\Windows\\Temp\\*" OR image matches "C:\\Windows\\Temp\\*"))
+    | fields _messageTime, _sourceHost, event_id, parent_process_name, parent_image, process_name, process_name_alt, image, command_line
 false_positives:
 - Security software
 - Authorized admin tools
@@ -95,7 +109,7 @@ tags:
 - execution
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Windows Process Execution Event\nWhere the Event ID is in [592, 4688]\nOR\n\tWhere the Parent Process Name is wmiprvse.exe\n\t\
   Where the Process Name is wsmprovhost.exe\n\nNOT (Where the Process Name is \"DismHost.exe\" AND the Process Path starts with \"C:\\Windows\\\

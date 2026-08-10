@@ -14,75 +14,85 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 90
 queries:
-  spl: |
-    index=windows sourcetype="WinEventLog:Security" (EventCode=1102 OR EventCode=104)
+  spl: 'index=windows sourcetype="WinEventLog:Security" (EventCode=1102 OR EventCode=104)
+
     | stats count values(EventCode) as EventCodes by user, IpAddress, LogonType
+
     | where count >= 1
+
     | table user, IpAddress, LogonType, EventCodes, count
-  kql: 'SecurityEvent
 
-    | where TimeGenerated > ago(1d)
+    '
+  kql: "SecurityEvent\n| where EventID == 1102\n| union (\n    Event\n    | where EventID == 104 and EventLog == \"System\"\n)\n| summarize \n\
+    \    EventCount = count(),\n    FirstSeen = min(TimeGenerated),\n    LastSeen = max(TimeGenerated),\n    Computers = make_set(Computer)\n\
+    \    by SubjectUserName, IpAddress, LogonType, EventID\n| where EventCount >= 1\n| project FirstSeen, LastSeen, EventID, SubjectUserName,\
+    \ IpAddress, LogonType, EventCount, Computers\n"
+  aql: |
+    SELECT username, sourceip, "EventID", "Logon Type", COUNT(*) AS event_count
+    FROM events
+    WHERE "EventID" IN ('1102', '104')
+    GROUP BY username, sourceip, "EventID", "Logon Type"
+    HAVING event_count >= 1
+    LAST 24 HOURS
+  yara_l: |
+    rule windows_event_log_cleared {
+      meta:
+        author = "TDL"
+        description = "Detects Windows Event Log clearing via event ID 1102 or 104"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1070.001"
+        severity = "HIGH"
 
+      events:
+        $e.metadata.event_type = "SYSTEM_AUDIT_LOG_WIPE"
+        (
+          $e.metadata.product_event_type = "1102" or
+          $e.metadata.product_event_type = "104"
+        )
+        $e.principal.user.userid = $user
+        $e.principal.ip = $ip
+        $e.metadata.product_event_type = $event_code
+
+      match:
+        $user, $ip, $event_code over 1h
+
+      outcome:
+        $risk_score = 85
+
+      condition:
+        #e >= 1
+    }
+  esql: |
+    FROM logs-system.security*, logs-system.system*, winlogbeat-*
+    | WHERE (event.code == "1102" OR event.code == "104")
+    | STATS event_count = COUNT(*) BY user.name, source.ip, winlog.logon.type, event.code
+    | WHERE event_count >= 1
+    | KEEP user.name, source.ip, winlog.logon.type, event.code, event_count
+  leql: |
+    where(source_json.EventID IN [1102, 104]) groupby(user, source_json.IpAddress, source_json.LogonType, source_json.EventCode) calculate(count)
+  crowdstrike: |
+    (EventCode=1102 OR EventCode=104)
+    | groupBy([User, IpAddress, LogonType, EventCode], function=count(as=event_count))
+    | event_count >= 1
+    | table([@timestamp, ComputerName, User, IpAddress, LogonType, EventCode, event_count])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (1102, 104)
+    | comp count() as event_count by actor_effective_username, action_remote_ip, action_evtlog_event_data_LogonType, action_evtlog_event_id
+    | filter event_count >= 1
+    | fields actor_effective_username, action_remote_ip, action_evtlog_event_data_LogonType, action_evtlog_event_id, event_count
+  lucene: |
+    (event.code:1102 OR event.code:104) OR (winlog.event_id:1102 OR winlog.event_id:104) OR (EventID:1102 OR EventID:104) OR (EventCode:1102 OR EventCode:104)
+  sumo: |
+    _sourceCategory=*Windows* ("1102" OR "104")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "SubjectUserName" as user
+    | json field=_raw "IpAddress" as ip_address
+    | json field=_raw "LogonType" as logon_type
     | where event_id in ("1102", "104")
-
-    | summarize Count=count() by Computer, Account, IpAddress, LogonType, EventID
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, username, hostname, \"Logon Type\" as logon_type, eventid\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ ILIKE '%Windows%'\n  AND \"event_id\" IN ('1102', '104')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_001 {\n  meta:\n    author = \"TDL\"\n    description = \"Windows Event Log Cleared\"\n    severity = \"CRITICAL\"\n\
-    \    tactic = \"TA0005\"\n    technique = \"T1070.001\"\n  events:\n    $e.metadata.event_type = \"USER_LOGIN\"\n    $e.event_id = /(1102|104)/\n\
-    \    $user = $e.target.user.userid\n  match:\n    $user over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-windows.security*,logs-system.security*
-
-    | WHERE @timestamp > NOW() - 1 day
-
-    | WHERE event.category == "authentication" AND event_id IN ("1102", "104")
-
-    | STATS count = COUNT(*) BY host.name, user.name, source.ip, winlog.event_data.LogonType, event.code
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["Active Directory", "Asset Authentication"] AND event_id IN [1102, 104])
-
-    groupby(destination_account, source_ip, asset)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName IN (UserLogon, UserLogonFailed2, AuthenticationFailedRdp) AND event_id IN (1102, 104)
-
-    | stats count as auth_events by ComputerName, UserName, RemoteIP, LogonType
-
-    | sort -auth_events
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.LOGIN AND event_id in ("1102", "104")
-
-    | comp count() as logins by agent_hostname, actor_effective_username, action_remote_ip, action_logon_type
-
-    | sort desc logins
-
-    '
-  lucene: 'event.category:"authentication" AND event_id:(1102 OR 104)
-
-    '
-  sumo: '_sourceCategory=*windows*security* OR _sourceCategory=*ad*
-
-    | parse "EventID=*\"" as event_id nodrop
-
-    | where event_id IN ("1102", "104")
-
-    | count by host, user, src_ip, logon_type, event_id
-
-    | sort by _count desc
-
-    '
+    | count as event_count by user, ip_address, logon_type, event_id
+    | where event_count >= 1
+    | fields user, ip_address, logon_type, event_id, event_count
 false_positives:
 - Authorized IT staff during maintenance
 tags:
@@ -92,7 +102,7 @@ tags:
 author: TDL
 created: '2024-01-25'
 test_method: purple_team
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'
 - Inspect the parent → child process tree, command line arguments, and code-signing status — distinguish administrative tooling from adversary

@@ -20,68 +20,69 @@ queries:
     \ OR type=\"CryptoCurrency:Runtime/BitcoinTool.B!DNS\" OR type=\"Impact:Runtime/BitcoinDomainRequest.Reputation\")\n| table _time, type, id,\
     \ resource.instanceDetails.instanceId, resource.instanceDetails.availabilityZone, resource.lambdaDetails.functionName, resource.ecsClusterDetails.name,\
     \ service.action.actionType, severity, description\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    AWSGuardDuty
+    | where TimeGenerated > ago(1h)
+    | where Type in ("CryptoCurrency:EC2/BitcoinTool.B", "CryptoCurrency:EC2/BitcoinTool.B!DNS", "Impact:EC2/BitcoinDomainRequest.Reputation", "CryptoCurrency:Lambda/BitcoinTool.B", "CryptoCurrency:Runtime/BitcoinTool.B", "CryptoCurrency:Runtime/BitcoinTool.B!DNS", "Impact:Runtime/BitcoinDomainRequest.Reputation")
+    | project TimeGenerated, Type, Title, Description, Severity, AccountId, Region, ResourceType, InstanceId = tostring(parse_json(Resource).InstanceDetails.InstanceId), AwsAccountId = tostring(parse_json(AccountId))
+  aql: |
+    SELECT QIDNAME(qid) AS event_name, sourceip, destinationip, username, LOGSOURCENAME(logsourceid) AS log_source, eventtime, "Finding Type" AS finding_type, "Resource Type" AS resource_type, "Instance ID" AS instance_id
+    FROM events
+    WHERE LOGSOURCENAME(logsourceid) ILIKE '%guardduty%'
+      AND ("Finding Type" IN ('CryptoCurrency:EC2/BitcoinTool.B', 'CryptoCurrency:EC2/BitcoinTool.B!DNS', 'Impact:EC2/BitcoinDomainRequest.Reputation', 'CryptoCurrency:Lambda/BitcoinTool.B', 'CryptoCurrency:Runtime/BitcoinTool.B', 'CryptoCurrency:Runtime/BitcoinTool.B!DNS', 'Impact:Runtime/BitcoinDomainRequest.Reputation')
+           OR QIDNAME(qid) IN ('CryptoCurrency:EC2/BitcoinTool.B', 'CryptoCurrency:EC2/BitcoinTool.B!DNS', 'Impact:EC2/BitcoinDomainRequest.Reputation', 'CryptoCurrency:Lambda/BitcoinTool.B', 'CryptoCurrency:Runtime/BitcoinTool.B', 'CryptoCurrency:Runtime/BitcoinTool.B!DNS', 'Impact:Runtime/BitcoinDomainRequest.Reputation'))
+    LAST 24 HOURS
+  yara_l: |
+    rule aws_guardduty_cryptocurrency_mining_t1496 {
+      meta:
+        author = "TDL"
+        description = "Detects AWS GuardDuty cryptocurrency mining alerts (T1496 - Resource Hijacking)"
+        mitre_attack_tactic = "Impact"
+        mitre_attack_technique = "T1496"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $e.metadata.vendor_name = "Amazon AWS"
+        $e.metadata.product_name = "Amazon GuardDuty"
+        (
+          $e.metadata.product_event_type = "CryptoCurrency:EC2/BitcoinTool.B" or
+          $e.metadata.product_event_type = "CryptoCurrency:EC2/BitcoinTool.B!DNS" or
+          $e.metadata.product_event_type = "Impact:EC2/BitcoinDomainRequest.Reputation" or
+          $e.metadata.product_event_type = "CryptoCurrency:Lambda/BitcoinTool.B" or
+          $e.metadata.product_event_type = "CryptoCurrency:Runtime/BitcoinTool.B" or
+          $e.metadata.product_event_type = "CryptoCurrency:Runtime/BitcoinTool.B!DNS" or
+          $e.metadata.product_event_type = "Impact:Runtime/BitcoinDomainRequest.Reputation"
+        )
+        $e.principal.resource.id = $resource_id
 
-    | where eventName matches regex "GuardDuty"
+      match:
+        $resource_id over 5m
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%GuardDuty%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_imp_000338 {\n  meta:\n    author = \"TDL\"\n    description = \"AWS Crypto Network Activity - GuardDuty\"\n    severity\
-    \ = \"LOW\"\n    tactic = \"TA0040\"\n    technique = \"T1496\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /GuardDuty/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%GuardDuty%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/GuardDuty/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*GuardDuty*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "GuardDuty"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*GuardDuty*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*GuardDuty*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-aws.guardduty*
+    | WHERE event.type IN ("CryptoCurrency:EC2/BitcoinTool.B", "CryptoCurrency:EC2/BitcoinTool.B!DNS", "Impact:EC2/BitcoinDomainRequest.Reputation", "CryptoCurrency:Lambda/BitcoinTool.B", "CryptoCurrency:Runtime/BitcoinTool.B", "CryptoCurrency:Runtime/BitcoinTool.B!DNS", "Impact:Runtime/BitcoinDomainRequest.Reputation")
+    | KEEP @timestamp, cloud.account.id, cloud.region, cloud.provider, event.type, event.action, event.severity, aws.guardduty.resource.resource_type, aws.guardduty.resource.instance_details.instance_id, host.name, message
+  leql: |
+    where(source_json.type IN ["CryptoCurrency:EC2/BitcoinTool.B", "CryptoCurrency:EC2/BitcoinTool.B!DNS", "Impact:EC2/BitcoinDomainRequest.Reputation", "CryptoCurrency:Lambda/BitcoinTool.B", "CryptoCurrency:Runtime/BitcoinTool.B", "CryptoCurrency:Runtime/BitcoinTool.B!DNS", "Impact:Runtime/BitcoinDomainRequest.Reputation"])
+  crowdstrike: |
+    #repo=guardduty event_simpleName=GuardDutyFinding
+    (Type="CryptoCurrency:EC2/BitcoinTool.B" OR Type="CryptoCurrency:EC2/BitcoinTool.B!DNS" OR Type="Impact:EC2/BitcoinDomainRequest.Reputation" OR Type="CryptoCurrency:Lambda/BitcoinTool.B" OR Type="CryptoCurrency:Runtime/BitcoinTool.B" OR Type="CryptoCurrency:Runtime/BitcoinTool.B!DNS" OR Type="Impact:Runtime/BitcoinDomainRequest.Reputation")
+    | table([@timestamp, AccountId, Region, Type, Severity, Resource.InstanceDetails.InstanceId, Resource.LambdaDetails.FunctionName])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "AWS" and vendor_name = "AWS" and event_type = "GuardDuty Finding"
+    | filter raw_log.detail.type in ("CryptoCurrency:EC2/BitcoinTool.B", "CryptoCurrency:EC2/BitcoinTool.B!DNS", "Impact:EC2/BitcoinDomainRequest.Reputation", "CryptoCurrency:Lambda/BitcoinTool.B", "CryptoCurrency:Runtime/BitcoinTool.B", "CryptoCurrency:Runtime/BitcoinTool.B!DNS", "Impact:Runtime/BitcoinDomainRequest.Reputation")
+    | fields _time, cloud_provider, raw_log.detail.type, raw_log.detail.severity, raw_log.detail.resource, raw_log.detail.title, raw_log.detail.description, raw_log.accountId, raw_log.region
+  lucene: |
+    event_type:("CryptoCurrency:EC2/BitcoinTool.B" OR "CryptoCurrency:EC2/BitcoinTool.B!DNS" OR "Impact:EC2/BitcoinDomainRequest.Reputation" OR "CryptoCurrency:Lambda/BitcoinTool.B" OR "CryptoCurrency:Runtime/BitcoinTool.B" OR "CryptoCurrency:Runtime/BitcoinTool.B!DNS" OR "Impact:Runtime/BitcoinDomainRequest.Reputation")
+  sumo: |
+    _sourceCategory=*guardduty* OR _sourceCategory=*GuardDuty*
+    | json field=_raw "type" as event_type
+    | where event_type in ("CryptoCurrency:EC2/BitcoinTool.B", "CryptoCurrency:EC2/BitcoinTool.B!DNS", "Impact:EC2/BitcoinDomainRequest.Reputation", "CryptoCurrency:Lambda/BitcoinTool.B", "CryptoCurrency:Runtime/BitcoinTool.B", "CryptoCurrency:Runtime/BitcoinTool.B!DNS", "Impact:Runtime/BitcoinDomainRequest.Reputation")
+    | fields _messageTime, event_type, _sourceHost
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -91,7 +92,7 @@ tags:
 - impact
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "1 Guard Duty Event \nWhere the Event Type is in [\"CryptoCurrency:EC2/BitcoinTool.B\", \"CryptoCurrency:EC2/BitcoinTool.B!DNS\"\
   , \"Impact:EC2/BitcoinDomainRequest.Reputation\",\"CryptoCurrency:Lambda/BitcoinTool.B\",\"CryptoCurrency:Runtime/BitcoinTool.B\",\"CryptoCurrency:Runtime/BitcoinTool.B!DNS\"\

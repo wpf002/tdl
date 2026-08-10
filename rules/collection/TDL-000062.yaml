@@ -20,68 +20,91 @@ queries:
     \ dc(ObjectId) as distinct_files values(ObjectId) as file_list by _time, UserId\n| where distinct_files >= 20\n| join type=outer UserId \n\
     \    [search index=mcas sourcetype=\"ms:cloudappsecurity\" Operation=\"AlertTriggered\" alert_name=\"Mass download by a single user\"\n  \
     \  | rename user as UserId]\n| table _time, UserId, distinct_files, file_list\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    let SharePointDownloads = OfficeActivity
+    | where TimeGenerated > ago(10m)
+    | where Operation == "FileDownloaded"
+    | where OfficeWorkload == "SharePoint"
+    | summarize DistinctFiles = dcount(OfficeObjectId), FileNames = make_set(OfficeObjectId) by bin(TimeGenerated, 10m), UserId
+    | where DistinctFiles >= 20;
+    let MCASAlerts = SecurityAlert
+    | where TimeGenerated > ago(10m)
+    | where AlertName == "Mass download by a single user"
+    | where ProviderName == "MCAS"
+    | extend UserId = tostring(parse_json(Entities)[0].Name);
+    SharePointDownloads
+    | join kind=inner (MCASAlerts) on UserId
+    | project TimeGenerated, UserId, DistinctFiles, FileNames, AlertName, AlertSeverity, ProviderName
+  aql: "SELECT username, COUNT(*) AS total_downloads, UNIQUECOUNT(\"FileName\") AS distinct_files\nFROM events\nWHERE \"Operation\" = 'FileDownloaded'\
+    \ \n  AND \"Workload\" = 'Sharepoint'\nGROUP BY username\nHAVING distinct_files >= 20\nLAST 10 MINUTES\n"
+  yara_l: |
+    rule sharepoint_mass_download_collection {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects mass file downloads from SharePoint indicative of data collection (T1213)"
+        mitre_attack_tactic = "Collection"
+        mitre_attack_technique = "T1213"
+        severity = "Medium"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $download.metadata.product_name = "Microsoft 365"
+        $download.metadata.product_event_type = "FileDownloaded"
+        $download.metadata.vendor_name = "Microsoft"
+        $download.target.application = "SharePoint"
+        $download.target.file.full_path = $filename
+        $download.principal.user.userid = $user
 
-    | where eventName matches regex "FileDownloaded"
+        $alert.metadata.product_name = "Microsoft Cloud App Security"
+        $alert.metadata.product_event_type = "AlertTriggered"
+        $alert.security_result.summary = "Mass download by a single user"
+        $alert.principal.user.userid = $user
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+      match:
+        $user over 10m
 
-    | order by Count desc
+      outcome:
+        $risk_score = 65
+        $distinct_files = count_distinct($download.target.file.full_path)
+        $total_downloads = count($download.metadata.id)
 
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%FileDownloaded%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_col_000062 {\n  meta:\n    author = \"TDL\"\n    description = \"Mass File Download\"\n    severity = \"LOW\"\n    tactic\
-    \ = \"TA0009\"\n    technique = \"T1213\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName = /FileDownloaded/\n\
-    \    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%FileDownloaded%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/FileDownloaded/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*FileDownloaded*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= "FileDownloaded"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*FileDownloaded*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*FileDownloaded*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        #download >= 20 or #alert >= 1
+    }
+  esql: "FROM logs-o365.audit*\n| WHERE @timestamp > NOW() - 10 minutes \n  AND event.action == \"FileDownloaded\" \n  AND o365.audit.Workload\
+    \ == \"SharePoint\"\n| STATS \n    distinct_files = COUNT_DISTINCT(file.name),\n    total_downloads = COUNT(*)\n  BY user.name, bucket = BUCKET(@timestamp,\
+    \ 10 minutes)\n| WHERE distinct_files >= 20\n| KEEP bucket, user.name, distinct_files, total_downloads\n"
+  leql: |
+    where(source_json.Workload="SharePoint" AND source_json.Operation="FileDownloaded") groupby(source_json.UserId) calculate(unique:source_json.ObjectId)
+  crowdstrike: |
+    event_platform=Win AND event_simpleName=*SharePoint* Operation=FileDownloaded Workload=SharePoint
+    | bucket(span=10m, field=@timestamp, as=timeWindow)
+    | groupBy([timeWindow, UserId], function=[count(ObjectId, distinct=true, as=distinctFiles), count(as=totalEvents)])
+    | distinctFiles >= 20
+    | table([timeWindow, UserId, distinctFiles, totalEvents])
+  xql: |
+    dataset = msft_365_management_activity_raw
+    | filter Operation = "FileDownloaded" and Workload = "SharePoint"
+    | bin _time span=10m
+    | comp count_distinct(ObjectId) as distinct_files by _time, UserId
+    | filter distinct_files >= 20
+    | fields _time, UserId, distinct_files
+  lucene: |
+    (Workload:SharePoint AND Operation:FileDownloaded) OR (Operation:AlertTriggered AND alert.name:"Mass download by a single user")
+  sumo: |
+    _sourceCategory=*SharePoint* OR _sourceCategory=*CloudAppSecurity*
+    | json field=_raw "Operation" as operation
+    | json field=_raw "Workload" as workload
+    | json field=_raw "UserId" as user_id
+    | json field=_raw "SourceFileName" as file_name
+    | json field=_raw "AlertName" as alert_name
+    | where (operation = "FileDownloaded" and workload = "SharePoint") or (operation = "AlertTriggered" and alert_name = "Mass download by a single user")
+    | if(operation = "FileDownloaded", 1, 0) as is_download
+    | if(operation = "AlertTriggered", 1, 0) as is_alert
+    | timeslice 10m
+    | where is_download = 1
+    | count_distinct(file_name) as distinct_files by _timeslice, user_id
+    | where distinct_files >= 20
+    | fields _timeslice, user_id, distinct_files
 false_positives:
 - Authorized scanners
 - Monitoring agents
@@ -91,7 +114,7 @@ tags:
 - collection
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: "20 Sharepoint Events\nWhere the Operation is \"FileDownloaded\"\nWhere the workload is \"Sharepoint\"\nWith distinct File Names\n\
   With the same Source Username \nWithin 10 minutes\n\n---------------------------------------------------------------------------------------------------------------\n\

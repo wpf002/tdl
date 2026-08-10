@@ -13,78 +13,112 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 90
 queries:
-  spl: |
-    index=endpoint sourcetype=Sysmon (EventCode=19 OR EventCode=20 OR EventCode=21)
+  spl: 'index=endpoint sourcetype=Sysmon (EventCode=19 OR EventCode=20 OR EventCode=21)
+
     | regex Image="*.+*"
-    | search NOT (Image="*\\ccmexec.exe" OR Image="*\\CcmExec.exe" OR ParentImage="*\\ccmexec.exe" OR ParentImage="*\\CcmExec.exe" OR Image="*\\HealthService.exe" OR ParentImage="*\\HealthService.exe")
+
+    | search NOT (Image="*\\ccmexec.exe" OR Image="*\\CcmExec.exe" OR ParentImage="*\\ccmexec.exe" OR ParentImage="*\\CcmExec.exe" OR Image="*\\HealthService.exe"
+    OR ParentImage="*\\HealthService.exe")
+
     | stats values(ComputerName) as hosts, values(User) as users, count by Image, ParentImage, CommandLine
+
     | rename Image as process_name, ParentImage as parent_process_name, CommandLine as command_line
+
     | table _time, process_name, parent_process_name, command_line, hosts, users, count
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_per_004 {\n  meta:\n    author = \"TDL\"\n    description = \"WMI Event Subscription Created for Persistence\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0003\"\n    technique = \"T1546.003\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n   \
-    \ $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
+  kql: |
+    Event
+    | where TimeGenerated > ago(90d)
+    | where Source == "Microsoft-Windows-Sysmon" and EventID in (19, 20, 21)
+    | extend EventData = parse_xml(EventData)
+    | extend ProcessName = tostring(EventData.DataItem.EventData.Data[4]["#text"])
+    | extend ParentProcessName = tostring(EventData.DataItem.EventData.Data[20]["#text"])
+    | extend CommandLine = tostring(EventData.DataItem.EventData.Data[10]["#text"])
+    | extend User = tostring(EventData.DataItem.EventData.Data[3]["#text"])
+    | where ProcessName matches regex ".+.+"
+    | where ProcessName !has_any ("ccmexec.exe", "CcmExec.exe", "SMS_", "smswd.exe", "CmRcService.exe")
+    | summarize Hosts = make_set(Computer), Users = make_set(User), Count = count() by ProcessName, ParentProcessName, CommandLine
+    | project ProcessName, ParentProcessName, CommandLine, Hosts, Users, Count
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, username, "Process Name" AS process_name, "Parent Process Name" AS parent_process_name, "Process CommandLine" AS command_line, "EventID", COUNT(*) AS event_count
+    FROM events
+    WHERE "EventID" IN ('19', '20', '21')
+      AND "Process Name" IS NOT NULL
+      AND "Process Name" != ''
+      AND "Process Name" NOT ILIKE '%ccmexec.exe%'
+      AND "Process Name" NOT ILIKE '%sccm%'
+      AND "Parent Process Name" NOT ILIKE '%ccmexec.exe%'
+      AND "Parent Process Name" NOT ILIKE '%sccm%'
+    GROUP BY eventtime, LOGSOURCENAME(logsourceid), username, "Process Name", "Parent Process Name", "Process CommandLine", "EventID"
+    ORDER BY eventtime DESC
+    LAST 24 HOURS
+  yara_l: |
+    rule wmi_event_subscription_persistence {
+      meta:
+        author = "Detection Engineer"
+        description = "Detects WMI Event Subscription creation (T1546.003) via Sysmon Event ID 19/20/21"
+        mitre_attack_tactic = "Persistence"
+        mitre_attack_technique = "T1546.003"
+        severity = "Medium"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_event_type = "19" or
+        $e.metadata.product_event_type = "20" or
+        $e.metadata.product_event_type = "21"
+        $e.principal.process.file.full_path = $process_name
+        $e.principal.process.parent_process.file.full_path = $parent_process_name
+        $e.principal.process.command_line = $command_line
+        $e.principal.hostname = $host
+        $e.principal.user.userid = $user
+        not re.regex($e.principal.process.file.full_path, `(?i)\\ccmexec\.exe$`)
+        not re.regex($e.principal.process.file.full_path, `(?i)\\ccmsetup\.exe$`)
+        not re.regex($e.principal.process.file.full_path, `(?i)\\sccm.*\.exe$`)
 
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
+      match:
+        $process_name, $parent_process_name, $command_line over 1h
 
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: "FROM logs-windows.sysmon_operational*\n| WHERE winlog.event_id IN (19, 20, 21)\n  AND process.name RLIKE \".+.*\"\n  AND NOT (\n    process.name\
+    \ IN (\"ccmexec.exe\", \"CcmExec.exe\", \"CCMEXEC.EXE\") \n    OR process.parent.name IN (\"ccmexec.exe\", \"CcmExec.exe\", \"CCMEXEC.EXE\"\
+    )\n    OR process.name LIKE \"*sccm*\"\n  )\n| STATS \n    hosts = VALUES(host.name),\n    users = VALUES(user.name),\n    event_count = COUNT(*)\n\
+    \  BY process.name, process.parent.name, process.command_line\n| WHERE event_count >= 1\n| KEEP process.name, process.parent.name, process.command_line,\
+    \ hosts, users, event_count\n"
+  leql: |
+    where(source_json.EventID IN [19, 20, 21]) groupby(process_name, parent_process_name, process_cmd_line, asset, user) calculate(count)
+  crowdstrike: |
+    EventCode IN [19, 20, 21]
+    | case {
+        EventCode=19 | rename("EventFilter", as=SubscriptionType);
+        EventCode=20 | rename("EventConsumer", as=SubscriptionType);
+        EventCode=21 | rename("FilterToConsumerBinding", as=SubscriptionType);
+        * | SubscriptionType:="Unknown";
+      }
+    | Image=/.+/
+    | not (Image IN [*sccm*, *ccmexec.exe, *SMS_*.exe, *wbemtest.exe] OR ParentImage IN [*sccm*, *ccmexec.exe, *SMS_*.exe])
+    | groupBy([Image, ParentImage, CommandLine], function=count(ComputerName, distinct=true, as=host_count))
+    | groupBy([Image, ParentImage, CommandLine], function=count(User, distinct=true, as=user_count))
+    | table([@timestamp, ComputerName, User, Image, ParentImage, CommandLine, EventCode, SubscriptionType, host_count, user_count])
+  xql: "dataset = xdr_data\n| filter action_evtlog_event_id in (19, 20, 21)\n| filter action_process_image_name ~= \".+.*\"\n| filter actor_process_image_name\
+    \ not in (\"ccmexec.exe\", \"CcmExec.exe\", \"SMS_EXECUTIVE.exe\", \"WmiPrvSE.exe\", \"wmiprvse.exe\") \n  and action_process_image_name not\
+    \ in (\"ccmexec.exe\", \"CcmExec.exe\", \"SMS_EXECUTIVE.exe\")\n| comp count_distinct(agent_hostname) as host_count, count_distinct(actor_effective_username)\
+    \ as user_count by action_process_image_name, actor_process_image_name, action_process_image_command_line\n| fields action_process_image_name,\
+    \ actor_process_image_name, action_process_image_command_line, host_count, user_count\n"
+  lucene: |
+    winlog.event_id:(19 OR 20 OR 21) AND NOT (process.name:(*CcmExec.exe OR *HealthService.exe OR *SCOM*.exe OR *ManagementServer.exe) OR process.parent.name:(*CcmExec.exe OR *HealthService.exe OR *SCOM*.exe OR *ManagementServer.exe))
+  sumo: |
+    _sourceCategory=*Sysmon* ("19" OR "20" OR "21")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Image" as process_name
+    | json field=_raw "ParentImage" as parent_process_name
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "Computer" as host
+    | json field=_raw "User" as user
+    | where event_id in ("19", "20", "21")
+    | where !(process_name matches "*sccm*" or process_name matches "*ccmexec.exe" or process_name matches "*CcmEval.exe")
+    | fields _messageTime, host, user, event_id, process_name, parent_process_name, command_line
 false_positives:
 - SCCM and management tools using WMI subscriptions
 tags:
@@ -94,7 +128,7 @@ tags:
 author: TDL
 created: '2024-01-22'
 test_method: purple_team
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the persistence artifact (registry path / scheduled task / service / config).'
 - Inspect the parent → child process tree, command line arguments, and code-signing status — verify the persistence target points to an unusual

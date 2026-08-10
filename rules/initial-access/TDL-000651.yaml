@@ -16,71 +16,75 @@ fidelity: Low
 lifecycle: Deployed
 risk_score: 30
 queries:
-  spl: |
-    index=azure sourcetype="azure:aad:audit" operationName="Add app role assignment to service principal" NOT (properties.targetResources{}.modifiedProperties{}.newValue="*.Read.All")
-    | table _time, properties.initiatedBy.user.userPrincipalName, properties.targetResources{}.displayName, properties.targetResources{}.modifiedProperties{}.newValue, properties.resultReason
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  spl: 'index=azure sourcetype="azure:aad:audit" operationName="Add app role assignment to service principal" NOT (properties.targetResources{}.modifiedProperties{}.newValue="*.Read.All")
 
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
+    | table _time, properties.initiatedBy.user.userPrincipalName, properties.targetResources{}.displayName, properties.targetResources{}.modifiedProperties{}.newValue,
+    properties.resultReason
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000651 {\n  meta:\n    author = \"TDL\"\n    description = \"Azure App Granted Privileged Delegated or App Permissions\"\
-    \n    severity = \"LOW\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\
-    \n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+  kql: |
+    AuditLogs
+    | where TimeGenerated > ago(24h)
+    | where OperationName == "Add app role assignment to service principal"
+    | where parse_json(TargetResources)[0].modifiedProperties !has ".Read.All"
+    | project TimeGenerated, OperationName, InitiatedBy = tostring(InitiatedBy.user.userPrincipalName), TargetResources, Result, CorrelationId
+  aql: |
+    SELECT eventtime, username, "Application Name", "Application Role", sourceip, LOGSOURCENAME(logsourceid) AS source
+    FROM events
+    WHERE "Event Name" = 'Add app role assignment to service principal'
+      AND "Application Role" NOT LIKE '%.Read.All%'
+    LAST 24 HOURS
+  yara_l: |
+    rule entra_app_role_assignment_non_read {
+      meta:
+        author = "Chronicle Detection"
+        description = "Detects app role assignments to service principals that are not Read.All permissions"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        platform = "Windows"
+        data_source = "Entra ID"
 
-    | WHERE @timestamp > NOW() - 1 hour
+      events:
+        $e.metadata.product_name = "Microsoft Azure"
+        $e.metadata.product_event_type = "Add app role assignment to service principal"
+        not re.regex($e.security_result.summary, `\.Read\.All`)
+        $e.principal.user.userid = $user
 
-    | WHERE eventName LIKE "%.+%"
+      match:
+        $user over 5m
 
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $e
+    }
+  esql: |
+    FROM logs-azure.auditlogs*
+    | WHERE azure.auditlogs.operation_name == "Add app role assignment to service principal"
+      AND NOT azure.auditlogs.properties.app_role LIKE "*.Read.All"
+    | KEEP @timestamp, azure.auditlogs.properties.target_resources, azure.auditlogs.properties.initiated_by, azure.auditlogs.properties.app_role, azure.auditlogs.operation_name
+  leql: |
+    where(source_json.operationName="Add app role assignment to service principal" AND source_json.properties.targetResources.modifiedProperties.newValue NOT ICONTAINS ".Read.All")
+  crowdstrike: |
+    #type=EntraID OperationName="Add app role assignment to service principal" NOT AppPermissions=*.Read.All
+    | table([@timestamp, ComputerName, UserName, ServicePrincipalName, AppPermissions, OperationName])
+  xql: |
+    dataset = msft_azure_ad_audit_raw
+    | filter event_name = "Add app role assignment to service principal"
+    | filter action_evtlog_message !~= ".*\\.Read\\.All.*"
+    | fields _time, actor_effective_username, action_evtlog_message, event_name, agent_hostname
+  lucene: |
+    event.action:"Add app role assignment to service principal" AND NOT app_role.value:*.Read.All
+  sumo: |
+    _sourceCategory=*Entra* OR _sourceCategory=*Azure* OR _sourceCategory=*AzureAD*
+    | json field=_raw "operationName" as operation_name
+    | json field=_raw "properties.appDisplayName" as app_name
+    | json field=_raw "properties.appRoleValue" as app_role_value
+    | json field=_raw "properties.targetResourceDisplayName" as target_resource
+    | json field=_raw "activityDisplayName" as activity_name
+    | json field=_raw "initiatedBy.user.userPrincipalName" as user_principal
+    | json field=_raw "targetResources[*].displayName" as target_display
+    | where (operation_name matches "*Add app role assignment*" or activity_name matches "*Add app role assignment to service principal*")
+    | where !(app_role_value matches "*.Read.All")
+    | fields _messageTime, user_principal, app_name, app_role_value, target_resource, target_display
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -90,7 +94,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: historical
 pseudo_logic: '1 Entra Audit Event
 

@@ -16,77 +16,90 @@ fidelity: Medium
 lifecycle: Proposed
 risk_score: 55
 queries:
-  spl: |
-    index=kubernetes sourcetype=kube:apiserver verb=list objectRef.resource=secrets responseStatus.code=2*
+  spl: 'index=kubernetes sourcetype=kube:apiserver verb=list objectRef.resource=secrets responseStatus.code=2*
+
     | bin _time span=24h
+
     | stats earliest(_time) as first_seen latest(_time) as last_seen by sourceIPs{}
+
     | where (now() - first_seen) < 2592000 AND (now() - last_seen) < 7776000 AND first_seen >= relative_time(now(), "-30d")
+
     | eval is_new=if(first_seen >= relative_time(now(), "-30d"), 1, 0)
+
     | where is_new=1
+
     | table _time, sourceIPs{}, first_seen, last_seen
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
-
-    | where TimeGenerated > ago(1d)
-
-    | where eventName matches regex ".+"
-
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
-
-    | order by Count desc
 
     '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_000568 {\n  meta:\n    author = \"TDL\"\n    description = \"First Seen Kubernetes Secrets Successsfully Listed from\
-    \ IP Address\"\n    severity = \"MEDIUM\"\n    tactic = \"TA0006\"\n    technique = \"T1552\"\n  events:\n    $e.metadata.event_type = \"\
-    USER_RESOURCE_ACCESS\"\n    $e.eventName = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n\
-    }\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+  kql: "let baseline_period = 90d;\nlet learning_period = 30d;\nlet detection_period = 1h;\nlet historical_ips = \n    KubeEvents\n    | where\
+    \ TimeGenerated between (ago(baseline_period) .. ago(learning_period))\n    | where Verb =~ \"list\"\n    | where Resource =~ \"secrets\"\n\
+    \    | where ResponseCode matches regex \"^2.*\"\n    | distinct SourceIP;\nKubeEvents\n| where TimeGenerated > ago(detection_period)\n| where\
+    \ Verb =~ \"list\"\n| where Resource =~ \"secrets\"\n| where ResponseCode matches regex \"^2.*\"\n| where SourceIP !in (historical_ips)\n\
+    | project TimeGenerated, SourceIP, Verb, Resource, ResponseCode, User, Namespace, ObjectRef, RequestURI\n"
+  aql: |
+    SELECT sourceip, COUNT(*) AS secret_list_attempts, FIRST(eventtime) AS first_seen
+    FROM events
+    WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%kubernetes%'
+      AND "Verb" = 'list'
+      AND "Resource" = 'secrets'
+      AND "Response Code" MATCHES '2.*'
+      AND sourceip NOT IN (
+        SELECT sourceip
+        FROM events
+        WHERE LOGSOURCETYPENAME(devicetype) ILIKE '%kubernetes%'
+          AND "Verb" = 'list'
+          AND "Resource" = 'secrets'
+          AND "Response Code" MATCHES '2.*'
+          AND eventtime BETWEEN (LAST 90 DAYS AND LAST 30 DAYS)
+      )
+    GROUP BY sourceip
+    LAST 90 DAYS
+  yara_l: "rule kubernetes_secret_enumeration_new_source_ip {\n  meta:\n    author = \"Detection Engineering\"\n    description = \"Detects Kubernetes\
+    \ secret enumeration from new source IP addresses - MITRE T1552\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique\
+    \ = \"T1552\"\n    severity = \"Medium\"\n    \n  events:\n    $e.metadata.event_type = \"RESOURCE_READ\"\n    $e.metadata.product_name =\
+    \ \"Kubernetes\"\n    $e.target.resource.name = \"secrets\"\n    $e.security_result.action = \"ALLOW\"\n    re.regex($e.security_result.detection_fields[\"\
+    verb\"], `list`)\n    re.regex($e.security_result.summary, `2\\d{2}`)\n    $e.principal.ip = $source_ip\n    \n  match:\n    $source_ip over\
+    \ 1h\n    \n  outcome:\n    $risk_score = 50\n    $first_seen_time = min($e.metadata.event_timestamp.seconds)\n    \n  condition:\n    $e\
+    \ and #source_ip == 1\n}\n"
+  esql: |
+    FROM logs-kubernetes.audit-*
+    | WHERE @timestamp > NOW() - 90 days
+      AND kubernetes.audit.verb == "list"
+      AND kubernetes.audit.objectRef.resource == "secrets"
+      AND kubernetes.audit.responseStatus.code RLIKE "2.*"
+    | EVAL baseline_start = NOW() - 90 days
+    | EVAL baseline_end = NOW() - 30 days
+    | EVAL is_baseline = CASE(@timestamp >= baseline_start AND @timestamp < baseline_end, 1, 0)
+    | EVAL is_recent = CASE(@timestamp >= baseline_end, 1, 0)
+    | STATS baseline_ips = COUNT_DISTINCT(source.ip) WHERE is_baseline == 1 BY source.ip,
+            recent_count = COUNT(*) WHERE is_recent == 1 BY source.ip
+    | WHERE recent_count > 0 AND baseline_ips == 0
+    | KEEP source.ip, recent_count
+  leql: |
+    where(source_json.verb="list" AND source_json.objectRef.resource="secrets" AND source_json.responseStatus.code=/^2.*/) groupby(source_address) calculate(count)
+  crowdstrike: |
+    #type=k8s* verb=list objectRef.resource=secrets responseStatus.code=/^2.*/
+    | groupBy([sourceIPs], function=count(as=eventCount))
+    | selfJoinFilter(field=[sourceIPs], where=[{eventCount=0}], window=30d, prefilter=true)
+  xql: |
+    dataset = cloud_audit_logs
+    | filter cloud_provider = "KUBERNETES" and operation_name_orig = "list" and resource_type = "secrets" and http_status_code ~= "2.*"
+    | alter baseline_end = timestamp_diff(_time, current_time(), "DAY")
+    | filter baseline_end <= 90
+    | comp count_distinct(_time) as days_seen by source_ip
+    | alter first_seen_day = baseline_end
+    | filter first_seen_day <= 30 and days_seen = 1
+    | fields _time, source_ip, user_name, resource_type, operation_name_orig, http_status_code
+  lucene: |
+    verb:"list" AND resource:"secrets" AND responseCode:/2.*/
+  sumo: |
+    _sourceCategory=*kubernetes* OR _sourceCategory=*k8s*
+    | json field=_raw "verb" as verb
+    | json field=_raw "objectRef.resource" as resource
+    | json field=_raw "responseStatus.code" as response_code
+    | json field=_raw "sourceIPs[0]" as source_ip
+    | where verb = "list" and resource = "secrets" and response_code matches "2.*"
+    | fields _messageTime, source_ip, verb, resource, response_code
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -96,7 +109,7 @@ tags:
 - credential-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: "1 Kubernetes Event \nWhere Verb is \"list\"\nWhere Resource is \"secrets\"\nWhere the Response Code matches \"2.*\"\n\nBaseline\
   \ Learning: 30 Days\nRetention: 90 Days\n\nNew Value: Source IP"

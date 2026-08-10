@@ -13,73 +13,101 @@ fidelity: High
 lifecycle: Deployed
 risk_score: 95
 queries:
-  spl: |
-    index=endpoint sourcetype=Sysmon EventCode=10 TargetImage="*\\lsass.exe" NOT (SourceImage="*\\MsMpEng.exe" OR SourceImage="*\\SenseIR.exe" OR SourceImage="*\\SenseCncProxy.exe" OR SourceImage="*\\NisSrv.exe" OR SourceImage="*\\CcSvcHst.exe" OR SourceImage="*\\CSFalconService.exe" OR SourceImage="*\\tanium*.exe" OR SourceImage="*\\CB.exe" OR SourceImage="*\\RepMgr*.exe" OR SourceImage="*\\AvastSvc.exe" OR SourceImage="*\\MBAMService.exe" OR SourceImage="*\\SentinelAgent.exe" OR SourceImage="*\\SentinelStaticEngine.exe" OR SourceImage="*\\SentinelServiceHost.exe" OR SourceImage="*\\SentinelHelperService.exe" OR SourceImage="*\\WerFault.exe" OR SourceImage="*\\WerFaultSecure.exe") | eval process_name=SourceImage, parent_process_name=ParentImage, command_line=CommandLine, host=ComputerName, user=SourceUser | stats count values(parent_process_name) as parent_process_name values(command_line) as command_line values(user) as user earliest(_time) as first_time latest(_time) as last_time by process_name, host | where count >= 1 | table first_time, last_time, host, process_name, parent_process_name, command_line, user, count
-  kql: 'DeviceProcessEvents
-
-    | where TimeGenerated > ago(1d)
-
-    | where process_name matches regex ".+"
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
+  spl: 'index=endpoint sourcetype=Sysmon EventCode=10 TargetImage="*\\lsass.exe" NOT (SourceImage="*\\MsMpEng.exe" OR SourceImage="*\\SenseIR.exe"
+    OR SourceImage="*\\SenseCncProxy.exe" OR SourceImage="*\\NisSrv.exe" OR SourceImage="*\\CcSvcHst.exe" OR SourceImage="*\\CSFalconService.exe"
+    OR SourceImage="*\\tanium*.exe" OR SourceImage="*\\CB.exe" OR SourceImage="*\\RepMgr*.exe" OR SourceImage="*\\AvastSvc.exe" OR SourceImage="*\\MBAMService.exe"
+    OR SourceImage="*\\SentinelAgent.exe" OR SourceImage="*\\SentinelStaticEngine.exe" OR SourceImage="*\\SentinelServiceHost.exe" OR SourceImage="*\\SentinelHelperService.exe"
+    OR SourceImage="*\\WerFault.exe" OR SourceImage="*\\WerFaultSecure.exe") | eval process_name=SourceImage, parent_process_name=ParentImage,
+    command_line=CommandLine, host=ComputerName, user=SourceUser | stats count values(parent_process_name) as parent_process_name values(command_line)
+    as command_line values(user) as user earliest(_time) as first_time latest(_time) as last_time by process_name, host | where count >= 1 | table
+    first_time, last_time, host, process_name, parent_process_name, command_line, user, count
 
     '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"process_name\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_ca_001 {\n  meta:\n    author = \"TDL\"\n    description = \"LSASS Memory Access by Non-System Process\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0006\"\n    technique = \"T1003.001\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n   \
-    \ $e.process_name = /.+/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND process_name LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND process_name=/.+/)
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND process_name=*.+*
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND process_name ~= ".+"
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND process_name:*.+*
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND process_name matches "*.+*"
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+  kql: |
+    Event
+    | where TimeGenerated > ago(1h)
+    | where Source == "Microsoft-Windows-Sysmon" and EventID == 10
+    | extend TargetImage = tostring(EventData.TargetImage)
+    | extend SourceImage = tostring(EventData.SourceImage)
+    | extend SourceProcessId = tostring(EventData.SourceProcessId)
+    | extend GrantedAccess = tostring(EventData.GrantedAccess)
+    | extend CallTrace = tostring(EventData.CallTrace)
+    | extend SourceUser = tostring(EventData.SourceUser)
+    | where TargetImage has "lsass.exe"
+    | where SourceImage !has_any ("MsMpEng.exe", "MsSense.exe", "SenseIR.exe", "SenseCncProxy.exe", "SenseNdr.exe", "WerFault.exe", "WerFaultSecure.exe", "wininit.exe", "csrss.exe", "services.exe", "winlogon.exe", "svchost.exe", "lsaiso.exe", "taskhostw.exe", "vmtoolsd.exe", "CylanceSvc.exe", "cb.exe", "RepMgr.exe", "TmListen.exe", "NisSrv.exe", "avp.exe", "kavtray.exe", "bdagent.exe", "AvastSvc.exe", "AVGUI.exe", "fortiedr.exe")
+    | extend process_name = tostring(split(SourceImage, "\\")[-1])
+    | extend parent_process_name = tostring(EventData.ParentImage)
+    | extend command_line = tostring(EventData.CommandLine)
+    | project TimeGenerated, Computer, SourceUser, process_name, parent_process_name, command_line, SourceImage, TargetImage, GrantedAccess, CallTrace
+  aql: "SELECT \n    LOGSOURCENAME(logsourceid) AS host,\n    username AS user,\n    \"Process Name\" AS process_name,\n    \"Parent Process Name\"\
+    \ AS parent_process_name,\n    \"Process CommandLine\" AS command_line,\n    sourceip,\n    eventtime,\n    COUNT(*) AS access_count\nFROM\
+    \ events\nWHERE \"EventID\" = '10'\n  AND \"TargetImage\" ILIKE '%lsass.exe%'\n  AND \"Process Name\" NOT ILIKE '%MsMpEng.exe%'\n  AND \"\
+    Process Name\" NOT ILIKE '%SenseIR.exe%'\n  AND \"Process Name\" NOT ILIKE '%SenseCncProxy.exe%'\n  AND \"Process Name\" NOT ILIKE '%CrowdStrike%'\n\
+    \  AND \"Process Name\" NOT ILIKE '%WerFault.exe%'\n  AND \"Process Name\" NOT ILIKE '%Tanium%'\n  AND \"Process Name\" NOT ILIKE '%Carbon\
+    \ Black%'\n  AND \"Process Name\" NOT ILIKE '%cylance%'\nGROUP BY LOGSOURCENAME(logsourceid), username, \"Process Name\", \"Parent Process\
+    \ Name\", \"Process CommandLine\", sourceip, eventtime\nHAVING access_count >= 1\nLAST 24 HOURS\n"
+  yara_l: "rule lsass_memory_access_t1003_001 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects non-system process accessing LSASS\
+    \ memory (T1003.001 - Credential Dumping)\"\n    severity = \"CRITICAL\"\n    mitre_attack_tactic = \"Credential Access\"\n    mitre_attack_technique\
+    \ = \"T1003.001\"\n    \n  events:\n    $e.metadata.event_type = \"PROCESS_OPEN\"\n    $e.metadata.product_event_type = \"10\"\n    re.regex($e.target.process.file.full_path,\
+    \ `(?i)\\\\lsass\\.exe$`)\n    not re.regex($e.principal.process.file.full_path, `(?i)(windows defender|microsoft\\\\windows defender|mcafee|symantec|crowdstrike|sentinelone|cylance|carbon\
+    \ black|trendmicro|sophos|kaspersky|eset|avast|avg|bitdefender|malwarebytes|palo alto|fireye|werfault\\.exe|wermgr\\.exe)`)\n    $e.principal.hostname\
+    \ = $host\n    $e.principal.process.file.full_path = $process_name\n    \n  match:\n    $host, $process_name over 1h\n    \n  outcome:\n \
+    \   $risk_score = 95\n    $process_name = array_distinct($e.principal.process.file.full_path)\n    $parent_process_name = array_distinct($e.principal.process.parent_process.file.full_path)\n\
+    \    $command_line = array_distinct($e.principal.process.command_line)\n    $user = array_distinct($e.principal.user.userid)\n    \n  condition:\n\
+    \    #e >= 1\n}\n"
+  esql: |
+    FROM logs-windows.sysmon_operational*
+    | WHERE winlog.event_id == 10
+      AND TO_LOWER(winlog.event_data.TargetImage) LIKE "*lsass.exe"
+      AND NOT (
+        TO_LOWER(winlog.event_data.SourceImage) LIKE "*windows defender*"
+        OR TO_LOWER(winlog.event_data.SourceImage) LIKE "*microsoft*antimalware*"
+        OR TO_LOWER(winlog.event_data.SourceImage) LIKE "*crowdstrike*"
+        OR TO_LOWER(winlog.event_data.SourceImage) LIKE "*carbonblack*"
+        OR TO_LOWER(winlog.event_data.SourceImage) LIKE "*sentinelone*"
+        OR TO_LOWER(winlog.event_data.SourceImage) LIKE "*cylance*"
+        OR TO_LOWER(winlog.event_data.SourceImage) LIKE "*werfault.exe"
+        OR TO_LOWER(winlog.event_data.SourceImage) LIKE "*wermgr.exe"
+      )
+    | EVAL process_name = winlog.event_data.SourceImage
+    | EVAL parent_process_name = process.parent.name
+    | EVAL command_line = process.command_line
+    | KEEP @timestamp, host.name, user.name, process_name, parent_process_name, command_line, winlog.event_data.SourceImage, winlog.event_data.TargetImage
+  leql: |
+    where(source_json.EventID=10 AND source_json.TargetImage ICONTAINS "lsass.exe" AND source_json.SourceImage NOT ICONTAINS "MsMpEng.exe" AND source_json.SourceImage NOT ICONTAINS "SenseCE.exe" AND source_json.SourceImage NOT ICONTAINS "WerFault.exe" AND source_json.SourceImage NOT ICONTAINS "SenseIR.exe" AND source_json.SourceImage NOT ICONTAINS "MsSense.exe" AND source_json.SourceImage NOT ICONTAINS "CylanceSvc.exe" AND source_json.SourceImage NOT ICONTAINS "cb.exe" AND source_json.SourceImage NOT ICONTAINS "CrowdStrike" AND source_json.SourceImage NOT ICONTAINS "tanium" AND source_json.SourceImage NOT STARTS-WITH "C:\\Windows\\System32\\" AND source_json.SourceImage NOT STARTS-WITH "C:\\Windows\\SysWOW64\\")
+  crowdstrike: |
+    EventCode=10 TargetImage=*lsass.exe
+    | !match(file=SourceImage, pattern="*Windows Defender*", ignoreCase=true)
+    | !match(file=SourceImage, pattern="*MsMpEng.exe*", ignoreCase=true)
+    | !match(file=SourceImage, pattern="*SenseCE.exe*", ignoreCase=true)
+    | !match(file=SourceImage, pattern="*WerFault.exe*", ignoreCase=true)
+    | !match(file=SourceImage, pattern="*csagent.exe*", ignoreCase=true)
+    | !match(file=SourceImage, pattern="*csfalcon*", ignoreCase=true)
+    | table([@timestamp, ComputerName, User, SourceImage, TargetImage, CommandLine, SourceParentImage])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id = 10
+    | filter lowercase(action_evtlog_event_data_TargetImage) contains "lsass.exe"
+    | filter actor_process_image_name not in ("MsMpEng.exe", "SenseIR.exe", "SenseCncProxy.exe", "CSFalconService.exe", "WerFault.exe", "WerFaultSecure.exe")
+    | filter not (lowercase(actor_process_image_name) ~= ".*antivirus.*" or lowercase(actor_process_image_name) ~= ".*defender.*")
+    | fields _time, agent_hostname, actor_effective_username, actor_process_image_name, action_process_image_command_line, action_evtlog_event_data_SourceImage, action_evtlog_event_data_TargetImage, action_evtlog_event_data_GrantedAccess
+  lucene: |
+    winlog.event_id:10 AND winlog.event_data.TargetImage:*lsass.exe AND NOT (winlog.event_data.SourceImage:(*defender* OR *carbonblack* OR *crowdstrike* OR *cylance* OR *sophos* OR *trend* OR *mcafee* OR *symantec* OR *kaspersky* OR *sentinel* OR *WerFault.exe* OR *SysInspector.exe* OR *MsMpEng.exe* OR *NisSrv.exe* OR *CSFalconService.exe* OR *cb.exe*))
+  sumo: |
+    _sourceCategory=*Sysmon* "10"
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "TargetImage" as target_image
+    | json field=_raw "SourceImage" as source_image
+    | json field=_raw "ProcessId" as process_id
+    | json field=_raw "CommandLine" as command_line
+    | json field=_raw "User" as user
+    | json field=_raw "Computer" as host
+    | where event_id = "10"
+    | where target_image matches "*lsass.exe"
+    | where !(source_image matches "*Windows Defender*" or source_image matches "*MsMpEng.exe*" or source_image matches "*SenseIR.exe*" or source_image matches "*SenseNdr.exe*" or source_image matches "*SenseCncProxy.exe*" or source_image matches "*WerFault.exe*" or source_image matches "*CrowdStrike*" or source_image matches "*Carbon Black*" or source_image matches "*Cylance*" or source_image matches "*Sophos*" or source_image matches "*Symantec*" or source_image matches "*McAfee*" or source_image matches "*Trend Micro*" or source_image matches "*ESET*")
+    | parse regex field=source_image "(?:[^\\]+\\)*(?<process_name>[^\\]+)$"
+    | parse regex field=source_image "(?<parent_path>.+)\\[^\\]+$"
+    | fields _messageTime, host, user, process_name, source_image, command_line, process_id, target_image
 false_positives:
 - AV/EDR products
 - Windows Error Reporting
@@ -92,7 +120,7 @@ author: TDL
 created: '2024-02-01'
 test_method: purple_team
 simulation_id: SIM-010
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 triage_steps:
 - 'Confirm the alert metadata: timestamp, target host (LSASS / DC / KDC) or identity provider, and the source process / actor.'
 - Inspect the parent → child process tree, command line arguments, and code-signing status — verify the read / dump / brute-force pattern is consistent

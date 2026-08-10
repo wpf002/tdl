@@ -23,77 +23,81 @@ queries:
     )\n| where (protocol=\"tcp\" OR protocol=\"https\" OR protocol=\"http\" OR protocol=\"ssl\" OR protocol=\"tls\")\n| search src_category=\"\
     workstation\" OR src_type=\"workstation\" OR src IN (workstation*)\n| table _time, src_ip, src, dest_ip, dest_port, protocol, bytes_out, bytes_in,\
     \ action\n"
-  kql: 'union (DeviceNetworkEvents), (CommonSecurityLog | extend SourceIP=tostring(SourceIP), DestinationIP=tostring(DestinationIP))
-
-    | where TimeGenerated > ago(1d)
-
-    | where destination_port in ("80", "443", "8080", "8443")
-
-    | summarize Count=count(), Bytes=sum(coalesce(SentBytes, 0)) by SourceIP, DestinationIP, DestinationPort
-
-    | order by Bytes desc
-
-    '
-  aql: 'SELECT sourceip, destinationip, destinationport, SUM(eventcount) as connections, SUM(bytessrc) as bytes_out
-
+  kql: "CommonSecurityLog\n| where TimeGenerated > ago(1h)\n| where DeviceAction =~ \"Allow\" or DeviceAction =~ \"Allowed\"\n| where DestinationPort\
+    \ !in (80, 443, 8080, 8443)\n| where DestinationIP !startswith \"10.\" \n    and DestinationIP !startswith \"172.16.\" \n    and DestinationIP\
+    \ !startswith \"172.17.\" \n    and DestinationIP !startswith \"172.18.\" \n    and DestinationIP !startswith \"172.19.\" \n    and DestinationIP\
+    \ !startswith \"172.20.\" \n    and DestinationIP !startswith \"172.21.\" \n    and DestinationIP !startswith \"172.22.\" \n    and DestinationIP\
+    \ !startswith \"172.23.\" \n    and DestinationIP !startswith \"172.24.\" \n    and DestinationIP !startswith \"172.25.\" \n    and DestinationIP\
+    \ !startswith \"172.26.\" \n    and DestinationIP !startswith \"172.27.\" \n    and DestinationIP !startswith \"172.28.\" \n    and DestinationIP\
+    \ !startswith \"172.29.\" \n    and DestinationIP !startswith \"172.30.\" \n    and DestinationIP !startswith \"172.31.\" \n    and DestinationIP\
+    \ !startswith \"192.168.\"\n    and DestinationIP !startswith \"127.\"\n| where SourceHostName has_any (\"workstation\", \"desktop\", \"laptop\"\
+    , \"ws-\", \"wks-\", \"pc-\")\n    or DeviceCustomString1 has_any (\"workstation\", \"desktop\", \"laptop\", \"ws-\", \"wks-\", \"pc-\")\n\
+    | project TimeGenerated, SourceIP, SourceHostName, DestinationIP, DestinationPort, Protocol, DeviceAction, DeviceVendor, DeviceProduct\n"
+  aql: |
+    SELECT sourceip, destinationip, destinationport, protocol, COUNT(*) AS connection_count
     FROM flows
-
-    WHERE "destination_port" IN (''80'', ''443'', ''8080'', ''8443'')
-
-    GROUP BY sourceip, destinationip, destinationport
-
+    WHERE destinationport NOT IN (80, 443, 8080, 8443)
+      AND (protocol = 6 OR protocol = 17)
+      AND destinationip NOT LIKE '10.%'
+      AND destinationip NOT LIKE '172.16.%'
+      AND destinationip NOT LIKE '172.17.%'
+      AND destinationip NOT LIKE '172.18.%'
+      AND destinationip NOT LIKE '172.19.%'
+      AND destinationip NOT LIKE '172.20.%'
+      AND destinationip NOT LIKE '172.21.%'
+      AND destinationip NOT LIKE '172.22.%'
+      AND destinationip NOT LIKE '172.23.%'
+      AND destinationip NOT LIKE '172.24.%'
+      AND destinationip NOT LIKE '172.25.%'
+      AND destinationip NOT LIKE '172.26.%'
+      AND destinationip NOT LIKE '172.27.%'
+      AND destinationip NOT LIKE '172.28.%'
+      AND destinationip NOT LIKE '172.29.%'
+      AND destinationip NOT LIKE '172.30.%'
+      AND destinationip NOT LIKE '172.31.%'
+      AND destinationip NOT LIKE '192.168.%'
+    GROUP BY sourceip, destinationip, destinationport, protocol
     LAST 1 HOURS
-
-    '
-  yara_l: "rule tdl_tdl_c2_000805 {\n  meta:\n    author = \"TDL\"\n    description = \"HTTP/TLS on Unexpected Port\"\n    severity = \"MEDIUM\"\
-    \n    tactic = \"TA0011\"\n    technique = \"T1571\"\n  events:\n    $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    $e.destination_port\
-    \ = /(80|443|8080|8443)/\n    $src = $e.principal.ip\n  match:\n    $src over 10m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-network*,logs-endpoint*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "network" AND destination_port IN ("80", "443", "8080", "8443")
-
-    | STATS bytes_out = SUM(network.bytes), conns = COUNT(*) BY source.ip, destination.ip, destination.port
-
-    | SORT bytes_out DESC
-
-    '
-  leql: 'where(logset = "Network Activity" AND destination_port IN [80, 443, 8080, 8443])
-
-    groupby(source_ip, destination_ip, destination_port)
-
-    calculate(count, sum(bytes_out))
-
-    '
-  crowdstrike: 'event_simpleName IN (NetworkConnectIP4, NetworkConnectIP6, DnsRequest) AND destination_port IN (80, 443, 8080, 8443)
-
-    | stats count as conns, sum(BytesSent) as bytes_out by ComputerName, RemoteAddressIP4, RemotePort
-
-    | sort -bytes_out
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.NETWORK AND destination_port in ("80", "443", "8080", "8443")
-
-    | comp count() as conns, sum(action_total_bytes) as bytes_out by agent_hostname, action_remote_ip, action_remote_port
-
-    | sort desc bytes_out
-
-    '
-  lucene: 'event.category:"network" AND destination_port:(80 OR 443 OR 8080 OR 8443)
-
-    '
-  sumo: '_sourceCategory=*firewall* OR _sourceCategory=*ids* OR _sourceCategory=*flow*
-
-    | where destination_port IN ("80", "443", "8080", "8443")
-
-    | sum(bytes_out) as bytes_out, count by src_ip, dest_ip, dest_port
-
-    | sort by bytes_out desc
-
-    '
+  yara_l: "rule non_standard_port_c2 {\n  meta:\n    author = \"TDL\"\n    description = \"Detects TLS/HTTP traffic on non-standard ports to external\
+    \ IPs from workstations\"\n    mitre_attack_tactic = \"Command and Control\"\n    mitre_attack_technique = \"T1571\"\n    \n  events:\n  \
+    \  $e.metadata.event_type = \"NETWORK_CONNECTION\"\n    (\n      $e.network.application_protocol = \"HTTPS\" or\n      $e.network.application_protocol\
+    \ = \"HTTP\" or\n      $e.network.application_protocol = \"TLS\" or\n      $e.network.application_protocol = \"SSL\"\n    )\n    not (\n \
+    \     $e.target.port = 80 or\n      $e.target.port = 443 or\n      $e.target.port = 8080 or\n      $e.target.port = 8443\n    )\n    not net.ip_in_range_cidr($e.target.ip,\
+    \ \"10.0.0.0/8\")\n    not net.ip_in_range_cidr($e.target.ip, \"172.16.0.0/12\")\n    not net.ip_in_range_cidr($e.target.ip, \"192.168.0.0/16\"\
+    )\n    not net.ip_in_range_cidr($e.target.ip, \"127.0.0.0/8\")\n    $e.principal.hostname = $host\n    \n  match:\n    $host over 5m\n   \
+    \ \n  condition:\n    $e\n}\n"
+  esql: |
+    FROM logs-network.firewall*, logs-firewall*
+    | WHERE @timestamp > NOW() - 24 hours
+      AND destination.port NOT IN (80, 443, 8080, 8443)
+      AND network.protocol IN ("tls", "http", "https")
+      AND NOT CIDR_MATCH(destination.ip, "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8")
+      AND (TO_LOWER(source.hostname) LIKE "*workstation*" OR TO_LOWER(host.name) LIKE "*workstation*" OR TO_LOWER(source.hostname) LIKE "*ws-*" OR TO_LOWER(host.name) LIKE "*ws-*")
+    | KEEP @timestamp, source.ip, source.hostname, host.name, destination.ip, destination.port, network.protocol, network.transport
+  leql: |
+    where(destination_port NOT IN [80, 443, 8080, 8443] AND (destination_address!=10.0.0.0/8 AND destination_address!=172.16.0.0/12 AND destination_address!=192.168.0.0/16) AND (service ICONTAINS "tls" OR service ICONTAINS "ssl" OR service ICONTAINS "http")) groupby(source_asset, destination_address, destination_port) calculate(count)
+  crowdstrike: "#type=firewall (event_simpleName=NetworkConnectIP4 OR event_simpleName=NetworkReceiveAcceptIP4) \n(LocalPort!=80 AND LocalPort!=443\
+    \ AND LocalPort!=8080 AND LocalPort!=8443 AND RemotePort!=80 AND RemotePort!=443 AND RemotePort!=8080 AND RemotePort!=8443)\nNOT cidr(RemoteAddressIP4,\
+    \ subnet=[\"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\", \"127.0.0.0/8\"])\nComputerName=/.*workstation.*|.*wks.*|.*desktop.*/i\n\
+    | table([@timestamp, ComputerName, LocalAddressIP4, LocalPort, RemoteAddressIP4, RemotePort, Protocol])\n"
+  xql: |
+    dataset = panw_ngfw_traffic_raw
+    | filter dest_port not in (80, 443, 8080, 8443)
+    | filter app in ("ssl", "web-browsing")
+    | filter to_zone = "untrust" or action_firewall_is_dest_external_ip = true
+    | filter source_device_category = "end-user-systems" or source_device_category = "workstation"
+    | fields _time, source_ip, dest_ip, dest_port, app, source_user, source_device_host
+  lucene: |
+    (network.transport:tcp OR network.protocol:tls OR network.protocol:http OR application_protocol:(http OR tls OR https)) AND destination.port:(* AND NOT (80 OR 443 OR 8080 OR 8443)) AND NOT destination.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16 OR 127.0.0.0/8) AND source.ip:(10.0.0.0/8 OR 172.16.0.0/12 OR 192.168.0.0/16)
+  sumo: |
+    _sourceCategory=*Firewall* OR _sourceCategory=*Network*
+    | parse regex "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}).*(?<dest_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}).*(?<dest_port>\d+)" nodrop
+    | parse regex "port[:\s]+(?<dest_port>\d+)" nodrop
+    | parse regex "dport[:\s]+(?<dest_port>\d+)" nodrop
+    | where !(dest_port in ("80","443","8080","8443"))
+    | where !(dest_ip matches "10.*" or dest_ip matches "172.16.*" or dest_ip matches "172.17.*" or dest_ip matches "172.18.*" or dest_ip matches "172.19.*" or dest_ip matches "172.20.*" or dest_ip matches "172.21.*" or dest_ip matches "172.22.*" or dest_ip matches "172.23.*" or dest_ip matches "172.24.*" or dest_ip matches "172.25.*" or dest_ip matches "172.26.*" or dest_ip matches "172.27.*" or dest_ip matches "172.28.*" or dest_ip matches "172.29.*" or dest_ip matches "172.30.*" or dest_ip matches "172.31.*" or dest_ip matches "192.168.*")
+    | where _raw matches "*TLS*" or _raw matches "*SSL*" or _raw matches "*handshake*" or _raw matches "*HTTP*" or _raw matches "*GET*" or _raw matches "*POST*"
+    | fields _messageTime, src_ip, dest_ip, dest_port, _raw
 pseudo_logic: TLS handshake or HTTP traffic on port not in [80,443,8080,8443] going to external IP from a workstation.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -109,7 +113,7 @@ references:
 - https://attack.mitre.org/techniques/T1571/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, source host, destination domain/IP, and the cadence pattern detected.'

@@ -20,68 +20,112 @@ queries:
     role_change_to_admin\")\n| sort 0 + event_time\n| streamstats current=f last(action) as prev_action last(event_time) as prev_time by target_username\n\
     | where action=\"role_change_to_admin\" AND prev_action IN (\"guest_reactivated\", \"guest_channel_join\", \"guest_created\") AND (event_time\
     \ - prev_time) <= 3600\n| table _time, target_username, prev_action, action, prev_time, event_time, user, src_ip\n"
-  kql: 'union AWSCloudTrail, AzureActivity, AuditLogs
+  kql: |
+    let GuestActions = Slack_CL
+    | where TimeGenerated > ago(1h)
+    | where Action_s in ("guest_reactivated", "guest_channel_join", "guest_created")
+    | project GuestTime = TimeGenerated, TargetUsername = TargetUsername_s;
+    let AdminChanges = Slack_CL
+    | where TimeGenerated > ago(1h)
+    | where Action_s == "role_change_to_admin"
+    | project AdminTime = TimeGenerated, TargetUsername = TargetUsername_s;
+    GuestActions
+    | join kind=inner AdminChanges on TargetUsername
+    | where AdminTime >= GuestTime and AdminTime <= GuestTime + 1h
+    | project GuestTime, AdminTime, TargetUsername
+  aql: "SELECT \n    FIRST(e1.eventtime) AS initial_event_time,\n    e1.username AS actor,\n    e1.\"Target Username\" AS target_user,\n    LAST(e2.eventtime)\
+    \ AS role_change_time,\n    e1.\"Action\" AS initial_action\nFROM events e1\nWHERE \n    e1.\"Action\" IN ('guest_reactivated', 'guest_channel_join',\
+    \ 'guest_created')\n    AND e1.\"Target Username\" IN (\n        SELECT e2.\"Target Username\"\n        FROM events e2\n        WHERE e2.\"\
+    Action\" = 'role_change_to_admin'\n            AND e2.eventtime BETWEEN e1.eventtime AND e1.eventtime + 3600000\n        LAST 1 HOURS\n  \
+    \  )\nGROUP BY e1.username, e1.\"Target Username\", e1.\"Action\"\nLAST 1 HOURS\n"
+  yara_l: |
+    rule slack_guest_to_admin_privilege_escalation {
+      meta:
+        author = "TDL"
+        description = "Detects guest account activation followed by elevation to admin within 1 hour"
+        mitre_attack_tactic = "Initial Access"
+        mitre_attack_technique = "T1078"
+        severity = "HIGH"
 
-    | where TimeGenerated > ago(1d)
+      events:
+        $guest.metadata.vendor_name = "Slack"
+        (
+          $guest.metadata.product_event_type = "guest_reactivated" or
+          $guest.metadata.product_event_type = "guest_channel_join" or
+          $guest.metadata.product_event_type = "guest_created"
+        )
+        $guest.target.user.userid = $target_user
 
-    | where eventName matches regex ".+"
+        $admin.metadata.vendor_name = "Slack"
+        $admin.metadata.product_event_type = "role_change_to_admin"
+        $admin.target.user.userid = $target_user
 
-    | summarize Count=count() by Identity, EventName=coalesce(EventName, OperationName), Resource=tostring(coalesce(ResourceId, ResourceProvider))
+        $guest.metadata.event_timestamp.seconds <= $admin.metadata.event_timestamp.seconds
 
-    | order by Count desc
+      match:
+        $target_user over 1h
 
-    '
-  aql: "SELECT DEVICETIME, \"User Identity\", \"Event Name\", \"Source IP Address\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype) IN ('AWS\
-    \ CloudTrail','Azure Audit','GCP Cloud Audit')\n  AND \"eventName\" LIKE '%.+%'\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_auth_000685 {\n  meta:\n    author = \"TDL\"\n    description = \"Guest User Privilege Escalation - Slack\"\n    severity\
-    \ = \"HIGH\"\n    tactic = \"TA0001\"\n    technique = \"T1078\"\n  events:\n    $e.metadata.event_type = \"USER_RESOURCE_ACCESS\"\n    $e.eventName\
-    \ = /.+/\n    $actor = $e.principal.user.userid\n  match:\n    $actor over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-aws*,logs-azure*,logs-gcp*
+      outcome:
+        $risk_score = 85
+        $guest_action = $guest.metadata.product_event_type
+        $guest_time = $guest.metadata.event_timestamp.seconds
+        $admin_time = $admin.metadata.event_timestamp.seconds
 
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE eventName LIKE "%.+%"
-
-    | STATS count = COUNT(*) BY user.name, event.action, cloud.account.id
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset IN ["AWS CloudTrail", "Azure Audit", "GCP Audit"] AND eventName=/.+/)
-
-    groupby(actor, event_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=CloudOcsfApiActivity AND eventName=*.+*
-
-    | stats count as calls by Actor, ApiName, SourceIPAddress
-
-    | sort -calls
-
-    '
-  xql: 'dataset = cloud_audit_logs
-
-    | filter eventName ~= ".+"
-
-    | comp count() as calls by actor_effective_username, action_evtlog_event_name, action_remote_ip
-
-    | sort desc calls
-
-    '
-  lucene: 'event.dataset:("aws.cloudtrail" OR "azure.audit" OR "gcp.audit") AND eventName:*.+*
-
-    '
-  sumo: '_sourceCategory=*aws/cloudtrail* OR _sourceCategory=*azure/audit* OR _sourceCategory=*gcp/audit*
-
-    | where eventName matches "*.+*"
-
-    | count by userIdentity_arn, eventName, sourceIPAddress
-
-    | sort by _count desc
-
-    '
+      condition:
+        $guest and $admin
+    }
+  esql: "FROM logs-slack*\n| WHERE @timestamp > NOW() - 2 hours\n| WHERE event.action IN (\"guest_reactivated\", \"guest_channel_join\", \"guest_created\"\
+    , \"role_change_to_admin\")\n| EVAL target_user = COALESCE(user.target.name, user.name)\n| SORT target_user, @timestamp\n| STATS \n    guest_time\
+    \ = MIN(@timestamp),\n    admin_time = MAX(@timestamp),\n    guest_count = COUNT(*) WHERE event.action IN (\"guest_reactivated\", \"guest_channel_join\"\
+    , \"guest_created\"),\n    admin_count = COUNT(*) WHERE event.action == \"role_change_to_admin\"\n  BY target_user\n| WHERE guest_count >=\
+    \ 1 AND admin_count >= 1\n| EVAL time_diff_minutes = (admin_time - guest_time) / 60000\n| WHERE time_diff_minutes >= 0 AND time_diff_minutes\
+    \ <= 60\n| KEEP target_user, guest_time, admin_time, time_diff_minutes\n"
+  leql: "where(source_json.action IN [\"guest_reactivated\", \"guest_channel_join\", \"guest_created\"]) \ngroupby(source_json.target_username)\
+    \ \ncalculate(count)\n"
+  crowdstrike: |
+    #type=slack action IN ["guest_reactivated", "guest_channel_join", "guest_created"]
+    | groupBy([target_username], function=collect([action, @timestamp]))
+    | rename("_collect", as="guest_events")
+    | join({
+        #type=slack action="role_change_to_admin"
+        | groupBy([target_username], function=collect([action, @timestamp]))
+        | rename("_collect", as="admin_events")
+      }, field=[target_username], include=[admin_events])
+    | test(guest_events[0] < admin_events[0])
+    | test((admin_events[0] - guest_events[0]) <= 3600000)
+    | table([target_username, guest_events, admin_events])
+  xql: |
+    dataset = cloud_audit_logs
+    | filter vendor = "Slack" and operation in ("guest_reactivated", "guest_channel_join", "guest_created")
+    | alter guest_username = target_username
+    | join type=inner (
+        dataset = cloud_audit_logs
+        | filter vendor = "Slack" and operation = "role_change_to_admin"
+        | alter admin_username = target_username, admin_time = _time
+      ) as admin_events
+      admin_events.admin_username = guest_username and admin_events.admin_time >= _time and admin_events.admin_time <= add(_time, hours(1))
+    | fields _time, guest_username, operation, admin_events.admin_time, admin_events.operation
+  lucene: |
+    (action:("guest_reactivated" OR "guest_channel_join" OR "guest_created")) AND action:"role_change_to_admin"
+  sumo: |
+    _sourceCategory=*Slack*
+    | json field=_raw "action" as action
+    | json field=_raw "target_username" as target_username
+    | json field=_raw "timestamp" as event_timestamp
+    | where action in ("guest_reactivated", "guest_channel_join", "guest_created", "role_change_to_admin")
+    | sort by target_username, event_timestamp
+    | where action in ("guest_reactivated", "guest_channel_join", "guest_created")
+    | first(event_timestamp) as first_event_time by target_username
+    | join (
+        _sourceCategory=*Slack*
+        | json field=_raw "action" as action
+        | json field=_raw "target_username" as target_username
+        | json field=_raw "timestamp" as event_timestamp
+        | where action = "role_change_to_admin"
+        | first(event_timestamp) as admin_event_time by target_username
+      ) on target_username
+    | where (admin_event_time - first_event_time) <= 3600000
+    | fields target_username, first_event_time, admin_event_time
 false_positives:
 - Legitimate admin activity
 - Authorized service accounts
@@ -91,7 +135,7 @@ tags:
 - initial-access
 author: TDL
 created: '2024-01-01'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 pseudo_logic: '1 Slack Event
 

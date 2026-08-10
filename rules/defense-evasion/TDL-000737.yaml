@@ -16,77 +16,92 @@ fidelity: High
 lifecycle: Proposed
 risk_score: 95
 queries:
-  spl: |
-    index=wineventlog sourcetype=WinEventLog:Security (EventCode=4928 OR EventCode=4929)
-    | eval suspicious_source=if(like(Subject_Security_ID, "%CN=Computers,DC=%") OR like(Subject_Security_ID, "%OU=Domain Controllers,DC=%"), 0, 1)
+  spl: 'index=wineventlog sourcetype=WinEventLog:Security (EventCode=4928 OR EventCode=4929)
+
+    | eval suspicious_source=if(like(Subject_Security_ID, "%CN=Computers,DC=%") OR like(Subject_Security_ID, "%OU=Domain Controllers,DC=%"), 0,
+    1)
+
     | where suspicious_source=1
-    | stats count values(Source_Address) as source_addresses values(Destination_DRA) as destination_dra values(Subject_Account_Name) as account_name by _time, ComputerName, EventCode
+
+    | stats count values(Source_Address) as source_addresses values(Destination_DRA) as destination_dra values(Subject_Account_Name) as account_name
+    by _time, ComputerName, EventCode
+
     | table _time, ComputerName, EventCode, account_name, source_addresses, destination_dra, count
-  kql: 'DeviceProcessEvents
 
-    | where TimeGenerated > ago(1d)
+    '
+  kql: |
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID in (4928, 4929)
+    | where Computer !has "DC"
+    | extend SourceComputer = tostring(extract(@"Source:\s*([^\s]+)", 1, EventData))
+    | extend ServicePrincipalName = tostring(extract(@"Service Principal Name:\s*([^\s]+)", 1, EventData))
+    | where isnotempty(SourceComputer) or isnotempty(ServicePrincipalName)
+    | project TimeGenerated, Computer, EventID, Account, SourceComputer, ServicePrincipalName, EventData
+  aql: |
+    SELECT eventtime, LOGSOURCENAME(logsourceid) AS host, sourceip, username, "EventID", "Service Principal Name" AS spn, "Naming Context" AS naming_context
+    FROM events
+    WHERE ("EventID" = '4928' OR "EventID" = '4929')
+      AND LOGSOURCENAME(logsourceid) NOT ILIKE '%OU=Domain Controllers%'
+    LAST 24 HOURS
+  yara_l: |
+    rule dcshadow_rogue_dc_replication {
+      meta:
+        author = "TDL"
+        description = "Detects DCShadow attack via rogue DC registration (EID 4928/4929) or DRSReplicaAdd from non-DC hosts"
+        mitre_attack_tactic = "Defense Evasion"
+        mitre_attack_technique = "T1207"
+        severity = "HIGH"
 
+      events:
+        $e.metadata.event_type = "USER_RESOURCE_UPDATE_CONTENT" or
+        $e.metadata.event_type = "SYSTEM_AUDIT_LOG_UNCATEGORIZED"
+        (
+          $e.metadata.product_event_type = "4928" or
+          $e.metadata.product_event_type = "4929"
+        )
+        $e.principal.hostname = $host
+        not re.regex($e.principal.asset.asset_id, `(?i)OU=Domain Controllers`)
+        not re.regex($e.principal.hostname, `(?i)^(DC|DOMAINCONTROLLER)`)
+
+      match:
+        $host over 5m
+
+      outcome:
+        $risk_score = 85
+
+      condition:
+        $e
+    }
+  esql: "FROM logs-system.security*\n| WHERE @timestamp > NOW() - 1 hour \n  AND event.code IN (\"4928\", \"4929\")\n  AND NOT winlog.event_data.SubjectUserName\
+    \ LIKE \"*$\"\n  AND NOT TO_LOWER(winlog.event_data.SourceDN) LIKE \"*ou=domain controllers*\"\n| STATS replications = COUNT(*) BY host.name,\
+    \ winlog.event_data.SubjectUserName, winlog.event_data.SourceDN, source.ip\n| WHERE replications > 0\n| KEEP @timestamp, host.name, winlog.event_data.SubjectUserName,\
+    \ winlog.event_data.SourceDN, source.ip, replications\n"
+  leql: |
+    where(source_json.EventID IN [4928, 4929]) groupby(source_asset, source_json.SubjectUserName, source_json.SourceDRA) calculate(count)
+  crowdstrike: |
+    EventCode IN [4928, 4929]
+    | groupBy([ComputerName, SourceDRA, SubjectUserName], function=count(as=events))
+    | table([@timestamp, ComputerName, SourceDRA, SubjectUserName, EventCode, events])
+  xql: |
+    dataset = xdr_data
+    | filter action_evtlog_event_id in (4928, 4929)
+    | alter source_host = coalesce(action_evtlog_event_data_SourceDRA, action_evtlog_event_data_SourceHostName, action_evtlog_event_data_SubjectUserName)
+    | filter source_host != null
+    | filter not (lowercase(action_evtlog_event_data_SourceDN) contains "ou=domain controllers" or lowercase(action_evtlog_event_data_SourceDN) contains "ou=domain_controllers")
+    | fields _time, agent_hostname, action_evtlog_event_id, source_host, action_evtlog_event_data_SourceDN, action_evtlog_event_data_SourceDRA, action_evtlog_event_data_SubjectUserName, action_evtlog_message
+  lucene: |
+    (event.code:(4928 OR 4929) AND NOT source.host.ou:*DC*) OR (event.code:4662 AND winlog.event_data.Properties:*1131f6aa-9c07-11d1-f79f-00c04fc2dcd2* AND NOT user.name:(*DC* OR *SYNC* OR *REPL*))
+  sumo: |
+    _sourceCategory=*Windows* ("4928" OR "4929")
+    | json field=_raw "EventID" as event_id
+    | json field=_raw "Computer" as computer
+    | json field=_raw "SubjectUserName" as subject_user
+    | json field=_raw "ServicePrincipalName" as spn
+    | json field=_raw "SourceDRA" as source_dra
     | where event_id in ("4928", "4929")
-
-    | summarize Count=count() by DeviceName, AccountName, FileName, InitiatingProcessFileName, ProcessCommandLine
-
-    | order by Count desc
-
-    '
-  aql: "SELECT DEVICETIME, sourceip, \"Process Name\", \"Parent Process Name\", \"Process CommandLine\"\nFROM events\nWHERE LOGSOURCETYPENAME(devicetype)\
-    \ = 'Microsoft Windows Sysmon'\n  AND \"EventID\" = '1'\n  AND \"event_id\" IN ('4928', '4929')\nLAST 24 HOURS\n"
-  yara_l: "rule tdl_tdl_de_000737 {\n  meta:\n    author = \"TDL\"\n    description = \"DCShadow Replication from Non-DC Source\"\n    severity\
-    \ = \"CRITICAL\"\n    tactic = \"TA0005\"\n    technique = \"T1207\"\n  events:\n    $e.metadata.event_type = \"PROCESS_LAUNCH\"\n    $e.event_id\
-    \ = /(4928|4929)/\n    $host = $e.principal.hostname\n  match:\n    $host over 30m\n  condition:\n    $e\n}\n"
-  esql: 'FROM logs-endpoint*,logs-windows*
-
-    | WHERE @timestamp > NOW() - 1 hour
-
-    | WHERE event.category == "process" AND event_id IN ("4928", "4929")
-
-    | STATS count = COUNT(*) BY host.name, user.name, process.name, process.parent.name, process.command_line
-
-    | SORT count DESC
-
-    '
-  leql: 'where(logset = "Endpoint Activity" AND event_id IN [4928, 4929])
-
-    groupby(asset, process_name, parent_process_name)
-
-    calculate(count)
-
-    '
-  crowdstrike: 'event_simpleName=ProcessRollup2 AND event_id IN (4928, 4929)
-
-    | stats count as occurrences by ComputerName, UserName, FileName, ParentBaseFileName, CommandLine
-
-    | sort -occurrences
-
-    '
-  xql: 'dataset = xdr_data
-
-    | filter event_type = ENUM.PROCESS AND event_id in ("4928", "4929")
-
-    | comp count() as occurrences by agent_hostname, actor_effective_username, action_process_image_name, causality_actor_process_image_name,
-    action_process_image_command_line
-
-    | sort desc occurrences
-
-    '
-  lucene: 'event.category:"process" AND event_id:(4928 OR 4929)
-
-    '
-  sumo: '_sourceCategory=*sysmon* OR _sourceCategory=*endpoint*
-
-    | parse "EventID=*\"" as event_id
-
-    | where event_id="1" AND event_id IN ("4928", "4929")
-
-    | count by host, user, parent_process_name, command_line
-
-    | sort by _count desc
-
-    '
+    | where !(computer matches "*OU=Domain Controllers*")
+    | fields _messageTime, computer, event_id, subject_user, spn, source_dra, _sourceHost
 pseudo_logic: EID 4928/4929 replication source from a host not in the DC OU, or DRSReplicaAdd from an unfamiliar SPN. DCShadow pattern.
 false_positives:
 - Sanctioned admin or engineering activity
@@ -103,7 +118,7 @@ references:
 - https://attack.mitre.org/techniques/T1207/
 author: TDL gap-analysis generator
 created: '2026-04-27'
-last_modified: '2026-07-18'
+last_modified: '2026-08-10'
 test_method: none
 triage_steps:
 - 'Confirm the alert metadata: timestamp, host, user, and the evasion artifact (process / DLL / log clear / service stop).'

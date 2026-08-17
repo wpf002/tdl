@@ -43,6 +43,16 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
   const [saving, setSaving] = useState(false)
   const [savedAt, setSavedAt] = useState(null)
   const [error, setError] = useState(null)
+  // Splunk lab URL — browser-local (per machine), drives the rule "Open in Splunk"
+  // link. Not part of the org profile; saved to localStorage immediately.
+  const [splunkUrl, setSplunkUrl] = useState(() => {
+    try { return localStorage.getItem('tdl_splunk_url') || 'http://localhost:8000' }
+    catch { return 'http://localhost:8000' }
+  })
+  const onSplunkUrlChange = (v) => {
+    setSplunkUrl(v)
+    try { localStorage.setItem('tdl_splunk_url', v.trim().replace(/\/+$/, '')) } catch { /* ignore */ }
+  }
 
   const logSources = useMemo(() => {
     const u = new Set()
@@ -124,6 +134,21 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
             onChange={(e) => setOrgName(e.target.value)}
             placeholder="Acme Security"
             required
+            style={S.input}
+          />
+        </label>
+
+        <label style={S.label}>
+          Splunk lab URL
+          <div style={S.sublabel}>
+            Where your local Splunk test-lab is reachable — drives the “Open in Splunk”
+            link on each rule. Saved to this browser instantly (no need to hit Save).
+          </div>
+          <input
+            type="text"
+            value={splunkUrl}
+            onChange={(e) => onSplunkUrlChange(e.target.value)}
+            placeholder="http://localhost:8100"
             style={S.input}
           />
         </label>

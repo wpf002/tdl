@@ -1005,8 +1005,8 @@ function CopyBtn({ text, label = 'Copy' }) {
 // ── Open a rule's matching logs in the local Splunk lab (test-lab/) ──────────
 // Base URL of the lab Splunk; override with localStorage 'tdl_splunk_url'.
 function splunkBaseUrl() {
-  try { return localStorage.getItem('tdl_splunk_url') || 'http://localhost:8000' }
-  catch { return 'http://localhost:8000' }
+  try { return localStorage.getItem('tdl_splunk_url') || 'http://localhost:8100' }
+  catch { return 'http://localhost:8100' }
 }
 // Transforming commands — everything after the first of these is dropped so the
 // link shows the RAW events the rule matches, not its aggregated output.

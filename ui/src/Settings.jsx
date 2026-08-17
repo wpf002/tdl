@@ -46,8 +46,8 @@ export default function Settings({ profile, onSave, onRerunSetup }) {
   // Splunk lab URL — browser-local (per machine), drives the rule "Open in Splunk"
   // link. Not part of the org profile; saved to localStorage immediately.
   const [splunkUrl, setSplunkUrl] = useState(() => {
-    try { return localStorage.getItem('tdl_splunk_url') || 'http://localhost:8000' }
-    catch { return 'http://localhost:8000' }
+    try { return localStorage.getItem('tdl_splunk_url') || 'http://localhost:8100' }
+    catch { return 'http://localhost:8100' }
   })
   const onSplunkUrlChange = (v) => {
     setSplunkUrl(v)

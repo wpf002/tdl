@@ -1008,14 +1008,26 @@ function splunkBaseUrl() {
   try { return localStorage.getItem('tdl_splunk_url') || 'http://localhost:8100' }
   catch { return 'http://localhost:8100' }
 }
-// Transforming commands — everything after the first of these is dropped so the
-// link shows the RAW events the rule matches, not its aggregated output.
-const SPL_TRANSFORM_RE = /\|\s*(stats|eventstats|streamstats|tstats|timechart|chart|eval|where|table|fields|sort|dedup|top|rare|rename|bin|transaction|head|tail|convert|fillnull|mvexpand|spath)\b/i
+// Transforming commands — everything after the first TOP-LEVEL one is dropped so
+// the link shows the RAW events the rule matches, not its aggregated output.
+const SPL_TRANSFORM_RE = /^(stats|eventstats|streamstats|tstats|timechart|chart|eval|where|table|fields|sort|dedup|top|rare|rename|bin|transaction|head|tail|convert|fillnull|mvexpand|spath)\b/i
 function splunkEventsUrl(spl) {
   if (!spl) return null
   let q = spl.trim()
-  const m = q.match(SPL_TRANSFORM_RE)
-  if (m) q = q.slice(0, m.index).trim()                       // keep only the filtering part
+  // Find the first transforming pipe at depth 0 (outside any (...) or [...]
+  // subsearch) and cut there — cutting inside a subsearch would leave the query
+  // with unbalanced brackets and fail to parse.
+  let depth = 0, cut = -1
+  for (let i = 0; i < q.length; i++) {
+    const c = q[i]
+    if (c === '(' || c === '[') depth++
+    else if (c === ')' || c === ']') depth = Math.max(0, depth - 1)
+    else if (c === '|' && depth === 0 && SPL_TRANSFORM_RE.test(q.slice(i + 1).trimStart())) {
+      cut = i
+      break
+    }
+  }
+  if (cut >= 0) q = q.slice(0, cut).trim()
   q = q.replace(/\bindex\s*=\s*"?[\w*-]+"?/gi, 'index=*')      // normalize to the lab data
   if (!/^(search|\|)\b/i.test(q)) q = 'search ' + q
   const params = new URLSearchParams({ q, earliest: '0', latest: 'now' })
